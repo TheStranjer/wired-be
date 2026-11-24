@@ -225,10 +225,10 @@ pub async fn create_reaction(
 /// `content_type`, served at `url`, sitting at `position` within the
 /// status, uploaded by the status's author.
 ///
-/// The embed card and the media-shaped tests need a status that actually
-/// carries attachments without restating the whole
-/// [`NewMediaAttachment`]; everything the card does not read (preview,
-/// description, dimensions) keeps its default.
+/// The media-shaped tests need a status that actually carries
+/// attachments without restating the whole [`NewMediaAttachment`];
+/// everything they do not read (preview, description, dimensions) keeps
+/// its default.
 ///
 /// # Panics
 ///

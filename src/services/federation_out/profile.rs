@@ -6,12 +6,17 @@
 //! The pair that announces an account's move is [`super::moves`]' arm, which
 //! finishes by running the profile `Update` documented here.
 
+use std::collections::HashSet;
+
 use serde_json::{Value, json};
 use tracing::{debug, warn};
 
 use super::PUBLIC;
 use crate::{
-    federation::{activities::activity_id, actor::actor_json, note, publisher},
+    error::AppResult,
+    federation::{
+        activities::activity_id, actor::actor_json, delivery::best_inbox, note, publisher,
+    },
     models::{
         follow, relay,
         user::{self, User},
@@ -93,69 +98,54 @@ fn update_document(state: &AppState, account: &User, followers_collection: &str)
 /// ([`user::all_remote_inboxes`]) not already named goes in a second, so
 /// the peers are not queued behind the long tail. The publisher drops
 /// unreachable hosts when each job runs.
-pub async fn after_account_deleted(state: &AppState, account: &User) {
+///
+/// # Errors
+///
+/// Any failure to read the recipients or to queue a publish is returned, so
+/// the deletion job can retry *before* it clears the follow rows the
+/// recipient list is built from. Federation disabled, a remote account and
+/// an account nobody knew all answer `Ok(())`.
+pub async fn after_account_deleted(state: &AppState, account: &User) -> AppResult<()> {
     if !state.config.federation_enabled.get() {
-        return;
+        return Ok(());
     }
     if !account.local.get() {
-        return; // only our own actors announce themselves
+        return Ok(()); // only our own actors announce themselves
     }
     let mut recipients: Vec<String> = Vec::new();
-    match follow::remote_followers(&state.db, account.id).await {
-        Ok(followers) => recipients.extend(followers.iter().filter_map(deliverable_inbox)),
-        Err(err) => {
-            warn!(%err, actor = %account.ap_id, "could not read the followers for Delete federation");
-        }
-    }
-    match follow::remote_followees(&state.db, account.id).await {
-        Ok(followees) => recipients.extend(followees.iter().filter_map(deliverable_inbox)),
-        Err(err) => {
-            warn!(%err, actor = %account.ap_id, "could not read the followees for Delete federation");
-        }
-    }
-    match relay::accepted_inboxes(&state.db).await {
-        Ok(relays) => recipients.extend(relays),
-        Err(err) => {
-            warn!(%err, actor = %account.ap_id, "could not read the relays for Delete federation");
-        }
-    }
+    let fans = follow::remote_followers(&state.db, account.id).await?;
+    recipients.extend(fans.iter().filter_map(best_inbox));
+    let idols = follow::remote_followees(&state.db, account.id).await?;
+    recipients.extend(idols.iter().filter_map(best_inbox));
+    recipients.extend(relay::accepted_inboxes(&state.db).await?);
     // Two remote accounts on one instance name one shared inbox; the
-    // snapshot POSTs there once.
-    recipients.sort_unstable();
-    recipients.dedup();
+    // publisher's fan-out deduplicates by URL, so the snapshot POSTs there
+    // once.
+    let named: HashSet<&str> = recipients.iter().map(String::as_str).collect();
     // Every other inbox this instance has ever stored: the long tail that
     // learns of the deletion behind the follow peers, never ahead of them.
-    let mut long_tail: Vec<String> = Vec::new();
-    match user::all_remote_inboxes(&state.db).await {
-        Ok(known) => long_tail.extend(
-            known
-                .into_iter()
-                .filter(|inbox| recipients.binary_search(inbox).is_err()),
-        ),
-        Err(err) => {
-            warn!(%err, actor = %account.ap_id, "could not read the known inboxes for Delete federation");
-        }
-    }
+    let long_tail: Vec<String> = user::all_remote_inboxes(&state.db)
+        .await?
+        .into_iter()
+        .filter(|inbox| !named.contains(inbox.as_str()))
+        .collect();
     if recipients.is_empty() && long_tail.is_empty() {
-        return; // nobody on another instance ever knew this account
+        return Ok(()); // nobody on another instance ever knew this account
     }
     let document = delete_document(state, account);
     for (batch, priority) in [(&recipients, "peers"), (&long_tail, "long tail")] {
         if batch.is_empty() {
             continue;
         }
-        match publisher::publish_in_background(state, account.id, &document, batch, None).await {
-            Ok(()) => debug!(
-                actor = %account.ap_id,
-                inboxes = batch.len(),
-                priority,
-                "queued account Delete federation"
-            ),
-            Err(err) => {
-                warn!(%err, actor = %account.ap_id, priority, "could not queue account Delete federation");
-            }
-        }
+        publisher::publish_in_background(state, account.id, &document, batch, None).await?;
+        debug!(
+            actor = %account.ap_id,
+            inboxes = batch.len(),
+            priority,
+            "queued account Delete federation"
+        );
     }
+    Ok(())
 }
 
 /// The account `Delete` activity: the actor id as both `actor` and
@@ -181,22 +171,6 @@ fn delete_document(state: &AppState, account: &User) -> Value {
     })
 }
 
-/// The inbox to deliver to one remote account: its shared (instance-wide)
-/// inbox when it publishes one, its personal inbox otherwise — the
-/// publisher's own [`best_inbox`] rule, applied by the `Delete` snapshot
-/// while the rows still exist. An account with no inbox at all answers
-/// `None`; refused and local-origin inboxes are filtered by the publisher
-/// when the queued fan-out runs.
-///
-/// [`best_inbox`]: crate::federation::delivery::best_inbox
-fn deliverable_inbox(account: &User) -> Option<String> {
-    let inbox = account
-        .shared_inbox
-        .as_deref()
-        .or(account.inbox.as_deref())?;
-    (!inbox.trim().is_empty() && inbox.starts_with("http")).then(|| inbox.to_owned())
-}
-
 /// The `disabled` landing hook: a deactivated account publishes nothing.
 ///
 /// An account switched off with `POST /api/pleroma/disable_account` keeps
@@ -215,7 +189,8 @@ mod tests {
         config::TEST_BASE_URL,
         models::user::{Flag, NewUser, insert},
         services::federation_out::test_support::{
-            accepted_follow, app_state, job_count, local, publish_jobs, remote,
+            accepted_follow, app_state, delivered_inboxes, delivery_jobs, job_count, local,
+            publish_jobs, remote, run_publishes,
         },
     };
 
@@ -269,7 +244,9 @@ mod tests {
         accepted_follow(&pool, &alice, &star).await;
         let state = app_state(&pool);
 
-        after_account_deleted(&state, &alice).await;
+        after_account_deleted(&state, &alice)
+            .await
+            .expect("the Delete federation runs");
 
         let jobs = publish_jobs(&pool).await;
         assert_eq!(jobs.len(), 1);
@@ -284,21 +261,40 @@ mod tests {
         assert_eq!(activity["actor"], alice.ap_id);
         assert_eq!(activity["object"], alice.ap_id);
         assert_eq!(activity["to"][0], PUBLIC);
-        let mut inboxes: Vec<&str> = args["extra_inboxes"]
-            .as_array()
-            .expect("the snapshot rides along")
-            .iter()
-            .map(Value::as_str)
-            .collect::<Option<Vec<_>>>()
-            .expect("every entry is a string")
-            .into_iter()
-            .collect();
-        inboxes.sort_unstable();
         assert_eq!(
-            inboxes,
-            vec!["https://remote.example/inbox"],
-            "both remote accounts share one instance inbox, and the snapshot names it once"
+            inboxes_of(args),
+            vec!["https://remote.example/inbox".to_owned(); 2],
+            "the snapshot names each account's best inbox"
         );
+
+        run_publishes(&state, &pool).await;
+        assert_eq!(
+            delivered_inboxes(&pool).await,
+            vec!["https://remote.example/inbox"],
+            "both remote accounts share one instance inbox, and it is delivered to once"
+        );
+    }
+
+    /// Two followers on one shared inbox cost one delivery job.
+    #[tokio::test]
+    async fn two_followers_on_a_shared_inbox_get_one_delivery() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = local(&pool, "alice").await;
+        let first = remote(&pool, "first").await;
+        let second = remote(&pool, "second").await;
+        accepted_follow(&pool, &first, &alice).await;
+        accepted_follow(&pool, &second, &alice).await;
+        let state = app_state(&pool);
+
+        after_account_deleted(&state, &alice)
+            .await
+            .expect("the Delete federation runs");
+        run_publishes(&state, &pool).await;
+
+        let deliveries = delivery_jobs(&pool).await;
+        assert_eq!(deliveries.len(), 1, "one shared inbox, one delivery");
+        assert_eq!(deliveries[0]["inbox"], "https://remote.example/inbox");
     }
 
     /// An account that no remote instance ever touched publishes no
@@ -310,7 +306,9 @@ mod tests {
         let alice = local(&pool, "alice").await;
         let state = app_state(&pool);
 
-        after_account_deleted(&state, &alice).await;
+        after_account_deleted(&state, &alice)
+            .await
+            .expect("the Delete federation runs");
 
         assert_eq!(
             job_count(&pool).await,
@@ -327,7 +325,9 @@ mod tests {
         let bob = remote(&pool, "bob").await;
         let state = app_state(&pool);
 
-        after_account_deleted(&state, &bob).await;
+        after_account_deleted(&state, &bob)
+            .await
+            .expect("the Delete federation runs");
         after_profile_updated(&state, &bob).await;
 
         assert_eq!(job_count(&pool).await, 0, "a mirror announces nothing");
@@ -409,7 +409,9 @@ mod tests {
         .expect("the pending relay stores");
         let state = app_state(&pool);
 
-        after_account_deleted(&state, &alice).await;
+        after_account_deleted(&state, &alice)
+            .await
+            .expect("the Delete federation runs");
 
         let jobs = publish_jobs(&pool).await;
         assert_eq!(jobs.len(), 2, "peers first, the long tail second");
@@ -437,7 +439,9 @@ mod tests {
         let _stranger = mirror_on(&pool, "stranger", "b.example").await;
         let state = app_state(&pool);
 
-        after_account_deleted(&state, &alice).await;
+        after_account_deleted(&state, &alice)
+            .await
+            .expect("the Delete federation runs");
 
         let jobs = publish_jobs(&pool).await;
         assert_eq!(jobs.len(), 1, "no peers, so only the long tail publishes");
@@ -484,7 +488,9 @@ mod tests {
         accepted_follow(&pool, &alice, &headless).await;
         let state = app_state(&pool);
 
-        after_account_deleted(&state, &alice).await;
+        after_account_deleted(&state, &alice)
+            .await
+            .expect("the Delete federation runs");
 
         let jobs = publish_jobs(&pool).await;
         let inboxes = jobs[0].0["extra_inboxes"]

@@ -11,7 +11,8 @@ use super::{DIGEST_HEADER, MALFORMED_BASE64, MALFORMED_DIGEST, SignatureError};
 ///
 /// Accepts the cavage spelling, `SHA-256=<base64>` in any case of the
 /// scheme, and the RFC 9530 structured-field spelling,
-/// `sha-256=:<base64>:`. A missing `Digest` header is an error exactly for
+/// `sha-256=:<base64>:`. The header may list several comma-separated
+/// digests (RFC 3230); the first `SHA-256` one is verified. A missing `Digest` header is an error exactly for
 /// requests that carry a body: bodyless requests never send one, so an
 /// empty `body` with no header verifies.
 ///
@@ -35,10 +36,17 @@ pub fn verify_digest(headers: &HeaderMap, body: &[u8]) -> Result<(), SignatureEr
             "the Digest header is not visible ASCII",
         ));
     };
-    let (scheme, encoded) = split_digest(text)?;
-    if !scheme.eq_ignore_ascii_case(DIGEST_SCHEME) {
-        return Err(SignatureError::UnsupportedAlgorithm);
+    let mut sha256 = None;
+    for part in text.split(',') {
+        let (scheme, encoded) = split_digest(part)?;
+        if scheme.eq_ignore_ascii_case(DIGEST_SCHEME) {
+            sha256 = Some(encoded);
+            break;
+        }
     }
+    let Some(encoded) = sha256 else {
+        return Err(SignatureError::UnsupportedAlgorithm);
+    };
     let claimed = BASE64.decode(encoded).map_err(|_err| MALFORMED_BASE64)?;
     let actual: [u8; 32] = Sha256::digest(body).into();
     if claimed == actual {
@@ -133,6 +141,44 @@ mod tests {
                 "`{value}` describes the body"
             );
         }
+    }
+
+    #[test]
+    fn a_header_listing_sha256_and_sha512_verifies() {
+        for value in [
+            format!("SHA-256={HELLO_B64},SHA-512=QUJD"),
+            format!("SHA-512=QUJD, sha-256={HELLO_B64}"),
+            format!("sha-256=:{HELLO_B64}:,SHA-512=:QUJD:"),
+        ] {
+            assert_eq!(
+                verify_digest(&digest_headers(&value), BODY),
+                Ok(()),
+                "`{value}` lists a SHA-256 that describes the body"
+            );
+        }
+    }
+
+    #[test]
+    fn a_header_listing_only_sha512_is_unsupported() {
+        assert_eq!(
+            verify_digest(&digest_headers("SHA-512=QUJD,SHA-384=REVG"), BODY),
+            Err(SignatureError::UnsupportedAlgorithm),
+            "no listed digest is SHA-256"
+        );
+    }
+
+    #[test]
+    fn a_listed_sha256_that_mismatches_is_bad_digest() {
+        assert_eq!(
+            verify_digest(
+                &digest_headers(
+                    "SHA-256=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=,SHA-512=QUJD"
+                ),
+                BODY
+            ),
+            Err(SignatureError::BadDigest),
+            "the SHA-256 entry does not describe the body"
+        );
     }
 
     #[test]

@@ -12,10 +12,10 @@
 
 use serde_json::Value;
 use sqlx::{PgPool, query};
-use tracing::info;
 
+use super::run_sweep;
 use crate::{
-    jobs::{AttemptInfo, HandlerFuture, JobError},
+    jobs::{AttemptInfo, HandlerFuture},
     state::AppState,
 };
 
@@ -92,18 +92,10 @@ async fn prune_jobs(pool: &PgPool) -> Result<u64, sqlx::Error> {
 ///
 /// Every row it reclaims is bookkeeping nothing reads any more — a job that
 /// ended a week ago — so the sweep only frees storage. A failed pass is a
-/// [`JobError::Retry`], and the scheduler enqueues the next day regardless,
+/// [`JobError::Retry`](crate::jobs::JobError::Retry), and the scheduler enqueues the next day regardless,
 /// so a pass lost to a database outage costs nothing but the storage.
 pub fn handle_jobs(state: AppState, _attempt: AttemptInfo, _args: Value) -> HandlerFuture {
-    Box::pin(async move {
-        match prune_jobs(&state.db).await {
-            Ok(deleted) => {
-                info!(deleted, "pruned maintenance rows");
-                Ok(())
-            }
-            Err(err) => Err(JobError::Retry(format!("prune sweep failed: {err}"))),
-        }
-    })
+    Box::pin(async move { run_sweep("pruned maintenance rows", prune_jobs(&state.db)).await })
 }
 
 #[cfg(test)]

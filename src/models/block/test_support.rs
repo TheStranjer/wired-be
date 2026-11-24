@@ -8,25 +8,14 @@ use crate::{
     config::TEST_BASE_URL,
     models::{
         follow::{self, FollowState},
-        user::{Flag, NewUser, User, get_by_id, insert, local_ap_id},
+        user::{Flag, NewUser, User, get_by_id, insert},
     },
     pagination::{MAX_LIMIT, PageParams},
-    util::id::parse_id,
+    test_fixtures::local_new,
+    util::id::assert_local_activity_id,
 };
 
-/// The `ActivityPub` path segment a local blocker's `ap_id` is built
-/// under, as [`block`] must write it (decision 6).
-pub(super) const ACTIVITY_PREFIX: &str = "/activities/";
-
-/// Inserts a local, unlocked user named `nickname`.
-pub(super) async fn local_user(pool: &PgPool, nickname: &str) -> User {
-    insert(
-        pool,
-        &NewUser::local(nickname, &local_ap_id(TEST_BASE_URL, nickname)),
-    )
-    .await
-    .expect("the local fixture inserts")
-}
+pub(super) use crate::test_fixtures::local_user;
 
 /// Inserts a local user named `nickname` whose account is locked, so a
 /// follow of it waits for an answer.
@@ -35,7 +24,7 @@ pub(super) async fn locked_user(pool: &PgPool, nickname: &str) -> User {
         pool,
         &NewUser {
             locked: Flag::new(true),
-            ..NewUser::local(nickname, &local_ap_id(TEST_BASE_URL, nickname))
+            ..local_new(nickname)
         },
     )
     .await
@@ -133,23 +122,7 @@ pub(super) fn page(query: &str) -> PageParams {
 /// The `{TEST_BASE_URL}/activities/{uuid}` id [`block`] minted for a local
 /// blocker, checked for its shape and reduced to the id part.
 pub(super) fn activity_id(row: &Block) -> String {
-    let prefix = format!("{TEST_BASE_URL}{ACTIVITY_PREFIX}");
-    let ap_id = row
-        .ap_id
-        .clone()
-        .expect("a local blocker's row carries a minted activity id");
-    assert!(
-        ap_id.starts_with(&prefix),
-        "the activity id is this instance's, got {ap_id}"
-    );
-    let tail = ap_id
-        .strip_prefix(&prefix)
-        .expect("the prefix was just checked");
-    assert!(
-        parse_id(tail).is_some(),
-        "the tail of the activity id is an id: {tail}"
-    );
-    tail.to_owned()
+    assert_local_activity_id(row.ap_id.as_deref())
 }
 
 /// The SQLSTATE a database failure carries, or an empty string when the

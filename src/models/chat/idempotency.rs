@@ -6,7 +6,7 @@ use uuid::Uuid;
 
 use crate::error::AppResult;
 
-use super::ChatMessageReference;
+use super::{ChatMessageReference, references::reference_select};
 
 /// [`sender_reference_for_key`]: the replay of a key inside its window — the
 /// sender's own reference to the newest live message they created under
@@ -16,16 +16,15 @@ use super::ChatMessageReference;
 /// `chats` join is what picks the *sender's* side out of a message's two
 /// references, and the tombstone plus time guards leave an expired or
 /// withdrawn answer without a row, which reads as "no replay".
-const IDEMPOTENT_REPLAY_SQL: &str = "SELECT r.id, r.chat_id, r.message_id, r.unread, r.inserted_at,
-           m.sender_id, m.content, m.raw_text, m.attachment_media_id, m.ap_id,
-           m.idempotency_key, m.inserted_at AS message_inserted_at
-      FROM chat_message_references r
-      JOIN chat_messages m ON m.id = r.message_id
+const IDEMPOTENT_REPLAY_SQL: &str = concat!(
+    reference_select!(),
+    "
       JOIN chats c ON c.id = r.chat_id
      WHERE c.user_id = $1 AND m.sender_id = $1 AND m.idempotency_key = $2
        AND m.deleted_at IS NULL AND m.inserted_at > now() - interval '1 hour'
      ORDER BY m.inserted_at DESC
-     LIMIT 1";
+     LIMIT 1"
+);
 
 /// The sender's own view of the message their `key` created, `None` when no
 /// live message of `sender_id` carries that key within the replay window —

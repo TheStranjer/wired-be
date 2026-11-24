@@ -54,13 +54,13 @@ use crate::{
     extract::ApiParams,
     models::{bookmark, bookmark_folder, status::Status as StatusRow, status_visibility},
     oauth::scopes::{READ_BOOKMARKS, WRITE_BOOKMARKS},
-    pagination::{PageParams, set_link_header},
+    pagination::{PageParams, link_for_page, set_link_header},
     services::render_status::{ViewerMode, render_statuses},
     state::AppState,
     util::id::parse_id,
 };
 
-use super::{current_entity, page_link};
+use super::current_entity;
 
 /// The body or query of `POST /api/v1/statuses/{id}/bookmark`.
 #[derive(Debug, Deserialize)]
@@ -264,7 +264,10 @@ pub(super) async fn list_bookmarks(
     let mut headers = HeaderMap::new();
     set_link_header(
         &mut headers,
-        page_link(&state.config.base_url, uri.path(), &cursors).as_deref(),
+        link_for_page(&state.config.base_url, uri.path(), &cursors, |cursor| {
+            *cursor
+        })
+        .as_deref(),
     )?;
     Ok((
         headers,

@@ -1,16 +1,17 @@
 //! The `Announce` fold and its withdrawal: boostability, the relay arm and
 //! the reblog row's own timestamp.
 
-use chrono::{DateTime, TimeDelta, Utc};
+use chrono::{DateTime, Utc};
 use serde_json::Value;
 use sqlx::PgPool;
 use tracing::debug;
 
-use super::{NO_INNER_ID, NO_TARGET, UNDO_LOCAL_SIGNER, target::resolve_target, transient};
+use super::{NO_INNER_ID, NO_TARGET, UNDO_LOCAL_SIGNER, target::resolve_target};
 use crate::{
     api::statuses::after_reblog_changed,
     federation::{
         dispatch::{ActivityView, FederationError, Outcome},
+        json::clamped_time,
         note_parser,
     },
     models::{
@@ -19,13 +20,7 @@ use crate::{
         user::User,
     },
     state::AppState,
-    util::time::parse_time,
 };
-
-/// How far an Announce's `published` may lead the local clock before the
-/// row is stamped `now` instead — the same skew the note and chat folds
-/// keep, restated here for the activity's own timestamp.
-const CLOCK_SKEW: TimeDelta = TimeDelta::minutes(5);
 
 /// The body of [`handle_announce`]: the shared target step, the relay arm,
 /// the boostability rule, the duplicate read, and the reblog row the
@@ -74,7 +69,9 @@ pub(super) async fn apply_announce(
     };
     let reblog = status::insert(&state.db, &state.config.base_url, &new)
         .await
-        .map_err(|err| transient("boost", &err))?;
+        .map_err(|err| {
+            FederationError::transient("could not fold the remote interaction's boost", &err)
+        })?;
     after_reblog_changed(&state, &reblog, true).await;
     debug!(
         status = %target.id,
@@ -101,7 +98,9 @@ pub(super) async fn apply_undo_announce(
     };
     let stored = status::get_by_uri(&state.db, announce_id)
         .await
-        .map_err(|err| transient("boost lookup", &err))?;
+        .map_err(|err| {
+            FederationError::transient("could not fold the remote interaction's boost lookup", &err)
+        })?;
     let claim = stored.filter(|row| row.user_id == signer.id && row.deleted_at.is_none());
     let Some(reblog) = claim else {
         debug!(announce_id, "an Undo naming no live boost of its actor");
@@ -114,7 +113,12 @@ pub(super) async fn apply_undo_announce(
     };
     let removed = status::remove_reblog(&state.db, signer.id, original_id)
         .await
-        .map_err(|err| transient("boost withdrawal", &err))?;
+        .map_err(|err| {
+            FederationError::transient(
+                "could not fold the remote interaction's boost withdrawal",
+                &err,
+            )
+        })?;
     let Some(tombstone) = removed else {
         return Ok(Outcome::Ignored("that boost is already withdrawn"));
     };
@@ -144,7 +148,12 @@ const fn boostable(visibility: Visibility) -> bool {
 async fn is_accepted_relay(state: &AppState, signer: &User) -> Result<bool, FederationError> {
     relay::is_accepted(&state.db, &signer.ap_id)
         .await
-        .map_err(|err| transient("the relay read", &err))
+        .map_err(|err| {
+            FederationError::transient(
+                "could not fold the remote interaction's the relay read",
+                &err,
+            )
+        })
 }
 
 /// Whether this `Announce` is already folded: the pair holds a live reblog
@@ -164,30 +173,31 @@ async fn boost_stands(
 ) -> Result<bool, FederationError> {
     let pair = status::reblogged_status_ids(db, signer.id, std::slice::from_ref(&target.id))
         .await
-        .map_err(|err| transient("the boost read", &err))?;
+        .map_err(|err| {
+            FederationError::transient(
+                "could not fold the remote interaction's the boost read",
+                &err,
+            )
+        })?;
     if pair.contains(&target.id) {
         return Ok(true);
     }
-    let same_id = status::get_by_uri(db, announce_id)
-        .await
-        .map_err(|err| transient("the boost uri read", &err))?;
+    let same_id = status::get_by_uri(db, announce_id).await.map_err(|err| {
+        FederationError::transient(
+            "could not fold the remote interaction's the boost uri read",
+            &err,
+        )
+    })?;
     Ok(same_id.is_some())
 }
 
 /// The reblog row's creation instant: the `Announce` activity's own
-/// `published` through [`parse_time`], clamped to `now` when it leads the
-/// local clock past [`CLOCK_SKEW`] — a peer's runaway clock moves nobody's
-/// timeline — and answered `now` when the field is absent or unreadable.
+/// `published` through [`clamped_time`], which answers `now` when it leads
+/// the local clock past [`CLOCK_SKEW`](crate::federation::json::CLOCK_SKEW)
+/// — a peer's runaway clock moves nobody's timeline — and so does this
+/// function when the field is absent or unreadable.
 fn announced_at(activity: &Value, now: DateTime<Utc>) -> DateTime<Utc> {
-    let Some(published) = activity
-        .get("published")
-        .and_then(Value::as_str)
-        .and_then(parse_time)
-    else {
-        return now;
-    };
-    let ceiling = now.checked_add_signed(CLOCK_SKEW).unwrap_or(now);
-    if published > ceiling { now } else { published }
+    clamped_time(activity.get("published"), now).unwrap_or(now)
 }
 
 #[cfg(test)]

@@ -142,7 +142,7 @@ use self::{
 };
 #[cfg(doc)]
 use crate::{auth::AuthUser, entities::relationship::Relationship, models::follow};
-use crate::{models::user::User, state::AppState, util::password::verify_password};
+use crate::{models::user::User, state::AppState};
 
 /// Whether `text` is given as an `ActivityPub` actor id rather than an
 /// `acct` handle: a case-insensitive `http://` or `https://` prefix.
@@ -247,10 +247,7 @@ impl fmt::Debug for PasswordParams {
 /// one (a bot-created account, a mirror) fails exactly like a wrong
 /// password, as Pleroma's `confirm_current_password` does.
 fn password_accepted(account: &User, password: &str) -> bool {
-    account
-        .password_hash
-        .as_deref()
-        .is_some_and(|hash| verify_password(password, hash))
+    account.password_matches(password)
 }
 
 /// The `{"status":"success"}` body all four endpoints answer success

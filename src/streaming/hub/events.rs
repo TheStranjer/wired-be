@@ -103,10 +103,151 @@ pub fn stream_matches(subscribed: &[String], event: &StreamEvent) -> bool {
         .any(|stream| subscribed.contains(stream))
 }
 
+/// The subscriptions of `subscribed` that `event` belongs to, each once and
+/// in the order the connection opened them: the names a connection writes
+/// one frame for (Mastodon sends one per matched channel).
+#[must_use]
+pub fn matched_streams<'subscribed>(
+    subscribed: &'subscribed [String],
+    event: &StreamEvent,
+) -> Vec<&'subscribed str> {
+    let mut matched: Vec<&str> = Vec::new();
+    for name in subscribed {
+        if event.streams.contains(name) && !matched.contains(&name.as_str()) {
+            matched.push(name.as_str());
+        }
+    }
+    matched
+}
+
+/// The `stream` array a client reads for the internal hub stream `internal`:
+/// Mastodon's public names, never the per-reader uuid the hub routes by.
+///
+/// `user:<uuid>` is `["user"]`, `user:notification:<uuid>` is
+/// `["user:notification"]`, `user:pleroma_chat:<uuid>` is
+/// `["user:pleroma_chat"]`, `direct:<uuid>` is `["direct"]`,
+/// `hashtag:<tag>` is `["hashtag", "<tag>"]`, `hashtag:local:<tag>` is
+/// `["hashtag:local", "<tag>"]`, `list:<id>` is `["list", "<id>"]` and
+/// `public:remote[:media]:<host>` is `["public:remote[:media]", "<host>"]`.
+/// Every other name (`public`, `public:local`, `public:media`, …) is its own
+/// public name.
+#[must_use]
+pub fn public_stream_name(internal: &str) -> Vec<String> {
+    for family in ["user:notification", "user:pleroma_chat", "user", "direct"] {
+        let owned = internal
+            .strip_prefix(family)
+            .and_then(|rest| rest.strip_prefix(':'))
+            .is_some_and(|rest| Uuid::parse_str(rest).is_ok());
+        if owned {
+            return vec![family.to_owned()];
+        }
+    }
+    if internal == "public:remote:media" {
+        // The unqualified media stream is its own name, not `public:remote` + "media".
+        return vec![internal.to_owned()];
+    }
+    for family in [
+        "hashtag:local",
+        "hashtag",
+        "list",
+        "public:remote:media",
+        "public:remote",
+    ] {
+        let qualifier = internal
+            .strip_prefix(family)
+            .and_then(|rest| rest.strip_prefix(':'))
+            .filter(|rest| !rest.is_empty());
+        if let Some(qualifier) = qualifier {
+            return vec![family.to_owned(), qualifier.to_owned()];
+        }
+    }
+    vec![internal.to_owned()]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::streaming::hub::test_support::event_on;
+
+    #[test]
+    fn public_stream_name_hides_the_readers_uuid() {
+        let id = Uuid::now_v7();
+        for (internal, public) in [
+            (format!("user:{id}"), vec!["user"]),
+            (format!("user:notification:{id}"), vec!["user:notification"]),
+            (format!("user:pleroma_chat:{id}"), vec!["user:pleroma_chat"]),
+            (format!("direct:{id}"), vec!["direct"]),
+        ] {
+            assert_eq!(public_stream_name(&internal), public, "{internal}");
+        }
+    }
+
+    #[test]
+    fn public_stream_name_splits_the_qualified_families() {
+        let id = Uuid::now_v7().to_string();
+        for (internal, public) in [
+            ("hashtag:rust".to_owned(), vec!["hashtag", "rust"]),
+            (
+                "hashtag:local:rust".to_owned(),
+                vec!["hashtag:local", "rust"],
+            ),
+            ("hashtag:local".to_owned(), vec!["hashtag", "local"]),
+            (format!("list:{id}"), vec!["list", id.as_str()]),
+            (
+                "public:remote:remote.example".to_owned(),
+                vec!["public:remote", "remote.example"],
+            ),
+            (
+                "public:remote:media:remote.example".to_owned(),
+                vec!["public:remote:media", "remote.example"],
+            ),
+        ] {
+            assert_eq!(public_stream_name(&internal), public, "{internal}");
+        }
+    }
+
+    #[test]
+    fn public_stream_name_keeps_the_names_that_are_already_public() {
+        for name in [
+            "public",
+            "public:local",
+            "public:media",
+            "public:local:media",
+            "public:remote",
+            "public:remote:media",
+            "user",
+            "user:notification",
+            "direct",
+            "hashtag",
+        ] {
+            assert_eq!(public_stream_name(name), vec![name], "{name}");
+        }
+        assert_eq!(
+            public_stream_name("user:not-a-uuid"),
+            vec!["user:not-a-uuid"],
+            "a suffix that is no uuid is not a reader's"
+        );
+    }
+
+    #[test]
+    fn matched_streams_lists_each_held_stream_of_the_event_once() {
+        let subscribed = vec![
+            "user:a".to_owned(),
+            "public".to_owned(),
+            "hashtag:rust".to_owned(),
+            "public".to_owned(),
+        ];
+
+        assert_eq!(
+            matched_streams(&subscribed, &event_on(&["public", "user:a", "list:1"])),
+            vec!["user:a", "public"],
+            "the connection's order, each name once, nothing it did not hold"
+        );
+        assert!(
+            matched_streams(&subscribed, &event_on(&["direct"])).is_empty(),
+            "no shared stream matches nothing"
+        );
+    }
 
     #[test]
     fn stream_matches_requires_one_shared_stream() {

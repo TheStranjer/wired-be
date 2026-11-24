@@ -31,7 +31,7 @@
 
 use std::{error::Error, fmt};
 
-use axum::http::HeaderMap;
+use axum::http::{HeaderMap, HeaderName, Uri, header};
 use chrono::{DateTime, TimeDelta, Utc};
 
 mod checks;
@@ -60,6 +60,8 @@ const REQUEST_TARGET: &str = "(request-target)";
 const CREATED: &str = "(created)";
 /// Pseudo-header whose unix seconds, once past, reject the signature.
 const EXPIRES: &str = "(expires)";
+/// The bare request header a signature may arrive in, lowercase.
+const SIGNATURE_HEADER: HeaderName = HeaderName::from_static("signature");
 /// Header names the signature rules refer to, lowercase.
 const HOST_HEADER: &str = "host";
 /// See [`HOST_HEADER`].
@@ -152,6 +154,54 @@ pub struct SignedRequestParts<'a> {
     pub path_and_query: &'a str,
     /// The request headers, where the signed values are looked up.
     pub headers: HeaderMap,
+}
+
+/// The request target both sides of a signature spell: `path`, then `?query`
+/// when there is one. [`path_and_query`] reads it off a received [`Uri`];
+/// the outbound signer reads it off the [`Url`](url::Url) it is about to
+/// call, so both sides build the same text.
+#[must_use]
+pub(super) fn target_text(path: &str, query: Option<&str>) -> String {
+    query.map_or_else(|| path.to_owned(), |query| format!("{path}?{query}"))
+}
+
+/// The `(request-target)` value of a received request, minus the method.
+///
+/// The path with its query string when it has one, exactly as the signer
+/// spells it.
+#[must_use]
+pub fn path_and_query(uri: &Uri) -> String {
+    target_text(uri.path(), uri.query())
+}
+
+/// The actor a `keyId` names: the key URI minus its `#fragment`.
+///
+/// E.g. `https://social.example/users/alice` for
+/// `https://social.example/users/alice#main-key`. Mastodon's `#main-key`
+/// names a key embedded in the actor document, which is addressed by the
+/// bare URL; a fragmentless id is its own actor.
+#[must_use]
+pub fn key_id_actor(key_id: &str) -> &str {
+    key_id.split_once('#').map_or(key_id, |(base, _)| base)
+}
+
+/// The text of the `Signature` parameters a request presents.
+///
+/// The bare `Signature` header first, then an `Authorization: Signature ...`
+/// carrying the same ones. `None` when neither is present (or readable as
+/// text); [`parse_signature_header`] reads the result and drops the scheme
+/// itself.
+#[must_use]
+pub fn signature_header(headers: &HeaderMap) -> Option<&str> {
+    let text = |name: &HeaderName| headers.get(name).and_then(|value| value.to_str().ok());
+    text(&SIGNATURE_HEADER).or_else(|| {
+        let value = text(&header::AUTHORIZATION)?;
+        value
+            .trim_start()
+            .split_once(char::is_whitespace)
+            .is_some_and(|(scheme, _rest)| scheme.eq_ignore_ascii_case(SCHEME))
+            .then_some(value)
+    })
 }
 
 /// Verifies a parsed inbound signature against the received request.
@@ -267,6 +317,76 @@ mod tests {
             verify(&parsed, &request, "not a public key at all", now()),
             Err(SignatureError::BadSignature),
             "and neither does unparseable key material"
+        );
+    }
+
+    #[test]
+    fn the_path_and_query_keeps_the_query() {
+        let plain = Uri::from_static("https://test.example/users/alice");
+        assert_eq!(path_and_query(&plain), "/users/alice", "path only");
+        let queried = Uri::from_static("https://test.example/followers?page=2");
+        assert_eq!(
+            path_and_query(&queried),
+            "/followers?page=2",
+            "the query rides along, as the signer spells it"
+        );
+    }
+
+    #[test]
+    fn the_key_id_actor_drops_the_fragment() {
+        assert_eq!(
+            key_id_actor("https://social.example/users/alice#main-key"),
+            "https://social.example/users/alice",
+            "the fragment names the key, not the actor"
+        );
+        assert_eq!(
+            key_id_actor("https://social.example/users/alice"),
+            "https://social.example/users/alice",
+            "a fragmentless id is its own actor"
+        );
+    }
+
+    #[test]
+    fn the_signature_header_reads_both_spellings() {
+        let with = |name: HeaderName, value: &str| {
+            let mut headers = HeaderMap::new();
+            let previous = headers.insert(name, value.parse().unwrap());
+            drop(previous);
+            headers
+        };
+        let bare = with(HeaderName::from_static("signature"), "keyId=\"k\"");
+        assert_eq!(signature_header(&bare), Some("keyId=\"k\""), "bare header");
+        for value in [
+            r#"Signature keyId="k""#,
+            r#"signature keyId="k""#,
+            r#"  SIGNATURE keyId="k""#,
+        ] {
+            let headers = with(header::AUTHORIZATION, value);
+            assert_eq!(
+                signature_header(&headers),
+                Some(value),
+                "`{value}` is a Signature authorization"
+            );
+        }
+        for value in ["Bearer tok3n", "Basic dXNlcjpwYXNz", "Signature"] {
+            let headers = with(header::AUTHORIZATION, value);
+            assert_eq!(
+                signature_header(&headers),
+                None,
+                "`{value}` presents no Signature parameters"
+            );
+        }
+        assert_eq!(signature_header(&HeaderMap::new()), None, "nothing at all");
+        let mut both = with(header::AUTHORIZATION, r#"Signature keyId="auth""#);
+        let previous = both.insert(
+            HeaderName::from_static("signature"),
+            "keyId=\"bare\"".parse().unwrap(),
+        );
+        drop(previous);
+        assert_eq!(
+            signature_header(&both),
+            Some("keyId=\"bare\""),
+            "the bare header wins"
         );
     }
 }

@@ -1,6 +1,5 @@
-//! The batched preload queries of a page render for polls, rich-media
-//! cards and the viewer's relationships to the page's authors — the
-//! second half of the loaders in [`super::loaders`].
+//! The batched preload queries of a page render for polls and rich-media
+//! cards — the second half of the loaders in [`super::loaders`].
 
 use std::collections::HashMap;
 
@@ -8,7 +7,6 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::{
-    entities::relationship::{Relationship, RelationshipMap},
     error::AppResult,
     models::{
         link_card::{self, LinkCard},
@@ -65,23 +63,4 @@ pub(super) async fn load_cards(pool: &PgPool, ids: &[Uuid]) -> AppResult<HashMap
         return Ok(HashMap::new());
     }
     link_card::for_statuses(pool, ids).await
-}
-
-/// The viewer's relationships to the page's authors, keyed by account id:
-/// [`Relationship::load_many`] runs its own fixed set of queries once per
-/// page; an anonymous viewer has none to load, and an empty author list
-/// skips even that set.
-pub(super) async fn load_relationships(
-    pool: &PgPool,
-    viewer: Option<&User>,
-    ids: &[Uuid],
-) -> AppResult<Option<RelationshipMap>> {
-    let Some(viewer) = viewer else {
-        return Ok(None);
-    };
-    if ids.is_empty() {
-        return Ok(Some(RelationshipMap::new()));
-    }
-    let loaded = Relationship::load_many(pool, viewer.id, ids).await?;
-    Ok(Some(ids.iter().copied().zip(loaded).collect()))
 }

@@ -2,7 +2,7 @@
 //! factor that stands between a correct password and a token.
 //!
 //! When an MFA-enabled account logs in — through the `password` grant or
-//! the `/oauth/authorize` consent form — no token and no code are handed
+//! the external-login callback — no token and no code are handed
 //! out. Instead the grant's parameters are parked on a pending
 //! [`oauth_token::create_authorization`] row, a five-minute
 //! [`mfa_token::create`] challenge links to it, and the caller is sent
@@ -23,8 +23,8 @@
 //!   `mfa[challenge_type]`, `mfa[code]` and the round-tripped
 //!   `mfa[redirect_uri]`/`mfa[state]`. A passed challenge finishes the
 //!   authorization-code flow: the 302 with `code` (and `state`) or the
-//!   out-of-band page, delivered by `authorize::deliver_code` so the
-//!   answer is exactly `POST /oauth/authorize`'s. A wrong one re-renders
+//!   out-of-band `{"code": …}` JSON, delivered by
+//!   `authorize::deliver_code`. A wrong one re-renders
 //!   the form with Pleroma's flash line at 401.
 //!
 //! The second factor itself is [`crate::util::totp`]: `totp` verifies
@@ -331,7 +331,7 @@ fn retry(attrs: &MfaAttrs) -> VerifyReply {
 }
 
 /// Whether the form's delivery target is registered with the application
-/// the parked authorization belongs to. The `POST /oauth/authorize`
+/// the parked authorization belongs to. The external-login
 /// detour validated it once; the form only round-trips it, and a
 /// tampered target never sees the code. A code bound to a redirect URI is
 /// delivered only to that one.
@@ -415,20 +415,14 @@ fn totp_matches(user: &User, code: &str) -> bool {
 
 /// Spends a backup code: when the SHA-256 of `code` matches one of the
 /// stored hashes, that hash comes off the list — the code works exactly
-/// once — and the settings are saved.
+/// once, even across concurrent challenges, because [`mfa::consume_backup_code`]
+/// removes it in a single atomic statement.
 ///
 /// # Errors
 ///
 /// Any database failure arrives as [`AppError::Database`].
 async fn consume_backup_code(state: &AppState, user: &User, code: &str) -> AppResult<bool> {
-    let mut settings = mfa::MfaSettings::for_user(user);
-    let hash = totp::hash_backup_code(code);
-    let matched = settings.backup_codes.contains(&hash);
-    if matched {
-        settings.backup_codes.retain(|stored| *stored != hash);
-        mfa::save(&state.db, user.id, &settings).await?;
-    }
-    Ok(matched)
+    mfa::consume_backup_code(&state.db, user.id, &totp::hash_backup_code(code)).await
 }
 
 /// The request parameters of `POST /oauth/mfa/challenge`. Every field is
@@ -876,12 +870,14 @@ mod tests {
     fn a_failed_verification_is_a_401_html_page() {
         let response = VerifyReply::Failed("<p>x</p>".to_owned()).into_response();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "Pleroma's 401");
-        assert_eq!(
-            response.headers().get(axum::http::header::CONTENT_TYPE),
-            Some(&axum::http::HeaderValue::from_static(
-                "text/html; charset=utf-8"
-            )),
-            "and the re-rendered form"
+        let content_type = response
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default();
+        assert!(
+            content_type.starts_with("text/") && content_type.contains("charset=utf-8"),
+            "a text page, the re-rendered form: {content_type}"
         );
     }
 

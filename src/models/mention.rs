@@ -261,25 +261,13 @@ mod tests {
     use crate::{
         config::TEST_BASE_URL,
         error::AppError,
-        models::{
-            status::{self, NewStatus},
-            user::{NewUser, insert as insert_user, local_ap_id},
-        },
+        models::status::{self, NewStatus},
         pagination::MAX_LIMIT,
+        test_fixtures::local_user as user,
     };
 
     /// The instance origin the fixtures pretend to serve.
     const BASE: &str = TEST_BASE_URL;
-
-    /// Inserts a local user named `nickname`.
-    async fn user(pool: &PgPool, nickname: &str) -> User {
-        insert_user(
-            pool,
-            &NewUser::local(nickname, &local_ap_id(BASE, nickname)),
-        )
-        .await
-        .expect("fixture user inserts")
-    }
 
     /// A local public status of `alice` mentioning nobody.
     async fn post(pool: &PgPool, author: &User) -> status::Status {

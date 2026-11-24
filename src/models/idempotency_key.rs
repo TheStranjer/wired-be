@@ -204,23 +204,16 @@ mod tests {
     use sqlx::PgPool;
 
     use super::*;
-    use crate::models::{
-        status::{self, NewStatus},
-        user::{NewUser, User, insert as insert_user, local_ap_id},
+    use crate::{
+        models::{
+            status::{self, NewStatus},
+            user::User,
+        },
+        test_fixtures::local_user as user,
     };
 
     /// The instance origin the fixture posts under.
     const BASE: &str = crate::config::TEST_BASE_URL;
-
-    /// A local user named `nickname`.
-    async fn user(pool: &PgPool, nickname: &str) -> User {
-        insert_user(
-            pool,
-            &NewUser::local(nickname, &local_ap_id(BASE, nickname)),
-        )
-        .await
-        .expect("the fixture user inserts")
-    }
 
     /// A plain live post by `author`, answering its row.
     async fn post(pool: &PgPool, author: &User, text: &str) -> Status {

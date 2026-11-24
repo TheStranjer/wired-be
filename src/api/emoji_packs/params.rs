@@ -9,8 +9,8 @@ use std::{
 use axum::{extract::FromRequestParts, http::request::Parts};
 use url::form_urlencoded;
 
-use super::{DEFAULT_PAGE, DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE, NAME_EMPTY};
-use crate::error::{AppError, AppResult};
+use super::{DEFAULT_PAGE, DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE, pack_writes::trimmed_name};
+use crate::error::AppResult;
 
 /// The `name`, `url`, `page` and `page_size` query parameters, parsed the
 /// way [`crate::pagination::PageParams`] parses its keys: `name` and `url`
@@ -35,11 +35,7 @@ impl PackParams {
     /// The trimmed pack `name`; the endpoints' 400 when it is absent or
     /// blank (Pleroma's `validate_not_empty([name])`).
     pub(super) fn required_name(&self) -> AppResult<&str> {
-        let name = self.name.as_deref().unwrap_or_default().trim();
-        if name.is_empty() {
-            return Err(AppError::BadRequest(NAME_EMPTY.to_owned()));
-        }
-        Ok(name)
+        trimmed_name(self.name.as_deref())
     }
 }
 
@@ -99,6 +95,7 @@ mod tests {
     use axum::http::{Request, Uri};
 
     use super::*;
+    use crate::{api::emoji_packs::NAME_EMPTY, error::AppError};
 
     /// Request parts carrying `uri`, the way the extractor receives them.
     fn parts_for(uri: &str) -> Parts {

@@ -99,7 +99,7 @@ async fn get_settings(app: &Router, token: &str, app_name: &str) -> common::Test
 fn default_mascot() -> Value {
     json!({
         "id": "default-mascot",
-        "url": "https://test.example/images/mascot.png",
+        "url": "https://test.example/media/default/mascot.png",
         "type": "image",
         "pleroma": { "mime_type": "image/png" },
     })
@@ -340,8 +340,7 @@ async fn a_non_object_patch_body_is_unprocessable() {
 }
 
 /// Without a stored mascot the answer is the instance default: Wired's
-/// own mascot. On the default config `FRONTEND_BASE_URL` is unset and so
-/// equals `BASE_URL`, which pins the URL where it has always been.
+/// own mascot, served by the backend under `/media/default`.
 #[tokio::test]
 async fn the_mascot_default_is_the_instance_mascot() {
     let db = common::test_db().await;
@@ -361,16 +360,16 @@ async fn the_mascot_default_is_the_instance_mascot() {
     );
 }
 
-/// The default mascot hangs under `FRONTEND_BASE_URL`, where the frontend
-/// ships the file, when that origin differs from `BASE_URL`; the test
-/// above keeps the unchanged URL for the default config, where the
-/// variable is unset and the two origins are equal.
+/// The default mascot hangs under `MEDIA_BASE_URL`, wherever that points,
+/// and ignores `FRONTEND_BASE_URL`; the test above pins the URL for the
+/// default config.
 #[tokio::test]
-async fn the_mascot_default_follows_the_frontend_origin() {
+async fn the_mascot_default_follows_the_media_base_url() {
     let db = common::test_db().await;
     let pool = db.pool().clone();
     let (_alice, token) = fixture(&pool, "alice", "read:accounts").await;
     let mut config = common::test_config();
+    config.media_base_url = "https://cdn.example/files".to_owned();
     config.frontend_base_url = "https://fe.example".to_owned();
     let app = common::test_app_with_config(pool, config);
 
@@ -380,9 +379,9 @@ async fn the_mascot_default_follows_the_frontend_origin() {
         .await;
     assert_eq!(response.status, StatusCode::OK, "the default answers 200");
     let url = response.json_value()["url"].as_str().unwrap().to_owned();
-    assert!(
-        url.starts_with("https://fe.example") && url.ends_with("/images/mascot.png"),
-        "the default mascot is served by the frontend, not the API: {url}"
+    assert_eq!(
+        url, "https://cdn.example/files/default/mascot.png",
+        "the default mascot is served by the backend's media tree, not the frontend"
     );
 }
 

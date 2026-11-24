@@ -72,6 +72,10 @@ pub(in crate::entities::status) struct Parts<'a> {
     /// ticket's batch hands the entity; `None` renders the quote
     /// null.
     quote: Option<Value>,
+    /// Whether the viewer may see the replied-to status, in the same
+    /// [`JsonBool`] wrapper the source field carries; `true` unless the
+    /// test hides the parent.
+    parent_visible: JsonBool,
 }
 
 impl<'a> Parts<'a> {
@@ -93,6 +97,17 @@ impl<'a> Parts<'a> {
             muted: JsonBool(false),
             poll: None,
             quote: None,
+            parent_visible: JsonBool(true),
+        }
+    }
+
+    /// Sets [`parent_visible`](Self::parent_visible) to `false`: the
+    /// batch's parent-visibility read did not admit the replied-to
+    /// status, so the viewer cannot see it.
+    pub(in crate::entities::status) fn parent_hidden(self) -> Self {
+        Self {
+            parent_visible: JsonBool(false),
+            ..self
         }
     }
 
@@ -266,6 +281,7 @@ pub(in crate::entities::status) fn render(
         quote: parts.quote.clone(),
         reblog: reblog.map(Box::new),
         poll: parts.poll.clone(),
+        parent_visible: parts.parent_visible.clone(),
     };
     serde_json::to_value(Status::from_source(source, None, None, &config)).unwrap()
 }
@@ -294,6 +310,7 @@ pub(in crate::entities::status) fn render_nested(row: &StatusRow, author: &User)
             quote: None,
             reblog: None,
             poll: None,
+            parent_visible: JsonBool(true),
         },
         None,
         None,

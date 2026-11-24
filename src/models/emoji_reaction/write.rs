@@ -4,8 +4,11 @@
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use super::{EmojiReaction, NewReaction, local_activity_id};
-use crate::{error::AppResult, util::id::new_id};
+use super::{EmojiReaction, NewReaction};
+use crate::{
+    error::AppResult,
+    util::id::{new_activity_ap_id, new_id},
+};
 
 /// [`react`]: the write, idempotent on `(user_id, status_id, emoji)`. A pair
 /// that already reacted keeps its row — id, `ap_id`, `inserted_at` and so its
@@ -47,7 +50,7 @@ pub async fn react(
     base_url: &str,
     reaction: &NewReaction<'_>,
 ) -> AppResult<EmojiReaction> {
-    react_with_ap_id(pool, reaction, &local_activity_id(base_url)).await
+    react_with_ap_id(pool, reaction, &new_activity_ap_id(base_url)).await
 }
 
 /// [`react`]'s write under an explicit `ap_id`: the federation mirror's

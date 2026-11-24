@@ -2,6 +2,7 @@
 //! The test modules are its children, so they reach every helper through
 //! `use super::*`.
 
+mod batch_cap;
 mod gates;
 mod listing;
 mod writes;

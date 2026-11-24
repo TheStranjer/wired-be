@@ -283,3 +283,22 @@ pub(super) async fn token_for(state: &AppState, reader: &User, scopes: &str) -> 
     .expect("token fixture inserts")
     .token
 }
+
+/// The single-frame view of [`Connection::frames_for`] most delivery tests
+/// read: the one frame an event was written as, `None` when it was dropped.
+pub(super) trait FrameFor {
+    /// The only frame `event` is written as.
+    ///
+    /// # Panics
+    ///
+    /// If the event is written as more than one frame.
+    async fn frame_for(&self, event: &StreamEvent) -> Option<String>;
+}
+
+impl FrameFor for Connection {
+    async fn frame_for(&self, event: &StreamEvent) -> Option<String> {
+        let mut frames = self.frames_for(event).await;
+        assert!(frames.len() <= 1, "one frame expected, got {frames:?}");
+        frames.pop()
+    }
+}

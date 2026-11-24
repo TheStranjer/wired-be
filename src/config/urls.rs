@@ -11,6 +11,7 @@ use super::Config;
 
 use super::{
     defaults::DEFAULT_MEDIA_URL_PATH,
+    parse::{trimmed, trimmed_url},
     vars::{FRONTEND_BASE_URL_VAR, MEDIA_BASE_URL_VAR},
 };
 
@@ -22,12 +23,7 @@ pub(crate) fn directory<F>(lookup: &F, var: &'static str, default: &str) -> Path
 where
     F: Fn(&str) -> Option<String>,
 {
-    PathBuf::from(
-        lookup(var)
-            .map(|dir| dir.trim().to_owned())
-            .filter(|dir| !dir.is_empty())
-            .unwrap_or_else(|| default.to_owned()),
-    )
+    trimmed(lookup, var).map_or_else(|| PathBuf::from(default), PathBuf::from)
 }
 
 /// Reads `MEDIA_BASE_URL`: the URL prefix media is served under, trimmed
@@ -39,9 +35,7 @@ pub(crate) fn media_base_url<F>(lookup: &F, base_url: &str) -> String
 where
     F: Fn(&str) -> Option<String>,
 {
-    lookup(MEDIA_BASE_URL_VAR)
-        .map(|url| url.trim().trim_end_matches('/').to_owned())
-        .filter(|url| !url.is_empty())
+    trimmed_url(lookup, MEDIA_BASE_URL_VAR)
         .unwrap_or_else(|| format!("{base_url}{DEFAULT_MEDIA_URL_PATH}"))
 }
 
@@ -57,10 +51,7 @@ pub(crate) fn frontend_base_url<F>(lookup: &F, base_url: &str) -> String
 where
     F: Fn(&str) -> Option<String>,
 {
-    lookup(FRONTEND_BASE_URL_VAR)
-        .map(|url| url.trim().trim_end_matches('/').to_owned())
-        .filter(|url| !url.is_empty())
-        .unwrap_or_else(|| base_url.to_owned())
+    trimmed_url(lookup, FRONTEND_BASE_URL_VAR).unwrap_or_else(|| base_url.to_owned())
 }
 
 #[cfg(test)]

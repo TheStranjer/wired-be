@@ -19,17 +19,24 @@
 //! `add_link_headers` (`lib/pleroma/web/controller_helper.ex`).
 
 use std::borrow::Cow;
+use std::fmt;
 use std::future::{self, Future};
 
 use axum::{
     extract::FromRequestParts,
     http::{HeaderMap, HeaderValue, header::LINK, request::Parts},
 };
-use sqlx::{QueryBuilder, postgres::Postgres};
+use sqlx::{
+    FromRow, PgPool, QueryBuilder,
+    postgres::{PgRow, Postgres},
+};
 use url::form_urlencoded;
 use uuid::Uuid;
 
-use crate::{error::AppError, util::id::parse_id};
+use crate::{
+    error::{AppError, AppResult},
+    util::id::parse_id,
+};
 
 /// Default page size when `limit` is absent, not a number, or not positive
 /// (Pleroma's `@default_limit`).
@@ -102,10 +109,7 @@ impl PageParams {
         default_limit: i64,
         cap: i64,
     ) -> Result<Self, AppError> {
-        let mut raw = RawParams::default();
-        for (key, value) in form_urlencoded::parse(query.unwrap_or_default().as_bytes()) {
-            raw.record(key.as_ref(), value);
-        }
+        let raw = raw_params(query);
         Ok(Self {
             max_id: id_param(raw.max_id.as_deref())?,
             min_id: id_param(raw.min_id.as_deref())?,
@@ -137,39 +141,12 @@ impl PageParams {
     /// page is read newest-first. Pass the fetched rows through
     /// [`Self::finish`] so a response is always newest-first.
     pub fn apply_keyset(&self, qb: &mut QueryBuilder<Postgres>, id_column: &str) {
-        // sqlx's builder methods hand back `&mut Self` for chaining; dropping
-        // that on the floor would be an unused result (decision 14), so each
-        // append binds it to an `_`-named value and lets the borrow end there.
-        if let Some(max_id) = self.max_id {
-            let _with_max: &mut _ = qb
-                .push(" AND ")
-                .push(id_column)
-                .push(" < ")
-                .push_bind(max_id);
-        }
-        if let Some(min_id) = self.min_id {
-            let _with_min: &mut _ = qb
-                .push(" AND ")
-                .push(id_column)
-                .push(" > ")
-                .push_bind(min_id);
-        }
-        if let Some(since_id) = self.since_id {
-            let _with_since: &mut _ = qb
-                .push(" AND ")
-                .push(id_column)
-                .push(" > ")
-                .push_bind(since_id);
-        }
-        let _ordered: &mut _ =
-            qb.push(" ORDER BY ")
-                .push(id_column)
-                .push(if self.min_id.is_some() {
-                    " ASC"
-                } else {
-                    " DESC"
-                });
-        let _limited: &mut _ = qb.push(" LIMIT ").push_bind(self.limit);
+        let cursors = Cursors {
+            max: self.max_id,
+            min: self.min_id,
+            since: self.since_id,
+        };
+        push_keyset(qb, id_column, cursors, Some(self.limit));
     }
 
     /// Brings rows fetched with a query built by [`Self::apply_keyset`] into
@@ -177,11 +154,8 @@ impl PageParams {
     /// read ascending and comes back reversed, every other page is returned
     /// unchanged.
     #[must_use]
-    pub fn finish<T>(&self, mut rows: Vec<T>) -> Vec<T> {
-        if self.min_id.is_some() {
-            rows.reverse();
-        }
-        rows
+    pub fn finish<T>(&self, rows: Vec<T>) -> Vec<T> {
+        reverse_if_min(self.min_id.is_some(), rows)
     }
 }
 
@@ -202,6 +176,59 @@ where
     ) -> impl Future<Output = Result<Self, Self::Rejection>> + Send {
         future::ready(Self::with_cap(MAX_LIMIT, parts))
     }
+}
+
+/// Runs one keyset page of the statement `builder` holds, paged on `column`.
+///
+/// Appends `page`'s cursors, ordering and `LIMIT` with
+/// [`PageParams::apply_keyset`], fetches every row as `T` and hands them
+/// through [`PageParams::finish`], so a `min_id` page comes back flipped to
+/// newest-first like every other.
+///
+/// The builder must already end in a `WHERE` predicate the cursors can
+/// continue with `AND` (callers push their own filters before the call).
+///
+/// # Errors
+///
+/// Any database failure (connection, encoding) arrives as
+/// [`AppError::Database`].
+pub async fn keyset_page<T>(
+    pool: &PgPool,
+    mut builder: QueryBuilder<Postgres>,
+    column: &str,
+    page: &PageParams,
+) -> AppResult<Vec<T>>
+where
+    T: for<'r> FromRow<'r, PgRow> + Send + Unpin,
+{
+    page.apply_keyset(&mut builder, column);
+    let rows = builder.build_query_as::<T>().fetch_all(pool).await?;
+    Ok(page.finish(rows))
+}
+
+/// [`keyset_page`] over a `stem` that ends at a placeholder bound to `bound`.
+///
+/// Builds the [`QueryBuilder`] over `stem`, binds `bound` as that
+/// placeholder, then pages on `column`.
+///
+/// # Errors
+///
+/// As [`keyset_page`].
+pub async fn keyset_page_by<T>(
+    pool: &PgPool,
+    stem: &str,
+    bound: Uuid,
+    column: &str,
+    page: &PageParams,
+) -> AppResult<Vec<T>>
+where
+    T: for<'r> FromRow<'r, PgRow> + Send + Unpin,
+{
+    let mut builder = QueryBuilder::<Postgres>::new(stem);
+    // The builder's push methods hand back `&mut Self` for chaining; binding
+    // it keeps the statement from having an unused result (decision 14).
+    let _bound: &mut _ = builder.push_bind(bound);
+    keyset_page(pool, builder, column, page).await
 }
 
 /// The pagination parameters of a listing whose keyset column is a `bigint`
@@ -241,10 +268,7 @@ impl OrdinalPageParams {
     /// [`AppError::BadRequest`] with `"Invalid id"` when `max_id`, `min_id` or
     /// `since_id` is present but is not a number.
     pub fn from_query(query: Option<&str>, cap: i64) -> Result<Self, AppError> {
-        let mut raw = RawParams::default();
-        for (key, value) in form_urlencoded::parse(query.unwrap_or_default().as_bytes()) {
-            raw.record(key.as_ref(), value);
-        }
+        let raw = raw_params(query);
         Ok(Self {
             max_id: ordinal_param(raw.max_id.as_deref())?,
             min_id: ordinal_param(raw.min_id.as_deref())?,
@@ -259,41 +283,85 @@ impl OrdinalPageParams {
     /// `LIMIT` is appended when [`Self::limit`] is `None`, the `limit=0` page
     /// that answers every row.
     pub fn apply_keyset(&self, qb: &mut QueryBuilder<Postgres>, column: &str) {
-        if let Some(max_id) = self.max_id {
-            let _with_max: &mut _ = qb.push(" AND ").push(column).push(" < ").push_bind(max_id);
-        }
-        if let Some(min_id) = self.min_id {
-            let _with_min: &mut _ = qb.push(" AND ").push(column).push(" > ").push_bind(min_id);
-        }
-        if let Some(since_id) = self.since_id {
-            let _with_since: &mut _ = qb
-                .push(" AND ")
-                .push(column)
-                .push(" > ")
-                .push_bind(since_id);
-        }
-        let _ordered: &mut _ = qb
-            .push(" ORDER BY ")
-            .push(column)
-            .push(if self.min_id.is_some() {
-                " ASC"
-            } else {
-                " DESC"
-            });
-        if let Some(limit) = self.limit {
-            let _limited: &mut _ = qb.push(" LIMIT ").push_bind(limit);
-        }
+        let cursors = Cursors {
+            max: self.max_id,
+            min: self.min_id,
+            since: self.since_id,
+        };
+        push_keyset(qb, column, cursors, self.limit);
     }
 
     /// [`PageParams::finish`] for an ordinal page: a `min_id` fetch came back
     /// ascending and goes out reversed, every other page unchanged.
     #[must_use]
-    pub fn finish<T>(&self, mut rows: Vec<T>) -> Vec<T> {
-        if self.min_id.is_some() {
-            rows.reverse();
-        }
-        rows
+    pub fn finish<T>(&self, rows: Vec<T>) -> Vec<T> {
+        reverse_if_min(self.min_id.is_some(), rows)
     }
+}
+
+/// The three keyset cursors of a page, of whatever type the keyset column is.
+struct Cursors<T> {
+    /// `max_id`: rows strictly before this one.
+    max: Option<T>,
+    /// `min_id`: rows strictly after this one, read ascending.
+    min: Option<T>,
+    /// `since_id`: rows strictly after this one, read descending.
+    since: Option<T>,
+}
+
+/// The keyset SQL both page shapes append: each present cursor narrows
+/// `column` (`max` with `<`, `min` and `since` with `>`), the order is
+/// ascending when `min` is present and descending otherwise, and a `limit`
+/// adds a bound `LIMIT`.
+fn push_keyset<'t, T>(
+    qb: &mut QueryBuilder<Postgres>,
+    column: &str,
+    cursors: Cursors<T>,
+    limit: Option<i64>,
+) where
+    T: sqlx::Encode<'t, Postgres> + sqlx::Type<Postgres>,
+{
+    let Cursors { max, min, since } = cursors;
+    // sqlx's builder methods hand back `&mut Self` for chaining; dropping
+    // that on the floor would be an unused result (decision 14), so each
+    // append binds it to an `_`-named value and lets the borrow end there.
+    let ascending = min.is_some();
+    if let Some(max) = max {
+        let _with_max: &mut _ = qb.push(" AND ").push(column).push(" < ").push_bind(max);
+    }
+    if let Some(min) = min {
+        let _with_min: &mut _ = qb.push(" AND ").push(column).push(" > ").push_bind(min);
+    }
+    if let Some(since) = since {
+        let _with_since: &mut _ = qb.push(" AND ").push(column).push(" > ").push_bind(since);
+    }
+    let _ordered: &mut _ =
+        qb.push(" ORDER BY ")
+            .push(column)
+            .push(if ascending { " ASC" } else { " DESC" });
+    if let Some(limit) = limit {
+        let _limited: &mut _ = qb.push(" LIMIT ").push_bind(limit);
+    }
+}
+
+/// Brings rows fetched by a [`push_keyset`] query into newest-first order: a
+/// `min` page was read ascending and is reversed, any other page is returned
+/// unchanged.
+fn reverse_if_min<T>(min_present: bool, mut rows: Vec<T>) -> Vec<T> {
+    if min_present {
+        rows.reverse();
+    }
+    rows
+}
+
+/// Parses a raw query string (`None` is the empty query) into the pagination
+/// keys it holds, the last occurrence of a repeated key winning.
+fn raw_params(query: Option<&str>) -> RawParams<'_> {
+    let mut raw = RawParams::default();
+    for (key, value) in form_urlencoded::parse(query.unwrap_or_default().as_bytes()) {
+        raw.record(key.as_ref(), value);
+    }
+    raw
 }
 
 /// One ordinal cursor: `None` when absent, the number when it parses, a 400
@@ -407,6 +475,44 @@ pub fn link_header(
     let next = page_url(base_url, path, extra_query, "max_id", oldest_id);
     let prev = page_url(base_url, path, extra_query, "min_id", newest_id);
     Some(format!(r#"<{next}>; rel="next", <{prev}>; rel="prev""#))
+}
+
+/// The `extra_query` of a [`keyset_link`] whose links carry no query
+/// parameters beyond the cursor.
+pub const NO_EXTRA_QUERY: [(String, String); 0] = [];
+
+/// The `Link` header value for a newest-first page of rows keyed on a UUID.
+///
+/// [`link_header`] over `cursor` of the first (newest) and last (oldest) row,
+/// repeating `extra_query` on both links; `None` for an empty page.
+#[must_use]
+pub fn keyset_link<T, C: Fn(&T) -> Uuid>(
+    base_url: &str,
+    path: &str,
+    extra_query: &[(String, String)],
+    rows: &[T],
+    cursor: C,
+) -> Option<String> {
+    let newest = cursor(rows.first()?).to_string();
+    let oldest = cursor(rows.last()?).to_string();
+    link_header(base_url, path, extra_query, &newest, &oldest)
+}
+
+/// The `Link` header value for a newest-first page of rows keyed on any
+/// displayable cursor (an ordinal position, say) with no extra query.
+///
+/// [`link_header`] over `cursor` of the first (newest) and last (oldest) row;
+/// `None` for an empty page.
+#[must_use]
+pub fn link_for_page<T, D: fmt::Display, C: Fn(&T) -> D>(
+    base_url: &str,
+    path: &str,
+    entries: &[T],
+    cursor: C,
+) -> Option<String> {
+    let newest = cursor(entries.first()?).to_string();
+    let oldest = cursor(entries.last()?).to_string();
+    link_header(base_url, path, &NO_EXTRA_QUERY, &newest, &oldest)
 }
 
 /// Builds the `Link` header value for an offset-paginated response.

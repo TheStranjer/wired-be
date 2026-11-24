@@ -35,13 +35,14 @@
 //!   nor this instance's own actor ever receives a copy);
 //! - relay inboxes ([`relay_inboxes`](crate::models::instance::relay_inboxes),
 //!   the `inbox` of every relay this instance follows and that has
-//!   accepted the follow) join the set only for activities whose addressing
-//!   carries the public address and that are not narrowed by
+//!   accepted the follow) join the set only for `Create`, `Announce`,
+//!   `Update`, `Delete`, `Undo` and `Move` activities whose `to` carries
+//!   the public address and that are not narrowed by
 //!   [`PublishOpts::only_to`] — the public `Delete`/`Update` of a note, the
 //!   profile `Update` and the account `Delete` all do, so relays keep their
-//!   copies fresh, while an `Update`, `Delete` or `Undo` with no public
-//!   address (a followers-only edit, an unfollow, an unblock) never reaches
-//!   a relay;
+//!   copies fresh, while an unlisted post (public only in `cc`), a
+//!   followers-only edit, an unfollow, an unblock or a `Like` never
+//!   reaches a relay;
 //! - inboxes whose host instance policy rejects — by its own table or by
 //!   the [`mrf`] domain lists — or whose
 //!   [`instances`](crate::models::instance) row carries an unreachable mark
@@ -72,6 +73,7 @@
 //! relay is subscribed to hear, and the reason a `local` status must
 //! never reach here by mistake).
 
+use chrono::{DateTime, Utc};
 use futures::future::BoxFuture;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -112,7 +114,7 @@ mod test_support;
 
 use inboxes::{deliverable_inboxes, unreachable_grace};
 pub use job::handle;
-use recipients::{addressed_to, expand_recipients, includes_public};
+use recipients::{addressed_to, expand_recipients, primary_public, relay_type};
 
 /// The job kind of a backgrounded fan-out, on
 /// [`QUEUE_FEDERATOR_OUTGOING`], handled by [`handle`].
@@ -167,8 +169,10 @@ type OutgoingFilter = fn(AppState, Value) -> BoxFuture<'static, MrfDecision>;
 /// [`PublishOpts::only_to`], when set), with the actor's followers
 /// collection expanded to their remote followers' shared-or-personal
 /// inboxes, every other resolved remote recipient at their personal inbox,
-/// relay inboxes for activities addressed to the public (never when
-/// [`PublishOpts::only_to`] is set),
+/// relay inboxes for post-lifecycle activities (`Create`, `Announce`,
+/// `Update`, `Delete`, `Undo`, `Move`) whose `to` names the public address
+/// — unlisted posts, likes and the rest never reach relays — and never when
+/// [`PublishOpts::only_to`] is set,
 /// [`PublishOpts::extra_inboxes`] added, and everything undeliverable —
 /// local, refused, rejected, unreachable, unknown, already counted —
 /// dropped.
@@ -222,7 +226,7 @@ async fn publish_filtered(
         .map_or_else(|| addressed_to(&activity), Clone::clone);
     let policy = mrf::load_config(state).await;
     let mut candidates = expand_recipients(&state.db, actor, &addresses).await?;
-    if opts.only_to.is_none() && includes_public(&addresses) {
+    if opts.only_to.is_none() && primary_public(&activity) && relay_type(&activity) {
         candidates.extend(instance::relay_inboxes(&state.db).await?);
     }
     candidates.extend(opts.extra_inboxes);
@@ -262,17 +266,54 @@ pub async fn publish_in_background(
     extra_inboxes: &[String],
     unique_key: Option<&str>,
 ) -> AppResult<()> {
+    let args = json!({
+        "actor_id": actor_id,
+        "activity": activity,
+        "extra_inboxes": extra_inboxes,
+    });
+    enqueue_publish(state, args, unique_key, None).await
+}
+
+/// [`publish_in_background`] for a debounced, delayed fan-out: the job is
+/// deduplicated under `unique_key` and not due before `run_at`, and it
+/// carries no extra inboxes.
+///
+/// A poll tally's `Update` uses it: it waits a few minutes so a burst of
+/// votes becomes one fan-out.
+///
+/// # Errors
+///
+/// Any database failure inserting the job row arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn publish_in_background_at(
+    state: &AppState,
+    actor_id: Uuid,
+    activity: &Value,
+    unique_key: &str,
+    run_at: DateTime<Utc>,
+) -> AppResult<()> {
+    let args = json!({
+        "actor_id": actor_id,
+        "activity": activity,
+        "extra_inboxes": Vec::<String>::new(),
+    });
+    enqueue_publish(state, args, Some(unique_key), Some(run_at)).await
+}
+
+/// Inserts the [`KIND_PUBLISH`] job row both background entry points share.
+async fn enqueue_publish(
+    state: &AppState,
+    args: Value,
+    unique_key: Option<&str>,
+    run_at: Option<DateTime<Utc>>,
+) -> AppResult<()> {
     let _job = enqueue(
         &state.db,
         NewJob {
             queue: QUEUE_FEDERATOR_OUTGOING,
             kind: KIND_PUBLISH,
-            args: json!({
-                "actor_id": actor_id,
-                "activity": activity,
-                "extra_inboxes": extra_inboxes,
-            }),
-            run_at: None,
+            args,
+            run_at,
             max_attempts: None,
             unique_key,
         },

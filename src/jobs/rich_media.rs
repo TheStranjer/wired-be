@@ -29,7 +29,6 @@ use scraper::{ElementRef, Html, Selector};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tracing::{debug, warn};
-use url::Url;
 use uuid::Uuid;
 
 use crate::{
@@ -43,6 +42,7 @@ use crate::{
     },
     services::rich_media::{card_json, fetch_card, host_ignored},
     state::AppState,
+    util::url::is_http_url,
 };
 
 /// The job kind of a status's link-card fetch, handled by [`handle_fetch`]
@@ -159,9 +159,7 @@ fn is_social_class(token: &str) -> bool {
 /// key and the fetched URL stay exactly what the post links.
 fn absolute_http(href: Option<&str>) -> Option<String> {
     let raw = href?;
-    Url::parse(raw)
-        .is_ok_and(|parsed| matches!(parsed.scheme(), "http" | "https"))
-        .then(|| raw.to_owned())
+    is_http_url(raw).then(|| raw.to_owned())
 }
 
 /// Whether `cached` is fresh enough to answer without a fetch: an `ok` row

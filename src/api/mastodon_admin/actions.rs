@@ -18,14 +18,12 @@ use crate::{
     auth::admin::AdminUser,
     error::{AppError, AppResult},
     extract::ApiBody,
-    jobs::{QUEUE_BACKGROUND, deletion},
     models::{
-        job::{NewJob, enqueue},
         moderation_log,
         report::{self, ReportState},
         user::{User, admin},
     },
-    services::webhooks,
+    services::report_moderation::set_report_state,
     state::AppState,
     util::id::parse_id,
 };
@@ -48,8 +46,7 @@ use crate::{
 /// [`AppError::NotFound`] from [`named_account`] or [`resolve_report`];
 /// [`AppError::BadRequest`] with [`WRONG_TARGET`];
 /// [`AppError::Unprocessable`] from the body extractor for a `type` that is
-/// no text; and [`AppError::Database`] from the writes, the queueing and the
-/// log.
+/// no text; and [`AppError::Database`] from the writes and the log.
 pub(super) async fn account_action(
     State(state): State<AppState>,
     admin: AdminUser,
@@ -65,15 +62,15 @@ pub(super) async fn account_action(
 }
 
 /// The effect of one action type: the flag its two real actions move, each
-/// with the `deactivate` entry every other writer of that flag leaves, the
-/// suspension's content sweep, and the entry naming the submitted type that
-/// records the request itself.
+/// with the `deactivate` entry every other writer of that flag leaves, and the
+/// entry naming the submitted type that records the request itself. Neither
+/// queues a job nor federates anything.
 ///
 /// # Errors
 ///
 /// [`AppError::NotFound`] when the activation write matches no row (the
-/// account went away mid-request); [`AppError::Database`] from the writes,
-/// the queueing and the log.
+/// account went away mid-request); [`AppError::Database`] from the writes
+/// and the log.
 async fn apply_action(
     state: &AppState,
     actor: &User,
@@ -91,9 +88,6 @@ async fn apply_action(
             "admin action deactivated an account"
         );
     }
-    if action == AccountAction::Suspend {
-        queue_content_deletion(state, account).await?;
-    }
     let logged = moderation_log::account_action(&state.db, actor, account, action.as_str()).await?;
     debug!(
         log = %logged.id,
@@ -104,44 +98,13 @@ async fn apply_action(
     Ok(())
 }
 
-/// Queues the `users.delete` sweep a suspension asks for: the same job
-/// [`helpers::start_deletion`] puts behind a deletion, and queued here on its
-/// own. A suspension takes the account's CONTENT away and leaves the row
-/// behind, deactivated and resolvable, so nothing is stamped in
-/// `deleted_at` and no token is revoked here — the sweep's own first act is
-/// the `Delete` announcement, which is what Mastodon's suspension of a local
-/// account amounts to.
-///
-/// # Errors
-///
-/// [`AppError::Database`] from the queue write.
-async fn queue_content_deletion(state: &AppState, account: &User) -> AppResult<()> {
-    let queued = enqueue(
-        &state.db,
-        NewJob {
-            queue: QUEUE_BACKGROUND,
-            kind: deletion::KIND_DELETE,
-            args: deletion::job_args(account.id),
-            run_at: None,
-            max_attempts: None,
-            unique_key: None,
-        },
-    )
-    .await?;
-    debug!(
-        account = %account.id,
-        queued = queued.is_some(),
-        "admin queued an account's content deletion"
-    );
-    Ok(())
-}
-
 /// Pleroma's `associated_report` and `resolve_report` pair for the umbrella
 /// request: no `report_id` is no report to resolve, an id that names none is
 /// the same 404 the account half gives, a report about another account is
 /// the 400 [`WRONG_TARGET`], and a report that passes both is moved to
-/// `resolved` — the write, its `report_update` entry and its
-/// `report.updated` event, exactly what the console's own state change does.
+/// `resolved` through [`set_report_state`] — the write, its `report_update`
+/// entry and its `report.updated` event, exactly what the console's own
+/// state change does.
 ///
 /// # Errors
 ///
@@ -167,17 +130,11 @@ async fn resolve_report(
     if filed.target_id != account.id {
         return Err(AppError::BadRequest(WRONG_TARGET.to_owned()));
     }
-    let resolved = report::set_state(&state.db, id, ReportState::Resolved, Some(actor.id))
+    let resolved = set_report_state(state, actor, id, ReportState::Resolved)
         .await?
         .ok_or(AppError::NotFound)?;
-    let logged =
-        moderation_log::report_update(&state.db, actor, id, resolved.state.as_str(), Some(account))
-            .await?;
-    webhooks::report_updated(state, &resolved).await;
     debug!(
-        log = %logged.id,
-        report = %id,
-        state = resolved.state.as_str(),
+        report = %resolved.id,
         "admin action resolved a report"
     );
     Ok(())
@@ -221,8 +178,8 @@ enum AccountAction {
     Silence,
     /// `disable`: [`is_active`](User::is_active) off, nothing else.
     Disable,
-    /// `suspend`: the flag off and the account's content swept by a queued
-    /// `users.delete`.
+    /// `suspend`: the same as [`Disable`](Self::Disable) — the flag off and
+    /// nothing federated or deleted, so `enable` undoes it.
     Suspend,
 }
 

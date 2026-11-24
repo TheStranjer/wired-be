@@ -62,6 +62,7 @@ use std::collections::HashMap;
 
 use chrono::{DateTime, Utc};
 use serde_json::{Map, Value};
+use sqlx::PgConnection;
 use tracing::debug;
 use uuid::Uuid;
 
@@ -106,9 +107,12 @@ const SECONDS_PER_MINUTE: usize = 60;
 ///
 /// The gates run in this order: the [`scheduled_at`] read, the create
 /// path's own body checks and parent/conversation resolution (the shared
-/// `prepared_new_status` step), the window, the two limits, and the media
-/// reservation — so a body that would not post is refused with the post's
-/// answer before the schedule says anything of its own.
+/// `prepared_new_status` step), the window, the media reservation, and the
+/// two limits — so a body that would not post is refused with the post's
+/// answer before the schedule says anything of its own. The limits run last
+/// because they and the insert are one transaction under the account's
+/// advisory lock ([`lock_user`](scheduled_status::lock_user)): concurrent
+/// creates of one account cannot all read a count under the cap and all store.
 ///
 /// The fire is queued through
 /// [`jobs::scheduled_statuses::schedule`](crate::jobs::scheduled_statuses::schedule),
@@ -140,11 +144,10 @@ pub async fn schedule_status(
     // fire's own moment, the way `expires_in` is counted from it.
     let (new, _poll) = prepared_new_status(state, user, app, &params).await?;
     check_window(&state.config, at)?;
-    check_limits(state, user.id, at).await?;
     check_media(state, user.id, &new.media_ids).await?;
     let stored = stored_params(&params, &new, idempotency, app)?;
-    let row = scheduled_status::insert(
-        &state.db,
+    let row = insert_within_limits(
+        state,
         &NewScheduledStatus {
             user_id: user.id,
             scheduled_at: at,
@@ -211,12 +214,44 @@ pub fn check_window(config: &Config, at: DateTime<Utc>) -> AppResult<()> {
     )))
 }
 
+/// Checks the schedule limits and stores the row as one atomic step.
+///
+/// The count and the insert share one transaction that first takes the
+/// account's [`lock_user`](scheduled_status::lock_user) advisory lock, so
+/// concurrent creates of one account queue up here and each counts the rows
+/// the ones before it committed; without the lock they all read the same
+/// count under the cap and all insert. A refusal drops the transaction, which
+/// rolls back and releases the lock.
+///
+/// # Errors
+///
+/// [`AppError::Unprocessable`] with [`TOO_MANY_SCHEDULED`] for either limit,
+/// plus any database failure as [`AppError::Database`].
+async fn insert_within_limits(
+    state: &AppState,
+    new_status: &NewScheduledStatus,
+) -> AppResult<StoredRow> {
+    let mut tx = state.db.begin().await?;
+    scheduled_status::lock_user(&mut tx, new_status.user_id).await?;
+    check_limits(
+        &mut tx,
+        &state.config,
+        new_status.user_id,
+        new_status.scheduled_at,
+    )
+    .await?;
+    let row = scheduled_status::insert_conn(&mut tx, new_status).await?;
+    tx.commit().await?;
+    Ok(row)
+}
+
 /// The two counts a schedule may not breach: the account's pending total
 /// against [`Config::max_scheduled_per_user`](crate::config::Config::max_scheduled_per_user),
 /// then the rows due within the UTC day [`utc_day_bounds`] draws around
 /// `at` against its per-day cap. Every row of the table is pending — the
 /// fire and the cancel both delete — so the counts are plain reads, and
-/// this row's own insert is what the counts refuse ahead of.
+/// this row's own insert is what the counts refuse ahead of. They are only
+/// sound under the account's lock; see [`insert_within_limits`].
 ///
 /// [`utc_day_bounds`]: scheduled_status::utc_day_bounds
 ///
@@ -224,16 +259,21 @@ pub fn check_window(config: &Config, at: DateTime<Utc>) -> AppResult<()> {
 ///
 /// [`AppError::Unprocessable`] with [`TOO_MANY_SCHEDULED`] for either
 /// breach.
-async fn check_limits(state: &AppState, user_id: Uuid, at: DateTime<Utc>) -> AppResult<()> {
-    let pending = scheduled_status::count_pending_for_user(&state.db, user_id).await?;
-    if breaches(pending, state.config.max_scheduled_per_user) {
+async fn check_limits(
+    conn: &mut PgConnection,
+    config: &Config,
+    user_id: Uuid,
+    at: DateTime<Utc>,
+) -> AppResult<()> {
+    let pending = scheduled_status::count_pending_for_user_conn(conn, user_id).await?;
+    if breaches(pending, config.max_scheduled_per_user) {
         return Err(AppError::Unprocessable(TOO_MANY_SCHEDULED.to_owned()));
     }
     let (day_start, day_end) = scheduled_status::utc_day_bounds(at);
     let in_day =
-        scheduled_status::count_pending_for_user_between(&state.db, user_id, day_start, day_end)
+        scheduled_status::count_pending_for_user_between_conn(conn, user_id, day_start, day_end)
             .await?;
-    if breaches(in_day, state.config.max_scheduled_per_user_per_day) {
+    if breaches(in_day, config.max_scheduled_per_user_per_day) {
         return Err(AppError::Unprocessable(TOO_MANY_SCHEDULED.to_owned()));
     }
     Ok(())
@@ -381,4 +421,108 @@ fn write_resolved(map: &mut Map<String, Value>, new: &NewStatus) {
 /// the drop is the point of the borrow, not a result to keep.
 fn put(map: &mut Map<String, Value>, key: &str, value: Value) {
     let _replaced: Option<Value> = map.insert(key.to_owned(), value);
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono::Duration as ChronoDuration;
+
+    use crate::{
+        config::TEST_BASE_URL,
+        models::user::{NewUser, insert as insert_user, local_ap_id},
+    };
+
+    use super::*;
+
+    /// A create body parking `text` an hour ahead.
+    fn body(text: &str) -> CreateStatusParams {
+        CreateStatusParams {
+            status: Some(text.to_owned()),
+            scheduled_at: Some((Utc::now() + ChronoDuration::hours(1)).to_rfc3339()),
+            ..CreateStatusParams::default()
+        }
+    }
+
+    /// Whether `result` is the limit's 422.
+    fn is_too_many<T>(result: &AppResult<T>) -> bool {
+        matches!(result, Err(AppError::Unprocessable(text)) if text == TOO_MANY_SCHEDULED)
+    }
+
+    /// Two concurrent schedules under a cap of one: the account lock makes the
+    /// count-then-insert atomic, so exactly one stores and the other is the
+    /// limit's 422.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn concurrent_schedules_cannot_pass_the_total_cap() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let mut config = Config::for_tests();
+        config.max_scheduled_per_user = 1;
+        config.max_scheduled_per_user_per_day = 100;
+        let state = AppState::for_tests(db.pool().clone(), config);
+        let user = insert_user(
+            &state.db,
+            &NewUser::local("alice", &local_ap_id(TEST_BASE_URL, "alice")),
+        )
+        .await
+        .expect("the user inserts");
+
+        let (first, second) = tokio::join!(
+            schedule_status(&state, &user, None, None, body("first")),
+            schedule_status(&state, &user, None, None, body("second")),
+        );
+
+        assert_eq!(
+            usize::from(first.is_ok()) + usize::from(second.is_ok()),
+            1,
+            "exactly one of the two concurrent schedules succeeds"
+        );
+        assert!(
+            is_too_many(&first) || is_too_many(&second),
+            "the loser is the limit's 422"
+        );
+        let stored = scheduled_status::count_pending_for_user(&state.db, user.id)
+            .await
+            .expect("the count runs");
+        assert_eq!(stored, 1, "exactly one row is stored");
+    }
+
+    /// The same race against the per-day cap, with a roomy total cap.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn concurrent_schedules_cannot_pass_the_per_day_cap() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let mut config = Config::for_tests();
+        config.max_scheduled_per_user = 100;
+        config.max_scheduled_per_user_per_day = 1;
+        let state = AppState::for_tests(db.pool().clone(), config);
+        let user = insert_user(
+            &state.db,
+            &NewUser::local("bob", &local_ap_id(TEST_BASE_URL, "bob")),
+        )
+        .await
+        .expect("the user inserts");
+        let at = Utc::now() + ChronoDuration::hours(1);
+        let same_day = |text: &str| CreateStatusParams {
+            status: Some(text.to_owned()),
+            scheduled_at: Some(at.to_rfc3339()),
+            ..CreateStatusParams::default()
+        };
+
+        let (first, second) = tokio::join!(
+            schedule_status(&state, &user, None, None, same_day("first")),
+            schedule_status(&state, &user, None, None, same_day("second")),
+        );
+
+        assert_eq!(
+            usize::from(first.is_ok()) + usize::from(second.is_ok()),
+            1,
+            "exactly one of the two concurrent schedules succeeds"
+        );
+        assert!(
+            is_too_many(&first) || is_too_many(&second),
+            "the loser is the limit's 422"
+        );
+        let stored = scheduled_status::count_pending_for_user(&state.db, user.id)
+            .await
+            .expect("the count runs");
+        assert_eq!(stored, 1, "exactly one row is stored");
+    }
 }

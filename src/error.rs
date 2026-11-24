@@ -22,7 +22,7 @@
 //! variant for a feature that is switched off or whose backing service does
 //! not answer (see [`crate::services::translate`]), likewise sent as-is.
 
-use std::{error::Error, fmt};
+use std::{error::Error, fmt, io, path::Path};
 
 use axum::{
     Json,
@@ -335,6 +335,13 @@ struct IdentifiedErrorBody<'a> {
 /// A result that fails with [`AppError`], the return type of every handler.
 pub type AppResult<T> = Result<T, AppError>;
 
+/// Wraps a filesystem failure, keeping the operation and path for the log:
+/// [`AppError::Internal`] never sends its detail to a client.
+#[must_use]
+pub fn io_error(operation: &str, path: &Path, err: &io::Error) -> AppError {
+    AppError::Internal(format!("{operation} {} failed: {err}", path.display()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -346,6 +353,19 @@ mod tests {
     /// A Pleroma-style machine-readable reason code, as the identifier
     /// variant puts it in the body.
     const ACCOUNT_ID: &str = "account_is_disabled";
+
+    /// `io_error` yields an internal error naming the operation, path and cause.
+    #[test]
+    fn io_error_is_internal_with_operation_path_and_cause() {
+        let cause = io::Error::new(io::ErrorKind::PermissionDenied, "disk on fire");
+        let error = io_error("write upload", Path::new("/srv/uploads/a.png"), &cause);
+        let AppError::Internal(message) = error else {
+            panic!("expected AppError::Internal");
+        };
+        assert!(message.contains("write upload"), "{message}");
+        assert!(message.contains("/srv/uploads/a.png"), "{message}");
+        assert!(message.contains("disk on fire"), "{message}");
+    }
 
     /// The exact body an [`AppError`] is answered with for `message`.
     fn json_body(message: &str) -> String {

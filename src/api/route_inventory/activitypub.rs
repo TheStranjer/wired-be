@@ -107,16 +107,6 @@ pub(super) const ROWS: &[RouteSpec] = &[
     },
     RouteSpec {
         method: "GET",
-        path: "/notice/:id/embed_player",
-        auth: AuthClass::Public,
-    },
-    RouteSpec {
-        method: "GET",
-        path: "/embed/:id",
-        auth: AuthClass::Public,
-    },
-    RouteSpec {
-        method: "GET",
         path: "/mailer/unsubscribe/:token",
         auth: AuthClass::Public,
     },
@@ -158,26 +148,6 @@ pub(super) const ROWS: &[RouteSpec] = &[
     RouteSpec {
         method: "POST",
         path: "/internal/fetch/inbox",
-        auth: AuthClass::Public,
-    },
-    RouteSpec {
-        method: "GET",
-        path: "/main/ostatus",
-        auth: AuthClass::Public,
-    },
-    RouteSpec {
-        method: "POST",
-        path: "/main/ostatus",
-        auth: AuthClass::Public,
-    },
-    RouteSpec {
-        method: "GET",
-        path: "/ostatus_subscribe",
-        auth: AuthClass::Public,
-    },
-    RouteSpec {
-        method: "POST",
-        path: "/ostatus_subscribe",
         auth: AuthClass::Public,
     },
     RouteSpec {

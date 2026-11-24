@@ -16,7 +16,7 @@ use crate::{
         status::{Status, Visibility},
         user::{User, followers},
     },
-    util::time::mastodon_time,
+    util::{id::activity_ap_id, time::mastodon_time},
 };
 
 use super::{
@@ -58,12 +58,14 @@ fn wrapped_context(note: &Value, config: &Config) -> Value {
         .unwrap_or_else(|| json_ld_context(config))
 }
 
-/// The JSON-LD context document served at [`LITEPUB_SCHEMA_PATH`].
+/// The JSON-LD context document served at [`LITEPUB_SCHEMA_PATH`]: the one
+/// term map of this instance, referenced by the actor documents, the notes
+/// and the activities alike.
 ///
-/// The prefixes and term definitions this instance's own documents use: the
-/// counterpart of Pleroma's `priv/static/schemas/litepub-0.1.jsonld`, cut
-/// down to what [`note_json`](super::note_json) and the activity builders
-/// actually write.
+/// The counterpart of Pleroma's `priv/static/schemas/litepub-0.1.jsonld`:
+/// the prefixes and every non-core term [`note_json`](super::note_json), the
+/// activity builders, the chat messages and the actor document write, so a
+/// JSON-LD processor never drops one as undefined.
 #[must_use]
 pub fn litepub_context_json() -> Value {
     json!({
@@ -72,16 +74,39 @@ pub fn litepub_context_json() -> Value {
             "fedibird": "http://fedibird.com/ns#",
             "litepub": "http://litepub.social/ns#",
             "ostatus": "http://ostatus.org#",
+            "schema": "http://schema.org#",
+            "sm": "http://smithereen.software/ns#",
             "toot": "http://joinmastodon.org/ns#",
-            "Hashtag": "as:Hashtag",
-            "Emoji": "toot:Emoji",
-            "EmojiReact": "litepub:EmojiReact",
+            "vcard": "http://www.w3.org/2006/vcard/ns#",
+            "_misskey_quote": "https://misskey-hub.net/ns#_misskey_quote",
+            "alsoKnownAs": { "@id": "as:alsoKnownAs", "@type": "@id" },
+            "blurhash": "toot:blurhash",
             "capabilities": "litepub:capabilities",
+            "ChatMessage": "litepub:ChatMessage",
             "conversation": { "@id": "ostatus:conversation", "@type": "@id" },
             "directMessage": "litepub:directMessage",
+            "discoverable": "toot:discoverable",
+            "Emoji": "toot:Emoji",
+            "EmojiReact": "litepub:EmojiReact",
+            "featured": { "@id": "toot:featured", "@type": "@id" },
+            "focalPoint": { "@container": "@list", "@id": "toot:focalPoint" },
+            "formerRepresentations": "litepub:formerRepresentations",
+            "formerType": "as:formerType",
+            "Hashtag": "as:Hashtag",
+            "invisible": "litepub:invisible",
+            "listMessage": { "@id": "litepub:listMessage", "@type": "@id" },
+            "manuallyApprovesFollowers": "as:manuallyApprovesFollowers",
+            "movedTo": { "@id": "as:movedTo", "@type": "@id" },
+            "nonAnonymous": "sm:nonAnonymous",
+            "oauthRegistrationEndpoint": {
+                "@id": "litepub:oauthRegistrationEndpoint",
+                "@type": "@id"
+            },
+            "PropertyValue": "schema:PropertyValue",
             "quoteUri": "fedibird:quoteUri",
             "quoteUrl": "as:quoteUrl",
             "sensitive": "as:sensitive",
+            "value": "schema:value",
             "votersCount": "toot:votersCount",
         }
     })
@@ -98,7 +123,7 @@ pub fn litepub_context_json() -> Value {
 pub fn create_activity_json(note: &Value, status: &Status, config: &Config) -> Value {
     json!({
         "@context": wrapped_context(note, config),
-        "id": format!("{}/activities/{}", config.base_url, status.id),
+        "id": activity_ap_id(&config.base_url, status.id),
         "type": TYPE_CREATE,
         "actor": note.get("actor").cloned().unwrap_or(Value::Null),
         "to": note.get("to").cloned().unwrap_or_else(|| json!([])),
@@ -129,7 +154,7 @@ pub fn create_activity_json(note: &Value, status: &Status, config: &Config) -> V
 pub fn update_activity_json(note: &Value, id: Uuid, config: &Config) -> Value {
     json!({
         "@context": wrapped_context(note, config),
-        "id": format!("{}/activities/{id}", config.base_url),
+        "id": activity_ap_id(&config.base_url, id),
         "type": TYPE_UPDATE,
         "actor": note.get("actor").cloned().unwrap_or(Value::Null),
         "to": note.get("to").cloned().unwrap_or_else(|| json!([])),
@@ -254,7 +279,7 @@ pub fn tombstone_json(status: &Status) -> Value {
 mod tests {
     use super::*;
     use crate::{
-        federation::note::{note_json, test_support::*},
+        federation::note::{PollData, PollOptionData, note_json, test_support::*},
         util::time::parse_time,
     };
 
@@ -290,6 +315,58 @@ mod tests {
         assert_eq!(context["sensitive"], "as:sensitive", "the cw flag");
         assert_eq!(context["Hashtag"], "as:Hashtag", "the tag type");
         assert_eq!(context["Emoji"], "toot:Emoji", "the emoji type");
+        assert_eq!(context["blurhash"], "toot:blurhash", "the media hash");
+        assert_eq!(
+            context["focalPoint"],
+            json!({"@container": "@list", "@id": "toot:focalPoint"}),
+            "the focal point is a list"
+        );
+        assert_eq!(context["formerType"], "as:formerType", "the tombstone type");
+        assert_eq!(
+            context["_misskey_quote"], "https://misskey-hub.net/ns#_misskey_quote",
+            "the Misskey quote"
+        );
+        assert_eq!(context["ChatMessage"], "litepub:ChatMessage", "chats");
+        assert_eq!(context["toot"], "http://joinmastodon.org/ns#", "toot iri");
+    }
+
+    #[test]
+    fn every_term_a_note_emits_is_defined_in_the_served_schema() {
+        let mut ctx = note_context(Visibility::Public);
+        ctx.quote_uri = Some("https://remote.example/objects/quoted".to_owned());
+        ctx.status.edited_at = Some(parse_time(DELETED).unwrap());
+        ctx.attachments = vec![{
+            let mut media = fixture_media(&format!("{BASE}/media/cat.png"), "image/png");
+            media.description = Some("a cat".to_owned());
+            media.blurhash = Some("UBLHZ;9a".to_owned());
+            media
+        }];
+        ctx.poll = Some(PollData {
+            multiple: true,
+            expires_at: Some(parse_time(DELETED).unwrap()),
+            closed: true,
+            voters_count: 1,
+            options: vec![PollOptionData {
+                title: "yes".to_owned(),
+                votes_count: 1,
+            }],
+        });
+        let note = note_json(&ctx).expect("the fixture renders");
+        assert_eq!(
+            undefined_terms(&note),
+            Vec::<String>::new(),
+            "no note key is left undefined"
+        );
+        assert!(
+            note["attachment"][0].get("blurhash").is_some(),
+            "the attachment really carries the blurhash the check covers"
+        );
+        let status = base_status(Visibility::Public);
+        assert_eq!(
+            undefined_terms(&tombstone_json(&status)),
+            Vec::<String>::new(),
+            "nor is a tombstone key"
+        );
     }
 
     #[test]

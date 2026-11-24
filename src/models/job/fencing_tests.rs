@@ -12,20 +12,22 @@ use super::{
 /// limit, rescues it and claims it again; returns the second claim
 /// (`attempts = 2`), leaving the row `executing` under it.
 async fn claim_rescue_and_reclaim(pool: &PgPool, queue: &'static str) -> Job {
-    let _job = enqueue(pool, new_job(queue, "slow"))
+    let enqueued = enqueue(pool, new_job(queue, "slow"))
         .await
         .unwrap()
         .expect("the job inserts");
+    assert_eq!(enqueued.queue, queue, "the job went to the asked queue");
     let first = claim_next(pool, &[queue])
         .await
         .unwrap()
         .expect("the first claim succeeds");
     assert_eq!(first.attempts, 1, "the first claim is attempt one");
-    let _aged = sqlx::query("UPDATE jobs SET locked_at = now() - interval '1 hour' WHERE id = $1")
+    let aged = sqlx::query("UPDATE jobs SET locked_at = now() - interval '1 hour' WHERE id = $1")
         .bind(first.id)
         .execute(pool)
         .await
         .unwrap();
+    assert_eq!(aged.rows_affected(), 1, "the lock was aged");
     let rescued = rescue_stuck(pool, Duration::from_secs(600)).await.unwrap();
     assert_eq!(rescued, 1, "the aged lock is rescued");
     let second = claim_next(pool, &[queue])
@@ -41,10 +43,11 @@ async fn claim_rescue_and_reclaim(pool: &PgPool, queue: &'static str) -> Job {
 async fn complete_with_the_current_attempt_completes() {
     let db = crate::test_db::test_db().await.expect("test database slot");
     let pool = db.pool().clone();
-    let _job = enqueue(&pool, new_job("default", "quick"))
+    let enqueued = enqueue(&pool, new_job("default", "quick"))
         .await
         .unwrap()
         .expect("the job inserts");
+    assert_eq!(enqueued.queue, "default", "the job went to its queue");
     let claimed = claim_next(&pool, &["default"])
         .await
         .unwrap()

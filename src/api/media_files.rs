@@ -33,6 +33,7 @@ use axum::{
 use bytes::Bytes;
 
 use crate::{
+    default_assets,
     error::{AppError, AppResult},
     state::AppState,
     uploads,
@@ -52,8 +53,11 @@ pub fn router() -> Router<AppState> {
     Router::new().route("/media/{*key}", get(serve_media))
 }
 
-/// `GET /media/{*key}` — the file stored under `key`. No authentication: a
-/// media key is unguessable and holding it is the permission to read it.
+/// `GET /media/{*key}` — the file stored under `key`, or the instance's
+/// built-in image when `key` names one of the [`default_assets`]
+/// (`default/avi.png` and friends, answered ahead of the uploads directory).
+/// No authentication: a media key is unguessable and holding it is the
+/// permission to read it.
 ///
 /// # Errors
 ///
@@ -66,6 +70,9 @@ async fn serve_media(
 ) -> AppResult<Response> {
     if uploads::check_key(&key).is_err() {
         return Err(AppError::NotFound);
+    }
+    if let Some(bytes) = default_assets::lookup(&key) {
+        return Ok(media_response(&key, bytes));
     }
     let bytes = state.uploader.read(&key).await?;
     Ok(media_response(&key, bytes))

@@ -2,22 +2,73 @@
 //! chosen option, its object a bodyless `Note` naming the option title and
 //! answering the question's uri, addressed to the poll's author alone.
 //!
-//! A poll on a local status is this instance's own fact and announces
-//! nothing; the row readers and the publisher hand are the root's.
+//! A ballot on a poll of a local status answers nobody; what it changes is
+//! the poll's tally, which [`after_local_poll_changed`] re-announces as a
+//! debounced `Update` of the `Question` (after a vote and when the poll
+//! closes). The row readers and the publisher hand are the root's.
 
+use chrono::{TimeDelta, Utc};
 use serde_json::{Value, json};
-use tracing::warn;
+use tracing::{debug, warn};
 use uuid::Uuid;
 
-use super::{load_status, load_user, queue_activity};
+use super::{
+    load_status, load_user,
+    notes::{NoteActivity, note_document, note_publisher},
+    queue_activity,
+};
 use crate::{
-    federation::note,
+    federation::{note, publisher},
     models::{
         poll::{self, Poll as PollRow, PollOption},
+        status::Status,
         user::User,
     },
     state::AppState,
+    util::id::OBJECTS_PATH,
 };
+
+/// How long a local poll's `Update` waits before it goes out: Mastodon's
+/// `DistributePollUpdateWorker` delay, so a burst of votes is one fan-out.
+const POLL_UPDATE_DELAY_MINUTES: i64 = 3;
+
+/// The deduplication key of a poll's queued `Update`: one live job per
+/// question, so every vote inside the delay folds into the one already
+/// waiting.
+fn poll_update_key(status_id: Uuid) -> String {
+    format!("poll-update:{status_id}")
+}
+
+/// Re-announce the tally of a LOCAL status' poll as a debounced `Update`.
+///
+/// The `Question` carries its current `votersCount`, option counts and
+/// `closed` state. The job is queued three minutes ahead under the key
+/// `poll-update:{status id}`, so votes landing meanwhile collapse into it.
+///
+/// The document is the edit hook's own (the status' note wrapped in an
+/// `Update`) and travels to the audience the `Create` reached. It is
+/// rendered when this hook runs, so a debounced job carries the tally of
+/// the first change it folded. Silence is the answer when federation is
+/// off, and for a row the note publishing gate refuses (a mirror, a
+/// reblog, a `local`-visibility post or an author that is gone or switched
+/// off).
+pub async fn after_local_poll_changed(state: &AppState, status: &Status) {
+    if !state.config.federation_enabled.get() {
+        return;
+    }
+    let Some(author) = note_publisher(state, status).await else {
+        return;
+    };
+    let Some(document) = note_document(state, status.id, NoteActivity::Update).await else {
+        return;
+    };
+    let key = poll_update_key(status.id);
+    let run_at = Utc::now() + TimeDelta::minutes(POLL_UPDATE_DELAY_MINUTES);
+    match publisher::publish_in_background_at(state, author.id, &document, &key, run_at).await {
+        Ok(()) => debug!(actor = %author.ap_id, "queued poll Update"),
+        Err(err) => warn!(%err, actor = %author.ap_id, "could not queue poll Update"),
+    }
+}
 
 /// The parts one federated answer document of a remote poll is built from:
 /// the ballot as [`after_poll_vote`] resolved it — the poll the marks count
@@ -55,7 +106,7 @@ struct Ballot<'a> {
 fn answer_document(state: &AppState, ballot: &Ballot<'_>, option: &PollOption) -> Value {
     let name = format!("vote-{}-{}", ballot.poll_id, option.position);
     let object = json!({
-        "id": format!("{}/objects/{name}", state.config.base_url),
+        "id": format!("{}{OBJECTS_PATH}{name}", state.config.base_url),
         "type": "Note",
         "attributedTo": ballot.voter_ap_id,
         "inReplyTo": ballot.question_uri,
@@ -81,9 +132,10 @@ fn answer_document(state: &AppState, ballot: &Ballot<'_>, option: &PollOption) -
 /// choice through its pipeline as an `Answer`, and the relational ballot
 /// here mints one answer document per mark instead (the documents' own
 /// `to` names the author, so the follower of nobody's timeline is
-/// expanded). Silence is the answer beside [`crate::services::notify`]'s
-/// telling in every other case: a poll on a LOCAL status keeps its ballots
-/// inside this instance (its author reads the counters, not the wire), a
+/// expanded). A poll on a LOCAL status sends no answer (its author reads
+/// the counters, not the wire) but re-announces its tally through
+/// [`after_local_poll_changed`]. Silence is the answer beside
+/// [`crate::services::notify`]'s telling in every other case: a
 /// gone status or author has nobody to answer, a non-local voter's ballot
 /// arrived from the wire and goes no further, and an option id the poll
 /// does not hold names nothing to announce.
@@ -98,7 +150,9 @@ pub async fn after_poll_vote(state: &AppState, poll: &PollRow, voter: &User, opt
         return; // a question whose row is gone has no author to answer
     };
     if posted.local {
-        return; // a local poll's ballot is this instance's own fact
+        // a local poll's ballot answers nobody; the tally is what changed
+        after_local_poll_changed(state, &posted).await;
+        return;
     }
     let Some(author) = load_user(state, posted.user_id).await else {
         return; // an author whose row is gone is nobody to tell
@@ -133,18 +187,167 @@ pub async fn after_poll_vote(state: &AppState, poll: &PollRow, voter: &User, opt
 mod tests {
     use super::*;
 
+    use sqlx::PgPool;
+
     use crate::{
         models::{poll::PollParams, status::Visibility},
         services::federation_out::test_support::{
-            app_state, job_count, local, local_status, publish_jobs, remote, remote_status,
+            app_state, job_count, local, local_post, local_status, publish_jobs, remote,
+            remote_status, state_with, unfederated,
         },
         util::id::new_id,
     };
 
-    /// A poll on a LOCAL status keeps its ballots inside the database: the
-    /// author's counters are the whole telling, and no answer goes out —
-    /// beside the other refusals of the hook: a ballot signed by nobody of
-    /// ours, and marks naming options the poll does not hold.
+    /// A two-option poll on the LOCAL public status `author` asks: the
+    /// poll row and its option ids.
+    async fn local_poll(pool: &PgPool, author: &User) -> (PollRow, Vec<Uuid>) {
+        let asked = local_status(pool, author, "tea or coffee?").await;
+        let stand = {
+            let mut conn = pool.acquire().await.expect("a slot connection");
+            poll::create(
+                &mut conn,
+                asked.id,
+                &PollParams {
+                    options: vec!["tea".to_owned(), "coffee".to_owned()],
+                    ..PollParams::default()
+                },
+            )
+            .await
+            .expect("the local poll creates")
+        };
+        let ids = poll::options(pool, stand.id)
+            .await
+            .expect("the options read")
+            .into_iter()
+            .map(|option| option.id)
+            .collect();
+        (stand, ids)
+    }
+
+    /// Writes `voter`'s mark on `option` and runs the vote hook, the way
+    /// the vote endpoint does.
+    async fn cast(state: &AppState, stand: &PollRow, voter: &User, option: Uuid) {
+        assert!(
+            poll::cast_vote(&state.db, stand.id, voter.id, &[option])
+                .await
+                .expect("the ballot writes"),
+            "the fixture ballot counts"
+        );
+        after_poll_vote(state, stand, voter, &[option]).await;
+    }
+
+    /// Whether every queued publish job is due strictly in the future.
+    async fn all_publishes_delayed(pool: &PgPool) -> bool {
+        sqlx::query_scalar::<_, bool>("SELECT bool_and(run_at > now()) FROM jobs WHERE kind = $1")
+            .bind(publisher::KIND_PUBLISH)
+            .fetch_one(pool)
+            .await
+            .expect("the run_at reads")
+    }
+
+    /// A vote on a poll of a LOCAL status sends no answer but queues one
+    /// delayed `Update` of the `Question` carrying the new count; a second
+    /// vote folds into that same job through the unique key.
+    #[tokio::test]
+    async fn local_votes_queue_one_debounced_question_update() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let carol = local(&pool, "carol").await;
+        let alice = local(&pool, "alice").await;
+        let dave = local(&pool, "dave").await;
+        let state = app_state(&pool);
+        let (stand, options) = local_poll(&pool, &carol).await;
+
+        cast(&state, &stand, &alice, options[0]).await;
+
+        let jobs = publish_jobs(&pool).await;
+        assert_eq!(jobs.len(), 1, "one job after the first vote");
+        let (args, key) = &jobs[0];
+        let activity = &args["activity"];
+        assert_eq!(activity["type"], "Update", "an Update, not an answer");
+        assert_eq!(activity["object"]["type"], "Question", "of the Question");
+        assert_eq!(activity["object"]["votersCount"], 1, "with the new count");
+        assert_eq!(
+            args["actor_id"],
+            json!(carol.id),
+            "published as the poll's author"
+        );
+        assert_eq!(
+            key.as_deref(),
+            Some(format!("poll-update:{}", stand.status_id).as_str()),
+            "under the per-status key"
+        );
+        assert!(all_publishes_delayed(&pool).await, "due in the future");
+
+        cast(&state, &stand, &dave, options[1]).await;
+        assert_eq!(
+            publish_jobs(&pool).await.len(),
+            1,
+            "the second vote folds into the queued job"
+        );
+    }
+
+    /// The Update hook stays silent when federation is off, when the poll's
+    /// status is a mirror, and when the status is `local`-visibility.
+    #[tokio::test]
+    async fn the_poll_update_hook_is_silent_where_it_has_no_business() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let carol = local(&pool, "carol").await;
+        let bob = remote(&pool, "bob").await;
+        let asked = local_status(&pool, &carol, "tea or coffee?").await;
+
+        after_local_poll_changed(&state_with(&pool, unfederated()), &asked).await;
+        assert_eq!(job_count(&pool).await, 0, "federation off: silence");
+
+        let state = app_state(&pool);
+        let mirrored = remote_status(&pool, &bob, "question-mirror", Visibility::Public).await;
+        after_local_poll_changed(&state, &mirrored).await;
+        assert_eq!(job_count(&pool).await, 0, "a mirror is its origin's");
+
+        let hidden = local_post(&pool, &carol, "instance only", Visibility::Local).await;
+        after_local_poll_changed(&state, &hidden).await;
+        assert_eq!(job_count(&pool).await, 0, "a local-visibility post stays");
+    }
+
+    /// A vote on a REMOTE poll is unchanged: one answer `Create` to the
+    /// author, no delay, no Update.
+    #[tokio::test]
+    async fn a_remote_poll_vote_still_sends_only_the_answer() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = local(&pool, "alice").await;
+        let bob = remote(&pool, "bob").await;
+        let state = app_state(&pool);
+        let asked = remote_status(&pool, &bob, "question-answered", Visibility::Public).await;
+        let stand = {
+            let mut conn = pool.acquire().await.expect("a slot connection");
+            poll::create(
+                &mut conn,
+                asked.id,
+                &PollParams {
+                    options: vec!["tea".to_owned(), "coffee".to_owned()],
+                    ..PollParams::default()
+                },
+            )
+            .await
+            .expect("the remote poll creates")
+        };
+        let options = poll::options(&pool, stand.id)
+            .await
+            .expect("the options read");
+
+        cast(&state, &stand, &alice, options[0].id).await;
+
+        let jobs = publish_jobs(&pool).await;
+        assert_eq!(jobs.len(), 1, "the answer alone");
+        assert_eq!(jobs[0].0["activity"]["type"], "Create", "a Create");
+        assert_eq!(jobs[0].1, None, "not debounced");
+        assert!(!all_publishes_delayed(&pool).await, "and not delayed");
+    }
+
+    /// The refusals of the answer hook: a ballot signed by nobody of ours,
+    /// and marks naming options the poll does not hold.
     #[tokio::test]
     async fn a_ballot_this_instance_has_no_answer_to_send_publishes_nothing() {
         let db = crate::test_db::test_db().await.expect("test database slot");
@@ -152,29 +355,6 @@ mod tests {
         let alice = local(&pool, "alice").await;
         let bob = remote(&pool, "bob").await;
         let state = app_state(&pool);
-
-        let own = local_status(&pool, &alice, "our own question").await;
-        let local_stand = {
-            let mut conn = pool.acquire().await.expect("a slot connection");
-            poll::create(
-                &mut conn,
-                own.id,
-                &PollParams {
-                    options: vec!["tea".to_owned()],
-                    ..PollParams::default()
-                },
-            )
-            .await
-            .expect("the local poll creates")
-        };
-        let own_options = poll::options(&pool, local_stand.id)
-            .await
-            .expect("the options read");
-        after_poll_vote(&state, &local_stand, &alice, &[own_options[0].id]).await;
-        assert!(
-            publish_jobs(&pool).await.is_empty(),
-            "a local poll's ballot announces nothing"
-        );
 
         let asked = remote_status(&pool, &bob, "question-remote-voter", Visibility::Public).await;
         let stand = {

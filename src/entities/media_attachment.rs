@@ -27,7 +27,7 @@ use serde_json::{Map, Value, json};
 
 use crate::{
     config::Config, models::media_attachment::MediaAttachment as AttachmentRow,
-    services::media_proxy,
+    services::media_proxy, util::media_type::top_level,
 };
 
 /// What kind of media an attachment is, as Mastodon names it in the
@@ -123,20 +123,11 @@ impl MediaAttachment {
 /// `image`; the `gifv` distinction needs a stored preview type this
 /// schema does not have.
 fn type_for_content_type(content_type: &str) -> AttachmentType {
-    let media_type = content_type
-        .split(';')
-        .next()
-        .unwrap_or(content_type)
-        .trim()
-        .to_ascii_lowercase();
-    if media_type.starts_with("image/") {
-        AttachmentType::Image
-    } else if media_type.starts_with("video/") {
-        AttachmentType::Video
-    } else if media_type.starts_with("audio/") {
-        AttachmentType::Audio
-    } else {
-        AttachmentType::Unknown
+    match top_level(content_type) {
+        Some("image") => AttachmentType::Image,
+        Some("video") => AttachmentType::Video,
+        Some("audio") => AttachmentType::Audio,
+        _ => AttachmentType::Unknown,
     }
 }
 

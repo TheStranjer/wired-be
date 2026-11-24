@@ -13,7 +13,7 @@ use url::form_urlencoded;
 use wired_be::{
     config::Config,
     models::{
-        oauth_app::{self, NewOauthApp, OauthApp},
+        oauth_app::{self, AppChanges, NewOauthApp, OauthApp},
         oauth_login_state,
         user::User,
         user_identity,
@@ -55,7 +55,7 @@ pub(super) async fn fixture_with(
     let mut config = provider.config();
     tweak(&mut config);
     let http = common::test_app_with_config(pool.clone(), config);
-    let app = common::create_app(&pool, app_scopes).await;
+    let app = set_trusted(&pool, common::create_app(&pool, app_scopes).await, true).await;
     let user = common::create_local_user(&pool, nickname).await;
     Site {
         provider,
@@ -63,6 +63,19 @@ pub(super) async fn fixture_with(
         app,
         user,
     }
+}
+
+/// `app` with its `trusted` flag set to `trusted`: registrations start
+/// untrusted, and only a trusted app is granted a code by the callback.
+pub(super) async fn set_trusted(pool: &PgPool, app: OauthApp, trusted: bool) -> OauthApp {
+    let changes = AppChanges {
+        trusted: Some(trusted),
+        ..AppChanges::default()
+    };
+    oauth_app::update(pool, app.id, &changes)
+        .await
+        .expect("the trusted flag update reaches the database")
+        .expect("the app fixture still exists")
 }
 
 /// Links `uid` at [`PROVIDER`] to `user`.
@@ -75,7 +88,7 @@ pub(super) async fn link(pool: &PgPool, user: &User, uid: &str) {
 
 /// An app registered with the out-of-band redirect URI only.
 pub(super) async fn oob_app(pool: &PgPool, scopes: &str) -> OauthApp {
-    oauth_app::create(
+    let app = oauth_app::create(
         pool,
         &NewOauthApp {
             client_name: "OOB Client".to_owned(),
@@ -86,7 +99,8 @@ pub(super) async fn oob_app(pool: &PgPool, scopes: &str) -> OauthApp {
         },
     )
     .await
-    .expect("the out-of-band app fixture inserts")
+    .expect("the out-of-band app fixture inserts");
+    set_trusted(pool, app, true).await
 }
 
 /// `GET /oauth/prepare_request` for `app` and returns the state out of the

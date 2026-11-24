@@ -67,7 +67,7 @@ mod tests {
     use crate::{
         api::streaming::{
             names::USER_PLEROMA_CHAT,
-            test_support::{account, for_reader, frame_payload, state},
+            test_support::{FrameFor as _, account, for_reader, frame_payload, state},
         },
         models::chat,
         streaming::hub::{Audience, RenderSpec, StreamEvent},

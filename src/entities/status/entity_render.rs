@@ -16,6 +16,22 @@ use super::test_support::{
 use crate::{entities::poll::Poll, models::user::Flag};
 
 #[test]
+fn a_hidden_parent_renders_parent_visible_false() {
+    let alice = base_user("alice");
+    let row = base_row();
+    let shown = render(&row, &Parts::of(&alice), None);
+    assert_eq!(
+        shown["pleroma"]["parent_visible"], true,
+        "the source's flag defaults to a visible parent"
+    );
+    let hidden = render(&row, &Parts::of(&alice).parent_hidden(), None);
+    assert_eq!(
+        hidden["pleroma"]["parent_visible"], false,
+        "the source's `parent_visible: false` reaches the pleroma block"
+    );
+}
+
+#[test]
 fn a_plain_status_emits_every_key_and_its_defaults() {
     let alice = base_user("alice");
     let row = base_row();

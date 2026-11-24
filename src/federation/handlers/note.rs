@@ -64,9 +64,6 @@
 //! the announce ticket's, not this module's; nothing here sends anything
 //! anywhere.
 
-use std::fmt;
-
-use chrono::TimeDelta;
 use futures::future::BoxFuture;
 
 mod delete;
@@ -99,12 +96,6 @@ const EDITED_OBJECT_TYPES: [&str; 4] = ["Note", "Question", "Article", "Page"];
 /// plus the `Tombstone` document Pleroma and Mastodon sometimes deliver
 /// embedded in the `Delete` in place of a bare id.
 const DELETED_OBJECT_TYPES: [&str; 5] = ["Note", "Question", "Article", "Page", "Tombstone"];
-
-/// How far a delivered `updated` may lead this clock before the fold stops
-/// trusting it — the same five minutes [`crate::federation::note_parser`]
-/// grants a note, so a peer's forward clock cannot mark a stored version
-/// stale with a timestamp from next week.
-const CLOCK_SKEW: TimeDelta = TimeDelta::minutes(5);
 
 /// Folds this module's routes into the dispatcher's registry.
 ///
@@ -166,18 +157,6 @@ pub fn delete_note(
 /// update over a number nobody can vote into being true.
 fn whole(count: i64) -> i32 {
     i32::try_from(count).unwrap_or(i32::MAX)
-}
-
-/// Shapes a database failure into the retryable arm of the dispatcher's
-/// error vocabulary, naming the read or write that failed.
-fn transient<E: fmt::Display>(what: &str, err: &E) -> FederationError {
-    FederationError::Transient(format!("{what} failed: {err}"))
-}
-
-/// Shapes a refusal no retry can outlive into the dispatcher's discardable
-/// arm.
-fn permanent<E: fmt::Display>(what: &str, err: &E) -> FederationError {
-    FederationError::Permanent(format!("{what}: {err}"))
 }
 
 #[cfg(test)]

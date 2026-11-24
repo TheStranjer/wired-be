@@ -3,77 +3,66 @@
 //! `OAuthController.create_authorization`,
 //! `lib/pleroma/web/o_auth/o_auth_controller.ex`).
 //!
-//! The browser half of OAuth, in two steps. The `GET` validates the
-//! request — `response_type` must name the code flow, `client_id` must
-//! belong to a registered application, `redirect_uri` must match one of
-//! that application's registered URIs exactly, and the requested scopes
-//! (default `read`) must fit inside its registration — and on success
-//! renders the login-and-consent page built by
-//! [`crate::oauth::authorize_page`]. The `POST` runs the same checks on
-//! the submitted form, authenticates the `authorization[name]`/
-//! `authorization[password]` pair with [`register::authenticate`] and,
-//! on success, mints a one-time authorization code through
-//! [`oauth_token::create_authorization`]. A bad login does not fail the
-//! request: the page re-renders with an error line at status 200, as
-//! Pleroma does. An MFA-enabled login (WBE-132) mints the same
-//! authorization but hands out no code: the challenge [`mfa`] links to
-//! it takes the browser to `/oauth/mfa` instead, and the verification
-//! delivers the parked code from there.
+//! This server renders no consent screen: it lives at
+//! `{FRONTEND_BASE_URL}/oauth/authorize`
+//! ([`crate::config::Config::frontend_base_url`]).
+//! The endpoint is the API behind it.
 //!
-//! The success reply follows the client: the `urn:ietf:wg:oauth:2.0:oob`
-//! out-of-band URI gets an HTML page showing the code, anything else
-//! gets a 302 redirect to `redirect_uri` with `code` (and `state`, when
-//! the client sent one) merged into its query. A submission that carries
-//! `authorization[deny]` skips authentication and redirects with
-//! `error=access_denied` instead (and `state`), never minting a code.
+//! `GET` without `Accept: application/json` is the browser's entry point.
+//! It validates the request — `response_type` must name the code flow,
+//! `client_id` must belong to a registered application, `redirect_uri`
+//! must match one of that application's registered URIs exactly, and the
+//! requested scopes (default `read`) must fit inside its registration —
+//! and on success answers `302` to the frontend's own
+//! `/oauth/authorize` with the original query string, re-encoded. A
+//! request that fails validation is the JSON 400 and never a redirect, so
+//! nothing is ever bounced to an unvalidated `redirect_uri`.
 //!
-//! Every answer — page, redirect or JSON error — carries
-//! `Cache-Control: no-store`. `force_login` is accepted and inert: this
-//! API-only server has no browser session, so every visit already
-//! renders a fresh form (Pleroma's existing-token short-circuit joins
-//! whichever ticket gives `/oauth` sessions). `lang` sets the page's
-//! language attribute.
+//! The JSON half (`authorize/json.rs`) is what the frontend then talks
+//! to: `GET` with `Accept: application/json` describes the request, and
+//! `POST` with a bearer token and a JSON body approves or denies it, but
+//! only for a token whose own app is trusted (WBE-205, WBE-666): admins
+//! set the `oauth_apps.trusted` flag through
+//! `PATCH /api/v1/pleroma/admin/oauth_app/{id}`. **`WiredFE`'s own app
+//! must therefore be marked `trusted`.** Any other `POST` — in particular
+//! the retired `authorization[name]`/`authorization[password]` form post —
+//! is a 400.
 //!
-//! Trusted apps (WBE-205, WBE-666): admins set the `oauth_apps.trusted`
-//! flag through `PATCH /api/v1/pleroma/admin/oauth_app/{id}`. The HTML
-//! consent form does not act on it. The JSON half (`authorize/json.rs`, for a
-//! frontend that renders the consent page itself) does: `GET` with
-//! `Accept: application/json` describes the request, and `POST` with a
-//! bearer token and a JSON body approves or denies it, but only for a
-//! token whose own app is trusted. **`WiredFE`'s own app must therefore
-//! be marked `trusted`.**
-
-use std::fmt;
+//! The helpers below also serve the external-login callback
+//! ([`crate::api::oauth_external`]) and the MFA verification ([`mfa`]),
+//! which finish an authorization on their own: `grant_code` mints the
+//! code (or `mfa_detour` parks it behind a second factor) and
+//! `deliver_code` hands it to the client — a 302 to `redirect_uri` with
+//! `code` (and `state`), or `{"code": …}` JSON for the
+//! `urn:ietf:wg:oauth:2.0:oob` out-of-band URI.
+//!
+//! Every answer — redirect or JSON — carries `Cache-Control: no-store`.
 
 use axum::{
-    Router,
+    Json, Router,
     extract::State,
     http::{
-        HeaderMap, HeaderValue, StatusCode,
+        HeaderMap, HeaderValue, StatusCode, Uri,
         header::{CACHE_CONTROL, LOCATION},
     },
     response::{Html, IntoResponse, Response},
     routing::get,
 };
 use serde::Deserialize;
-use serde_json::Value;
+use serde_json::{Value, json};
 use sqlx::PgPool;
 use url::form_urlencoded;
 
 use super::{NO_STORE, mfa};
 use crate::{
-    api::oauth::check_account_ready,
     error::{AppError, AppResult},
-    extract::{ApiBody, ApiParams, into_params},
+    extract::{ApiBody, ApiParams},
     models::{
         oauth_app::{self, OauthApp},
         oauth_token::{self, OauthAuthorization},
-        user::{User, register},
+        user::User,
     },
-    oauth::{
-        authorize_page::{self, ConsentPage},
-        scopes::Scopes,
-    },
+    oauth::scopes::Scopes,
     state::AppState,
 };
 
@@ -91,24 +80,22 @@ pub(crate) const INVALID_CLIENT: &str = "Invalid client";
 pub(crate) const INVALID_REDIRECT_URI: &str = "Invalid redirect_uri";
 /// 400 body when the requested scopes reach outside the registration.
 pub(crate) const INVALID_SCOPE: &str = "Invalid scope";
-/// The error line of a re-rendered consent page after a failed login —
-/// Pleroma's `FallbackController` flash "Invalid Username/Password",
-/// shown here by re-rendering `authorize` the way Pleroma does, at
-/// status 200 per the ticket.
-const INVALID_LOGIN: &str = "Invalid Username/Password";
 /// The out-of-band `redirect_uri` whose client reads the code off the
-/// page instead of a redirect (Pleroma's `@oob_token_redirect_uri`).
+/// answer instead of a redirect (Pleroma's `@oob_token_redirect_uri`).
 pub(crate) const OOB_REDIRECT_URI: &str = "urn:ietf:wg:oauth:2.0:oob";
 /// The `error` value of a denied authorization (RFC 6749 §4.1.2.1).
 pub(crate) const ACCESS_DENIED: &str = "access_denied";
-/// The path both halves are mounted on, and the consent form posts to.
+/// The `error_description` of a login refused for want of a consent step.
+pub(crate) const CONSENT_REQUIRED: &str = "consent_required";
+/// The path both halves are mounted on, and the one the frontend serves
+/// its consent screen at.
 const AUTHORIZE_PATH: &str = "/oauth/authorize";
 
 /// The `/oauth/authorize` routes, merged into the `/oauth` router by
 /// [`super::router`], in the limiter's `authentication` bucket.
 ///
-/// Pleroma throttles the whole path, `GET` consent page and `POST`
-/// consent alike (see [`crate::rate_limit`]).
+/// Pleroma throttles the whole path, `GET` and `POST` alike (see
+/// [`crate::rate_limit`]).
 pub fn router(state: &AppState) -> Router<AppState> {
     Router::new().route(
         AUTHORIZE_PATH,
@@ -122,7 +109,7 @@ pub fn router(state: &AppState) -> Router<AppState> {
 /// `redirect_uri` and the client's own `state`, which the reply echoes.
 /// [`crate::api::oauth_external`] recovers both from a stored login state,
 /// so the provider callback's success answer is built by exactly the code
-/// the consent form's is.
+/// the MFA verification's is.
 #[derive(Debug)]
 pub(crate) struct Delivery<'a> {
     /// The app's registered redirect URI verbatim, or the out-of-band
@@ -132,29 +119,32 @@ pub(crate) struct Delivery<'a> {
     pub state: Option<&'a str>,
 }
 
-/// `GET /oauth/authorize` — validate the request and render the
-/// login-and-consent page. No authentication: this is where it comes
-/// from. `Accept: application/json` gets [`json::describe`]'s JSON
-/// instead of the page. Every answer gets the no-store header.
+/// `GET /oauth/authorize` — validate the request and send the browser on
+/// to the frontend's consent screen ([`redirect_to_frontend`]).
+/// No authentication: this is where it comes from.
+/// `Accept: application/json` gets [`json::describe`]'s JSON instead.
+/// Every answer gets the no-store header.
 async fn show(
     State(state): State<AppState>,
     headers: HeaderMap,
+    uri: Uri,
     ApiParams(query): ApiParams<AuthorizeQuery>,
 ) -> Response {
     let response = if json::wants_json(&headers) {
         json::describe(&state, &query).await
     } else {
-        match consent(&state, query).await {
-            Ok(page) => Html(page).into_response(),
+        match redirect_to_frontend(&state, &query, &uri).await {
+            Ok(found) => found,
             Err(err) => err.into_response(),
         }
     };
     no_store(response)
 }
 
-/// `POST /oauth/authorize` — the consent form submission, or, with a
-/// bearer token or a JSON body, the frontend's verdict ([`json::approve`]);
-/// same answer header treatment as [`show`].
+/// `POST /oauth/authorize` — the frontend's verdict ([`json::approve`])
+/// when it carries a bearer token or a JSON body, a 400
+/// ([`json::refuse_form`]) for anything else; same answer header
+/// treatment as [`show`].
 async fn create(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -163,87 +153,66 @@ async fn create(
     let response = if json::is_json_approval(&headers, &body) {
         json::approve(&state, &headers, body).await
     } else {
-        let submitted = match into_params::<AuthorizeForm>(body) {
-            Ok(form) => authorize_submission(&state, form).await,
-            Err(err) => Err(err),
-        };
-        match submitted {
-            Ok(reply) => reply.into_response(),
-            Err(err) => err.into_response(),
-        }
+        json::refuse_form()
     };
     no_store(response)
 }
 
-/// The `GET` half in order: response type, application, redirect URI,
-/// scopes — then the rendered consent page carrying the request's
-/// `state`, `lang` and scope list.
-async fn consent(state: &AppState, query: AuthorizeQuery) -> AppResult<String> {
+/// The browser `GET` in order: response type, application, redirect URI,
+/// scopes — then the 302 to the frontend's consent screen carrying the
+/// request's query.
+///
+/// # Errors
+///
+/// The validators' 400s, a database failure, and an
+/// [`AppError::Internal`] when the configured frontend URL and the query
+/// do not make a header value.
+async fn redirect_to_frontend(
+    state: &AppState,
+    query: &AuthorizeQuery,
+    uri: &Uri,
+) -> AppResult<Response> {
     require_code_response(query.response_type.as_deref())?;
     let app = load_app(&state.db, query.client_id.as_deref()).await?;
-    let redirect_uri = query.redirect_uri.as_deref().unwrap_or_default();
-    require_registered_redirect(&app, redirect_uri)?;
-    let scopes = requested_scopes(query.scope.as_deref());
-    check_scopes_subset(&scopes, &app)?;
-    // `force_login` only matters once the endpoint can auto-approve an
-    // existing session; until then every visit already renders a form.
-    tracing::trace!(
-        client_id = query.client_id.as_deref().unwrap_or_default(),
-        force_login = query.force_login.as_deref().unwrap_or_default(),
-        "authorization request validated",
-    );
-    Ok(authorize_page::render_consent(&ConsentPage {
-        app_name: &app.client_name,
-        client_id: query.client_id.as_deref().unwrap_or_default(),
-        redirect_uri,
-        state: query.state.as_deref(),
-        scopes: scopes.names(),
-        lang: query.lang.as_deref(),
-        error: None,
-    }))
+    require_registered_redirect(&app, query.redirect_uri.as_deref().unwrap_or_default())?;
+    check_scopes_subset(&requested_scopes(query.scope.as_deref()), &app)?;
+    let location = frontend_location(
+        &state.config.frontend_base_url,
+        uri.query().unwrap_or_default(),
+    )?;
+    Ok((StatusCode::FOUND, [(LOCATION, location)]).into_response())
 }
 
-/// The `POST` half in order: application, redirect URI, the denial
-/// short-circuit, scopes, the login, the account's readiness — then the
-/// MFA detour or the minted code.
+/// The frontend's consent screen URL: `base` and [`AUTHORIZE_PATH`], then
+/// the request's raw `query` decoded and urlencoded again pair by pair,
+/// in order, unknown parameters (PKCE and the like) included.
 ///
-/// A wrong login re-renders the form; an account that logged in but is not
-/// ready to use it — awaiting approval, or with an unconfirmed address — is
-/// refused [`check_account_ready`]'s 403 with its identifier, the same pair
-/// the token endpoint answers (Pleroma shows it as the page's flash error;
-/// this server has no page to flash it on, decision 1). A *deactivated*
-/// account never reaches that gate: [`register::authenticate`] is the strict
-/// login check and refuses it with every other bad credential.
-async fn authorize_submission(state: &AppState, form: AuthorizeForm) -> AppResult<AuthorizeReply> {
-    let attrs = form.authorization;
-    let app = load_app(&state.db, attrs.client_id.as_deref()).await?;
-    let redirect_uri = attrs.redirect_uri.as_deref().unwrap_or_default();
-    require_registered_redirect(&app, redirect_uri)?;
-    if attrs.deny.is_some() {
-        return denied(&attrs.delivery());
+/// # Errors
+///
+/// [`AppError::Internal`] when the URL is not a header value (nothing a
+/// configured frontend URL and an urlencoded query can produce).
+fn frontend_location(base: &str, query: &str) -> AppResult<HeaderValue> {
+    let encoded = form_urlencoded::Serializer::new(String::new())
+        .extend_pairs(form_urlencoded::parse(query.as_bytes()))
+        .finish();
+    let mut url = format!("{base}{AUTHORIZE_PATH}");
+    if !encoded.is_empty() {
+        url.push('?');
+        url.push_str(&encoded);
     }
-    let scopes = submitted_scopes(attrs.scope.as_ref());
-    check_scopes_subset(&scopes, &app)?;
-    let Some(user) = authenticate_attrs(&state.db, &attrs).await else {
-        return Ok(AuthorizeReply::Page(consent_html(
-            &app,
-            &attrs,
-            &scopes,
-            Some(INVALID_LOGIN),
-        )));
-    };
-    check_account_ready(&user)?;
-    if mfa::required(&user) {
-        return mfa_detour(state, &user, &app, &scopes, &attrs.delivery()).await;
-    }
-    grant_code(state, &user, &app, &scopes, &attrs.delivery()).await
+    HeaderValue::from_str(&url).map_err(|err| {
+        AppError::Internal(format!(
+            "the frontend authorize redirect is not header-safe: {err}"
+        ))
+    })
 }
 
 /// The MFA detour of a valid login (Pleroma's
 /// `handle_create_authorization_error({:mfa_required, user, auth, _})`):
-/// the authorization is created exactly as a direct approval would, the
+/// the authorization is created as a direct approval would, the
 /// challenge links it, and the browser goes to the code page instead of
-/// receiving the code.
+/// receiving the code. The external-login callback takes it for an
+/// MFA-enabled account.
 ///
 /// # Errors
 ///
@@ -274,7 +243,8 @@ pub(crate) async fn mfa_detour(
 /// The request parameters of `GET /oauth/authorize`. Every field is
 /// optional at the shape level — the endpoint answers the missing ones
 /// with its own 400 bodies (Pleroma matches on the keys), so the handler
-/// checks each field.
+/// checks each field. Unknown parameters are ignored here and still
+/// ride along in the redirect.
 #[derive(Debug, Deserialize)]
 struct AuthorizeQuery {
     /// The flow to run; only [`RESPONSE_TYPE_CODE`] is implemented.
@@ -290,94 +260,21 @@ struct AuthorizeQuery {
     /// [`Scopes::default`] (`read`).
     #[serde(default)]
     scope: Option<String>,
-    /// Opaque client value, round-tripped through the form to the
-    /// redirect.
+    /// Opaque client value, echoed by the JSON description.
     #[serde(default)]
     state: Option<String>,
-    /// Fresh-login demand; accepted and inert (see the module docs).
-    #[serde(default)]
-    force_login: Option<String>,
-    /// Page language; sets the `lang` attribute of the consent page.
-    #[serde(default)]
-    lang: Option<String>,
 }
 
-/// The request body of `POST /oauth/authorize`: the consent form, whose
-/// fields arrive nested under `authorization` (`authorization[name]`
-/// and friends, structured out of the bracketed keys by the
-/// [`crate::extract`] form parser).
-#[derive(Debug, Default, Deserialize)]
-struct AuthorizeForm {
-    /// The submitted form; absent means every field absent.
-    #[serde(default)]
-    authorization: AuthorizationAttrs,
-}
-
-/// The `authorization[...]` fields of the consent form. All optional:
-/// the handler tells a failed check from a missing field and answers
-/// each the way the flow prescribes. The `Debug` impl is manual (see
-/// below) because `password` is secret material.
-#[derive(Default, Deserialize)]
-struct AuthorizationAttrs {
-    /// The account nickname or email to log in with.
-    #[serde(default)]
-    name: Option<String>,
-    /// That account's password. Never in `Debug` output.
-    #[serde(default)]
-    password: Option<String>,
-    /// The application being authorized, round-tripped from the form.
-    #[serde(default)]
-    client_id: Option<String>,
-    /// The delivery target, round-tripped from the form.
-    #[serde(default)]
-    redirect_uri: Option<String>,
-    /// The client state, round-tripped from the form.
-    #[serde(default)]
-    state: Option<String>,
-    /// The approved scopes: the checked `authorization[scope][]` boxes
-    /// (a list; a lone scalar also arrives this way from JSON bodies).
-    #[serde(default)]
-    scope: Option<Value>,
-    /// The Deny button's field: present, whatever its value, denies.
-    #[serde(default)]
-    deny: Option<Value>,
-}
-
-impl AuthorizationAttrs {
-    /// The delivery target this submission names: its own `redirect_uri`
-    /// and `state`, which [`grant_code`] and [`denied`] answer with.
-    fn delivery(&self) -> Delivery<'_> {
-        Delivery {
-            redirect_uri: self.redirect_uri.as_deref().unwrap_or_default(),
-            state: self.state.as_deref(),
-        }
-    }
-}
-
-/// [`password`](Self::password) is secret material and renders as
-/// `<redacted>`; everything else shows.
-impl fmt::Debug for AuthorizationAttrs {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("AuthorizationAttrs")
-            .field("name", &self.name)
-            .field("password", &"<redacted>")
-            .field("client_id", &self.client_id)
-            .field("redirect_uri", &self.redirect_uri)
-            .field("state", &self.state)
-            .field("scope", &self.scope)
-            .field("deny", &self.deny)
-            .finish()
-    }
-}
-
-/// What a validated `POST /oauth/authorize` answers with.
+/// What a finished authorization answers with.
 #[derive(Debug)]
 pub(crate) enum AuthorizeReply {
     /// 302 with this `Location`: the registered redirect URI carrying
     /// `code` (or `error=access_denied`), merged over its query.
     Found(HeaderValue),
-    /// 200 `text/html` page: the re-rendered consent form or the
-    /// out-of-band code.
+    /// 200 `{"code": …}` JSON: the code of an out-of-band client, which
+    /// cannot be redirected.
+    Code(String),
+    /// 200 page: the external-login registration form or message.
     Page(String),
 }
 
@@ -385,6 +282,7 @@ impl IntoResponse for AuthorizeReply {
     fn into_response(self) -> Response {
         match self {
             Self::Found(location) => (StatusCode::FOUND, [(LOCATION, location)]).into_response(),
+            Self::Code(code) => Json(json!({ "code": code })).into_response(),
             Self::Page(page) => Html(page).into_response(),
         }
     }
@@ -442,35 +340,14 @@ pub(crate) fn require_registered_redirect(app: &OauthApp, redirect_uri: &str) ->
     Err(AppError::BadRequest(INVALID_REDIRECT_URI.to_owned()))
 }
 
-/// The scopes a `GET` asks for: parsed from `scope`, [`Scopes::default`]
-/// (`read`) when the field is absent or blank — the token endpoint's
-/// rule, applied to the consent page.
+/// The scopes a request asks for: parsed from `scope`,
+/// [`Scopes::default`] (`read`) when the field is absent or blank — the
+/// token endpoint's rule, applied to the authorize request.
 pub(crate) fn requested_scopes(scope: Option<&str>) -> Scopes {
     scope
         .map(str::trim)
         .filter(|text| !text.is_empty())
         .map_or_else(Scopes::default, Scopes::parse)
-}
-
-/// The scopes a `POST` was approved for: the submitted
-/// `authorization[scope][]` values verbatim. No default here — the form
-/// rendered the requested scopes checked, so an empty submission is the
-/// user approving nothing, not a client that asked for nothing.
-fn submitted_scopes(scope: Option<&Value>) -> Scopes {
-    match scope {
-        Some(Value::Array(items)) => {
-            let joined = items
-                .iter()
-                .filter_map(Value::as_str)
-                .collect::<Vec<&str>>()
-                .join(" ");
-            Scopes::parse(&joined)
-        }
-        Some(Value::String(text)) => Scopes::parse(text),
-        Some(Value::Bool(_) | Value::Null | Value::Number(_) | Value::Object(_)) | None => {
-            Scopes::parse("")
-        }
-    }
 }
 
 /// Checks the requested scopes against the registration.
@@ -486,23 +363,10 @@ pub(crate) fn check_scopes_subset(requested: &Scopes, app: &OauthApp) -> AppResu
     Err(AppError::BadRequest(INVALID_SCOPE.to_owned()))
 }
 
-/// The submitted login, verified.
-///
-/// A missing name or password, a wrong pair, an unknown or remote
-/// account and a deactivated account all answer `None`:
-/// [`register::authenticate`] is the strict gate, and every one of those
-/// cases re-renders the form with the same error line — Pleroma does not
-/// tell them apart on this page either.
-async fn authenticate_attrs(pool: &PgPool, attrs: &AuthorizationAttrs) -> Option<User> {
-    let name = attrs.name.as_deref()?;
-    let password = attrs.password.as_deref()?;
-    register::authenticate(pool, name, password).await
-}
-
 /// Mints the authorization code for the approved scopes and answers with
-/// it (Pleroma's `after_create_authorization`). An MFA-enabled account
-/// never gets here: [`authorize_submission`] parks the authorization
-/// through [`mfa::start_challenge`] and detours to the code page instead.
+/// it (Pleroma's `after_create_authorization`). The external-login
+/// callback of a login without a second factor ends here; an MFA-enabled
+/// account is parked through [`mfa_detour`] instead.
 ///
 /// # Errors
 ///
@@ -528,11 +392,11 @@ pub(crate) async fn grant_code(
 }
 
 /// The answer that hands a finished authorization's code to the client
-/// (Pleroma's `after_create_authorization`): the out-of-band page for
-/// the `urn:ietf:wg:oauth:2.0:oob` client, the 302 carrying `code` (and
+/// (Pleroma's `after_create_authorization`): `{"code": …}` JSON for the
+/// `urn:ietf:wg:oauth:2.0:oob` client, the 302 carrying `code` (and
 /// `state`) for every other URI. [`crate::api::oauth::mfa`] delivers
 /// through here too, which is what makes a completed MFA verification's
-/// answer *exactly* this one.
+/// answer *exactly* the external login's.
 ///
 /// # Errors
 ///
@@ -543,9 +407,7 @@ pub(crate) fn deliver_code(
     delivery: &Delivery<'_>,
 ) -> AppResult<AuthorizeReply> {
     if delivery.redirect_uri == OOB_REDIRECT_URI {
-        return Ok(AuthorizeReply::Page(authorize_page::render_oob(
-            &authorization.token,
-        )));
+        return Ok(AuthorizeReply::Code(authorization.token.clone()));
     }
     let mut params: Vec<(&str, &str)> = vec![("code", authorization.token.as_str())];
     if let Some(client_state) = delivery.state {
@@ -564,7 +426,25 @@ pub(crate) fn deliver_code(
 /// A redirect URI that cannot become a header value is a 400
 /// [`INVALID_REDIRECT_URI`].
 pub(crate) fn denied(delivery: &Delivery<'_>) -> AppResult<AuthorizeReply> {
+    denied_with(delivery, None)
+}
+
+/// [`denied`] with an `error_description` beside the `error`, for a refusal
+/// the client can act on: [`CONSENT_REQUIRED`] tells an untrusted app that
+/// the login needs a consent step this server cannot render yet.
+///
+/// # Errors
+///
+/// A redirect URI that cannot become a header value is a 400
+/// [`INVALID_REDIRECT_URI`].
+pub(crate) fn denied_with(
+    delivery: &Delivery<'_>,
+    description: Option<&str>,
+) -> AppResult<AuthorizeReply> {
     let mut params: Vec<(&str, &str)> = vec![("error", ACCESS_DENIED)];
+    if let Some(text) = description {
+        params.push(("error_description", text));
+    }
     if let Some(client_state) = delivery.state {
         params.push(("state", client_state));
     }
@@ -578,26 +458,6 @@ pub(crate) fn redirect_to(uri: &str, params: &[(&str, &str)]) -> AppResult<Autho
     let location = HeaderValue::from_str(&url)
         .map_err(|_header_error| AppError::BadRequest(INVALID_REDIRECT_URI.to_owned()))?;
     Ok(AuthorizeReply::Found(location))
-}
-
-/// The consent page as the `POST` re-renders it: the same document the
-/// `GET` served, its round-trip fields taken from the submitted form and
-/// `error` shown above the request text.
-fn consent_html(
-    app: &OauthApp,
-    attrs: &AuthorizationAttrs,
-    scopes: &Scopes,
-    error: Option<&str>,
-) -> String {
-    authorize_page::render_consent(&ConsentPage {
-        app_name: &app.client_name,
-        client_id: attrs.client_id.as_deref().unwrap_or_default(),
-        redirect_uri: attrs.redirect_uri.as_deref().unwrap_or_default(),
-        state: attrs.state.as_deref(),
-        scopes: scopes.names(),
-        lang: None,
-        error,
-    })
 }
 
 /// `uri` with `params` added to its query, Pleroma's
@@ -637,8 +497,8 @@ pub(crate) fn with_query_params(uri: &str, params: &[(&str, &str)]) -> String {
 }
 
 /// Stamps the `Cache-Control: no-store` every authorize answer carries:
-/// the consent page holds the live redirect target and state, and a code
-/// is single-use material.
+/// the redirect holds the live request, and a code is single-use
+/// material.
 pub(crate) fn no_store(mut response: Response) -> Response {
     let stored: Option<HeaderValue> = response
         .headers_mut()
@@ -648,329 +508,4 @@ pub(crate) fn no_store(mut response: Response) -> Response {
 }
 
 #[cfg(test)]
-mod tests {
-    use axum::http::{Request, header::CONTENT_TYPE};
-    use chrono::Utc;
-    use serde_json::json;
-    use tower::ServiceExt as _;
-    use uuid::Uuid;
-
-    use super::*;
-    use crate::config::Config;
-
-    /// The redirect URI the [`app_row`] fixture registers.
-    const REGISTERED: &str = "https://client.example/callback";
-
-    /// A stored-looking app row: `scopes` registered, `REGISTERED` and
-    /// the out-of-band URI as redirect URIs.
-    fn app_row(scopes: &str) -> OauthApp {
-        let now = Utc::now();
-        OauthApp {
-            id: Uuid::now_v7(),
-            client_name: "Client".to_owned(),
-            redirect_uris: format!("{REGISTERED} {OOB_REDIRECT_URI}"),
-            scopes: scopes.to_owned(),
-            website: None,
-            client_id: "client-id".to_owned(),
-            client_secret: "client-secret".to_owned(),
-            trusted: false,
-            user_id: None,
-            inserted_at: now,
-            updated_at: now,
-        }
-    }
-
-    /// The message an [`AppError`] answers with.
-    fn message_of(err: &AppError) -> String {
-        err.to_string()
-    }
-
-    #[test]
-    fn the_code_response_type_is_the_only_one_accepted() {
-        require_code_response(Some(RESPONSE_TYPE_CODE)).expect("code is the code flow");
-        for rejected in [None, Some(""), Some("token"), Some("CODE")] {
-            let err = require_code_response(rejected).unwrap_err();
-            assert_eq!(
-                message_of(&err),
-                UNSUPPORTED_RESPONSE_TYPE,
-                "`{rejected:?}` names no implemented flow"
-            );
-        }
-    }
-
-    #[test]
-    fn redirect_uris_must_match_a_registered_entry_exactly() {
-        let app = app_row("read");
-        require_registered_redirect(&app, REGISTERED).expect("a space-separated entry");
-        require_registered_redirect(&app, OOB_REDIRECT_URI).expect("the out-of-band uri");
-        let newlined = OauthApp {
-            redirect_uris: format!("{REGISTERED}\n{OOB_REDIRECT_URI}"),
-            ..app_row("read")
-        };
-        require_registered_redirect(&newlined, REGISTERED).expect("newline-separated too");
-        for presented in [
-            "",
-            &format!("{REGISTERED}/extra"),
-            "https://client.example",
-            &format!("{REGISTERED}?x=1"),
-            &format!("{REGISTERED} "),
-        ] {
-            let err = require_registered_redirect(&app, presented).unwrap_err();
-            assert_eq!(
-                message_of(&err),
-                INVALID_REDIRECT_URI,
-                "`{presented:?}` is not the registered spelling"
-            );
-        }
-    }
-
-    #[test]
-    fn requested_scopes_default_to_read() {
-        for blank in [None, Some(""), Some("   ")] {
-            let scopes = requested_scopes(blank);
-            assert_eq!(
-                scopes.to_string(),
-                Scopes::default().to_string(),
-                "`{blank:?}` falls back to the default"
-            );
-        }
-        assert_eq!(
-            requested_scopes(Some("read+write")).to_string(),
-            "read write",
-            "an encoded query separator parses"
-        );
-    }
-
-    #[test]
-    fn submitted_scopes_read_the_checkbox_list() {
-        let checked = submitted_scopes(Some(&json!(["read", "write"])));
-        assert_eq!(checked.to_string(), "read write", "one per box");
-        let lone = submitted_scopes(Some(&json!("admin:read")));
-        assert_eq!(lone.to_string(), "admin:read", "a lone scalar counts too");
-        assert_eq!(
-            submitted_scopes(Some(&json!([]))).to_string(),
-            "",
-            "unchecking every box approves nothing"
-        );
-        assert_eq!(
-            submitted_scopes(None).to_string(),
-            "",
-            "and a form without the field"
-        );
-        assert_eq!(
-            submitted_scopes(Some(&json!(7))).to_string(),
-            "",
-            "a value that names no scope approves nothing"
-        );
-    }
-
-    #[test]
-    fn scopes_must_fit_inside_the_registration() {
-        let app = app_row("read write");
-        check_scopes_subset(&Scopes::parse("read:accounts"), &app).expect("sub-scope of read");
-        check_scopes_subset(&Scopes::parse(""), &app).expect("approving nothing fits");
-        let err = check_scopes_subset(&Scopes::parse("read follow"), &app).unwrap_err();
-        assert_eq!(
-            message_of(&err),
-            INVALID_SCOPE,
-            "unregistered follow is refused"
-        );
-    }
-
-    #[test]
-    fn query_deserializes_every_wire_field() {
-        let query: AuthorizeQuery = into_params(json!({
-            "response_type": "code",
-            "client_id": "client-id",
-            "redirect_uri": "urn:ietf:wg:oauth:2.0:oob",
-            "scope": "read write",
-            "state": "st",
-            "force_login": "true",
-            "lang": "de",
-        }))
-        .unwrap();
-        assert_eq!(
-            query.response_type.as_deref(),
-            Some(RESPONSE_TYPE_CODE),
-            "the flow"
-        );
-        assert_eq!(query.redirect_uri.as_deref(), Some(OOB_REDIRECT_URI));
-        assert_eq!(query.state.as_deref(), Some("st"), "the round trip");
-        assert_eq!(query.force_login.as_deref(), Some("true"), "login demand");
-        assert_eq!(query.lang.as_deref(), Some("de"), "language");
-    }
-
-    #[test]
-    fn form_deserializes_the_nested_authorization_object() {
-        // `extract::parse_form` turns the posted `authorization[name]`
-        // keys into exactly this shape (its own tests cover that step);
-        // this test covers the struct reading it back.
-        let form: AuthorizeForm = into_params(json!({
-            "authorization": {
-                "name": "alice",
-                "password": "pw",
-                "client_id": "cid",
-                "redirect_uri": "cb",
-                "state": "st",
-                "scope": ["read", "write"],
-                "deny": "Deny",
-            }
-        }))
-        .unwrap();
-        let attrs = form.authorization;
-        assert_eq!(attrs.name.as_deref(), Some("alice"), "the login name");
-        assert_eq!(attrs.password.as_deref(), Some("pw"), "the password");
-        assert_eq!(attrs.client_id.as_deref(), Some("cid"), "the client");
-        assert_eq!(
-            attrs.scope,
-            Some(json!(["read", "write"])),
-            "the checked boxes"
-        );
-        assert!(attrs.deny.is_some(), "the deny marker survives");
-
-        let empty: AuthorizeForm = into_params(json!({})).unwrap();
-        assert_eq!(
-            empty.authorization.client_id, None,
-            "an absent form reads as all-absent fields"
-        );
-    }
-
-    #[test]
-    fn form_debug_redacts_the_password() {
-        let form: AuthorizeForm = into_params(json!({
-            "authorization": { "name": "alice", "password": "s3cr3t" }
-        }))
-        .unwrap();
-        let debug = format!("{form:?}");
-        assert!(!debug.contains("s3cr3t"), "the password must not leak");
-        assert!(
-            debug.contains(r#"password: "<redacted>""#),
-            "the marker names the field: {debug}"
-        );
-        assert!(debug.contains("alice"), "the rest shows");
-    }
-
-    #[test]
-    fn query_params_are_merged_and_replaced() {
-        let appended = with_query_params(REGISTERED, &[("code", "abc")]);
-        assert_eq!(appended, format!("{REGISTERED}?code=abc"), "a bare uri");
-
-        let merged = with_query_params(
-            &format!("{REGISTERED}?foo=1&state=old&code=stale"),
-            &[("code", "new"), ("state", "x")],
-        );
-        assert_eq!(
-            merged,
-            format!("{REGISTERED}?foo=1&code=new&state=x"),
-            "existing pairs are kept, replaced keys take the new value"
-        );
-
-        let kept_fragment =
-            with_query_params(&format!("{REGISTERED}?x=1#frag"), &[("code", "abc")]);
-        assert_eq!(
-            kept_fragment,
-            format!("{REGISTERED}?x=1&code=abc#frag"),
-            "the fragment stays at the end"
-        );
-
-        let encoded = with_query_params(REGISTERED, &[("state", "a b&c=d")]);
-        assert_eq!(
-            encoded,
-            format!("{REGISTERED}?state=a+b%26c%3Dd"),
-            "values are urlencoded"
-        );
-
-        assert_eq!(
-            with_query_params(&format!("{REGISTERED}?"), &[]),
-            REGISTERED,
-            "an emptied query drops the question mark"
-        );
-    }
-
-    #[test]
-    fn a_found_reply_is_a_302_with_a_location() {
-        let location = format!("{REGISTERED}?code=abc");
-        let reply = AuthorizeReply::Found(HeaderValue::from_str(&location).unwrap());
-        let response = reply.into_response();
-        assert_eq!(response.status(), StatusCode::FOUND, "302");
-        assert_eq!(
-            response.headers().get(LOCATION),
-            Some(&HeaderValue::from_str(&location).unwrap()),
-            "the exact Location"
-        );
-    }
-
-    #[test]
-    fn a_page_reply_is_200_html() {
-        let response = AuthorizeReply::Page("<p>ok</p>".to_owned()).into_response();
-        assert_eq!(response.status(), StatusCode::OK, "the ticket's 200");
-        assert_eq!(
-            response.headers().get(CONTENT_TYPE),
-            Some(&HeaderValue::from_static("text/html; charset=utf-8")),
-            "and its content type"
-        );
-    }
-
-    #[test]
-    fn no_store_sets_and_replaces_the_cache_control() {
-        let mut response = Html("x".to_owned()).into_response();
-        let absent: Option<HeaderValue> = response
-            .headers_mut()
-            .insert(CACHE_CONTROL, HeaderValue::from_static("max-age=60"));
-        assert!(absent.is_none(), "an html answer starts without one");
-        let response = no_store(response);
-        assert_eq!(
-            response.headers().get(CACHE_CONTROL),
-            Some(&HeaderValue::from_static(NO_STORE)),
-            "no-store wins"
-        );
-    }
-
-    /// The state the route-shaped tests below need: config only, the
-    /// lazy pool is never consulted (the validation gates that fail here
-    /// run before any query).
-    fn test_state() -> AppState {
-        AppState::lazy_for_tests(Config::for_tests())
-    }
-
-    #[tokio::test]
-    async fn get_answers_at_oauth_authorize_and_refuses_other_flows() {
-        let state = test_state();
-        let app = router(&state).with_state(state);
-        let request = Request::get("/oauth/authorize?response_type=token&client_id=whatever")
-            .body(axum::body::Body::empty())
-            .unwrap();
-        let response = app.oneshot(request).await.unwrap();
-        assert_eq!(
-            response.status(),
-            StatusCode::BAD_REQUEST,
-            "the routed endpoint answers and rejects the flow"
-        );
-        assert_eq!(
-            response.headers().get(CACHE_CONTROL),
-            Some(&HeaderValue::from_static(NO_STORE)),
-            "and stamps no-store"
-        );
-    }
-
-    #[tokio::test]
-    async fn post_without_an_authorization_object_is_an_invalid_client() {
-        let state = test_state();
-        let app = router(&state).with_state(state);
-        let request = Request::post(AUTHORIZE_PATH)
-            .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
-            .body(axum::body::Body::from("name=alice"))
-            .unwrap();
-        let response = app.oneshot(request).await.unwrap();
-        assert_eq!(
-            response.status(),
-            StatusCode::BAD_REQUEST,
-            "a form with no authorization fields cannot name a client"
-        );
-        assert_eq!(
-            response.headers().get(CACHE_CONTROL),
-            Some(&HeaderValue::from_static(NO_STORE)),
-            "even the rejection is not cacheable"
-        );
-    }
-}
+mod tests;

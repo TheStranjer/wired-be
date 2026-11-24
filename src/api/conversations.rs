@@ -77,9 +77,9 @@ use tracing::debug;
 use uuid::Uuid;
 
 use crate::{
-    api::{
-        helpers::{distinct, distinct_ids},
-        notifications_v2::{NO_EXTRA_QUERY, StringList, names_of},
+    api::helpers::{
+        StringList, capped_distinct_ids, distinct, distinct_ids, keyed_json, names_of,
+        render_visible,
     },
     auth::AuthUser,
     entities::{
@@ -92,12 +92,11 @@ use crate::{
     extract::{ApiBody, ApiParams},
     models::{
         conversation::{self, Participation},
-        status::{self, Status as StatusRow},
         status_visibility,
         user::{self, User},
     },
     oauth::scopes::{READ_STATUSES, WRITE_CONVERSATIONS},
-    pagination::{PageParams, link_header, set_link_header},
+    pagination::{NO_EXTRA_QUERY, PageParams, keyset_link, link_for_page, set_link_header},
     services::render_status::{ViewerMode, render_statuses},
     state::AppState,
     util::id::parse_id,
@@ -173,7 +172,15 @@ async fn list(
     let mut headers = HeaderMap::new();
     set_link_header(
         &mut headers,
-        participation_link(&state.config.base_url, uri.path(), &rows).as_deref(),
+        // The cursors are the participation ids the keyset walks.
+        keyset_link(
+            &state.config.base_url,
+            uri.path(),
+            &NO_EXTRA_QUERY,
+            &rows,
+            |row| row.id,
+        )
+        .as_deref(),
     )?;
     Ok((headers, Json(entities)))
 }
@@ -301,12 +308,7 @@ async fn list_statuses(
     auth.require(READ_STATUSES)?;
     let row = owned_participation(&state, auth.0.id, &id).await?;
     let fetched = conversation::page_direct_statuses(&state.db, row.conversation_id, page).await?;
-    let mut visible: Vec<StatusRow> = Vec::new();
-    for status in &fetched {
-        if status_visibility::can_view(&state.db, status, Some(&auth.0)).await? {
-            visible.push(status.clone());
-        }
-    }
+    let visible = status_visibility::filter_visible(&state.db, fetched, Some(&auth.0)).await?;
     debug!(
         conversation = %row.id,
         count = visible.len(),
@@ -317,7 +319,11 @@ async fn list_statuses(
     let mut headers = HeaderMap::new();
     set_link_header(
         &mut headers,
-        status_link(&state.config.base_url, uri.path(), &entities).as_deref(),
+        // The cursors are the rendered entities' ids.
+        link_for_page(&state.config.base_url, uri.path(), &entities, |entity| {
+            entity.id.clone()
+        })
+        .as_deref(),
     )?;
     Ok((headers, Json(entities)))
 }
@@ -344,7 +350,9 @@ struct RecipientsParams {
 /// The auth errors of [`mark_read`]; the same 404 [`show`] renders for an
 /// unreadable participation or a refused recipient;
 /// [`Unprocessable`](crate::error::AppError::Unprocessable) from the
-/// extractor for a body without `recipients`.
+/// extractor for a body without `recipients`, and `Too many ids` for more
+/// than [`MAX_BATCH_IDS`](crate::api::helpers::MAX_BATCH_IDS) distinct
+/// recipients, before anything is read.
 async fn update(
     State(state): State<AppState>,
     auth: AuthUser,
@@ -352,8 +360,9 @@ async fn update(
     ApiBody(body): ApiBody<RecipientsParams>,
 ) -> AppResult<Json<Conversation>> {
     auth.require(WRITE_CONVERSATIONS)?;
+    let requested = requested_recipients(&body.recipients)?;
     let row = owned_participation(&state, auth.0.id, &id).await?;
-    let recipients = kept_recipients(requested_recipients(&body.recipients)?, auth.0.id);
+    let recipients = kept_recipients(requested, auth.0.id);
     if !all_are_accounts(&state, &recipients).await? {
         return Err(unknown_conversation());
     }
@@ -374,10 +383,12 @@ async fn update(
 ///
 /// # Errors
 ///
-/// [`NotFoundMessage`](crate::error::AppError::NotFoundMessage) when any
-/// value is not id text.
+/// [`Unprocessable`](crate::error::AppError::Unprocessable) when more than
+/// [`MAX_BATCH_IDS`](crate::api::helpers::MAX_BATCH_IDS) distinct ids are
+/// named; [`NotFoundMessage`](crate::error::AppError::NotFoundMessage) when
+/// any value is not id text.
 fn requested_recipients(list: &StringList) -> AppResult<Vec<Uuid>> {
-    let (ids, all_ids) = distinct_ids(list.names());
+    let (ids, all_ids) = capped_distinct_ids(list.names())?;
     if all_ids {
         Ok(ids)
     } else {
@@ -560,42 +571,7 @@ async fn visible_statuses(
     if ids.is_empty() {
         return Ok(HashMap::new());
     }
-    let rows = status::get_many(&state.db, ids).await?;
-    let mut visible: Vec<StatusRow> = Vec::new();
-    for row in rows {
-        if status_visibility::can_view(&state.db, &row, viewer).await? {
-            visible.push(row);
-        }
-    }
-    let rendered = render_statuses(state, ViewerMode::User(viewer), &visible).await?;
-    let mut statuses = HashMap::new();
-    for entity in rendered {
-        let Some(id) = parse_id(&entity.id) else {
-            continue;
-        };
-        let value = serde_json::to_value(entity).map_err(|err| {
-            AppError::Internal(format!("status entity failed to serialize: {err}"))
-        })?;
-        let _first = statuses.insert(id, value);
-    }
-    Ok(statuses)
-}
-
-/// The `Link` header value for one page of participations: [`link_header`]
-/// over the first and last row's participation id — the ids the keyset
-/// walks — and `None` for an empty page.
-fn participation_link(base_url: &str, path: &str, rows: &[Participation]) -> Option<String> {
-    let newest = rows.first()?.id.to_string();
-    let oldest = rows.last()?.id.to_string();
-    link_header(base_url, path, &NO_EXTRA_QUERY, &newest, &oldest)
-}
-
-/// The `Link` header value for one page of rendered statuses: the same
-/// [`link_header`] over the entities' ids.
-fn status_link(base_url: &str, path: &str, rows: &[StatusEntity]) -> Option<String> {
-    let newest = rows.first()?.id.clone();
-    let oldest = rows.last()?.id.clone();
-    link_header(base_url, path, &NO_EXTRA_QUERY, &newest, &oldest)
+    keyed_json(render_visible(state, viewer, ids).await?)
 }
 
 #[cfg(test)]

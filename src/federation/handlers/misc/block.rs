@@ -21,7 +21,7 @@ use crate::{
     state::AppState,
 };
 
-use super::{resolve_local_target, transient};
+use super::resolve_local_target;
 
 /// The `Block` route: mirror a remote account's block of a local user,
 /// severing the pair's follows and recording the activity id.
@@ -69,7 +69,9 @@ async fn apply_block(
     }
     let target = resolve_local_target(&state.db, &view)
         .await
-        .map_err(|err| transient("block target", &err))?;
+        .map_err(|err| {
+            FederationError::transient("could not fold the remote activity's block target", &err)
+        })?;
     let Some(target) = target else {
         return Ok(Outcome::Ignored(
             "a Block whose object is not a stored local account",
@@ -77,11 +79,18 @@ async fn apply_block(
     };
     let row = block::block(&state.db, &state.config.base_url, &signer, &target)
         .await
-        .map_err(|err| transient("block", &err))?;
+        .map_err(|err| {
+            FederationError::transient("could not fold the remote activity's block", &err)
+        })?;
     if row.ap_id.as_deref() != Some(view.id.as_str()) {
         block::set_ap_id(&state.db, row.id, &view.id)
             .await
-            .map_err(|err| transient("block activity id", &err))?;
+            .map_err(|err| {
+                FederationError::transient(
+                    "could not fold the remote activity's block activity id",
+                    &err,
+                )
+            })?;
     }
     debug!(
         blocker = %signer.nickname,
@@ -103,9 +112,9 @@ async fn apply_undo_block(
             "an Undo of a Block signed by an account this instance owns",
         ));
     }
-    let target = undo_block_target(&state.db, &view)
-        .await
-        .map_err(|err| transient("undone block", &err))?;
+    let target = undo_block_target(&state.db, &view).await.map_err(|err| {
+        FederationError::transient("could not fold the remote activity's undone block", &err)
+    })?;
     let Some(target) = target else {
         return Ok(Outcome::Ignored(
             "an Undo of a Block this instance cannot resolve to a blocked account",
@@ -113,7 +122,9 @@ async fn apply_undo_block(
     };
     let lifted = block::unblock(&state.db, &signer, &target)
         .await
-        .map_err(|err| transient("block lift", &err))?;
+        .map_err(|err| {
+            FederationError::transient("could not fold the remote activity's block lift", &err)
+        })?;
     if lifted.is_none() {
         return Ok(Outcome::Ignored(
             "an Undo of a Block its actor never placed",

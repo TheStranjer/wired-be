@@ -2,9 +2,8 @@
 //!
 //! `GET /api/v1/pleroma/chats/{id}/messages` (Pleroma's `messages`) and
 //! `DELETE …/messages/{message_id}` (its `delete_message`), with
-//! `message_page_link` for the page's `Link` header, `chat_recipient`
-//! for the counterpart, and `message_of` and `message_json` for the
-//! entity. The posting route lives in the sibling `post_message` child.
+//! `keyset_link` for the page's `Link` header, `chat_recipient` for the
+//! counterpart, and `message_of` and `message_json` for the entity. The posting route lives in the sibling `post_message` child.
 
 use axum::{
     Json,
@@ -24,16 +23,16 @@ use crate::{
         user::{self, User},
     },
     oauth::scopes::{READ_CHATS, WRITE_CHATS},
-    pagination::{MAX_LIMIT, PageParams, link_header, set_link_header},
+    pagination::{MAX_LIMIT, NO_EXTRA_QUERY, PageParams, keyset_link, set_link_header},
     state::AppState,
     util::id::parse_id,
 };
 
-use super::{NO_EXTRA_QUERY, chats_list::owned_chat, events::after_chat_message_deleted};
+use super::{chats_list::owned_chat, events::after_chat_message_deleted};
 
 /// `GET /api/v1/pleroma/chats/{id}/messages` — Pleroma's `messages`: the
 /// caller's chat, one [`PageParams`] page of at most [`MAX_LIMIT`] messages,
-/// newest first, with the `Link` header [`message_page_link`] keys on the
+/// newest first, with the `Link` header [`keyset_link`] keys on the
 /// reference ids of the page.
 ///
 /// # Errors
@@ -54,7 +53,15 @@ pub(super) async fn list_messages(
     let chat_row = owned_chat(&state, auth.0.id, &id).await?;
     let page = PageParams::from_query(uri.query(), MAX_LIMIT)?;
     let references = chat::messages_page(&state.db, chat_row.id, page).await?;
-    let link = message_page_link(&state.config.base_url, uri.path(), &references);
+    // The cursors are the first and last row's reference id, which is what
+    // [`chat::messages_page`] keys its pages on.
+    let link = keyset_link(
+        &state.config.base_url,
+        uri.path(),
+        &NO_EXTRA_QUERY,
+        &references,
+        |reference| reference.id,
+    );
     let mut headers = HeaderMap::new();
     set_link_header(&mut headers, link.as_deref())?;
     debug!(
@@ -68,22 +75,6 @@ pub(super) async fn list_messages(
         entities.push(message_of(&state, reference).await?);
     }
     Ok((headers, Json(entities)))
-}
-
-/// The `Link` header value for a fetched message page: [`page_link`] for
-/// references instead of chats — the cursors are the first and last row's
-/// reference id, which is what [`chat::messages_page`] keys its pages on.
-/// [`crate::api::admin::chats`] links its admin message list the same way.
-///
-/// [`page_link`]: crate::api::chats::chats_list::page_link
-pub(crate) fn message_page_link(
-    base_url: &str,
-    path: &str,
-    rows: &[ChatMessageReference],
-) -> Option<String> {
-    let newest = rows.first()?.id.to_string();
-    let oldest = rows.last()?.id.to_string();
-    link_header(base_url, path, &NO_EXTRA_QUERY, &newest, &oldest)
 }
 
 /// `DELETE /api/v1/pleroma/chats/{id}/messages/{message_id}` — Pleroma's
@@ -214,10 +205,12 @@ mod tests {
 
     #[test]
     fn the_message_link_keys_on_the_pages_reference_ids() {
-        let link = message_page_link(
+        let link = keyset_link(
             "https://h",
             "/p",
+            &NO_EXTRA_QUERY,
             &[link_reference(3), link_reference(2), link_reference(1)],
+            |reference| reference.id,
         )
         .expect("a page links");
         assert!(
@@ -228,8 +221,12 @@ mod tests {
             link.contains("min_id=00000000-0000-0000-0000-000000000003"),
             "prev walks to the newest: {link}"
         );
+        let none: [ChatMessageReference; 0] = [];
         assert!(
-            message_page_link("https://h", "/p", &[]).is_none(),
+            keyset_link("https://h", "/p", &NO_EXTRA_QUERY, &none, |reference| {
+                reference.id
+            })
+            .is_none(),
             "an empty page links nowhere"
         );
     }

@@ -92,10 +92,10 @@ impl Filters {
     /// from a blocked domain, or part of a muted thread. A payload that
     /// names none of those — a `delete`, whose payload is only a status id,
     /// or a body-less event — is never suppressed: there is nothing to
-    /// object to. The payload judged is the one [`frame_for`] resolved, so
+    /// object to. The payload judged is the one [`frames_for`] resolved, so
     /// a render-hinted event is weighed by its rendered entity too.
     ///
-    /// [`frame_for`]: super::connection::Connection::frame_for
+    /// [`frames_for`]: super::connection::Connection::frames_for
     pub(super) fn suppresses(&self, payload: Option<&str>) -> bool {
         if self.is_empty() {
             return false;

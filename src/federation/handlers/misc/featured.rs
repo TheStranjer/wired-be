@@ -12,8 +12,6 @@ use crate::{
     state::AppState,
 };
 
-use super::transient;
-
 /// The `Add` route: pin the actor's own stored status to its featured
 /// collection.
 ///
@@ -76,9 +74,9 @@ async fn apply_featured_change(
             "an Add or Remove whose object names no id",
         ));
     };
-    let stored = status::get_by_uri(&state.db, uri)
-        .await
-        .map_err(|err| transient("featured status", &err))?;
+    let stored = status::get_by_uri(&state.db, uri).await.map_err(|err| {
+        FederationError::transient("could not fold the remote activity's featured status", &err)
+    })?;
     let Some(stored) = stored else {
         debug!(
             uri,
@@ -96,11 +94,21 @@ async fn apply_featured_change(
     if pinning {
         let _pinned = pinned_status::pin(&state.db, signer.id, stored.id)
             .await
-            .map_err(|err| transient("featured pin", &err))?;
+            .map_err(|err| {
+                FederationError::transient(
+                    "could not fold the remote activity's featured pin",
+                    &err,
+                )
+            })?;
     } else {
         let _unpinned = pinned_status::unpin(&state.db, signer.id, stored.id)
             .await
-            .map_err(|err| transient("featured pin", &err))?;
+            .map_err(|err| {
+                FederationError::transient(
+                    "could not fold the remote activity's featured pin",
+                    &err,
+                )
+            })?;
     }
     debug!(
         actor = %signer.nickname,

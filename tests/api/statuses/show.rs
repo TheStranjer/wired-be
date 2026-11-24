@@ -335,3 +335,64 @@ async fn a_reblog_answers_its_own_entity_with_the_original_nested() {
         "a reblog whose original is gone, and the original itself",
     );
 }
+
+/// A deactivated author's post, and a boost of it, answer the shared 404 to
+/// a stranger and the anonymous caller alike (the author's own token is
+/// refused at the gate); reactivating the account brings the post back.
+#[tokio::test]
+async fn a_deactivated_authors_status_is_the_shared_404() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let (alice, alice_token) = user_with_token(&pool, "alice", SCOPES).await;
+    let (bob, bob_token) = user_with_token(&pool, "bob", SCOPES).await;
+    let app = common::test_app(pool.clone());
+    let post = common::create_status(&pool, &alice, "going dark", Visibility::Public).await;
+    let boost = reblog_of(&pool, &bob, &post).await;
+    let id = post.id.to_string();
+    let boost_id = boost.id.to_string();
+
+    common::assert_answer(
+        &show(&app, None, &id).await,
+        StatusCode::OK,
+        "an active author's post",
+    );
+
+    set_active(&pool, alice.id, false).await;
+    common::assert_answer(
+        &show(&app, Some(alice_token.as_str()), &id).await,
+        StatusCode::UNAUTHORIZED,
+        "the deactivated author's own token no longer authenticates",
+    );
+    for (who, token) in [
+        ("a stranger", Some(bob_token.as_str())),
+        ("an anonymous caller", None),
+    ] {
+        common::assert_all_refused(
+            &[
+                show(&app, token, &id).await,
+                show(&app, token, &boost_id).await,
+            ],
+            StatusCode::NOT_FOUND,
+            NOT_FOUND,
+            who,
+        );
+    }
+
+    set_active(&pool, alice.id, true).await;
+    common::assert_answer(
+        &show(&app, None, &id).await,
+        StatusCode::OK,
+        "the reactivated author's post",
+    );
+}
+
+/// Sets `users.is_active` of the account `id`.
+async fn set_active(pool: &sqlx::PgPool, id: uuid::Uuid, active: bool) {
+    let _updated: sqlx::postgres::PgQueryResult =
+        sqlx::query("UPDATE users SET is_active = $2 WHERE id = $1")
+            .bind(id)
+            .bind(active)
+            .execute(pool)
+            .await
+            .expect("the flag updates");
+}

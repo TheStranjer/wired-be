@@ -23,7 +23,7 @@ use crate::{
     models::{hashtag::Hashtag, oauth_app::OauthApp, status, user::User},
     services::mentions::resolve_mentions,
     state::AppState,
-    util::id::new_id,
+    util::id::{new_id, object_ap_id},
 };
 
 /// Builds the [`Status`] entity `params` describes **without writing
@@ -95,6 +95,7 @@ pub async fn preview_status(
             quote: None,
             reblog: None,
             poll: None,
+            parent_visible: JsonBool(true),
         },
         Some(user),
         None,
@@ -139,7 +140,7 @@ fn preview_row(
     let base = state.config.base_url.as_str();
     status::Status {
         id,
-        uri: format!("{base}/objects/{id}"),
+        uri: object_ap_id(base, id),
         url: Some(format!("{base}/notice/{id}")),
         user_id: user.id,
         content: fields.content.clone(),

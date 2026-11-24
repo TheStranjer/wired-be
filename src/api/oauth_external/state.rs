@@ -216,6 +216,18 @@ pub(super) async fn completed(
         }
         Landing::Linked(user) => {
             let _burned = oauth_login_state::delete(&state.db, &stored.state).await?;
+            let app = authorize::load_app(&state.db, Some(params.client_id.as_str())).await?;
+            if !app.trusted {
+                warn!(
+                    provider = provider.name,
+                    client_id = params.client_id,
+                    "external login refused for an untrusted application"
+                );
+                return authorize::denied_with(
+                    &params.delivery(),
+                    Some(authorize::CONSENT_REQUIRED),
+                );
+            }
             granted(state, &user, &params).await
         }
         Landing::Unlinked(account) => {

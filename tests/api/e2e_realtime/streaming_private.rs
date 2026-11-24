@@ -7,7 +7,7 @@ use serde_json::{Value, json};
 
 use super::server::{SCOPES, Server, Verb, action_ok, write_ok};
 use super::sockets::{
-    account, assert_absent, chat_stream, direct_stream, favourite, follow, frame_payload, id_of,
+    account, assert_absent, direct_stream, favourite, follow, frame_payload, id_of,
     notification_stream, open, open_with_protocol, post_status, read_until, read_until_json,
     settled, streams_of, user_stream,
 };
@@ -47,9 +47,14 @@ async fn favourites_and_follows_stream_notification_frames() {
         like["event"], "notification",
         "the favourite arrives on the recipient's client stream"
     );
-    assert!(
-        streams_of(&like).contains(&alice_stream.as_str()),
+    assert_eq!(
+        streams_of(&like),
+        ["user:notification"],
         "named by the recipient's notification stream: {like}"
+    );
+    assert!(
+        !like.to_string().contains(alice_stream.as_str()),
+        "not by its internal uuid-named form: {like}"
     );
     let like_payload = frame_payload(&like);
     assert_eq!(like_payload["type"], "favourite", "the like renders");
@@ -115,10 +120,15 @@ async fn a_direct_post_streams_update_and_conversation_frames() {
             .expect("the message itself streamed before the conversation"),
     )
     .expect("frames are JSON envelopes");
-    let held_streams = streams_of(&update);
+    assert_eq!(
+        streams_of(&update),
+        ["direct"],
+        "the DM rides the one stream the socket subscribed to, `direct`: {update}"
+    );
     assert!(
-        held_streams.contains(&own_direct.as_str()) && held_streams.contains(&own_home.as_str()),
-        "the DM rides the reader's direct and user streams: {update}"
+        !update.to_string().contains(own_home.as_str())
+            && !update.to_string().contains(own_direct.as_str()),
+        "and never the internal uuid-named ones: {update}"
     );
     let conversation: Value = serde_json::from_str(
         frames
@@ -127,8 +137,9 @@ async fn a_direct_post_streams_update_and_conversation_frames() {
             .expect("the conversation frame arrived"),
     )
     .expect("frames are JSON envelopes");
-    assert!(
-        streams_of(&conversation).contains(&own_direct.as_str()),
+    assert_eq!(
+        streams_of(&conversation),
+        ["direct"],
         "it rides the direct stream: {conversation}"
     );
     let payload = frame_payload(&conversation);
@@ -158,8 +169,6 @@ async fn chat_messages_and_filter_writes_stream_their_tellings() {
     let srv = Server::start().await;
     let (alice, alice_token) = account(&srv, "rt226-chat-alice", SCOPES).await;
     let (bob, bob_token) = account(&srv, "rt226-chat-bob", SCOPES).await;
-    let alice_chat_stream = chat_stream(alice.id);
-    let alice_home = user_stream(alice.id);
 
     let alice_chat = action_ok(
         &srv,
@@ -198,8 +207,9 @@ async fn chat_messages_and_filter_writes_stream_their_tellings() {
         update["event"], "pleroma:chat_update",
         "the chat change rides its own event"
     );
-    assert!(
-        streams_of(&update).contains(&alice_chat_stream.as_str()),
+    assert_eq!(
+        streams_of(&update),
+        ["user:pleroma_chat"],
         "on Alice's own chat stream: {update}"
     );
     let chat_payload = frame_payload(&update);
@@ -232,8 +242,9 @@ async fn chat_messages_and_filter_writes_stream_their_tellings() {
         changed.get("payload").is_none(),
         "Mastodon sends it bare: {changed}"
     );
-    assert!(
-        streams_of(&changed).contains(&alice_home.as_str()),
+    assert_eq!(
+        streams_of(&changed),
+        ["user"],
         "on the owner's own user stream: {changed}"
     );
 }
@@ -288,9 +299,14 @@ async fn tokens_in_the_query_and_in_the_subprotocol_open_their_sockets() {
             .expect("the query socket got the post"),
     )
     .expect("frames are JSON envelopes");
-    assert!(
-        streams_of(&query_frame).contains(&alice_own.as_str()),
+    assert_eq!(
+        streams_of(&query_frame),
+        ["user"],
         "the query-token socket streams for its user: {query_frame}"
+    );
+    assert!(
+        !query_frame.to_string().contains(alice_own.as_str()),
+        "without leaking the internal uuid-named stream: {query_frame}"
     );
     let query_payload = frame_payload(&query_frame);
     assert_eq!(
@@ -306,9 +322,14 @@ async fn tokens_in_the_query_and_in_the_subprotocol_open_their_sockets() {
             .expect("the subprotocol socket got the post"),
     )
     .expect("frames are JSON envelopes");
-    assert!(
-        streams_of(&protocol_frame).contains(&bob_own.as_str()),
+    assert_eq!(
+        streams_of(&protocol_frame),
+        ["user"],
         "the subprotocol socket streams for ITS user: {protocol_frame}"
+    );
+    assert!(
+        !protocol_frame.to_string().contains(bob_own.as_str()),
+        "without leaking the internal uuid-named stream: {protocol_frame}"
     );
     let protocol_payload = frame_payload(&protocol_frame);
     assert_eq!(

@@ -21,8 +21,8 @@ use axum::{
 use serde_json::{Value, json};
 use tokio::{net::TcpListener, sync::Mutex, task::JoinHandle};
 use wired_be::{
-    api::instance::sha256_hex_bytes,
     services::emoji_packs::{self, Pack},
+    util::token::sha256_hex_bytes,
 };
 
 use super::support::{GIF_BYTES, PNG_BYTES};

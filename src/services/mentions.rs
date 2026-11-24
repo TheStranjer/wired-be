@@ -21,6 +21,7 @@
 //! persists the links (see [`NewStatus::mentioned_user_ids`]), and the
 //! Status entity renders them (see [`crate::entities::mention`]).
 //!
+//! [`Config::max_remote_mention_lookups`]: crate::config::Config::max_remote_mention_lookups
 //! [`get_or_fetch_by_acct`]: crate::federation::fetch_actor::get_or_fetch_by_acct
 //! [`users`]: crate::models::user
 //! [`NewStatus::mentioned_user_ids`]: crate::models::status::NewStatus::mentioned_user_ids
@@ -31,7 +32,6 @@ use futures::future::join_all;
 use tracing::debug;
 
 use crate::{
-    config::Config,
     error::AppResult,
     federation::{
         fetch_actor::{FetchError, get_or_fetch_by_acct, get_or_fetch_by_ap_id},
@@ -61,7 +61,8 @@ pub const REMOTE_LOOKUP_BUDGET: Duration = Duration::from_secs(5);
 /// a foreign domain with no stored row is fetched by this module's
 /// `resolve_remote_mention`, concurrently with the other unknown remotes
 /// of the same status under the shared [`REMOTE_LOOKUP_BUDGET`] and capped
-/// at [`Config::max_remote_mention_lookups`] lookups per status. What is
+/// at [`Config::max_remote_mention_lookups`](crate::config::Config::max_remote_mention_lookups)
+/// lookups per status. What is
 /// left unknown — an unresolvable local, a failed or abandoned fetch, a
 /// mention past the cap — is simply absent from the answer, so callers
 /// leave it the plain text it was written as. A mention repeated in the
@@ -112,8 +113,8 @@ pub(crate) async fn resolve_mentions_on_budget(
     let mut queued: Vec<&MentionRef> = Vec::new();
     for mention in &mentions {
         if let Some(user) = user::get_by_acct(&state.db, &state.config, &mention.acct()).await? {
-            drop(found.insert(mention_key(mention), user));
-        } else if !names_own_domain(&state.config, mention)
+            drop(found.insert(mention.key(), user));
+        } else if !mention.names_domain(state.config.domain())
             && queued.len() < state.config.max_remote_mention_lookups
         {
             queued.push(mention);
@@ -123,7 +124,7 @@ pub(crate) async fn resolve_mentions_on_budget(
     Ok(mentions
         .into_iter()
         .filter_map(|mention| {
-            let user = found.remove(&mention_key(&mention))?;
+            let user = found.remove(&mention.key())?;
             Some((mention, user))
         })
         .collect())
@@ -151,7 +152,7 @@ async fn resolve_queued_remotes(
         Ok(outcomes) => {
             for (mention, user) in queued.iter().zip(outcomes) {
                 if let Some(user) = user {
-                    drop(found.insert(mention_key(mention), user));
+                    drop(found.insert(mention.key(), user));
                 }
             }
         }
@@ -218,25 +219,6 @@ async fn fetch_remote_acct(
     }
 }
 
-/// Whether a mention can name a local account at all: a bare `@nick`, or a
-/// `@nick@domain` whose domain is this instance's own
-/// ([`Config::domain`], compared case-insensitively). Such a mention never
-/// reaches the network: a local account that is not stored simply is not
-/// there.
-fn names_own_domain(config: &Config, mention: &MentionRef) -> bool {
-    mention
-        .domain
-        .as_deref()
-        .is_none_or(|domain| domain.eq_ignore_ascii_case(config.domain()))
-}
-
-/// The key one mention's resolution is recorded under: the account it
-/// names, case-folded — the identity [`extract_mentions`] deduplicates by,
-/// so repeated mentions share one lookup and distinct ones never collide.
-fn mention_key(mention: &MentionRef) -> String {
-    mention.acct().to_lowercase()
-}
-
 #[cfg(test)]
 mod tests {
     use std::{
@@ -262,7 +244,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        config::TEST_BASE_URL,
+        config::{Config, TEST_BASE_URL},
         http_client::HttpClient,
         models::user::{NewUser, get_by_id, insert},
     };

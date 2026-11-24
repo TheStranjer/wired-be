@@ -147,11 +147,7 @@ impl<'a> From<&'a CardRows> for Card<'a> {
         Self {
             display_name: &rows.author.name,
             handle: &rows.author.nickname,
-            profile_url: rows
-                .author
-                .profile_url
-                .as_deref()
-                .unwrap_or(&rows.author.ap_id),
+            profile_url: rows.author.profile_url_or_ap_id(),
             content: &rows.status.content,
             attachments: &rows.attachments,
             published: rows.status.inserted_at,

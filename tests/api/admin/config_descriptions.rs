@@ -61,7 +61,7 @@ async fn config_descriptions_answer_with_the_registry() {
     let token = config_admin(&pool, "configdocs").await;
 
     let objects = descriptions_json(&app, &token).await;
-    assert_eq!(objects.len(), 8, "one object per whitelist entry");
+    assert_eq!(objects.len(), 7, "one object per whitelist entry");
     let keys: Vec<&str> = objects
         .iter()
         .map(|object| {
@@ -88,10 +88,9 @@ async fn config_descriptions_answer_with_the_registry() {
             ":mrf_keyword",
             ":mrf_hellthread",
             ":mrf_object_age",
-            ":media_proxy",
-            ":restrict_unauthenticated",
+            ":mrf_hashtag",
         ],
-        "the whitelist, in table order"
+        "the whitelist, in table order, the two unread keys absent"
     );
 
     let instance = &objects[0];
@@ -124,9 +123,8 @@ async fn config_descriptions_answer_with_the_registry() {
 
 /// The payload's other child metadata: the `[:atom]` policy chain with
 /// its example names, the whole-value policy entries documented as
-/// keyword parameter objects, the media proxy's three reported subkeys,
-/// the nested restriction maps — and every `type`, at every depth,
-/// inside the ticket's vocabulary.
+/// keyword parameter objects — and every `type`, at every depth, inside
+/// the ticket's vocabulary.
 #[tokio::test]
 async fn config_descriptions_document_the_registry_children() {
     let db = common::test_db().await;
@@ -164,27 +162,7 @@ async fn config_descriptions_document_the_registry_children() {
     );
     assert_eq!(lists[0]["type"], json!("[:atom]"));
 
-    let proxy = &objects[6];
-    assert_eq!(proxy["type"], json!("group"));
-    let proxy_children = proxy["children"].as_array().expect("the reported subkeys");
-    let names: Vec<&str> = proxy_children
-        .iter()
-        .map(|child| child["key"].as_str().expect("a string key"))
-        .collect();
-    assert_eq!(
-        names,
-        vec!["enabled", "blacklist", "max_bytes"],
-        "the registry's three subkeys"
-    );
-
-    let restricted = &objects[7];
-    let halves = restricted["children"].as_array().expect("the three halves");
-    assert_eq!(halves.len(), 3, "timelines, profiles, activities");
-    assert_eq!(halves[0]["type"], json!("map"), "a map of booleans");
-    let fields = halves[0]["children"]
-        .as_array()
-        .expect("the map nests fields");
-    assert_eq!(fields[0]["type"], json!("boolean"), "and they are booleans");
+    assert_eq!(objects.len(), 7, "the registry's seven entries, no more");
 
     let mut types = Vec::new();
     for object in objects {
@@ -205,10 +183,12 @@ async fn config_descriptions_document_the_registry_children() {
 }
 
 /// `GET /need_reboot` reads the process-wide flag, not the store: down
-/// for a fresh boot, still down after a live key's write, and raised by
-/// a restart-requiring change.
+/// for a fresh boot, still down after a live key's write and after a
+/// refused write of a key nothing reads, and up once the flag is raised
+/// (no whitelisted key raises it through the API today, so the test
+/// raises it directly).
 #[tokio::test]
-async fn need_reboot_toggles_after_a_restart_requiring_change() {
+async fn need_reboot_toggles_once_raised() {
     let _flag_guard = PROCESS_FLAGS_LOCK.lock().await;
     RuntimeConfig::reset_process_flags();
     let db = common::test_db().await;
@@ -248,7 +228,7 @@ async fn need_reboot_toggles_after_a_restart_requiring_change() {
         ":instance takes effect live and raises nothing"
     );
 
-    let rebooting = post_configs(
+    let refused = post_configs(
         &app,
         &token,
         json!([{
@@ -258,7 +238,18 @@ async fn need_reboot_toggles_after_a_restart_requiring_change() {
         }]),
     )
     .await;
-    common::assert_answer(&rebooting, StatusCode::OK, "the flagged write");
+    common::assert_answer(&refused, StatusCode::BAD_REQUEST, "the unread key");
+    let untouched = TestRequest::get(NEED_REBOOT)
+        .bearer(&token)
+        .send(&app)
+        .await;
+    assert_eq!(
+        untouched.json_value(),
+        json!({ "need_reboot": false }),
+        "a refused write raises nothing"
+    );
+
+    RuntimeConfig::set_need_reboot();
     let raised = TestRequest::get(NEED_REBOOT)
         .bearer(&token)
         .send(&app)
@@ -266,8 +257,9 @@ async fn need_reboot_toggles_after_a_restart_requiring_change() {
     assert_eq!(
         raised.json_value(),
         json!({ "need_reboot": true }),
-        "the restart-requiring change raised the flag"
+        "the raised flag is what the read answers"
     );
+    RuntimeConfig::reset_process_flags();
 }
 
 /// Once raised, `GET /need_reboot` keeps answering true: only the next
@@ -283,17 +275,7 @@ async fn need_reboot_stands_through_calm_and_refused_writes() {
     let app = common::test_app(pool.clone());
     let token = config_admin(&pool, "confighold").await;
 
-    let raising = post_configs(
-        &app,
-        &token,
-        json!([{
-            "group": ":pleroma",
-            "key": ":media_proxy",
-            "value": wire(&[("max_bytes", json!(2048))]),
-        }]),
-    )
-    .await;
-    common::assert_answer(&raising, StatusCode::OK, "the flagged write");
+    RuntimeConfig::set_need_reboot();
 
     let later = post_configs(
         &app,
@@ -372,17 +354,7 @@ async fn restart_raises_the_shutdown_flag() {
         "the shutdown flag stands for serve() to drain on"
     );
 
-    let flagged = post_configs(
-        &app,
-        &token,
-        json!([{
-            "group": ":pleroma",
-            "key": ":media_proxy",
-            "value": wire(&[("max_bytes", json!(4096))]),
-        }]),
-    )
-    .await;
-    common::assert_answer(&flagged, StatusCode::OK, "the flagged write");
+    RuntimeConfig::set_need_reboot();
     let raised = TestRequest::get(NEED_REBOOT)
         .bearer(&token)
         .send(&app)

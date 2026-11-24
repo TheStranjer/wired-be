@@ -22,8 +22,9 @@
 //!   `chat_message_delete` moderation entry, queues the federation `Delete`
 //!   for a local-origin message whose partner is remote and nothing
 //!   otherwise, and 404s a second strike at the same message;
-//! - every route sits behind `AdminUser` plus its scope: `admin:read:chats`
-//!   for the three reads, `admin:write:chats` for the delete, the class
+//! - the three reads sit behind `AdminUser` plus `admin:read:chats`, the
+//!   delete behind `StaffUser` plus `admin:write:chats` (a moderator may
+//!   delete, and is logged as the actor, but may not read), the class
 //!   roots standing for both.
 
 #![cfg(test)]

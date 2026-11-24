@@ -19,7 +19,9 @@ use crate::{common, remote};
 /// Scenario: the boost and its withdrawal. A public `Announce` names the
 /// world in `to` and the followers with the original author in `cc`, and
 /// travels under the reblog row's own `uri`; the `Undo` repeats the
-/// addressing and embeds that very document.
+/// addressing and embeds that very document. An unlisted `Announce` names
+/// the followers in `to` and the original author with the public address
+/// in `cc`.
 #[tokio::test]
 async fn a_boost_and_its_withdrawal_travel_with_the_original_author_in_cc() {
     let db = common::test_db().await;
@@ -70,8 +72,8 @@ async fn a_boost_and_its_withdrawal_travel_with_the_original_author_in_cc() {
     );
     assert_eq!(
         quiet_announce.activity()["cc"],
-        with_author,
-        "and still carries the followers with the original author in `cc`"
+        json!([carol.ap_id, AS_PUBLIC]),
+        "and carries the original author with the public address in `cc`"
     );
 
     let _withdrawn = status_action(&app, &alice_token, &id_of(&boost), "unreblog", None).await;

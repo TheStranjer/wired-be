@@ -127,6 +127,8 @@ struct Tokens {
     read_relays: String,
     /// An admin holding only `admin:write:relays`.
     write_relays: String,
+    /// An admin holding only `admin:write:follows`.
+    write_follows: String,
 }
 
 /// Mints the [`Tokens`] fixture.
@@ -144,6 +146,7 @@ async fn tokens(pool: &PgPool) -> Tokens {
     let app_only = common::create_app_only_token(pool, ALL_ADMIN).await;
     let (_reader, read_relays) = admin(pool, "reader", "admin:read:relays").await;
     let (_writer, write_relays) = admin(pool, "writer", "admin:write:relays").await;
+    let (_follower, write_follows) = admin(pool, "follower", "admin:write:follows").await;
     Tokens {
         all,
         plain,
@@ -151,6 +154,7 @@ async fn tokens(pool: &PgPool) -> Tokens {
         app_only,
         read_relays,
         write_relays,
+        write_follows,
     }
 }
 
@@ -287,14 +291,14 @@ async fn the_federation_scopes_pass_their_own_routes() {
         "admin:read:relays on the ledger",
     );
     let scoped_follow = common::TestRequest::post(RELAY)
-        .bearer(&everyone.write_relays)
+        .bearer(&everyone.write_follows)
         .json(&json!({"relay_url": mock.actor_ap_id()}))
         .send(&app)
         .await;
     common::assert_answer(
         &scoped_follow,
         StatusCode::OK,
-        "admin:write:relays on the follow",
+        "admin:write:follows on the follow",
     );
     assert_eq!(
         queued_args(&pool, KIND_DELIVER).await.len(),
@@ -306,4 +310,71 @@ async fn the_federation_scopes_pass_their_own_routes() {
         .send(&app)
         .await;
     common::assert_answer(&roots, StatusCode::OK, "the admin roots on the reload");
+}
+
+/// The relay writes sit on `admin:write:follows`, as Pleroma's
+/// `relay_controller.ex` has it: the follow and the unfollow answer a
+/// follows-only token (a refusal of the relay itself is not a 403), and
+/// the relay area's own write token — and the follows token on the other
+/// writes — is refused.
+#[tokio::test]
+async fn the_relay_follow_writes_demand_the_follows_scope() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let (app, _state) = federation_app(&pool);
+    let everyone = tokens(&pool).await;
+    let body = json!({"relay_url": "nope/nope"});
+
+    let follow = common::TestRequest::post(RELAY)
+        .bearer(&everyone.write_follows)
+        .json(&body)
+        .send(&app)
+        .await;
+    assert_ne!(
+        follow.status,
+        StatusCode::FORBIDDEN,
+        "admin:write:follows passes the follow gate"
+    );
+    let unfollow = common::TestRequest::delete(RELAY)
+        .bearer(&everyone.write_follows)
+        .json(&body)
+        .send(&app)
+        .await;
+    assert_ne!(
+        unfollow.status,
+        StatusCode::FORBIDDEN,
+        "admin:write:follows passes the unfollow gate"
+    );
+
+    for request in [
+        common::TestRequest::post(RELAY).json(&body),
+        common::TestRequest::delete(RELAY).json(&body),
+    ] {
+        let refused = request.bearer(&everyone.write_relays).send(&app).await;
+        common::assert_answer(
+            &refused,
+            StatusCode::FORBIDDEN,
+            "admin:write:relays no longer authorizes the relay writes",
+        );
+        common::assert_error(
+            &refused,
+            "Insufficient permissions: admin:write.",
+            "in the write class's words",
+        );
+    }
+
+    let listing = common::TestRequest::get(RELAY)
+        .bearer(&everyone.write_follows)
+        .send(&app)
+        .await;
+    common::assert_answer(
+        &listing,
+        StatusCode::FORBIDDEN,
+        "the follows scope does not list the ledger",
+    );
+    let reload = common::TestRequest::post(RELOAD)
+        .bearer(&everyone.write_follows)
+        .send(&app)
+        .await;
+    common::assert_answer(&reload, StatusCode::FORBIDDEN, "nor does it reload emoji");
 }

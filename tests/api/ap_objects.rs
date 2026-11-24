@@ -483,6 +483,41 @@ async fn a_local_status_is_never_a_document() {
     );
 }
 
+/// A public status of a deactivated author is no document: the unscoped
+/// read answers the plain 404 until the account is reactivated.
+#[tokio::test]
+async fn a_deactivated_authors_note_is_not_served() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let alice = common::create_local_user(&pool, "alice").await;
+    let note = common::create_status(&pool, &alice, "going dark", Visibility::Public).await;
+    let app = common::test_app(pool.clone());
+    let path = object_path(&note);
+
+    let _deactivated: sqlx::postgres::PgQueryResult =
+        sqlx::query("UPDATE users SET is_active = false WHERE id = $1")
+            .bind(alice.id)
+            .execute(&pool)
+            .await
+            .expect("the account deactivates");
+    assert_not_found(
+        &fetch_ap(&app, &path).await,
+        "an anonymous read of a deactivated author's note",
+    );
+
+    let _reactivated: sqlx::postgres::PgQueryResult =
+        sqlx::query("UPDATE users SET is_active = true WHERE id = $1")
+            .bind(alice.id)
+            .execute(&pool)
+            .await
+            .expect("the account reactivates");
+    assert_eq!(
+        fetch_ap(&app, &path).await.status,
+        StatusCode::OK,
+        "the reactivated author is served again"
+    );
+}
+
 /// A soft-deleted status answers 410, and the body is the `Tombstone`
 /// document — the reserved id, the type it lived as, and the moment it
 /// went — not the generic `{"error":"Gone"}` JSON.
@@ -791,5 +826,36 @@ fn the_test_frontend_origin_is_the_test_origin() {
     assert_eq!(
         config.base_url, BASE,
         "and the fixture origin is the one the assertions above name"
+    );
+}
+
+/// A frontend on its own origin: a browser on `/objects/{id}/replies` is
+/// sent to the post page on `FRONTEND_BASE_URL`, and the answer varies on
+/// `Accept`.
+#[tokio::test]
+async fn the_replies_redirect_follows_the_frontend_origin() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let mut config = common::test_config();
+    config.frontend_base_url = "https://fe.example".to_owned();
+    let alice = common::create_local_user(&pool, "alice").await;
+    let note = common::create_status(&pool, &alice, "a replied note", Visibility::Public).await;
+    let app = common::test_app_with_config(pool, config);
+
+    let response = common::TestRequest::get(&format!("/objects/{}/replies", note.id))
+        .header("accept", "text/html")
+        .send(&app)
+        .await;
+
+    assert_eq!(response.status, StatusCode::FOUND, "a browser redirects");
+    assert_eq!(
+        response.header("location"),
+        Some(format!("https://fe.example/notice/{}", note.id).as_str()),
+        "to the post page on the frontend origin"
+    );
+    assert_eq!(
+        response.header("vary"),
+        Some("Accept"),
+        "the redirect varies on Accept"
     );
 }

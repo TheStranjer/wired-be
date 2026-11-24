@@ -8,6 +8,8 @@
 
 use url::Url;
 
+use crate::config::Config;
+
 /// Parses `text` as an absolute URL on the `http` or `https` scheme with a
 /// host; `None` for anything else.
 #[must_use]
@@ -43,9 +45,109 @@ pub fn host_with_port(url: &Url) -> String {
         .map_or_else(|| host.to_owned(), |port| format!("{host}:{port}"))
 }
 
+/// Whether two URLs name the same origin: the same host and port.
+///
+/// The comparison is case-insensitive on [`host_with_port`]. Userinfo is
+/// ignored, so `https://evil@peer` is `https://peer`, and so is the scheme
+/// (`http` and `https` on their default ports compare equal, as delivery has
+/// always treated an inbox). A URL without a host matches nothing.
+#[must_use]
+pub fn same_origin(a: &Url, b: &Url) -> bool {
+    a.host_str().is_some()
+        && b.host_str().is_some()
+        && host_with_port(a).eq_ignore_ascii_case(&host_with_port(b))
+}
+
+/// Whether `url` is on this instance's own origin, the one in
+/// [`Config::base_url`]. A `base_url` that does not parse matches nothing.
+#[must_use]
+pub fn is_local_url(config: &Config, url: &Url) -> bool {
+    Url::parse(&config.base_url).is_ok_and(|base| same_origin(&base, url))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::TEST_BASE_URL;
+
+    /// Parses a URL the test spells out.
+    fn url(text: &str) -> Url {
+        Url::parse(text).expect("valid url")
+    }
+
+    /// Host case does not matter.
+    #[test]
+    fn same_origin_ignores_host_case() {
+        assert!(same_origin(
+            &url("https://Peer.Example/a"),
+            &url("https://peer.example/b")
+        ));
+    }
+
+    /// A different port is a different origin; a default port is not a port.
+    #[test]
+    fn same_origin_compares_ports() {
+        assert!(!same_origin(
+            &url("https://peer.example:8443/"),
+            &url("https://peer.example/")
+        ));
+        assert!(same_origin(
+            &url("https://peer.example:443/"),
+            &url("https://peer.example/")
+        ));
+        assert!(!same_origin(
+            &url("https://a.example/"),
+            &url("https://b.example/")
+        ));
+    }
+
+    /// Userinfo never makes or breaks a match.
+    #[test]
+    fn same_origin_ignores_userinfo() {
+        assert!(same_origin(
+            &url("https://evil@peer.example/"),
+            &url("https://peer.example/")
+        ));
+        assert!(same_origin(
+            &url("https://u:p@peer.example/"),
+            &url("https://x@peer.example/")
+        ));
+    }
+
+    /// The scheme is not compared: `http` and `https` on the default ports
+    /// of each are the same origin, as `is_local_inbox` has always treated
+    /// them.
+    #[test]
+    fn same_origin_ignores_the_scheme() {
+        assert!(same_origin(
+            &url("http://peer.example/"),
+            &url("https://peer.example/")
+        ));
+    }
+
+    /// URLs without a host match nothing, not even each other.
+    #[test]
+    fn same_origin_needs_a_host() {
+        assert!(!same_origin(&url("urn:uuid:1"), &url("urn:uuid:2")));
+        assert!(!same_origin(
+            &url("urn:uuid:1"),
+            &url("https://peer.example/")
+        ));
+    }
+
+    /// `is_local_url` compares against the configured base URL.
+    #[test]
+    fn is_local_url_compares_against_the_base_url() {
+        let config = Config::for_tests();
+        assert!(is_local_url(
+            &config,
+            &url(&format!("{TEST_BASE_URL}/users/alice"))
+        ));
+        assert!(is_local_url(&config, &url("https://TEST.EXAMPLE/x")));
+        assert!(is_local_url(&config, &url("https://evil@test.example/x")));
+        assert!(!is_local_url(&config, &url("https://test.example.evil/x")));
+        assert!(!is_local_url(&config, &url("https://test.example:8443/x")));
+    }
 
     /// Both web schemes parse; the result is the parsed URL.
     #[test]

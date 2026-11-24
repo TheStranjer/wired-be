@@ -70,7 +70,7 @@
 //! [`Account`]: crate::entities::account::Account
 //! [`Translation`]: crate::entities::translation::Translation
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use axum::{
     Json, Router,
@@ -81,8 +81,7 @@ use uuid::Uuid;
 use crate::{
     entities::status::Status,
     error::{AppError, AppResult},
-    models::{status, user::User},
-    pagination::link_header,
+    models::{block, status, user::User},
     services::render_status::{ViewerMode, render_status},
     state::AppState,
 };
@@ -207,13 +206,6 @@ pub(crate) const CANNOT_REBLOG: &str = "Could not reblog private status";
 /// default the plain [`PageParams::from_query`] keeps.
 const FAVOURITED_BY_MAX_LIMIT: i64 = 80;
 
-/// The `Link` headers' query parameters carry nothing but the cursor:
-/// none of the favourites and bookmarks listings repeats a filter on
-/// either link (the relationship listings' constant, same rule) — the
-/// bookmarks listing's `folder_id` is not repeated either, the cursors
-/// alone pick up the walk where the page left it.
-const NO_EXTRA_QUERY: [(String, String); 0] = [];
-
 /// The `/api/v1` statuses router, merged into [`crate::api::v1`].
 ///
 /// `state` reaches the seven status writes that mount the
@@ -312,15 +304,38 @@ async fn current_entity(state: &AppState, viewer: &User, id: Uuid) -> AppResult<
     Ok(Json(entity))
 }
 
-/// The `Link` header of a favourites or bookmarks page: [`link_header`]
-/// over the first (newest) and last (oldest) like or bookmark row id of
-/// the page, the follow lists' [`page_link`](crate::api::accounts) shape
-/// with the row id in place of the relationship id's. An empty page names
-/// no cursor and links nowhere.
-fn page_link(base_url: &str, path: &str, entry_ids: &[Uuid]) -> Option<String> {
-    let newest = entry_ids.first()?.to_string();
-    let oldest = entry_ids.last()?.to_string();
-    link_header(base_url, path, &NO_EXTRA_QUERY, &newest, &oldest)
+/// `entries` without the accounts `viewer` has blocked, in the same order;
+/// `account_id` names the account behind one entry. An anonymous viewer has
+/// no blocks, so the list comes back as it was (Pleroma's `favourited_by`
+/// and `reblogged_by` drop the viewer's blocked accounts the same way).
+///
+/// The listings call it *after* the `Link` header is computed from the raw
+/// page, so a page emptied by the filter still names its cursors and the
+/// walk does not stall.
+///
+/// # Errors
+///
+/// Any database failure arrives through `?` as [`AppError::Database`].
+async fn without_blocked<T>(
+    state: &AppState,
+    viewer: Option<&User>,
+    entries: Vec<T>,
+    account_id: impl Fn(&T) -> Uuid,
+) -> AppResult<Vec<T>> {
+    let Some(viewer) = viewer else {
+        return Ok(entries);
+    };
+    let blocked: HashSet<Uuid> = block::blocked_ids(&state.db, viewer.id)
+        .await?
+        .into_iter()
+        .collect();
+    if blocked.is_empty() {
+        return Ok(entries);
+    }
+    Ok(entries
+        .into_iter()
+        .filter(|entry| !blocked.contains(&account_id(entry)))
+        .collect())
 }
 
 /// The status a like or a boost lands on: `row` itself for a plain post,
@@ -352,7 +367,10 @@ fn in_requested_order(requested: &[Uuid], visible: Vec<status::Status>) -> Vec<s
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::statuses::test_support::{ids, row};
+    use crate::{
+        api::statuses::test_support::{ids, row},
+        pagination::link_for_page,
+    };
 
     #[test]
     fn the_answer_follows_the_request_not_the_row_order() {
@@ -390,10 +408,11 @@ mod tests {
     #[test]
     fn the_link_pages_off_the_first_and_last_like_ids() {
         let (newest, middle, oldest) = (Uuid::now_v7(), Uuid::now_v7(), Uuid::now_v7());
-        let link = page_link(
+        let link = link_for_page(
             "https://host",
             "/api/v1/favourites",
             &[newest, middle, oldest],
+            |id| *id,
         )
         .expect("a page with ids links");
         assert_eq!(
@@ -409,8 +428,9 @@ mod tests {
 
     #[test]
     fn an_empty_page_links_nowhere() {
+        let none: [Uuid; 0] = [];
         assert_eq!(
-            page_link("https://host", "/api/v1/favourites", &[]),
+            link_for_page("https://host", "/api/v1/favourites", &none, |id| *id),
             None,
             "no rows, no cursors, no Link header"
         );

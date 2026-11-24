@@ -8,10 +8,8 @@ use uuid::Uuid;
 
 use crate::{
     config::TEST_BASE_URL,
-    models::{
-        status::{self, NewStatus, Status},
-        user::{NewUser, insert as insert_user, local_ap_id},
-    },
+    models::status::{self, NewStatus, Status},
+    test_fixtures::local_user,
 };
 
 use super::Hashtag;
@@ -43,12 +41,7 @@ pub(super) fn tags(names: &[&str]) -> Vec<String> {
 
 /// A local user named `nickname` and one public status of theirs.
 pub(super) async fn post(pool: &PgPool, nickname: &str, text: &str) -> Status {
-    let author = insert_user(
-        pool,
-        &NewUser::local(nickname, &local_ap_id(BASE, nickname)),
-    )
-    .await
-    .expect("fixture user inserts");
+    let author = local_user(pool, nickname).await;
     status::insert(pool, BASE, &NewStatus::local(&author, text))
         .await
         .expect("fixture status inserts")

@@ -13,7 +13,7 @@ use super::{
     error::ConfigError,
     federation_types::Toggle,
     integrations::MediaProxyConfig,
-    parse::{boolean, comma_list, number},
+    parse::{boolean, comma_list, number, trimmed, trimmed_url},
     vars::{
         MEDIA_PROXY_BASE_URL_VAR, MEDIA_PROXY_BLACKLIST_VAR, MEDIA_PROXY_CACHE_LIMIT_VAR,
         MEDIA_PROXY_ENABLED_VAR, MEDIA_PROXY_MAX_BYTES_VAR, MEDIA_PROXY_PURGE_URL_VAR,
@@ -32,9 +32,7 @@ where
     F: Fn(&str) -> Option<String>,
 {
     let enabled = boolean(lookup, MEDIA_PROXY_ENABLED_VAR, DEFAULT_MEDIA_PROXY_ENABLED)?;
-    let secret = lookup(MEDIA_PROXY_SECRET_VAR)
-        .map(|secret| secret.trim().to_owned())
-        .filter(|secret| !secret.is_empty());
+    let secret = trimmed(lookup, MEDIA_PROXY_SECRET_VAR);
     if enabled {
         let secret = secret
             .as_deref()
@@ -43,9 +41,7 @@ where
             return Err(ConfigError::ShortMediaProxySecret(MEDIA_PROXY_SECRET_VAR));
         }
     }
-    let base_url = lookup(MEDIA_PROXY_BASE_URL_VAR)
-        .map(|url| url.trim().trim_end_matches('/').to_owned())
-        .filter(|url| !url.is_empty());
+    let base_url = trimmed_url(lookup, MEDIA_PROXY_BASE_URL_VAR);
     let max_bytes = number(
         lookup,
         MEDIA_PROXY_MAX_BYTES_VAR,
@@ -57,9 +53,7 @@ where
         MEDIA_PROXY_CACHE_LIMIT_VAR,
         DEFAULT_MEDIA_PROXY_CACHE_LIMIT,
     )?;
-    let purge_url = lookup(MEDIA_PROXY_PURGE_URL_VAR)
-        .map(|url| url.trim().trim_end_matches('/').to_owned())
-        .filter(|url| !url.is_empty());
+    let purge_url = trimmed_url(lookup, MEDIA_PROXY_PURGE_URL_VAR);
     Ok(MediaProxyConfig {
         enabled,
         secret,

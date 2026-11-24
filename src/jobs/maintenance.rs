@@ -82,6 +82,12 @@ mod tokens;
 #[cfg(test)]
 mod test_support;
 
+use std::fmt;
+
+use tracing::info;
+
+use super::JobError;
+
 pub use self::{
     deleted_statuses::{KIND_DELETED_STATUSES, handle_purge_deleted_statuses},
     media::{KIND_MEDIA, handle_sweep_media},
@@ -89,3 +95,55 @@ pub use self::{
     prunes::{KIND_JOBS, handle_jobs},
     tokens::{KIND_TOKENS, handle_tokens},
 };
+
+/// Runs one sweep future and turns its outcome into the handler result every
+/// single-statement sweep shares: a row count is logged at `info` as
+/// `deleted` under `label`, and an error becomes a [`JobError::Retry`] whose
+/// detail is `"{label} failed: {err}"`, so the queue keeps the pass.
+///
+/// `label` names what the sweep reclaimed (`"expired mutes deleted"`); it is
+/// both the log message and the prefix of the retry detail.
+pub(crate) async fn run_sweep<E: fmt::Display>(
+    label: &'static str,
+    sweep: impl Future<Output = Result<u64, E>>,
+) -> Result<(), JobError> {
+    match sweep.await {
+        Ok(deleted) => {
+            info!(deleted, "{label}");
+            Ok(())
+        }
+        Err(err) => Err(JobError::Retry(format!("{label} failed: {err}"))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::future::ready;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn a_count_is_a_clean_pass() {
+        let outcome = run_sweep("rows deleted", ready(Ok::<u64, String>(3))).await;
+
+        assert_eq!(outcome, Ok(()), "a swept count of three succeeds");
+    }
+
+    #[tokio::test]
+    async fn a_zero_count_is_a_clean_pass() {
+        let outcome = run_sweep("rows deleted", ready(Ok::<u64, String>(0))).await;
+
+        assert_eq!(outcome, Ok(()), "nothing to delete succeeds too");
+    }
+
+    #[tokio::test]
+    async fn an_error_retries_with_the_label_and_the_cause() {
+        let outcome = run_sweep("rows deleted", ready(Err::<u64, &str>("boom"))).await;
+
+        assert_eq!(
+            outcome,
+            Err(JobError::Retry("rows deleted failed: boom".to_owned())),
+            "the retry names the sweep and carries the error"
+        );
+    }
+}

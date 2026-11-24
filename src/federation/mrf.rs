@@ -16,8 +16,8 @@
 //! document, one shared "now", and the local domain — before the chain
 //! runs. The configuration itself comes from the admin config store: the
 //! `:mrf` entry's fields with the `:mrf_simple`, `:mrf_keyword`,
-//! `:mrf_hellthread` and `:mrf_object_age` entries under their policy
-//! keys (see [`crate::services::runtime_config`]), composed by
+//! `:mrf_hellthread`, `:mrf_object_age` and `:mrf_hashtag` entries under
+//! their policy keys (see [`crate::services::runtime_config`]), composed by
 //! [`RuntimeConfig::mrf_document`](crate::services::runtime_config::RuntimeConfig::mrf_document),
 //! with the `MRF_POLICIES` environment
 //! variable (a comma list) as the fallback for deployments that enable
@@ -45,6 +45,12 @@
 //! [`object_age`]); further policy tickets add one `match` arm to
 //! [`build_chain`] each. Unknown names are warned about and skipped, so a
 //! configuration written ahead of a deploy never drops traffic.
+//!
+//! One more policy is not named by the configuration at all: Pleroma
+//! appends its `HashtagPolicy`
+//! (`lib/pleroma/web/activity_pub/mrf/hashtag_policy.ex`, in [`hashtag`]) to
+//! every chain, so [`build_chain`] does too — last, after the configured
+//! policies, on its default lists when the `hashtag` key is absent.
 //!
 //! Two of those policies read facts about the actors an activity speaks
 //! about — follower and status counters, profile tags — that live in the
@@ -76,6 +82,7 @@
 //! list.
 
 pub mod anti_link_spam;
+pub mod hashtag;
 pub mod hellthread;
 pub mod keyword;
 pub mod normalize_markup;

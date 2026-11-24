@@ -37,18 +37,19 @@ const REJECT_SQL: &str = "DELETE FROM follows WHERE id = $1 RETURNING *";
 /// unfollow may have removed it); any other database failure arrives as
 /// [`AppError::Database`](crate::error::AppError).
 pub async fn accept(pool: &PgPool, follow_id: Uuid) -> AppResult<Follow> {
+    let mut tx = pool.begin().await?;
     let granted = sqlx::query_as::<_, Follow>(ACCEPT_SQL)
         .bind(follow_id)
-        .fetch_optional(pool)
+        .fetch_optional(&mut *tx)
         .await?;
-    match granted {
-        Some(follow) => {
-            step_counters(pool, &follow, 1).await?;
-            Ok(follow)
-        }
+    let Some(follow) = granted else {
         // Nothing to change: the row was accepted already, or it is gone.
-        None => required(by_id(pool, follow_id).await?),
-    }
+        drop(tx);
+        return required(by_id(pool, follow_id).await?);
+    };
+    step_counters(&mut tx, &follow, 1).await?;
+    tx.commit().await?;
+    Ok(follow)
 }
 
 /// Withdraws a follow request: the row is deleted and the removed
@@ -64,14 +65,16 @@ pub async fn accept(pool: &PgPool, follow_id: Uuid) -> AppResult<Follow> {
 /// [`AppError::NotFound`](crate::error::AppError::NotFound) when no follow has this id; any other database
 /// failure arrives as [`AppError::Database`](crate::error::AppError).
 pub async fn reject(pool: &PgPool, follow_id: Uuid) -> AppResult<Follow> {
+    let mut tx = pool.begin().await?;
     let removed = sqlx::query_as::<_, Follow>(REJECT_SQL)
         .bind(follow_id)
-        .fetch_optional(pool)
+        .fetch_optional(&mut *tx)
         .await?;
     let follow = required(removed)?;
     if follow.state == FollowState::Accepted {
-        step_counters(pool, &follow, -1).await?;
+        step_counters(&mut tx, &follow, -1).await?;
     }
+    tx.commit().await?;
     Ok(follow)
 }
 
@@ -147,6 +150,35 @@ mod tests {
             ),
             (1, 1),
             "and the second call moves no counters"
+        );
+    }
+
+    /// Two accepts of one request race: the row moves to accepted once, so the
+    /// counters step up once and both calls answer the accepted row.
+    #[tokio::test]
+    async fn accepting_a_request_twice_at_once_steps_the_counters_once() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = local_user(&pool, "alice").await;
+        let carol = locked_user(&pool, "carol").await;
+        let requested = follow(&pool, TEST_BASE_URL, &alice, &carol).await.unwrap();
+
+        let (first, second) =
+            tokio::join!(accept(&pool, requested.id), accept(&pool, requested.id));
+        let (first, second) = (first.unwrap(), second.unwrap());
+        assert_eq!(first.state, FollowState::Accepted, "the first call answers");
+        assert_eq!(
+            second.state,
+            FollowState::Accepted,
+            "and so does the second"
+        );
+        assert_eq!(
+            (
+                fresh_user(&pool, carol.id).await.followers_count,
+                fresh_user(&pool, alice.id).await.following_count
+            ),
+            (1, 1),
+            "the counters stepped once for the one transition"
         );
     }
 

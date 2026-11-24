@@ -654,6 +654,75 @@ mod tests {
         }
     }
 
+    /// `resolve` rules each stored state of a token: live and app-only
+    /// tokens are valid, while an unknown string, a lapsed token, a
+    /// deactivated owner and an approval-pending owner are each refused
+    /// with their own verdict (the extractors map them to 401 or 403).
+    #[tokio::test]
+    async fn resolve_rules_every_stored_state_of_a_token() {
+        use crate::models::user::{Flag, NewUser, insert};
+
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let app = app_state(db.pool());
+        let owner = reader(&app.db, "resolve-owner", true).await;
+        let dormant = reader(&app.db, "resolve-dormant", false).await;
+        let pending = insert(
+            &app.db,
+            &NewUser {
+                approval_pending: Flag::new(true),
+                ..NewUser::local(
+                    "resolve-pending",
+                    "https://test.example/users/resolve-pending",
+                )
+            },
+        )
+        .await
+        .expect("user fixture inserts");
+        let live = token(&app.db, Some(&owner), "read").await;
+        let lapsed = token(&app.db, Some(&owner), "read").await;
+        lapse(&app.db, lapsed.id).await;
+        let app_only = token(&app.db, None, "read").await;
+        let dormant_token = token(&app.db, Some(&dormant), "read").await;
+        let pending_token = token(&app.db, Some(&pending), "read").await;
+
+        assert!(
+            matches!(
+                resolve(&app, &live.token).await.unwrap(),
+                Auth::Valid(ctx) if ctx.user.as_ref().map(|found| found.id) == Some(owner.id)
+            ),
+            "a live user token is valid and carries its user"
+        );
+        assert!(
+            matches!(
+                resolve(&app, &app_only.token).await.unwrap(),
+                Auth::Valid(ctx) if ctx.user.is_none()
+            ),
+            "an app-only token is valid without a user"
+        );
+        assert!(
+            matches!(resolve(&app, "no-such-token").await.unwrap(), Auth::Invalid),
+            "an unknown string is invalid"
+        );
+        assert!(
+            matches!(resolve(&app, &lapsed.token).await.unwrap(), Auth::Invalid),
+            "an expired token is invalid"
+        );
+        assert!(
+            matches!(
+                resolve(&app, &dormant_token.token).await.unwrap(),
+                Auth::Deactivated
+            ),
+            "a deactivated owner's token is refused as deactivated"
+        );
+        assert!(
+            matches!(
+                resolve(&app, &pending_token.token).await.unwrap(),
+                Auth::ApprovalPending
+            ),
+            "an approval-pending owner's token does not authenticate"
+        );
+    }
+
     #[test]
     fn bearer_from_headers_matches_the_scheme_case_insensitively() {
         for scheme in ["Bearer", "bearer", "BEARER"] {

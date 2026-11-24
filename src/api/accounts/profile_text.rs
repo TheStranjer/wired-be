@@ -12,7 +12,6 @@ use sqlx::PgPool;
 
 use crate::{
     config::Config,
-    entities::account::local_url,
     error::{AppError, AppResult},
     extract::index_map_to_vec,
     models::user::{self, User},
@@ -135,12 +134,12 @@ pub(crate) fn sanitized_name(raw: &str, max_chars: usize) -> AppResult<String> {
 pub(crate) async fn render_note(state: &AppState, raw: &str) -> AppResult<String> {
     let html = text_to_html(raw);
     let urls = local_mention_urls(&state.db, &state.config, &html).await?;
-    let resolver = |mention: &MentionRef| urls.get(&mention_key(mention)).cloned();
+    let resolver = |mention: &MentionRef| urls.get(&mention.key()).cloned();
     Ok(linkify_entities(&html, &resolver, &state.config.base_url))
 }
 
 /// The profile URLs of every mention [`extract_mentions`] finds in
-/// `text` that names a local user, keyed by [`mention_key`]. Lookups are
+/// `text` that names a local user, keyed by [`MentionRef::key`]. Lookups are
 /// citext, so `@ALICE` finds `alice`; the [`local`](User::local) flag is
 /// the guard that keeps a remote mirror out of the table whatever its
 /// stored nickname looks like.
@@ -151,44 +150,17 @@ async fn local_mention_urls(
 ) -> AppResult<HashMap<String, String>> {
     let mut urls = HashMap::new();
     for mention in extract_mentions(text) {
-        if !names_own_domain(config, &mention) {
+        if !mention.names_domain(config.domain()) {
             continue;
         }
         if let Some(found) = user::get_by_nickname(db, &mention.nickname)
             .await?
             .filter(|found| found.local.get())
         {
-            let _seen = urls.insert(mention_key(&mention), local_url(config, &found.nickname));
+            let _seen = urls.insert(mention.key(), found.profile_url_or_ap_id().to_owned());
         }
     }
     Ok(urls)
-}
-
-/// The lookup key of one mention: the account it names, lowercased —
-/// `nick` for a bare one, `nick@domain` when the reference spelled the
-/// domain out (the case-fold
-/// [`mention_html`](crate::util::entities::mention_html) never needs
-/// because it renders the written spelling).
-fn mention_key(mention: &MentionRef) -> String {
-    mention
-        .domain
-        .as_ref()
-        .map_or_else(
-            || mention.nickname.clone(),
-            |domain| format!("{}@{}", mention.nickname, domain),
-        )
-        .to_lowercase()
-}
-
-/// Whether a mention can name a local user at all: a bare `@nick`, or a
-/// `@nick@domain` whose domain is this instance's own
-/// ([`Config::domain`], compared case-insensitively). Any other domain
-/// names a remote account, which this render never links.
-fn names_own_domain(config: &Config, mention: &MentionRef) -> bool {
-    mention
-        .domain
-        .as_deref()
-        .is_none_or(|domain| domain.eq_ignore_ascii_case(config.domain()))
 }
 
 /// Post-update hook of [`update_credentials`], run once per accepted
@@ -207,14 +179,6 @@ pub(crate) async fn after_profile_updated(state: &AppState, user: &User) {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Builds a `MentionRef` for the key and domain helpers.
-    fn mention(nickname: &str, domain: Option<&str>) -> MentionRef {
-        MentionRef {
-            nickname: nickname.to_owned(),
-            domain: domain.map(str::to_owned),
-        }
-    }
 
     #[test]
     fn display_name_limit_is_counted_in_characters() {
@@ -242,33 +206,6 @@ mod tests {
             sanitized_name("", 50).unwrap(),
             "",
             "the empty string is stored empty, not reset to the nickname"
-        );
-    }
-
-    #[test]
-    fn mention_keys_fold_case_across_domains() {
-        assert_eq!(mention_key(&mention("Alice", None)), "alice", "a bare nick");
-        assert_eq!(
-            mention_key(&mention("Bob", Some("Remote.Example"))),
-            "bob@remote.example",
-            "the spelled-out domain joins the key, lowercased"
-        );
-    }
-
-    #[test]
-    fn only_bare_or_own_domain_mentions_can_be_local() {
-        let config = Config::for_tests();
-        assert!(
-            names_own_domain(&config, &mention("alice", None)),
-            "a bare nick may name a local user"
-        );
-        assert!(
-            names_own_domain(&config, &mention("alice", Some("TEST.example"))),
-            "and so may one spelled with this instance's own domain"
-        );
-        assert!(
-            !names_own_domain(&config, &mention("bob", Some("elsewhere.example"))),
-            "another domain never names a local user"
         );
     }
 }

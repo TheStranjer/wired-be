@@ -58,6 +58,8 @@
 //! [`HttpClient`]: crate::http_client::HttpClient
 //! [`sanitize_html`]: crate::util::sanitize::sanitize_html
 //! [`TimedCache`]: crate::util::cache::TimedCache
+use std::fmt;
+
 use chrono::TimeDelta;
 use tracing::warn;
 
@@ -117,11 +119,9 @@ const JSON_MIME: &str = "application/json";
 const FORM_MIME: &str = "application/x-www-form-urlencoded";
 /// Bytes a `GET` provider answer may hold before the read gives up: a language
 /// list is far smaller than this, and an endless body from a hostile server
-/// must not be buffered. The `POST` calls — whose answers this service asks
-/// for, from a URL the operator configured — go through the client's uncapped
-/// read (see [`HttpClient::post_bytes`]).
-///
-/// [`HttpClient::post_bytes`]: crate::http_client::HttpClient::post_bytes
+/// must not be buffered. The `POST` calls cap their answers at
+/// [`DEFAULT_RESPONSE_BYTES`](crate::http_client::DEFAULT_RESPONSE_BYTES),
+/// the same size.
 const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 
 /// One source language and the languages it can be translated into: one row
@@ -150,7 +150,7 @@ pub struct Translation {
 
 /// The instance's translator: which provider status translation goes through,
 /// built from the `TRANSLATION_*` settings (see [`Translator::from_config`]).
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub enum Translator {
     /// No provider is configured, so nothing translates: every
     /// [`translate`](Self::translate) call fails and
@@ -177,6 +177,28 @@ pub enum Translator {
         /// The provider's API key, from `TRANSLATION_API_KEY`.
         api_key: String,
     },
+}
+
+/// The translator's `Debug` names the variant and `api_url` and never prints
+/// an API key: a configured key shows as `"<redacted>"`.
+impl fmt::Debug for Translator {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::None => f.write_str("None"),
+            Self::LibreTranslate {
+                api_url, api_key, ..
+            } => f
+                .debug_struct("LibreTranslate")
+                .field("api_url", api_url)
+                .field("api_key", &api_key.as_ref().map(|_key| "<redacted>"))
+                .finish_non_exhaustive(),
+            Self::DeepL { api_url, .. } => f
+                .debug_struct("DeepL")
+                .field("api_url", api_url)
+                .field("api_key", &"<redacted>")
+                .finish_non_exhaustive(),
+        }
+    }
 }
 
 impl Translator {
@@ -332,6 +354,56 @@ mod tests {
         Mock, TEST_KEY, TEST_UA, libre_body, provider_config, provider_translator, spawn,
     };
     use super::*;
+
+    #[test]
+    fn debug_output_never_carries_the_api_key() {
+        let http = HttpClient::new_for_tests(TEST_UA);
+        let deepl = format!(
+            "{:?}",
+            Translator::DeepL {
+                http: http.clone(),
+                api_url: "http://deepl.test".to_owned(),
+                api_key: "secret-key".to_owned(),
+            }
+        );
+        assert!(!deepl.contains("secret-key"), "DeepL leaked: {deepl}");
+        assert!(deepl.contains("DeepL"), "names the variant: {deepl}");
+        assert!(
+            deepl.contains("http://deepl.test"),
+            "shows the url: {deepl}"
+        );
+        assert!(deepl.contains("<redacted>"), "marks the key: {deepl}");
+
+        let libre = format!(
+            "{:?}",
+            Translator::LibreTranslate {
+                http: http.clone(),
+                api_url: "http://libre.test".to_owned(),
+                api_key: Some("secret-key".to_owned()),
+            }
+        );
+        assert!(!libre.contains("secret-key"), "Libre leaked: {libre}");
+        assert!(
+            libre.contains("LibreTranslate"),
+            "names the variant: {libre}"
+        );
+        assert!(
+            libre.contains("http://libre.test"),
+            "shows the url: {libre}"
+        );
+        assert!(libre.contains("<redacted>"), "marks the key: {libre}");
+
+        let keyless = format!(
+            "{:?}",
+            Translator::LibreTranslate {
+                http,
+                api_url: "http://libre.test".to_owned(),
+                api_key: None,
+            }
+        );
+        assert!(keyless.contains("api_key: None"), "no key: {keyless}");
+        assert_eq!(format!("{:?}", Translator::None), "None");
+    }
 
     #[test]
     fn settings_that_name_no_usable_provider_build_none() {

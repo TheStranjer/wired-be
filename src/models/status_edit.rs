@@ -395,22 +395,12 @@ mod tests {
         models::{
             media_attachment::{self, NewMediaAttachment},
             status::{self, NewStatus, Visibility},
-            user::{NewUser, insert as insert_user, local_ap_id},
         },
+        test_fixtures::local_user as user,
     };
 
     /// The instance origin the fixtures post under.
     const BASE: &str = TEST_BASE_URL;
-
-    /// A local user named `nickname`.
-    async fn user(pool: &PgPool, nickname: &str) -> crate::models::user::User {
-        insert_user(
-            pool,
-            &NewUser::local(nickname, &local_ap_id(BASE, nickname)),
-        )
-        .await
-        .expect("the fixture user inserts")
-    }
 
     /// `author`'s live local post of `text`, public, with no entities.
     async fn post(pool: &PgPool, author: &crate::models::user::User, text: &str) -> Status {

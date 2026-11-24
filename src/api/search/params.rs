@@ -7,6 +7,7 @@ use url::form_urlencoded;
 use uuid::Uuid;
 
 use crate::{
+    api::helpers::is_true,
     entities::tag::Tag,
     error::{AppError, AppResult},
     models::{hashtag::Hashtag, user_search::SearchOpts},
@@ -85,6 +86,29 @@ pub(super) struct SearchParams {
     /// `account_id`: restrict the status search to that one author; an
     /// absent, empty or unusable value narrows nothing.
     pub(super) account_id: Option<Uuid>,
+    /// Whether the raw query carries a non-blank `offset` (last occurrence
+    /// wins), whether or not it parses as a usable number.
+    offset: OffsetParam,
+}
+
+/// Whether a request carries an `offset` parameter worth paging by.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OffsetParam {
+    /// No `offset`, or one that is empty or blank.
+    Absent,
+    /// A non-blank `offset`, usable as a number or not.
+    Present,
+}
+
+impl OffsetParam {
+    /// Reads one raw `offset` value: blank is [`OffsetParam::Absent`].
+    fn of(text: &str) -> Self {
+        if text.trim().is_empty() {
+            Self::Absent
+        } else {
+            Self::Present
+        }
+    }
 }
 
 impl SearchParams {
@@ -104,9 +128,11 @@ impl SearchParams {
             resolve: false,
             resource: Resource::default(),
             account_id: None,
+            offset: OffsetParam::Absent,
         };
         for (key, value) in form_urlencoded::parse(query.unwrap_or_default().as_bytes()) {
             match key.as_ref() {
+                "offset" => found.offset = OffsetParam::of(&value),
                 "q" => found.q = value.into_owned(),
                 "following" => found.following = is_true(&value),
                 "resolve" => found.resolve = is_true(&value),
@@ -128,6 +154,12 @@ impl SearchParams {
             following_only: self.following,
             resolve: self.resolve,
         }
+    }
+
+    /// Whether the request asked to page by `offset`: the raw query carries
+    /// a non-blank value for it (Mastodon's `params[:offset].present?`).
+    pub(super) fn has_offset(&self) -> bool {
+        self.offset == OffsetParam::Present
     }
 
     /// Whether the query opens with the hashtag sigil: `#tag` (any
@@ -161,15 +193,6 @@ fn account_id_param(text: &str) -> AppResult<Option<Uuid>> {
     parse_id(text)
         .map(Some)
         .ok_or_else(|| AppError::BadRequest(INVALID_ID.to_owned()))
-}
-
-/// Whether a query parameter's text spells a true boolean: `true` or `1`,
-/// trimmed and matched case-insensitively — the same reading the directory
-/// gives its `local` flag; anything else (absent, empty, `false`, junk)
-/// is `false`.
-fn is_true(text: &str) -> bool {
-    let text = text.trim();
-    text.eq_ignore_ascii_case("true") || text == "1"
 }
 
 /// The hashtag list of a combined-search answer, in the spelling the
@@ -254,7 +277,7 @@ mod tests {
         assert_eq!(bare.page.offset, None, "no offset means the first page");
         assert_eq!(bare.account_id, None, "no author narrows the status search");
 
-        let junk = parse("q=bob&following=yes&resolve=0");
+        let junk = parse("q=bob&following=maybe&resolve=0");
         assert!(!junk.following, "junk is not a true");
         assert!(!junk.resolve);
 
@@ -319,6 +342,22 @@ mod tests {
             None,
             "and junk means the first page"
         );
+    }
+
+    #[test]
+    fn an_offset_is_present_when_its_value_is_not_blank() {
+        for (query, want) in [
+            ("q=a&offset=20", true),
+            ("q=a&offset=junk", true),
+            ("q=a&offset=0", true),
+            ("q=a&offset=", false),
+            ("q=a&offset=%20", false),
+            ("q=a", false),
+            ("q=a&offset=3&offset=", false),
+            ("q=a&offset=&offset=3", true),
+        ] {
+            assert_eq!(parse(query).has_offset(), want, "`{query}`");
+        }
     }
 
     #[test]
@@ -453,10 +492,10 @@ mod tests {
 
     #[test]
     fn only_the_true_spellings_of_a_flag_are_true() {
-        for text in ["true", "TRUE", " true ", "1"] {
+        for text in ["true", "TRUE", " true ", "1", "yes", "on"] {
             assert!(is_true(text), "`{text}` asks for the restriction");
         }
-        for text in ["", "false", "0", "yes", "2", " true and then some "] {
+        for text in ["", "false", "0", "no", "2", " true and then some "] {
             assert!(!is_true(text), "`{text}` is not a true flag");
         }
     }

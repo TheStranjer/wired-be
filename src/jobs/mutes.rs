@@ -17,10 +17,10 @@
 //! already ignore).
 
 use serde_json::Value;
-use tracing::debug;
 
+use super::maintenance::run_sweep;
 use crate::{
-    jobs::{AttemptInfo, HandlerFuture, JobError},
+    jobs::{AttemptInfo, HandlerFuture},
     models::mute,
     state::AppState,
 };
@@ -35,22 +35,14 @@ pub const KIND_EXPIRE: &str = "mutes.expire";
 /// sweep of the mutes whose duration has run out, i.e.
 /// [`mute::delete_expired`].
 ///
-/// A failed sweep is a [`JobError::Retry`], and the scheduler enqueues the next
+/// A failed sweep is a [`JobError::Retry`](crate::jobs::JobError::Retry), and the scheduler enqueues the next
 /// period regardless, so a missed pass costs the lapsed rows their stay in the
 /// table, never a mute's effect: the reads already treat an expired mute as
 /// absent.
 pub fn handle_expire(state: AppState, _attempt: AttemptInfo, _args: Value) -> HandlerFuture {
-    Box::pin(async move {
-        match mute::delete_expired(&state.db).await {
-            Ok(count) => {
-                if count > 0 {
-                    debug!(count, "expired mutes deleted");
-                }
-                Ok(())
-            }
-            Err(err) => Err(JobError::Retry(format!("expired mute sweep failed: {err}"))),
-        }
-    })
+    Box::pin(
+        async move { run_sweep("expired mutes deleted", mute::delete_expired(&state.db)).await },
+    )
 }
 
 #[cfg(test)]
@@ -64,7 +56,7 @@ mod tests {
     use super::*;
     use crate::{
         config::{Config, TEST_BASE_URL},
-        jobs::{QUEUE_BACKGROUND, scheduler::periodic_jobs},
+        jobs::{JobError, QUEUE_BACKGROUND, scheduler::periodic_jobs},
         models::user::{NewUser, User, insert, local_ap_id},
     };
 
@@ -176,7 +168,7 @@ mod tests {
 
         match outcome {
             Err(JobError::Retry(detail)) => assert!(
-                detail.starts_with("expired mute sweep failed"),
+                detail.starts_with("expired mutes deleted failed"),
                 "the retry states what failed: {detail}"
             ),
             Ok(()) => panic!("a closed pool must not read as a successful sweep"),

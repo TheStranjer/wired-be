@@ -48,7 +48,7 @@
 //!   same 404 for an unknown id.
 //!
 //! `trusted` is stored and rendered but not yet acted on: a trusted app
-//! may skip the `/oauth/authorize` consent form, the way Pleroma's
+//! may skip the `/oauth/authorize` consent screen, the way Pleroma's
 //! `OAuthController` skips it for `app.trusted`. The flag is the admin's
 //! to set through these routes; acting on it in the authorize flow is
 //! left to the ticket that reworks that page — see the note there

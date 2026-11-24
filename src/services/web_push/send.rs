@@ -15,6 +15,10 @@ use crate::{
 
 use super::{PushError, TTL_HEADER, URGENCY_HEADER, encrypt_payload};
 
+/// Most response-body bytes read from a push service: only the status
+/// matters, so 64 KiB is ample.
+const PUSH_RESPONSE_BYTES: usize = 64 * 1024;
+
 /// Delivers one payload to one subscription: [`encrypt_payload`] the JSON,
 /// then the `POST`.
 ///
@@ -64,6 +68,7 @@ pub async fn send(
                 ("urgency", URGENCY_HEADER),
             ],
             body,
+            PUSH_RESPONSE_BYTES,
         )
         .await
         .map_err(|err| PushError::Retryable(err.to_string()))?;

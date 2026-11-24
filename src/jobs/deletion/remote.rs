@@ -6,10 +6,10 @@ use tracing::debug;
 
 #[cfg(doc)]
 use super::KIND_DELETE_REMOTE;
-use super::{local::load_account, parse_args, retry};
+use super::{SweepCounts, clear_shared, local::load_account, parse_args};
 use crate::{
     jobs::{AttemptInfo, HandlerFuture, JobError},
-    models::{bookmark, chat, emoji_reaction, favourite, follow, notification, status, user},
+    models::user,
     state::AppState,
 };
 
@@ -44,31 +44,17 @@ pub fn handle_delete_remote(state: AppState, _attempt: AttemptInfo, args: Value)
 ///
 /// # Errors
 ///
-/// [`JobError::Retry`] on any database failure (see [`retry`]).
+/// [`JobError::Retry`] on any database failure (see [`clear_shared`]).
 async fn clear_remote_data(state: &AppState, account: &user::User) -> Result<(), JobError> {
-    let db = &state.db;
-    let id = account.id;
-    let statuses = status::soft_delete_all_for_user(db, id)
-        .await
-        .map_err(|err| retry(&err))?;
-    let chat_messages = chat::withdraw_all_from_sender(db, id)
-        .await
-        .map_err(|err| retry(&err))?;
-    let follows = follow::delete_all_for_user_with_counts(db, id)
-        .await
-        .map_err(|err| retry(&err))?;
-    let favourites = favourite::delete_all_for_user(db, id)
-        .await
-        .map_err(|err| retry(&err))?;
-    let reactions = emoji_reaction::delete_all_for_user(db, id)
-        .await
-        .map_err(|err| retry(&err))?;
-    let bookmarks = bookmark::delete_all_for_user(db, id)
-        .await
-        .map_err(|err| retry(&err))?;
-    let notifications = notification::delete_all_for_user(db, id)
-        .await
-        .map_err(|err| retry(&err))?;
+    let SweepCounts {
+        statuses,
+        chat_messages,
+        follows,
+        favourites,
+        reactions,
+        bookmarks,
+        notifications,
+    } = clear_shared(state, account).await?;
     debug!(
         account = %account.nickname,
         statuses, chat_messages, follows, favourites, reactions, bookmarks, notifications,

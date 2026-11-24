@@ -190,41 +190,13 @@ mod tests {
         }
     }
 
-    /// An image upload and a document, the attachment fixture pair.
-    fn fixture_attachment(url: &str, content_type: &str) -> MediaAttachment {
-        MediaAttachment {
-            id: Uuid::parse_str(STATUS_ID).unwrap(),
-            user_id: Some(Uuid::parse_str(AUTHOR_ID).unwrap()),
-            status_id: Some(Uuid::parse_str(STATUS_ID).unwrap()),
-            position: 0,
-            storage_key: None,
-            remote_url: None,
-            url: url.to_owned(),
-            preview_url: None,
-            content_type: content_type.to_owned(),
-            description: None,
-            blurhash: None,
-            width: None,
-            height: None,
-            preview_width: None,
-            preview_height: None,
-            duration: None,
-            focus_x: None,
-            focus_y: None,
-            file_size: None,
-            sensitive_hint: false,
-            inserted_at: parse_time(PUBLISHED).unwrap(),
-            updated_at: parse_time(PUBLISHED).unwrap(),
-        }
-    }
-
     #[test]
     fn attachments_federate_as_images_and_documents() {
         let mut ctx = note_context(Visibility::Public);
-        let mut photo = fixture_attachment(&format!("{BASE}/media/cat.png"), "image/png");
+        let mut photo = fixture_media(&format!("{BASE}/media/cat.png"), "image/png");
         photo.description = Some("a cat".to_owned());
         photo.blurhash = Some("UBLHZ;9a".to_owned());
-        let file = fixture_attachment(&format!("{BASE}/media/report.pdf"), "application/pdf");
+        let file = fixture_media(&format!("{BASE}/media/report.pdf"), "application/pdf");
         ctx.attachments = vec![photo, file];
         let document = note_json(&ctx).expect("attachments federate");
         assert_eq!(

@@ -7,13 +7,10 @@ use uuid::Uuid;
 
 #[cfg(doc)]
 use super::{KIND_DELETE, KIND_DELETE_REMOTE};
-use super::{parse_args, retry};
+use super::{SweepCounts, clear_shared, parse_args, retry};
 use crate::{
     jobs::{AttemptInfo, HandlerFuture, JobError, backups::sweep_archive_file, scheduled_statuses},
-    models::{
-        backup, bookmark, chat, favourite, follow, job, list, media_attachment, notification,
-        scheduled_status, status, user, web_push_subscription,
-    },
+    models::{backup, job, list, media_attachment, scheduled_status, user, web_push_subscription},
     state::AppState,
 };
 
@@ -23,12 +20,18 @@ use crate::{
 ///
 /// A vanished user row or an unparsable payload is discarded — no retry
 /// can fix either; everything else that fails is a database failure over
-/// work that is idempotent, and retries.
+/// work that is idempotent, and retries. That includes queueing the actor
+/// `Delete`: it happens before the follow rows go, so a failed attempt
+/// leaves the recipients in place for the next one.
 pub fn handle_delete(state: AppState, _attempt: AttemptInfo, args: Value) -> HandlerFuture {
     Box::pin(async move {
         let user_id = parse_args(&args)?;
         let account = load_account(&state, user_id).await?;
-        crate::services::federation_out::after_account_deleted(&state, &account).await;
+        // A failure here retries before `clear_data` deletes the follow rows
+        // the recipient list is built from.
+        crate::services::federation_out::after_account_deleted(&state, &account)
+            .await
+            .map_err(|err| retry(&err))?;
         clear_data(&state, &account).await?;
         user::purge_personal_data(&state.db, account.id)
             .await
@@ -68,24 +71,15 @@ pub(super) async fn load_account(state: &AppState, user_id: Uuid) -> Result<user
 async fn clear_data(state: &AppState, account: &user::User) -> Result<(), JobError> {
     let db = &state.db;
     let id = account.id;
-    let statuses = status::soft_delete_all_for_user(db, id)
-        .await
-        .map_err(|err| retry(&err))?;
-    let chat_messages = chat::withdraw_all_from_sender(db, id)
-        .await
-        .map_err(|err| retry(&err))?;
-    let follows = follow::delete_all_for_user_with_counts(db, id)
-        .await
-        .map_err(|err| retry(&err))?;
-    let favourites = favourite::delete_all_for_user(db, id)
-        .await
-        .map_err(|err| retry(&err))?;
-    let bookmarks = bookmark::delete_all_for_user(db, id)
-        .await
-        .map_err(|err| retry(&err))?;
-    let notifications = notification::delete_all_for_user(db, id)
-        .await
-        .map_err(|err| retry(&err))?;
+    let SweepCounts {
+        statuses,
+        chat_messages,
+        follows,
+        favourites,
+        reactions,
+        bookmarks,
+        notifications,
+    } = clear_shared(state, account).await?;
     let lists = list::delete_all_for_user(db, id)
         .await
         .map_err(|err| retry(&err))?;
@@ -99,7 +93,8 @@ async fn clear_data(state: &AppState, account: &user::User) -> Result<(), JobErr
         .map_err(|err| retry(&err))?;
     debug!(
         account = %account.nickname,
-        statuses, chat_messages, follows, favourites, bookmarks, notifications, lists, media,
+        statuses, chat_messages, follows, favourites, reactions, bookmarks, notifications,
+        lists, media,
         scheduled, backups, push_subscriptions,
         "account deletion cleared"
     );
@@ -153,6 +148,9 @@ async fn clear_backups(state: &AppState, user_id: Uuid) -> Result<usize, JobErro
 }
 
 #[cfg(test)]
+mod announce_tests;
+
+#[cfg(test)]
 mod tests {
     use serde_json::json;
 
@@ -160,7 +158,7 @@ mod tests {
         BATCH_OVERSHOOT, accepted_follow, app_state, available_jobs_keyed, broken_state,
         count_where, follows, fresh_user, has_follow, is_blank_tombstone, likes, list_of,
         listed_messages, live_statuses, local_user, locked_user, marks, media_row, notify, post,
-        post_many, processed_backup, push_subscription, run, scheduled_with_job, send_chat,
+        post_many, processed_backup, push_subscription, reacts, run, scheduled_with_job, send_chat,
         status_deleted_at, uploads_state,
     };
     use super::super::{KIND_DELETE, job_args};
@@ -276,7 +274,7 @@ mod tests {
             account.avatar,
             format!(
                 "{}{}",
-                state.config.frontend_base_url,
+                state.config.media_base_url,
                 crate::entities::account::DEFAULT_AVATAR_PATH
             ),
             "the avatar is the default"
@@ -285,7 +283,7 @@ mod tests {
             account.header,
             format!(
                 "{}{}",
-                state.config.frontend_base_url,
+                state.config.media_base_url,
                 crate::entities::account::DEFAULT_BANNER_PATH
             ),
             "the header is the default"
@@ -528,6 +526,46 @@ mod tests {
             (departed.followers_count, departed.following_count),
             (0, 0),
             "the deleted account's own counters are zero"
+        );
+    }
+
+    /// The deleted local account's emoji reactions go — its row is kept, so
+    /// no cascade removes them — while another account's reaction on the
+    /// deleted account's status stays, and a second pass changes nothing.
+    #[tokio::test]
+    async fn the_handler_clears_the_accounts_emoji_reactions() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = local_user(&pool, "alice").await;
+        let bob = local_user(&pool, "bob").await;
+        let alices_post = post(&pool, &alice, "alice posts").await;
+        let bobs_post = post(&pool, &bob, "bob posts").await;
+        reacts(&pool, &alice, bobs_post.id, "\u{1f44d}").await;
+        reacts(&pool, &bob, alices_post.id, "\u{1f389}").await;
+        assert_eq!(
+            count_where(&pool, "emoji_reactions", "status_id", bobs_post.id).await,
+            1,
+            "alice's reaction renders on bob's status"
+        );
+
+        let state = app_state(&pool);
+        run(&state, alice.id).await.expect("the first pass runs");
+        run(&state, alice.id).await.expect("the second pass runs");
+
+        assert_eq!(
+            count_where(&pool, "emoji_reactions", "user_id", alice.id).await,
+            0,
+            "alice's reaction on bob's status is gone"
+        );
+        assert_eq!(
+            count_where(&pool, "emoji_reactions", "status_id", bobs_post.id).await,
+            0,
+            "so bob's status no longer shows it"
+        );
+        assert_eq!(
+            count_where(&pool, "emoji_reactions", "user_id", bob.id).await,
+            1,
+            "bob's own reaction is not alice's to clear"
         );
     }
 

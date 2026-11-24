@@ -9,10 +9,10 @@
 
 use serde_json::Value;
 use sqlx::{PgPool, query};
-use tracing::info;
 
+use super::run_sweep;
 use crate::{
-    jobs::{AttemptInfo, HandlerFuture, JobError},
+    jobs::{AttemptInfo, HandlerFuture},
     state::AppState,
 };
 
@@ -47,21 +47,17 @@ async fn delete_dismissed(pool: &PgPool) -> Result<u64, sqlx::Error> {
 /// one sweep of the notifications dismissed longer than `RETENTION_DAYS`
 /// days ago, logging how many rows it deleted.
 ///
-/// A failed sweep is a [`JobError::Retry`], and the scheduler enqueues the
+/// A failed sweep is a [`JobError::Retry`](crate::jobs::JobError::Retry), and the scheduler enqueues the
 /// next period regardless, so the same sweep runs again shortly; the rows are
 /// only invisible, never needed, so a pass lost to a database outage costs
 /// nothing but the storage.
 pub fn handle_notifications(state: AppState, _attempt: AttemptInfo, _args: Value) -> HandlerFuture {
     Box::pin(async move {
-        match delete_dismissed(&state.db).await {
-            Ok(deleted) => {
-                info!(deleted, "dismissed notifications deleted");
-                Ok(())
-            }
-            Err(err) => Err(JobError::Retry(format!(
-                "dismissed notification sweep failed: {err}"
-            ))),
-        }
+        run_sweep(
+            "dismissed notifications deleted",
+            delete_dismissed(&state.db),
+        )
+        .await
     })
 }
 

@@ -1,11 +1,8 @@
 //! The policy half of the object fetcher: resolve a URI to a stored status,
 //! from the local mirror first and a contained remote fetch second.
 
-use std::fmt;
-
 use serde_json::Value;
 use tracing::debug;
-use uuid::Uuid;
 
 use super::{FetchBudget, FetchError, fetch::fetch_contained};
 use crate::{
@@ -22,6 +19,10 @@ use crate::{
     },
     services::ingest::{self, IngestOutcome},
     state::AppState,
+    util::{
+        id::{object_ap_id, parse_id},
+        url::{host_with_port, parse_http_url},
+    },
 };
 
 /// Human-facing url path segment of a local status (see
@@ -29,8 +30,6 @@ use crate::{
 /// `/notice/{uuid}` resolves against the `/objects/{uuid}` the row is
 /// stored under.
 const NOTICE_PATH: &str = "/notice/";
-/// Object id path segment [`resolve_status`] also matches locally.
-const OBJECTS_PATH: &str = "/objects/";
 
 /// Resolves `uri` to a stored status, fetching the remote object when this
 /// instance does not have one.
@@ -101,14 +100,14 @@ async fn resolve_uri(
 ) -> Result<Option<Status>, FederationError> {
     let stored = status::get_by_uri(&state.db, uri)
         .await
-        .map_err(|err| transient("the status uri read", &err))?;
+        .map_err(|err| FederationError::transient("the status uri read failed", &err))?;
     if let Some(row) = stored {
         return Ok(live_or_deleted(row));
     }
     if let Some(alias) = local_object_uri(&state.config, uri) {
         let aliased = status::get_by_uri(&state.db, &alias)
             .await
-            .map_err(|err| transient("the status object-id read", &err))?;
+            .map_err(|err| FederationError::transient("the status object-id read failed", &err))?;
         if let Some(row) = aliased {
             return Ok(live_or_deleted(row));
         }
@@ -135,6 +134,22 @@ async fn resolve_uri(
         debug!(uri, "a fetched object whose attributedTo names nothing");
         return Ok(None);
     };
+    // Containment before any actor fetch: an author on another origin than
+    // the object would be rejected by the ingest anyway, and fetching it
+    // first would let any peer make this instance mirror an arbitrary actor.
+    let document_origin = document
+        .get("id")
+        .and_then(Value::as_str)
+        .and_then(origin_of);
+    if document_origin.is_none() || document_origin != origin_of(&attributed) {
+        debug!(
+            uri,
+            attributed, "a fetched object whose attributedTo is not on the object's origin"
+        );
+        return Err(FederationError::Permanent(
+            "attributedTo host differs from object host".to_owned(),
+        ));
+    }
     // The as_actor arm refuses before any further fetch: a document the
     // delivering actor did not author is nobody's business but theirs.
     let mirror;
@@ -181,10 +196,7 @@ fn local_object_uri(config: &Config, uri: &str) -> Option<String> {
     let rest = uri
         .strip_prefix(&config.base_url)?
         .strip_prefix(NOTICE_PATH)?;
-    if Uuid::parse_str(rest).is_err() {
-        return None;
-    }
-    Some(format!("{}{OBJECTS_PATH}{rest}", config.base_url))
+    Some(object_ap_id(&config.base_url, parse_id(rest)?))
 }
 
 /// Whether a fetched document is of the `Note` family the status handlers
@@ -206,6 +218,14 @@ fn attributed_to(document: &Value) -> Option<String> {
         .get("attributedTo")
         .map(json::as_array)
         .and_then(|entries| entries.iter().find_map(json::value_or_id))
+}
+
+/// The `host[:port]` an `http(s)` URL names, lowercased; `None` for any
+/// other text. The port is part of it: two listeners on one loopback host
+/// are different origins, and a peer's actor never lives on a sibling port
+/// of its objects.
+fn origin_of(text: &str) -> Option<String> {
+    parse_http_url(text).map(|url| host_with_port(&url))
 }
 
 /// The author mirror of an instance-initiated resolve. Any actor-fetch
@@ -231,10 +251,4 @@ fn federation_error(err: FetchError) -> FederationError {
         FetchError::Gone | FetchError::NotFound => FederationError::Permanent(err.to_string()),
         FetchError::Invalid(detail) => FederationError::Permanent(detail),
     }
-}
-
-/// Shapes a database failure into the retryable arm of the dispatcher's
-/// error vocabulary, naming the read or write that failed.
-fn transient(what: &str, err: &impl fmt::Display) -> FederationError {
-    FederationError::Transient(format!("{what} failed: {err}"))
 }

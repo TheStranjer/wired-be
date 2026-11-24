@@ -107,9 +107,9 @@ pub async fn link(
 mod tests {
     use super::*;
     use crate::{
-        config::Config,
         error::AppError,
-        models::user::{self, Flag, NewUser, local_ap_id},
+        models::user::{self, Flag, NewUser},
+        test_fixtures::local_user as create_user,
     };
     use sqlx::PgPool;
 
@@ -117,17 +117,6 @@ mod tests {
     const PROVIDER: &str = "github";
     /// See [`PROVIDER`].
     const UID: &str = "4242";
-
-    /// A local user named `nickname`, straight through the user model.
-    async fn create_user(pool: &PgPool, nickname: &str) -> User {
-        let config = Config::for_tests();
-        user::insert(
-            pool,
-            &NewUser::local(nickname, &local_ap_id(&config.base_url, nickname)),
-        )
-        .await
-        .expect("the user fixture inserts")
-    }
 
     /// A mirror of a remote actor named `nickname` on `host`.
     async fn create_remote_user(pool: &PgPool, nickname: &str) -> User {

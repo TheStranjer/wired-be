@@ -60,6 +60,28 @@ where
     }
 }
 
+/// Reads an optional string setting: the value trimmed, `None` when the
+/// variable is unset or blank.
+pub(crate) fn trimmed<F>(lookup: &F, var: &str) -> Option<String>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    lookup(var)
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+}
+
+/// Reads an optional URL setting: the value trimmed and with its trailing
+/// slashes dropped, `None` when the variable is unset or nothing is left.
+pub(crate) fn trimmed_url<F>(lookup: &F, var: &str) -> Option<String>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    lookup(var)
+        .map(|value| value.trim().trim_end_matches('/').to_owned())
+        .filter(|value| !value.is_empty())
+}
+
 /// Splits a comma-separated list into trimmed, non-empty owned values.
 pub(crate) fn comma_list(value: &str) -> Vec<String> {
     value
@@ -93,6 +115,35 @@ mod tests {
             UPLOAD_MAX_FILES_VAR,
         },
     };
+
+    /// A lookup answering `value` for every variable.
+    fn answering(value: Option<&'static str>) -> impl Fn(&str) -> Option<String> {
+        move |_| value.map(str::to_owned)
+    }
+
+    #[test]
+    fn trimmed_reads_unset_blank_and_padded_values() {
+        assert_eq!(trimmed(&answering(None), "X"), None);
+        assert_eq!(trimmed(&answering(Some("")), "X"), None);
+        assert_eq!(trimmed(&answering(Some("  ")), "X"), None);
+        assert_eq!(trimmed(&answering(Some(" x ")), "X"), Some("x".to_owned()));
+        assert_eq!(
+            trimmed(&answering(Some(" a/ ")), "X"),
+            Some("a/".to_owned())
+        );
+    }
+
+    #[test]
+    fn trimmed_url_also_drops_trailing_slashes() {
+        assert_eq!(trimmed_url(&answering(None), "X"), None);
+        assert_eq!(trimmed_url(&answering(Some("  ")), "X"), None);
+        assert_eq!(trimmed_url(&answering(Some("/")), "X"), None);
+        assert_eq!(trimmed_url(&answering(Some(" / ")), "X"), None);
+        assert_eq!(
+            trimmed_url(&answering(Some(" https://a.example/// ")), "X"),
+            Some("https://a.example".to_owned())
+        );
+    }
 
     #[test]
     fn invalid_numbers_are_errors() {

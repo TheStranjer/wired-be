@@ -6,9 +6,71 @@ use chrono::Utc;
 use p256::ecdsa::{Signature, VerifyingKey, signature::Verifier as _};
 use serde_json::Value;
 
-use super::super::test_support::{Setup, captured_body, header, run, setup};
+use super::super::test_support::{
+    Setup, account, app_state_with, captured_body, client_keys, header, mock_push_service,
+    note_about, open_pref, run, setup, subscribe,
+};
 use super::*;
-use crate::{config::TEST_BASE_URL, entities::account::DEFAULT_AVATAR_PATH};
+use crate::{
+    config::{Config, TEST_BASE_URL},
+    entities::account::DEFAULT_AVATAR_PATH,
+    services::media_proxy,
+};
+
+/// A signing secret long enough for the media proxy's minimum.
+const PROXY_SECRET: &str = "0123456789abcdef0123456789abcdef01234567";
+
+/// The stored avatar every fixture actor below carries.
+const STORED_AVATAR: &str = "https://remote.example/avatar.png";
+
+/// The test config with the media proxy switched on.
+fn proxy_config() -> Config {
+    let mut config = Config::for_tests();
+    config.media_proxy.enabled = true;
+    config.media_proxy.secret = Some(PROXY_SECRET.to_owned());
+    config
+}
+
+/// A federated actor `bob@remote.example` with `name` and `avatar`.
+async fn remote_actor(pool: &PgPool, name: &str, avatar: Option<&str>) -> user::User {
+    user::insert(
+        pool,
+        &user::NewUser {
+            nickname: "bob@remote.example".to_owned(),
+            ap_id: "https://remote.example/users/bob".to_owned(),
+            domain: Some("remote.example".to_owned()),
+            name: name.to_owned(),
+            avatar_url: avatar.map(str::to_owned),
+            ..user::NewUser::default()
+        },
+    )
+    .await
+    .expect("the remote fixture inserts")
+}
+
+/// The decrypted payload of one follow push from `actor` to a fresh
+/// recipient, delivered under `config`.
+async fn follow_payload(pool: &PgPool, config: Config, actor: &user::User) -> Value {
+    let recipient = account(pool, "payload-bob").await;
+    let (url, seen, server) = mock_push_service(201).await;
+    let keys = client_keys();
+    let subscription = subscribe(pool, &recipient, &url, &keys, &open_pref()).await;
+    let note = note_about(
+        pool,
+        &recipient.user,
+        actor,
+        notification::TYPE_FOLLOW,
+        None,
+    )
+    .await;
+    run(&app_state_with(pool, config), note.id, subscription.id)
+        .await
+        .expect("delivered");
+    server.abort();
+    let decrypted = web_push::decrypt_payload(&captured_body(&seen), &keys.private_key, &keys.auth)
+        .expect("the client reads the body");
+    serde_json::from_slice(&decrypted).expect("the payload is JSON")
+}
 
 #[tokio::test]
 async fn a_follow_wakes_the_subscription_with_a_signed_encrypted_payload() {
@@ -45,16 +107,16 @@ async fn a_follow_wakes_the_subscription_with_a_signed_encrypted_payload() {
         web_push::decrypt_payload(&captured_body(&s.seen), &s.keys.private_key, &s.keys.auth)
             .expect("the body is a record the client's keys read");
     let payload: Value = serde_json::from_slice(&decrypted).expect("the payload is JSON");
-    assert_eq!(
-        payload["access_token"], s.recipient.token.token,
-        "the wake token is the subscription's own"
+    assert!(
+        payload.get("access_token").is_none(),
+        "the payload carries no credential: only digests are stored"
     );
     assert_eq!(payload["notification_id"], s.note.id.to_string());
     assert_eq!(payload["notification_type"], notification::TYPE_FOLLOW);
     assert_eq!(payload["preferred_locale"], "en", "the fixed locale");
     assert_eq!(
         payload["icon"],
-        format!("{TEST_BASE_URL}{DEFAULT_AVATAR_PATH}"),
+        format!("{TEST_BASE_URL}/media{DEFAULT_AVATAR_PATH}"),
         "an actor with no avatar wakes with the instance default"
     );
     assert_eq!(
@@ -65,11 +127,6 @@ async fn a_follow_wakes_the_subscription_with_a_signed_encrypted_payload() {
     assert_eq!(s.actor.name, "Alice", "the fixture actor's name");
 }
 
-/// The fallback icon for an avatar-less actor hangs under
-/// `FRONTEND_BASE_URL`, where the frontend ships the file, not under
-/// the API's own origin; [`a_follow_wakes_the_subscription_with_a_signed_encrypted_payload`]
-/// above keeps the unchanged URL pinned for the default config, where
-/// the variable is unset and the origins are equal.
 #[tokio::test]
 async fn the_delivered_vapid_jwt_verifies_and_names_the_endpoint_origin() {
     let db = crate::test_db::test_db().await.expect("test database slot");
@@ -184,4 +241,107 @@ async fn a_server_error_retries_the_job_and_keeps_the_subscription() {
         "a retryable failure keeps the subscription"
     );
     s.server.abort();
+}
+
+#[tokio::test]
+async fn a_remote_actors_icon_is_the_signed_proxy_link_when_the_proxy_is_on() {
+    let db = crate::test_db::test_db().await.expect("test database slot");
+    let pool = db.pool().clone();
+    let config = proxy_config();
+    let actor = remote_actor(&pool, "Bob", Some(STORED_AVATAR)).await;
+
+    let payload = follow_payload(&pool, config.clone(), &actor).await;
+
+    let icon = payload["icon"].as_str().expect("the icon is a string");
+    assert!(
+        icon.starts_with(&format!("{TEST_BASE_URL}/proxy/")) && icon.ends_with("/avatar.png"),
+        "the push service never sees the remote host: {icon}"
+    );
+    let (_, tail) = icon.split_once("/proxy/").expect("a proxy link");
+    let mut segments = tail.split('/');
+    let (sig, encoded) = (
+        segments.next().expect("a signature"),
+        segments.next().expect("an encoded url"),
+    );
+    assert_eq!(
+        media_proxy::decode(&config, sig, encoded).expect("the signature verifies"),
+        STORED_AVATAR,
+        "the link decodes back to the stored avatar"
+    );
+}
+
+#[tokio::test]
+async fn a_remote_actors_icon_is_the_stored_url_when_the_proxy_is_off() {
+    let db = crate::test_db::test_db().await.expect("test database slot");
+    let pool = db.pool().clone();
+    let actor = remote_actor(&pool, "Bob", Some(STORED_AVATAR)).await;
+
+    let payload = follow_payload(&pool, Config::for_tests(), &actor).await;
+
+    assert_eq!(
+        payload["icon"], STORED_AVATAR,
+        "a disabled proxy leaves the stored url"
+    );
+}
+
+#[tokio::test]
+async fn a_local_actors_icon_is_the_stored_url_even_with_the_proxy_on() {
+    let db = crate::test_db::test_db().await.expect("test database slot");
+    let pool = db.pool().clone();
+    let actor = user::insert(
+        &pool,
+        &user::NewUser {
+            name: "Alice".to_owned(),
+            avatar_url: Some(STORED_AVATAR.to_owned()),
+            ..user::NewUser::local("carol", &user::local_ap_id(TEST_BASE_URL, "carol"))
+        },
+    )
+    .await
+    .expect("the local fixture inserts");
+
+    let payload = follow_payload(&pool, proxy_config(), &actor).await;
+
+    assert_eq!(
+        payload["icon"], STORED_AVATAR,
+        "only remote actors' avatars are proxied"
+    );
+}
+
+/// The fallback icon for an avatar-less actor hangs under
+/// `MEDIA_BASE_URL`, where the backend serves the file, not under
+/// `FRONTEND_BASE_URL`;
+/// [`a_follow_wakes_the_subscription_with_a_signed_encrypted_payload`]
+/// pins the URL for the default config.
+#[tokio::test]
+async fn the_default_icon_hangs_off_the_media_base_url() {
+    let db = crate::test_db::test_db().await.expect("test database slot");
+    let pool = db.pool().clone();
+    let mut config = Config::for_tests();
+    config.media_base_url = "https://cdn.example/files".to_owned();
+    config.frontend_base_url = "https://fe.example".to_owned();
+    let actor = remote_actor(&pool, "Bob", None).await;
+
+    let payload = follow_payload(&pool, config, &actor).await;
+
+    assert_eq!(
+        payload["icon"],
+        format!("https://cdn.example/files{DEFAULT_AVATAR_PATH}"),
+        "the fallback icon is the default avatar under the media base URL"
+    );
+}
+
+#[tokio::test]
+async fn a_remote_actors_markup_never_reaches_the_title() {
+    let db = crate::test_db::test_db().await.expect("test database slot");
+    let pool = db.pool().clone();
+    let actor = remote_actor(&pool, "<b>Bob</b>", Some(STORED_AVATAR)).await;
+
+    let payload = follow_payload(&pool, Config::for_tests(), &actor).await;
+
+    let title = payload["title"].as_str().expect("the title is a string");
+    assert!(
+        title.starts_with("Bob"),
+        "the name leads the title: {title}"
+    );
+    assert!(!title.contains('<'), "no markup survives: {title}");
 }

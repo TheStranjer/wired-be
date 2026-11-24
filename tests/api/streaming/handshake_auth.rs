@@ -166,10 +166,8 @@ async fn token_in_the_query_string_opens_the_user_stream() {
     assert_absent(&frames, &["for-other", &other_stream]);
     assert_eq!(
         frames.last().expect("the control frame"),
-        &format!(
-            r#"{{"stream":["{own_stream}"],"event":"update","payload":"{{\"id\":\"for-me\"}}"}}"#
-        ),
-        "the socket's own event arrives on its uuid-named stream"
+        r#"{"stream":["user"],"event":"update","payload":"{\"id\":\"for-me\"}"}"#,
+        "the socket's own event arrives on its public `user` stream, not the uuid-named one"
     );
 }
 

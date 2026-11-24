@@ -221,22 +221,13 @@ mod tests {
         models::{
             bookmark,
             status::{NewStatus, insert as insert_status},
-            user::{NewUser, User, insert as insert_user, local_ap_id},
+            user::User,
         },
+        test_fixtures::local_user as user,
     };
 
     /// The instance origin the fixtures post under.
     const BASE: &str = TEST_BASE_URL;
-
-    /// A local user named `nickname`.
-    async fn user(pool: &PgPool, nickname: &str) -> User {
-        insert_user(
-            pool,
-            &NewUser::local(nickname, &local_ap_id(BASE, nickname)),
-        )
-        .await
-        .expect("the fixture user inserts")
-    }
 
     /// A folder named `name` owned by `owner`.
     async fn seed(pool: &PgPool, owner: &User, name: &str) -> BookmarkFolder {

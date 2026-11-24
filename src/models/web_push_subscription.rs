@@ -18,6 +18,8 @@
 //! already fixed). Deleting the user or the token takes the row down
 //! through the cascades.
 
+use std::fmt;
+
 use chrono::{DateTime, Utc};
 use serde_json::Value;
 use sqlx::PgPool;
@@ -71,7 +73,7 @@ const DELETE_SQL: &str = "DELETE FROM web_push_subscriptions WHERE token_id = $1
 
 /// One row of `web_push_subscriptions`: the Web Push subscription of one
 /// access token.
-#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+#[derive(Clone, PartialEq, Eq, sqlx::FromRow)]
 pub struct WebPushSubscription {
     /// `UUIDv7` primary key, minted by [`create`] (decision 4); the
     /// replace-on-re-create upsert keeps it, so one token keeps one id.
@@ -102,12 +104,32 @@ pub struct WebPushSubscription {
     pub updated_at: DateTime<Utc>,
 }
 
+/// [`endpoint`](Self::endpoint) is a bearer capability URL and
+/// [`key_auth`](Self::key_auth) is the RFC 8291 auth secret; both render as
+/// `<redacted>`, everything else shows.
+impl fmt::Debug for WebPushSubscription {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("WebPushSubscription")
+            .field("id", &self.id)
+            .field("user_id", &self.user_id)
+            .field("token_id", &self.token_id)
+            .field("endpoint", &"<redacted>")
+            .field("key_p256dh", &self.key_p256dh)
+            .field("key_auth", &"<redacted>")
+            .field("alerts", &self.alerts)
+            .field("policy", &self.policy)
+            .field("inserted_at", &self.inserted_at)
+            .field("updated_at", &self.updated_at)
+            .finish()
+    }
+}
+
 /// What [`create`] registers, besides the `id` it mints and the
 /// timestamps the database defaults.
 ///
 /// The whole subscription, already validated and normalized by the
 /// endpoint that parsed the request.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct NewSubscription {
     /// The authenticated owner.
     pub user_id: Uuid,
@@ -123,6 +145,22 @@ pub struct NewSubscription {
     pub alerts: Value,
     /// The policy to store (validated, one of the four spellings).
     pub policy: String,
+}
+
+/// [`endpoint`](Self::endpoint) and [`key_auth`](Self::key_auth) render as
+/// `<redacted>`; everything else shows.
+impl fmt::Debug for NewSubscription {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("NewSubscription")
+            .field("user_id", &self.user_id)
+            .field("token_id", &self.token_id)
+            .field("endpoint", &"<redacted>")
+            .field("key_p256dh", &self.key_p256dh)
+            .field("key_auth", &"<redacted>")
+            .field("alerts", &self.alerts)
+            .field("policy", &self.policy)
+            .finish()
+    }
 }
 
 /// Registers `new` as `token_id`'s subscription, replacing any the token
@@ -335,6 +373,37 @@ mod tests {
     async fn owner_and_token(pool: &PgPool, nickname: &str) -> (Uuid, Uuid) {
         let owner_id = user(pool, nickname).await;
         (owner_id, token(pool, owner_id).await)
+    }
+
+    /// `Debug` of a row and of a [`NewSubscription`] hides the endpoint and
+    /// the auth secret but still shows the other fields.
+    #[test]
+    fn debug_redacts_the_endpoint_and_auth_secret() {
+        let endpoint = "https://push.example/capability-url-7f3a";
+        let auth = "auth-secret-value-91bc";
+        let mut new = subscription(Uuid::now_v7(), Uuid::now_v7(), endpoint);
+        new.key_auth = auth.to_owned();
+        let now = Utc::now();
+        let row = WebPushSubscription {
+            id: Uuid::now_v7(),
+            user_id: Some(new.user_id),
+            token_id: new.token_id,
+            endpoint: new.endpoint.clone(),
+            key_p256dh: new.key_p256dh.clone(),
+            key_auth: new.key_auth.clone(),
+            alerts: new.alerts.clone(),
+            policy: new.policy.clone(),
+            inserted_at: now,
+            updated_at: now,
+        };
+
+        for rendered in [format!("{row:?}"), format!("{new:?}")] {
+            assert!(rendered.contains("<redacted>"), "marker in {rendered}");
+            assert!(!rendered.contains(endpoint), "endpoint leaked: {rendered}");
+            assert!(!rendered.contains(auth), "auth leaked: {rendered}");
+            assert!(rendered.contains("BFraw-key"), "public key shows");
+            assert!(rendered.contains("policy"), "other fields show");
+        }
     }
 
     /// [`create`] then [`find`] round-trips every column, with the

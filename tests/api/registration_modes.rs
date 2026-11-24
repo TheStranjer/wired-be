@@ -12,7 +12,7 @@
 //! out a credential.
 //!
 //! The waits then close the login door: `check_account_ready` refuses the
-//! password grant, the authorization submission and the refresh grant with
+//! password grant and the refresh grant with
 //! 403 and the same identifier, and a credential that already exists for an
 //! unapproved account fails the bearer extractor with the same refusal.
 //!
@@ -40,7 +40,7 @@ use wired_be::{
         oauth_app::OauthApp,
         user::{self, Flag, NewUser, User},
     },
-    util::password::hash_password,
+    util::{password::hash_password, token::sha256_hex},
 };
 
 use crate::common;
@@ -446,60 +446,6 @@ async fn deactivation_outranks_the_registration_modes() {
     );
 }
 
-/// The authorization submission runs the same gate: a good password for a
-/// pending account is a 403 with the identifier, never a code.
-#[tokio::test]
-async fn the_authorization_endpoint_refuses_an_unready_account() {
-    let db = common::test_db().await;
-    let pool = db.pool().clone();
-    let pending = account_with_status(&pool, "consent-pending", |new| NewUser {
-        approval_pending: Flag::new(true),
-        ..new
-    })
-    .await;
-    let unconfirmed = account_with_status(&pool, "consent-unconfirmed", |new| NewUser {
-        email_confirmed: Flag::new(false),
-        ..new
-    })
-    .await;
-    assert!(
-        pending.approval_pending.get() && !unconfirmed.email_confirmed.get(),
-        "both consent fixtures are the accounts the gate must stop"
-    );
-    let app = common::create_app(&pool, "read").await;
-    let http = common::test_app(pool);
-
-    let refusals = [
-        ("consent-pending", APPROVAL_ERROR, "awaiting_approval"),
-        (
-            "consent-unconfirmed",
-            CONFIRMATION_ERROR,
-            "missing_confirmed_email",
-        ),
-    ];
-    for (name, error, identifier) in refusals {
-        let response = common::TestRequest::post("/oauth/authorize")
-            .form(&[
-                ("authorization[client_id]", app.client_id.as_str()),
-                (
-                    "authorization[redirect_uri]",
-                    "https://client.example/callback",
-                ),
-                ("authorization[name]", name),
-                ("authorization[password]", PASSWORD),
-                ("authorization[scope][]", "read"),
-            ])
-            .send(&http)
-            .await;
-        assert_eq!(
-            response.status,
-            StatusCode::FORBIDDEN,
-            "{name} is refused a code"
-        );
-        assert_login_refused(&response, error, identifier);
-    }
-}
-
 /// The refresh grant runs the gate too: an unapproved account cannot rotate
 /// its way back into a live credential, and the old pair survives the
 /// refusal. An unknown refresh token keeps the shared 400.
@@ -528,7 +474,7 @@ async fn the_refresh_grant_refuses_an_unready_account() {
     assert_login_refused(&response, APPROVAL_ERROR, "awaiting_approval");
     let standing: i64 =
         sqlx::query_scalar("SELECT count(*) FROM oauth_tokens WHERE refresh_token = $1")
-            .bind(&pair.refresh_token)
+            .bind(sha256_hex(&pair.refresh_token))
             .fetch_one(&pool)
             .await
             .expect("the lookup runs");
