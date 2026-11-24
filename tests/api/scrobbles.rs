@@ -456,6 +456,52 @@ async fn private_scrobbles_are_visible_to_their_owner_only() {
     );
 }
 
+#[tokio::test]
+async fn private_scrobbles_need_a_token_granting_read_scrobbles() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let app = common::test_app(pool.clone());
+    let (alice, read_token) = fixture(&pool, "alice", "read").await;
+    let granular = common::create_app_and_token(&pool, &alice, "read:scrobbles").await;
+    let write_only = common::create_app_and_token(&pool, &alice, "write").await;
+    let narrow = common::create_app_and_token(&pool, &alice, "write:statuses push").await;
+    for (title, visibility) in [
+        ("public one", Visibility::Public),
+        ("unlisted one", Visibility::Unlisted),
+        ("private one", Visibility::Private),
+        ("direct one", Visibility::Direct),
+    ] {
+        let _row: Stored = seed(&pool, &alice, title, visibility).await;
+    }
+    let path = account_path(&alice, "");
+    let all = ["direct one", "private one", "unlisted one", "public one"];
+    let open = ["unlisted one", "public one"];
+
+    for (label, token) in [("`read`", &read_token), ("`read:scrobbles`", &granular)] {
+        let response = list(&app, Some(token), &path).await;
+        assert_eq!(
+            titles(&response.json_value()),
+            all,
+            "the owner's {label} token sees every scrobble"
+        );
+    }
+    for (label, token) in [("`write`", &write_only), ("`write:statuses push`", &narrow)] {
+        let response = list(&app, Some(token), &path).await;
+        assert_eq!(response.status, StatusCode::OK, "{label} may still list");
+        assert_eq!(
+            titles(&response.json_value()),
+            open,
+            "but the owner's {label} token reads as no token"
+        );
+    }
+    let anonymous = list(&app, None, &path).await;
+    assert_eq!(
+        titles(&anonymous.json_value()),
+        open,
+        "and anonymous sees only public and unlisted"
+    );
+}
+
 /// `GET`s the scrobble list of `owner`'s own account with `query` (its leading
 /// `?` and all) as `token`.
 async fn own_page(app: &Router, token: &str, owner: &User, query: &str) -> common::TestResponse {
@@ -680,8 +726,23 @@ async fn creating_needs_a_user_token_granting_write() {
     );
     assert_eq!(
         wrong_scope.json_value(),
-        error_body("Insufficient permissions: write."),
+        error_body("Insufficient permissions: write:scrobbles."),
         "and is told which scope it lacks"
+    );
+
+    let (_carol, narrow) = fixture(&pool, "carol", "write:scrobbles").await;
+    let granular = create_json(&app, &narrow, body.clone()).await;
+    assert_eq!(
+        granular.status,
+        StatusCode::OK,
+        "while the granular `write:scrobbles` scope is enough"
+    );
+    let (_dave, status_only) = fixture(&pool, "dave", "write:statuses").await;
+    let sibling = create_json(&app, &status_only, body.clone()).await;
+    assert_eq!(
+        sibling.status,
+        StatusCode::FORBIDDEN,
+        "and a sibling write scope is not"
     );
 
     let app_token = create_json(&app, &app_only, body.clone()).await;

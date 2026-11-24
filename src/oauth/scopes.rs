@@ -180,6 +180,18 @@ pub const READ_BACKUPS: &str = "read:backups";
 /// Pleroma's `write:backups` on that controller's `create` action.
 pub const WRITE_BACKUPS: &str = "write:backups";
 
+/// The read side of scrobbles, gating the owner's private listens.
+///
+/// `GET /api/v1/pleroma/accounts/{id}/scrobbles` shows an owner their
+/// `private` and `direct` rows only when the token grants this (Pleroma's
+/// `read:scrobbles` on the `ScrobbleController` `index` action, with
+/// `:proceed_unauthenticated`).
+pub const READ_SCROBBLES: &str = "read:scrobbles";
+/// The write side of scrobbles: `POST /api/v1/pleroma/scrobble`.
+///
+/// Pleroma's `write:scrobbles` on the controller's `create` action.
+pub const WRITE_SCROBBLES: &str = "write:scrobbles";
+
 /// The roots of the scope trees [`Scopes::validate`] accepts.
 const VALID_ROOTS: [&str; 6] = [READ, WRITE, FOLLOW, PUSH, ADMIN_READ, ADMIN_WRITE];
 

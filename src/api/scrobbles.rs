@@ -9,9 +9,9 @@
 //! is what the two routes below read and write — no federation, no
 //! notifications, no streaming.
 //!
-//! - `POST /api/v1/pleroma/scrobble` requires a user token with the `write`
-//!   scope (Pleroma's `write:scrobbles`, of which a `write` token is the
-//!   parent) and answers the created [`Scrobble`] with 200, as Pleroma's
+//! - `POST /api/v1/pleroma/scrobble` requires a user token with the
+//!   `write:scrobbles` scope (of which a `write` token is the parent) and
+//!   answers the created [`Scrobble`] with 200, as Pleroma's
 //!   `render("show.json", …)` does. Its parameters (decision 10: through
 //!   [`ApiBody`], so the form spellings work) are `title` (required, at most
 //!   255 characters), `artist`, `album`, `length` in milliseconds,
@@ -29,8 +29,9 @@
 //!   [`MAX_LIMIT`](crate::pagination::MAX_LIMIT) at most) with the `Link`
 //!   header Pleroma's `add_link_headers` writes. Authentication is optional —
 //!   Pleroma's
-//!   `OAuthScopesPlug … fallback: :proceed_unauthenticated` — and the token,
-//!   when there is one, names the reader: the account itself sees all of its
+//!   `OAuthScopesPlug … fallback: :proceed_unauthenticated` — and a token
+//!   that grants `read:scrobbles` names the reader (one without the scope
+//!   reads as no token): the account itself sees all of its
 //!   scrobbles, anyone else only the `public` and `unlisted` ones, which is
 //!   what Pleroma's address filter leaves of a `private` or `direct` `Listen`
 //!   for a stranger. An id that is malformed, unknown or deactivated is the
@@ -52,7 +53,7 @@ use tracing::debug;
 
 use crate::{
     api::helpers::account_or_404,
-    auth::{AuthUser, MaybeAuthUser},
+    auth::{AuthUser, MaybeAuthUser, require_scope},
     entities::scrobble::Scrobble,
     error::{AppError, AppResult},
     extract::{ApiBody, flex},
@@ -60,7 +61,7 @@ use crate::{
         scrobble::{self, NewScrobble},
         status::Visibility,
     },
-    oauth::scopes::WRITE,
+    oauth::scopes::{READ_SCROBBLES, WRITE_SCROBBLES},
     pagination::{NO_EXTRA_QUERY, PageParams, keyset_link, set_link_header},
     state::AppState,
     util::url::is_http_url,
@@ -98,7 +99,7 @@ pub fn router() -> Router<AppState> {
 /// # Errors
 ///
 /// [`AppError::Unauthorized`] / [`AppError::Forbidden`] from [`AuthUser`] and
-/// the `write` check; [`AppError::Unprocessable`] for a blank, absent or
+/// the `write:scrobbles` check; [`AppError::Unprocessable`] for a blank, absent or
 /// too-long title, an unknown `visibility` or a `length` that is not an
 /// integer. Any database failure arrives through `?` as
 /// [`AppError::Database`].
@@ -107,7 +108,7 @@ async fn create_scrobble(
     auth: AuthUser,
     ApiBody(params): ApiBody<ScrobbleParams>,
 ) -> AppResult<Json<Scrobble>> {
-    auth.require(WRITE)?;
+    auth.require(WRITE_SCROBBLES)?;
     let new = params.into_new_scrobble()?;
     let row = scrobble::insert(&state.db, auth.0.id, &new).await?;
     debug!(
@@ -149,11 +150,17 @@ async fn create_scrobble(
 /// [`Uri`]: axum::http::Uri
 async fn list_scrobbles(
     State(state): State<AppState>,
-    MaybeAuthUser(viewer, _): MaybeAuthUser,
+    auth: MaybeAuthUser,
     Path(id): Path<String>,
     page: PageParams,
     OriginalUri(uri): OriginalUri,
 ) -> AppResult<(HeaderMap, Json<Vec<Scrobble>>)> {
+    // Pleroma's `fallback: :proceed_unauthenticated`: a token without
+    // `read:scrobbles` reads as no token at all.
+    let viewer = match (auth.0, auth.1) {
+        (Some(user), Some(token)) if require_scope(&token, READ_SCROBBLES).is_ok() => Some(user),
+        _ => None,
+    };
     let owner = account_or_404(&state, &id).await?;
     let rows = scrobble::page_for_user(
         &state.db,
