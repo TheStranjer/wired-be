@@ -333,15 +333,13 @@ impl User {
             .is_some_and(|hash| verify_password(password, hash))
     }
 
-    /// The URL a mention of this account links to: the stored
-    /// [`profile_url`](User::profile_url) that Pleroma's
-    /// `Formatter.mention_from_user` prefers as `user.uri`, or the actor id
-    /// every row is guaranteed to carry.
+    /// The URL a profile links to: the stored
+    /// [`profile_url`](User::profile_url) when set (what Pleroma's
+    /// `Formatter.mention_from_user` prefers as `user.uri`), else the actor
+    /// id every row is guaranteed to carry.
     #[must_use]
-    pub fn mention_url(&self) -> String {
-        self.profile_url
-            .clone()
-            .unwrap_or_else(|| self.ap_id.clone())
+    pub fn profile_url_or_ap_id(&self) -> &str {
+        self.profile_url.as_deref().unwrap_or(&self.ap_id)
     }
 }
 
@@ -378,6 +376,33 @@ mod tests {
         assert!(
             !user.password_matches(PASSWORD),
             "a hashless row fails like a wrong password"
+        );
+    }
+
+    #[tokio::test]
+    async fn profile_url_or_ap_id_prefers_the_stored_profile_url() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let bare = insert(&pool, &local_new("plain")).await.unwrap();
+        assert_eq!(
+            bare.profile_url_or_ap_id(),
+            bare.ap_id,
+            "without a profile_url the actor id stands in"
+        );
+        let profile = format!("{BASE}/@fancy");
+        let with_url = insert(
+            &pool,
+            &NewUser {
+                profile_url: Some(profile.clone()),
+                ..local_new("fancy")
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            with_url.profile_url_or_ap_id(),
+            profile,
+            "a stored profile_url wins over the actor id"
         );
     }
 
