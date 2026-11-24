@@ -96,6 +96,7 @@ pub(crate) use self::issue::check_account_ready;
 pub mod authorize;
 mod grants;
 pub mod issue;
+pub mod json_media;
 pub mod mfa;
 mod params;
 mod revoke;
