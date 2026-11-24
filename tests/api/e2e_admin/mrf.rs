@@ -32,6 +32,7 @@ pub(super) async fn set_mrf(app: &Router, token: &str, policies: &[&str], rows: 
         json!({"group": ":pleroma", "key": ":mrf_keyword", "delete": true}),
         json!({"group": ":pleroma", "key": ":mrf_hellthread", "delete": true}),
         json!({"group": ":pleroma", "key": ":mrf_object_age", "delete": true}),
+        json!({"group": ":pleroma", "key": ":mrf_hashtag", "delete": true}),
         mrf_write,
     ];
     for (key, value) in rows {
@@ -264,7 +265,7 @@ async fn simple_policy_refuses_and_reports_itself(
     let federation = federation_block(&world.app).await;
     assert_eq!(
         federation["mrf_policies"],
-        json!(["SimplePolicy"]),
+        json!(["SimplePolicy", "HashtagPolicy"]),
         "the named chain"
     );
     assert_eq!(
@@ -289,7 +290,7 @@ async fn simple_policy_refuses_and_reports_itself(
     common::assert_answer(&nodeinfo, StatusCode::OK, "the NodeInfo document");
     assert_eq!(
         nodeinfo.json_value()["metadata"]["federation"]["mrf_policies"],
-        json!(["SimplePolicy"]),
+        json!(["SimplePolicy", "HashtagPolicy"]),
         "NodeInfo tells the same chain"
     );
 }

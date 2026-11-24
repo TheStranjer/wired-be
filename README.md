@@ -253,8 +253,8 @@ grant or revoke `admin` and `moderator`.
 
 Every activity this instance receives or is about to send runs the policy
 chain configured by the admin config store — the `:mrf` entry's fields plus
-the dedicated `:mrf_simple`, `:mrf_keyword`, `:mrf_hellthread` and
-`:mrf_object_age` entries, all in group `:pleroma`, read cached for 30 s and
+the dedicated `:mrf_simple`, `:mrf_keyword`, `:mrf_hellthread`,
+`:mrf_object_age` and `:mrf_hashtag` entries, all in group `:pleroma`, read cached for 30 s and
 editable at runtime through `POST /api/v1/pleroma/admin/config` — with
 `MRF_POLICIES` as the fallback list of names. Stored as one document, the
 chain looks like this:
@@ -401,6 +401,27 @@ The three policies publish their configured subsets as the `mrf_keyword`,
 `mrf_hellthread` and `mrf_objectage` transparency objects beside their
 `KeywordPolicy`, `HellthreadPolicy` and `ObjectAgePolicy` names in
 `mrf_policies`.
+
+`HashtagPolicy` (Pleroma's
+`lib/pleroma/web/activity_pub/mrf/hashtag_policy.ex`) is not named in
+`policies`: like Pleroma, every chain runs it last. It speaks about
+`Create`/`Update` notes of remote actors and compares the names of the note's
+`Hashtag` tags (lowercased, without the `#`) with three lists under the
+`:mrf_hashtag` entry (`hashtag` key of the document); a list left out keeps
+its default:
+
+```json
+{ "hashtag": { "sensitive": ["nsfw"], "reject": [], "federated_timeline_removal": [] } }
+```
+
+| List | Effect of a match |
+|---|---|
+| `sensitive` (default `["nsfw"]`) | The note's `sensitive` flag is set |
+| `reject` | The activity is refused |
+| `federated_timeline_removal` | The public address moves from `to` into `cc`: the note arrives unlisted |
+
+It publishes the effective lists as the `mrf_hashtag` transparency object
+beside the `HashtagPolicy` name in `mrf_policies`.
 
 ### Transparency: publishing the lists
 

@@ -26,8 +26,8 @@ async fn setting_mrf_policies_through_the_api_activates_simple_policy() {
     let before = TestRequest::get("/api/v1/instance").send(&app).await;
     assert_eq!(
         before.json_value()["pleroma"]["metadata"]["federation"]["mrf_policies"],
-        json!([]),
-        "the fresh instance runs no policy, and this read fills the cache"
+        json!(["HashtagPolicy"]),
+        "the fresh instance runs only the always-on policy, and this read fills the cache"
     );
 
     let written = post_configs(
@@ -58,7 +58,7 @@ async fn setting_mrf_policies_through_the_api_activates_simple_policy() {
     let federation = after.json_value()["pleroma"]["metadata"]["federation"].clone();
     assert_eq!(
         federation["mrf_policies"],
-        json!(["SimplePolicy"]),
+        json!(["SimplePolicy", "HashtagPolicy"]),
         "the POST cleared the cache and the new chain answers"
     );
     assert_eq!(
@@ -80,8 +80,8 @@ async fn setting_mrf_policies_through_the_api_activates_simple_policy() {
     let reverted = TestRequest::get("/api/v1/instance").send(&app).await;
     assert_eq!(
         reverted.json_value()["pleroma"]["metadata"]["federation"]["mrf_policies"],
-        json!([]),
-        "and with the rows gone the env fallback runs the empty chain again"
+        json!(["HashtagPolicy"]),
+        "and with the rows gone the env fallback runs the always-on policy alone again"
     );
 }
 

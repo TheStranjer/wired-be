@@ -140,7 +140,12 @@ fn expected_document(version: &str) -> Value {
             "staffAccounts": [],
             "federation": {
                 "enabled": true,
-                "mrf_policies": [],
+                "mrf_policies": ["HashtagPolicy"],
+                "mrf_hashtag": {
+                    "sensitive": ["nsfw"],
+                    "reject": [],
+                    "federated_timeline_removal": [],
+                },
                 "quarantined_instances": [],
                 "exclusions": false,
             },
@@ -552,7 +557,7 @@ async fn federation_reports_the_enabled_mrf_policies() {
     let federation = &document["metadata"]["federation"];
     assert_eq!(
         federation["mrf_policies"],
-        json!(["NoOpPolicy"]),
+        json!(["NoOpPolicy", "HashtagPolicy"]),
         "the chain's names in Pleroma formatting"
     );
     assert_eq!(
@@ -604,7 +609,7 @@ async fn federation_is_the_same_answer_the_instance_documents_give() {
         if transparency {
             assert_eq!(
                 federation["mrf_policies"],
-                json!(["SimplePolicy"]),
+                json!(["SimplePolicy", "HashtagPolicy"]),
                 "the running policy is named"
             );
             assert_eq!(

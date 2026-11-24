@@ -4,11 +4,11 @@
 use serde_json::{Map, Value, json};
 
 use super::{
-    GROUP_PLEROMA, INSTANCE_LIMIT, KEY_INSTANCE, KEY_MRF, KEY_MRF_HELLTHREAD, KEY_MRF_KEYWORD,
-    KEY_MRF_OBJECT_AGE, KEY_MRF_SIMPLE,
+    GROUP_PLEROMA, INSTANCE_LIMIT, KEY_INSTANCE, KEY_MRF, KEY_MRF_HASHTAG, KEY_MRF_HELLTHREAD,
+    KEY_MRF_KEYWORD, KEY_MRF_OBJECT_AGE, KEY_MRF_SIMPLE,
     children::{
-        INSTANCE_CHILDREN, MRF_CHILDREN, MRF_HELLTHREAD_CHILDREN, MRF_KEYWORD_CHILDREN,
-        MRF_OBJECT_AGE_CHILDREN, MRF_SIMPLE_CHILDREN,
+        INSTANCE_CHILDREN, MRF_CHILDREN, MRF_HASHTAG_CHILDREN, MRF_HELLTHREAD_CHILDREN,
+        MRF_KEYWORD_CHILDREN, MRF_OBJECT_AGE_CHILDREN, MRF_SIMPLE_CHILDREN,
     },
     types::{EntryDescription, RegistryEntry, ValueKind},
 };
@@ -56,9 +56,9 @@ pub fn requires_restart(group: &str, key: &str) -> bool {
     find(group, key).is_some_and(|entry| entry.requires_restart)
 }
 
-/// The whole registry: the six entries the admin API may change, each one
+/// The whole registry: the seven entries the admin API may change, each one
 /// read at runtime.
-static REGISTRY: [RegistryEntry; 6] = [
+static REGISTRY: [RegistryEntry; 7] = [
     RegistryEntry {
         group: GROUP_PLEROMA,
         key: KEY_INSTANCE,
@@ -125,6 +125,16 @@ static REGISTRY: [RegistryEntry; 6] = [
         kind: ValueKind::Keyword,
         description: "Object age policy: the age gate and the actions it runs",
         children: &MRF_OBJECT_AGE_CHILDREN,
+        subkeys: &[],
+        requires_restart: false,
+        defaults: empty_defaults,
+    },
+    RegistryEntry {
+        group: GROUP_PLEROMA,
+        key: KEY_MRF_HASHTAG,
+        kind: ValueKind::Keyword,
+        description: "Hashtag policy: the tag lists it marks, unlists and rejects by",
+        children: &MRF_HASHTAG_CHILDREN,
         subkeys: &[],
         requires_restart: false,
         defaults: empty_defaults,

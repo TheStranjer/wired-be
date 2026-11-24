@@ -53,9 +53,10 @@ async fn keyword_hellthread_object_age_and_tag_policies_judge_the_inbound_chain(
             "KeywordPolicy",
             "HellthreadPolicy",
             "ObjectAgePolicy",
-            "TagPolicy"
+            "TagPolicy",
+            "HashtagPolicy"
         ]),
-        "the instance answers all five policies in chain order"
+        "the instance answers all five policies in chain order, the always-on one last"
     );
 }
 

@@ -11,7 +11,7 @@ use super::{
     MrfContext, MrfDecision, MrfPolicy, MrfResult, anti_link_spam,
     config::{MrfConfig, load_config},
     filter::activity_context,
-    hellthread, keyword, normalize_markup, object_age, simple, tag,
+    hashtag, hellthread, keyword, normalize_markup, object_age, simple, tag,
     transparency::describe_policies,
 };
 use crate::state::AppState;
@@ -60,7 +60,8 @@ impl PolicyChain {
 ///
 /// Each recognized name gets its policy, each unknown name is warned
 /// about and skipped — never a reason to fail an activity. Policy
-/// tickets add one `match` arm here each.
+/// tickets add one `match` arm here each. The always-on
+/// [`HashtagPolicy`](hashtag::HashtagPolicy) comes last, as in Pleroma.
 #[must_use]
 pub fn build_chain(config: &MrfConfig) -> PolicyChain {
     let mut policies: Vec<Box<dyn MrfPolicy + Send + Sync>> = Vec::new();
@@ -98,6 +99,10 @@ pub fn build_chain(config: &MrfConfig) -> PolicyChain {
         };
         policies.extend(policy);
     }
+    // Pleroma appends `HashtagPolicy` to every chain, whatever is configured.
+    policies.push(Box::new(hashtag::HashtagPolicy::new(
+        config.params_for(hashtag::PARAMS_KEY),
+    )));
     PolicyChain { policies }
 }
 
@@ -302,8 +307,69 @@ mod tests {
                 "KeywordPolicy".to_owned(),
                 "HellthreadPolicy".to_owned(),
                 "ObjectAgePolicy".to_owned(),
+                "HashtagPolicy".to_owned(),
             ],
-            "every known name built its policy in order and the unknown name dropped out"
+            "every known name built its policy in order, the unknown name dropped out \
+             and the always-on policy came last"
+        );
+    }
+
+    /// The hashtag policy is appended to every chain, after the configured
+    /// policies, and runs on its default lists when nothing configures it.
+    #[test]
+    fn build_chain_appends_the_hashtag_policy_last() {
+        let chain = build_chain(&config_with(&["noop"], &Value::Null));
+
+        assert_eq!(
+            describe_policies(&chain),
+            vec!["NoOpPolicy".to_owned(), "HashtagPolicy".to_owned()],
+            "the configured policy first, the hashtag policy last"
+        );
+        assert_eq!(
+            describe_policies(&build_chain(&config_with(&[], &Value::Null))),
+            vec!["HashtagPolicy".to_owned()],
+            "and an empty configuration still runs it"
+        );
+        assert_eq!(
+            describe_transparency(&chain, &Transparency::open())["mrf_hashtag"],
+            json!({"sensitive": ["nsfw"], "reject": [], "federated_timeline_removal": []}),
+            "with Pleroma's default lists"
+        );
+    }
+
+    /// The `hashtag` parameter block reaches the policy `build_chain`
+    /// appends, and a remote `#nsfw` note leaves the chain sensitive.
+    #[test]
+    fn the_appended_hashtag_policy_reads_its_params_and_marks_remote_notes() {
+        let note = json!({
+            "id": "https://peer.example/activities/hashtag-1",
+            "type": "Create",
+            "actor": "https://peer.example/users/alice",
+            "to": ["https://www.w3.org/ns/activitystreams#Public"],
+            "object": {
+                "id": "https://peer.example/objects/hashtag-1",
+                "type": "Note",
+                "to": ["https://www.w3.org/ns/activitystreams#Public"],
+                "tag": [{"type": "Hashtag", "name": "#NSFW"}],
+            },
+        });
+
+        let MrfDecision::Accept(accepted) =
+            build_chain(&config_with(&[], &Value::Null)).apply(&ctx(), note.clone())
+        else {
+            panic!("the default lists accept a #nsfw note");
+        };
+        assert_eq!(
+            accepted["object"]["sensitive"],
+            json!(true),
+            "the remote #nsfw note is stored sensitive"
+        );
+
+        let configured = config_with(&[], &json!({"hashtag": {"reject": ["nsfw"]}}));
+        assert_eq!(
+            build_chain(&configured).apply(&ctx(), note),
+            MrfDecision::Reject("[HashtagPolicy] the note carries a rejected hashtag".to_owned()),
+            "the configured reject list is the one in force"
         );
     }
 
@@ -391,8 +457,8 @@ mod tests {
 
         assert_eq!(
             describe_policies(&chain),
-            vec!["NoOpPolicy".to_owned()],
-            "the env list built the chain"
+            vec!["NoOpPolicy".to_owned(), "HashtagPolicy".to_owned()],
+            "the env list built the chain, the always-on policy behind it"
         );
     }
 
@@ -414,8 +480,9 @@ mod tests {
                 "AntiLinkSpamPolicy".to_owned(),
                 "NormalizeMarkupPolicy".to_owned(),
                 "TagPolicy".to_owned(),
+                "HashtagPolicy".to_owned(),
             ],
-            "the three names build their policies in order"
+            "the three names build their policies in order, then the always-on one"
         );
         assert_eq!(
             describe_transparency(&chain, &Transparency::open()),
@@ -423,6 +490,10 @@ mod tests {
                 ("mrf_antilinkspam".to_owned(), json!({})),
                 ("mrf_normalizemarkup".to_owned(), json!({})),
                 ("mrf_tag".to_owned(), json!({"echo": true})),
+                (
+                    "mrf_hashtag".to_owned(),
+                    json!({"sensitive": ["nsfw"], "reject": [], "federated_timeline_removal": []})
+                ),
             ]),
             "each policy describes back its own configured subset"
         );
