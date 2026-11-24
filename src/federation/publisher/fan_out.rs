@@ -236,6 +236,39 @@ async fn a_rejected_domain_is_excluded() {
     );
 }
 
+/// The per-inbox enqueue repeats no policy check, so the publish-level filter
+/// is the only thing keeping a rejected host out: an extra inbox on a
+/// rejected host (no follower row involved) must still queue nothing.
+#[tokio::test]
+async fn a_rejected_extra_inbox_is_never_enqueued() {
+    let db = crate::test_db::test_db().await.expect("test database slot");
+    let pool = db.pool().clone();
+    let alice = alice(&pool).await;
+    policy_reject(&pool, "spam.example").await;
+    let state = test_state(&pool);
+
+    let count = publish_ok(
+        &state,
+        &alice,
+        &public_activity(&alice),
+        PublishOpts {
+            extra_inboxes: vec![
+                "https://spam.example/inbox".to_owned(),
+                "https://other.example/inbox".to_owned(),
+            ],
+            only_to: None,
+        },
+    )
+    .await;
+
+    assert_eq!(count, 1, "only the unrejected extra inbox is a target");
+    assert_eq!(
+        delivered_inboxes(&pool).await,
+        vec!["https://other.example/inbox"],
+        "the rejected host never gets a job"
+    );
+}
+
 /// A follower whose host the MRF domain lists reject is dropped the
 /// same way: allowlist mode means this instance fans out only to the
 /// hosts it chose, and the enqueue would refuse the others anyway.

@@ -78,7 +78,7 @@ mod send_signing;
 #[cfg(test)]
 mod test_support;
 
-pub use enqueue::{best_inbox, enqueue_delivery};
+pub use enqueue::{best_inbox, enqueue_checked, enqueue_delivery};
 pub use send::{handle, is_local_inbox};
 
 /// The job kind of one inbox delivery, on

@@ -96,6 +96,32 @@ pub async fn enqueue_delivery(
         debug!(inbox, "delivery refused: instance policy rejects {host}");
         return Ok(());
     }
+    enqueue_checked(state, inbox, actor, activity).await
+}
+
+/// [`enqueue_delivery`] without the checks: queues one signed delivery of
+/// `activity` to `inbox` and nothing else.
+///
+/// The caller has already established everything [`enqueue_delivery`]
+/// would: federation is on, `inbox` is an `http(s)` URL on a foreign
+/// authority, and its host is not refused by instance policy. The
+/// publisher does that once per publish, over the whole candidate set, so
+/// this per-inbox step does no policy read and no MRF configuration load.
+/// The deduplication key and queue are the same as [`enqueue_delivery`]'s.
+///
+/// # Errors
+///
+/// The same as [`enqueue_delivery`]: [`AppError::Unprocessable`] for an
+/// `activity` without a string `id`, a database failure as
+/// [`AppError::Database`](crate::error::AppError).
+///
+/// [`AppError::Unprocessable`]: crate::error::AppError::Unprocessable
+pub async fn enqueue_checked(
+    state: &AppState,
+    inbox: &str,
+    actor: &User,
+    activity: &Value,
+) -> AppResult<()> {
     let activity_id = activity_id_of(activity)?;
     let unique_key = format!("{UNIQUE_KEY_PREFIX}:{activity_id}:{inbox}");
     let queued = enqueue(
