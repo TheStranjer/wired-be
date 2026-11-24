@@ -59,10 +59,7 @@ use crate::{
 /// [`api::html_pages`] (`/mailer/unsubscribe/{token}`), the
 /// remote-interaction pages of [`api::remote_interaction`]
 /// (`/ostatus_subscribe`, `/authorize_interaction` and `/main/ostatus`)
-/// and the invite registration link of
-/// [`api::admin::invites::registration_router`] (`/registration/{token}`,
-/// redirecting to the frontend's registration page), and the public
-/// instance documents of [`api::admin::apps_docs::public_router`]
+/// and the public instance documents of [`api::admin::apps_docs::public_router`]
 /// (`/instance/{name}.html`, the terms-of-service pages an admin
 /// uploads).
 /// Paths no route matches get the standard JSON error response (decision 8),
@@ -92,7 +89,6 @@ pub fn app(state: AppState) -> Router {
             .merge(api::misc::router())
             .merge(api::html_pages::router())
             .merge(api::remote_interaction::router())
-            .merge(api::admin::invites::registration_router())
             .merge(api::admin::apps_docs::public_router())
             .fallback(not_found)
             .with_state(state),
