@@ -77,10 +77,7 @@ use tracing::debug;
 use uuid::Uuid;
 
 use crate::{
-    api::{
-        helpers::{capped_distinct_ids, distinct, distinct_ids},
-        notifications_v2::{StringList, names_of},
-    },
+    api::helpers::{StringList, capped_distinct_ids, distinct, distinct_ids, names_of},
     auth::AuthUser,
     entities::{
         account::{Account, AccountViewer},

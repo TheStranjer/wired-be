@@ -5,7 +5,10 @@
 use serde::Deserialize;
 use uuid::Uuid;
 
-use crate::{api::helpers::capped_distinct_ids, error::AppResult};
+use crate::{
+    api::helpers::{StringList, capped_distinct_ids, names_of},
+    error::AppResult,
+};
 
 /// The bulk dismissal's parameters: `ids` under either spelling clients
 /// send — a list (`ids[]=a&ids[]=b`, or a JSON array) or a lone value —
@@ -14,28 +17,7 @@ use crate::{api::helpers::capped_distinct_ids, error::AppResult};
 pub(super) struct DestroyParams {
     /// The notifications to dismiss; absent asks for none.
     #[serde(default)]
-    ids: Option<IdList>,
-}
-
-/// One value or a list (a JSON array, or `ids[]=…` keys) — the two
-/// spellings Mastodon clients and forms both send.
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
-enum IdList {
-    /// A lone id.
-    Single(String),
-    /// A list of ids.
-    Multiple(Vec<String>),
-}
-
-impl IdList {
-    /// The values, borrowed, in the order sent.
-    fn values(&self) -> Vec<&str> {
-        match self {
-            Self::Single(value) => vec![value.as_str()],
-            Self::Multiple(values) => values.iter().map(String::as_str).collect(),
-        }
-    }
+    ids: Option<StringList>,
 }
 
 impl DestroyParams {
@@ -48,8 +30,7 @@ impl DestroyParams {
     /// [`TOO_MANY_IDS`](crate::api::helpers::TOO_MANY_IDS) for more than
     /// [`MAX_BATCH_IDS`](crate::api::helpers::MAX_BATCH_IDS) distinct ids.
     pub(super) fn parsed_ids(&self) -> AppResult<Vec<Uuid>> {
-        let values = self.ids.as_ref().map_or_else(Vec::new, IdList::values);
-        Ok(capped_distinct_ids(values)?.0)
+        Ok(capped_distinct_ids(names_of(self.ids.as_ref()))?.0)
     }
 }
 
