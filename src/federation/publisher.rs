@@ -35,13 +35,14 @@
 //!   nor this instance's own actor ever receives a copy);
 //! - relay inboxes ([`relay_inboxes`](crate::models::instance::relay_inboxes),
 //!   the `inbox` of every relay this instance follows and that has
-//!   accepted the follow) join the set only for activities whose addressing
-//!   carries the public address and that are not narrowed by
+//!   accepted the follow) join the set only for `Create`, `Announce`,
+//!   `Update`, `Delete`, `Undo` and `Move` activities whose `to` carries
+//!   the public address and that are not narrowed by
 //!   [`PublishOpts::only_to`] — the public `Delete`/`Update` of a note, the
 //!   profile `Update` and the account `Delete` all do, so relays keep their
-//!   copies fresh, while an `Update`, `Delete` or `Undo` with no public
-//!   address (a followers-only edit, an unfollow, an unblock) never reaches
-//!   a relay;
+//!   copies fresh, while an unlisted post (public only in `cc`), a
+//!   followers-only edit, an unfollow, an unblock or a `Like` never
+//!   reaches a relay;
 //! - inboxes whose host instance policy rejects — by its own table or by
 //!   the [`mrf`] domain lists — or whose
 //!   [`instances`](crate::models::instance) row carries an unreachable mark
@@ -112,7 +113,7 @@ mod test_support;
 
 use inboxes::{deliverable_inboxes, unreachable_grace};
 pub use job::handle;
-use recipients::{addressed_to, expand_recipients, includes_public};
+use recipients::{addressed_to, expand_recipients, primary_public, relay_type};
 
 /// The job kind of a backgrounded fan-out, on
 /// [`QUEUE_FEDERATOR_OUTGOING`], handled by [`handle`].
@@ -167,8 +168,10 @@ type OutgoingFilter = fn(AppState, Value) -> BoxFuture<'static, MrfDecision>;
 /// [`PublishOpts::only_to`], when set), with the actor's followers
 /// collection expanded to their remote followers' shared-or-personal
 /// inboxes, every other resolved remote recipient at their personal inbox,
-/// relay inboxes for activities addressed to the public (never when
-/// [`PublishOpts::only_to`] is set),
+/// relay inboxes for post-lifecycle activities (`Create`, `Announce`,
+/// `Update`, `Delete`, `Undo`, `Move`) whose `to` names the public address
+/// — unlisted posts, likes and the rest never reach relays — and never when
+/// [`PublishOpts::only_to`] is set,
 /// [`PublishOpts::extra_inboxes`] added, and everything undeliverable —
 /// local, refused, rejected, unreachable, unknown, already counted —
 /// dropped.
@@ -222,7 +225,7 @@ async fn publish_filtered(
         .map_or_else(|| addressed_to(&activity), Clone::clone);
     let policy = mrf::load_config(state).await;
     let mut candidates = expand_recipients(&state.db, actor, &addresses).await?;
-    if opts.only_to.is_none() && includes_public(&addresses) {
+    if opts.only_to.is_none() && primary_public(&activity) && relay_type(&activity) {
         candidates.extend(instance::relay_inboxes(&state.db).await?);
     }
     candidates.extend(opts.extra_inboxes);

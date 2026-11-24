@@ -89,10 +89,26 @@ fn may_receive(recipient: &User, actor: &User) -> bool {
         && recipient.nickname != INSTANCE_ACTOR_NICKNAME
 }
 
-/// Whether any address in `addresses` is the public address — the only
-/// condition that makes relays eligible for the activity.
-pub(super) fn includes_public(addresses: &[String]) -> bool {
-    addresses.iter().any(|address| is_public(address))
+/// Whether the public address is in the activity's `to` — the primary
+/// audience. An unlisted post carries it in `cc` only, so it is not
+/// public in this sense and relays never see it.
+pub(super) fn primary_public(activity: &Value) -> bool {
+    activity
+        .get("to")
+        .map_or_else(Vec::new, json::references)
+        .iter()
+        .any(|address| is_public(address))
+}
+
+/// Whether relays carry activities of this `type`: the ones that spread a
+/// post, its edits and its removal (`Create`, `Announce`, `Update`,
+/// `Delete`, `Undo`, `Move`), and nothing else — never a `Like`, an
+/// `EmojiReact`, a collection change, a report or a relationship activity.
+pub(super) fn relay_type(activity: &Value) -> bool {
+    matches!(
+        activity.get("type").and_then(Value::as_str),
+        Some("Create" | "Announce" | "Update" | "Delete" | "Undo" | "Move")
+    )
 }
 
 /// Whether `address` is the public address in any of its three
@@ -136,8 +152,7 @@ mod tests {
         );
     }
 
-    /// The public address is recognized in all three spellings and is the
-    /// relay condition's trigger.
+    /// The public address is recognized in all three spellings.
     #[test]
     fn the_public_spellings_are_recognised() {
         for spelling in PUBLIC_RECIPIENTS {
@@ -147,13 +162,70 @@ mod tests {
             !is_public("https://peer.example/users/bob"),
             "an actor id is nobody's public address"
         );
+    }
+
+    /// Only the public address in `to` makes an activity relay-eligible,
+    /// whichever spelling it uses; in `cc` (unlisted) it does not.
+    #[test]
+    fn primary_public_reads_only_the_to_field() {
+        for spelling in PUBLIC_RECIPIENTS {
+            assert!(
+                primary_public(&json!({"to": [spelling]})),
+                "`{spelling}` in a `to` list is primary public"
+            );
+            assert!(
+                primary_public(&json!({"to": spelling})),
+                "`{spelling}` as a bare `to` string is primary public"
+            );
+        }
         assert!(
-            includes_public(&["as:Public".to_owned()]),
-            "one public spelling in the set triggers the rule"
+            primary_public(&json!({"to": ["as:Public"]})),
+            "the compact spelling counts"
         );
         assert!(
-            !includes_public(&["https://peer.example/users/bob".to_owned()]),
-            "a private set does not"
+            primary_public(&json!({"to": ["Public"]})),
+            "the bare spelling counts"
+        );
+        assert!(
+            !primary_public(&json!({
+                "to": ["https://test.example/users/alice/followers"],
+                "cc": [PUBLIC],
+            })),
+            "public only in `cc` is unlisted"
+        );
+        assert!(
+            !primary_public(&json!({"cc": ["as:Public"], "bto": ["Public"]})),
+            "no `to` at all is not public"
+        );
+        assert!(
+            !primary_public(&json!({"to": ["https://peer.example/users/bob"]})),
+            "a private `to` is not public"
+        );
+    }
+
+    /// The relay-carried activity types, and the ones relays never get.
+    #[test]
+    fn relay_type_accepts_only_post_lifecycle_activities() {
+        for kind in ["Create", "Announce", "Update", "Delete", "Undo", "Move"] {
+            assert!(relay_type(&json!({"type": kind})), "`{kind}` is relayed");
+        }
+        for kind in [
+            "Like",
+            "EmojiReact",
+            "Add",
+            "Remove",
+            "Flag",
+            "Block",
+            "Follow",
+            "Accept",
+            "Reject",
+        ] {
+            assert!(!relay_type(&json!({"type": kind})), "`{kind}` is not");
+        }
+        assert!(!relay_type(&json!({})), "an untyped document is not");
+        assert!(
+            !relay_type(&json!({"type": ["Create"]})),
+            "a non-string type is not"
         );
     }
 }

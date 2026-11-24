@@ -381,3 +381,124 @@ async fn a_public_profile_update_still_reaches_the_relay() {
         "and its inbox is queued"
     );
 }
+
+/// An unlisted `Create` (`to` the followers, the public address only in
+/// `cc`) reaches the follower and never the accepted relay: unlisted means
+/// off the federated timelines a relay would feed.
+#[tokio::test]
+async fn an_unlisted_create_stays_off_the_relay() {
+    let db = crate::test_db::test_db().await.expect("test database slot");
+    let pool = db.pool().clone();
+    let alice = alice(&pool).await;
+    let erin = mirror(&pool, "erin", "other.example", ERIN_INBOX, None).await;
+    followed(&pool, &erin, &alice).await;
+    accepted_relay(&pool).await;
+    let state = test_state(&pool);
+    let create = json!({
+        "id": ACTIVITY_ID,
+        "type": "Create",
+        "actor": alice.ap_id,
+        "object": {"type": "Note", "id": "https://test.example/objects/1", "content": "hi"},
+        "to": [alice.followers_url],
+        "cc": [PUBLIC],
+    });
+
+    assert_eq!(
+        publish_default(&state, &alice, &create).await,
+        1,
+        "the unlisted Create fans out to the follower alone"
+    );
+    assert_eq!(
+        delivered_inboxes(&pool).await,
+        vec![ERIN_INBOX],
+        "and no delivery job names the relay's inbox"
+    );
+}
+
+/// A public `Create` (`to` the public address) reaches the accepted relay.
+#[tokio::test]
+async fn a_public_create_reaches_the_relay() {
+    let db = crate::test_db::test_db().await.expect("test database slot");
+    let pool = db.pool().clone();
+    let alice = alice(&pool).await;
+    accepted_relay(&pool).await;
+    let state = test_state(&pool);
+    let create = json!({
+        "id": ACTIVITY_ID,
+        "type": "Create",
+        "actor": alice.ap_id,
+        "object": {"type": "Note", "id": "https://test.example/objects/1", "content": "hi"},
+        "to": [PUBLIC],
+    });
+
+    assert_eq!(
+        publish_default(&state, &alice, &create).await,
+        1,
+        "the relay is the one target"
+    );
+    assert_eq!(
+        delivered_inboxes(&pool).await,
+        vec![RELAY_INBOX],
+        "and its inbox is queued"
+    );
+}
+
+/// A public `Like` (`cc` the followers and the public address) reaches the
+/// author and the follower but never the relay: relays do not carry likes.
+#[tokio::test]
+async fn a_public_like_stays_off_the_relay() {
+    let db = crate::test_db::test_db().await.expect("test database slot");
+    let pool = db.pool().clone();
+    let alice = alice(&pool).await;
+    let erin = mirror(&pool, "erin", "other.example", ERIN_INBOX, None).await;
+    accepted_relay(&pool).await;
+    let state = test_state(&pool);
+    let like = json!({
+        "id": ACTIVITY_ID,
+        "type": "Like",
+        "actor": alice.ap_id,
+        "object": "https://other.example/objects/1",
+        "to": [erin.ap_id],
+        "cc": [alice.followers_url, PUBLIC],
+    });
+
+    assert_eq!(
+        publish_default(&state, &alice, &like).await,
+        1,
+        "the Like goes to the author alone"
+    );
+    assert_eq!(
+        delivered_inboxes(&pool).await,
+        vec![ERIN_INBOX],
+        "and no delivery job names the relay's inbox"
+    );
+}
+
+/// A `Like` that even names the public address in `to` stays off the
+/// relay: the type, not only the addressing, decides.
+#[tokio::test]
+async fn a_like_to_the_public_stays_off_the_relay() {
+    let db = crate::test_db::test_db().await.expect("test database slot");
+    let pool = db.pool().clone();
+    let alice = alice(&pool).await;
+    accepted_relay(&pool).await;
+    let state = test_state(&pool);
+    let like = json!({
+        "id": ACTIVITY_ID,
+        "type": "Like",
+        "actor": alice.ap_id,
+        "object": "https://other.example/objects/1",
+        "to": [PUBLIC],
+    });
+
+    assert_eq!(
+        publish_default(&state, &alice, &like).await,
+        0,
+        "nobody is a target"
+    );
+    assert_eq!(
+        delivered_inboxes(&pool).await,
+        Vec::<String>::new(),
+        "and no delivery job is queued"
+    );
+}
