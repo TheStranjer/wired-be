@@ -9,7 +9,10 @@ use uuid::Uuid;
 use super::{KIND_DELETE, KIND_DELETE_REMOTE};
 use super::{SweepCounts, clear_shared, parse_args, retry};
 use crate::{
-    jobs::{AttemptInfo, HandlerFuture, JobError, backups::sweep_archive_file, scheduled_statuses},
+    jobs::{
+        AttemptInfo, HandlerFuture, JobError, backups::sweep_archive_file, load_user,
+        scheduled_statuses,
+    },
     models::{backup, job, list, media_attachment, scheduled_status, user, web_push_subscription},
     state::AppState,
 };
@@ -43,20 +46,15 @@ pub fn handle_delete(state: AppState, _attempt: AttemptInfo, args: Value) -> Han
 
 /// The account the job clears. A vanished row is permanent (discard): the
 /// endpoint only queues this job for a row it just marked, and if it is
-/// gone by a later attempt, there is nothing left to clear.
+/// gone by a later attempt, there is nothing left to clear. The account is
+/// already deactivated by then, so the load does not gate on activity.
 ///
 /// # Errors
 ///
 /// [`JobError::Discard`] when the user row is gone, [`JobError::Retry`]
 /// on a database failure.
 pub(super) async fn load_account(state: &AppState, user_id: Uuid) -> Result<user::User, JobError> {
-    match user::get_by_id(&state.db, user_id).await {
-        Ok(Some(account)) => Ok(account),
-        Ok(None) => Err(JobError::Discard(format!(
-            "the delete job's user {user_id} no longer exists"
-        ))),
-        Err(err) => Err(retry(&err)),
-    }
+    load_user(state, user_id, "delete", false).await
 }
 
 /// Steps 1 to 5: the account's posts tombstone, its relationships, likes,
@@ -674,7 +672,7 @@ mod tests {
         let outcome = run(&state, alice.id).await;
         match outcome {
             Err(JobError::Retry(detail)) => assert!(
-                detail.starts_with("account delete pass failed"),
+                detail.starts_with("delete user read failed"),
                 "the retry states what failed: {detail}"
             ),
             other => panic!("a closed pool must retry, not {other:?}"),

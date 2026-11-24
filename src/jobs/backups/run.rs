@@ -16,11 +16,8 @@ use uuid::Uuid;
 
 use super::archive::build;
 use crate::{
-    jobs::{AttemptInfo, HandlerFuture, JobError},
-    models::{
-        backup,
-        user::{self, User},
-    },
+    jobs::{AttemptInfo, HandlerFuture, JobError, load_user},
+    models::backup,
     state::AppState,
 };
 
@@ -84,7 +81,10 @@ pub fn handle_run(state: AppState, _attempt: AttemptInfo, args: Value) -> Handle
     Box::pin(async move {
         let backup_id = parse_args(&args)?;
         let row = load_backup(&state, backup_id).await?;
-        let owner = load_owner(&state, row.user_id).await?;
+        // The id comes from the row, so a vanished owner is the race the
+        // account's delete won between the two reads. A deactivated owner
+        // still gets the archive they asked for.
+        let owner = load_user(&state, row.user_id, "backup", false).await?;
         let archive = build(&state, &owner, &row.file_name)
             .await
             .map_err(|err| retry("archive build", &err))?;
@@ -134,24 +134,6 @@ async fn load_backup(state: &AppState, id: Uuid) -> Result<backup::Backup, JobEr
             "the backup job's backup {id} no longer exists"
         ))),
         Err(err) => Err(retry("row read", &err)),
-    }
-}
-
-/// The account whose archive the row requests. A vanished owner is
-/// permanent (discard), exactly as in [`load_backup`]; the id comes from
-/// the row, so this is the race the delete won between the two reads.
-///
-/// # Errors
-///
-/// [`JobError::Discard`] when the user row is gone, [`JobError::Retry`]
-/// on a database failure.
-async fn load_owner(state: &AppState, user_id: Uuid) -> Result<User, JobError> {
-    match user::get_by_id(&state.db, user_id).await {
-        Ok(Some(owner)) => Ok(owner),
-        Ok(None) => Err(JobError::Discard(format!(
-            "the backup job's user {user_id} no longer exists"
-        ))),
-        Err(err) => Err(retry("owner read", &err)),
     }
 }
 

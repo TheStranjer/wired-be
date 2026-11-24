@@ -312,7 +312,7 @@ mod tests {
 
         let outcome = run_remote(&broken_state().await, alice.id).await;
         assert!(
-            matches!(&outcome, Err(JobError::Retry(detail)) if detail.starts_with("account delete pass failed")),
+            matches!(&outcome, Err(JobError::Retry(detail)) if detail.starts_with("delete user read failed")),
             "a closed pool retries: {outcome:?}"
         );
     }

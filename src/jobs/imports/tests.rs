@@ -9,7 +9,7 @@ use super::*;
 use crate::{
     config::{Config, TEST_BASE_URL},
     models::job::Job,
-    models::user::{NewUser, insert, local_ap_id},
+    models::user::{self, NewUser, insert, local_ap_id},
 };
 
 /// A handle that neither the database nor a fast-failing `WebFinger`
