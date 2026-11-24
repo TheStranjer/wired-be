@@ -34,8 +34,9 @@ pub(super) const NOT_ADMIN: &str = "User is not an admin.";
 pub(super) const NO_ADMIN_READ: &str = "Insufficient permissions: admin:read.";
 /// The 404 body of the admin API's misses.
 pub(super) const NOT_FOUND: &str = "Not found";
-/// The frontend's default avatar, which an account without one renders.
-pub(super) const DEFAULT_AVATAR: &str = "/images/avi.png";
+/// The backend's default avatar (path under the instance origin), which an
+/// account without one renders.
+pub(super) const DEFAULT_AVATAR: &str = "/media/default/avi.png";
 
 /// What the fixture leaves behind for one test.
 pub(super) struct Seeded {

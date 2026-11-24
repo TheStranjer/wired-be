@@ -68,16 +68,17 @@ pub use self::{
 /// The `actor_type` value that makes the entity's `group` flag true.
 const GROUP_ACTOR_TYPE: &str = "Group";
 
-/// Path appended to [`Config::frontend_base_url`] for the default avatar,
+/// Path appended to [`Config::media_base_url`] for the default avatar,
 /// matching Pleroma's `[:assets, :default_user_avatar]` fallback
-/// (`lib/pleroma/user.ex`, `avatar_url/2`). Crate-visible because the
+/// (`lib/pleroma/user.ex`, `avatar_url/2`); the backend serves the image
+/// itself (see [`crate::default_assets`]). Crate-visible because the
 /// `push.deliver` job renders the same fallback into a payload's `icon`
 /// (see [`crate::jobs::web_push`]).
-pub(crate) const DEFAULT_AVATAR_PATH: &str = "/images/avi.png";
+pub(crate) const DEFAULT_AVATAR_PATH: &str = crate::default_assets::AVATAR_PATH;
 
-/// Path appended to [`Config::frontend_base_url`] for the default banner,
+/// Path appended to [`Config::media_base_url`] for the default banner,
 /// matching Pleroma's `banner_url/2` fallback.
-pub(crate) const DEFAULT_BANNER_PATH: &str = "/images/banner.png";
+pub(crate) const DEFAULT_BANNER_PATH: &str = crate::default_assets::BANNER_PATH;
 
 /// Format of `last_status_at`: a bare `YYYY-MM-DD` date, the counterpart
 /// of Pleroma's `NaiveDateTime.to_date() |> Date.to_iso8601()`.

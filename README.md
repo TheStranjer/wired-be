@@ -37,7 +37,7 @@ below.
 |---|---|---|---|
 | `DATABASE_URL` | yes | | PostgreSQL URL, e.g. `postgres://user:pass@localhost:5432/wired` |
 | `BASE_URL` | yes | | Public origin of this instance, e.g. `https://social.example` (http(s) with a host, no path or query; trailing slash stripped) |
-| `FRONTEND_BASE_URL` | no | `BASE_URL` | Origin the frontend pages are served from; the source of browser redirects such as `/notice/{id}` and `/oauth/authorize` (the consent screen) and of the default-asset URLs (see "Default assets" below; no trailing slash) |
+| `FRONTEND_BASE_URL` | no | `BASE_URL` | Origin the frontend pages are served from; the source of browser redirects such as `/notice/{id}` and `/oauth/authorize` (the consent screen; no trailing slash; the default-asset URLs do not use it, see "Default assets" below) |
 | `BIND_ADDR` | no | `127.0.0.1:4000` | Address the HTTP server listens on |
 | `INSTANCE_NAME` | no | `Wired` | Instance display name |
 | `INSTANCE_DESCRIPTION` | no | `A Wired instance, compatible with Pleroma clients` | Short instance description |
@@ -136,18 +136,21 @@ below.
 
 ### Default assets
 
-wired-be serves API only and ships no files: the four default assets are
-served by the frontend, so their URLs are built from `FRONTEND_BASE_URL`
-(unset or blank, that is `BASE_URL` — a same-origin deployment whose
-reverse proxy routes `/images/*` to the frontend keeps the URLs it has
-now). The frontend must ship exactly these paths under that origin:
+wired-be serves the four default assets itself, from the `/media` tree
+(`src/default_assets.rs`, answered by `GET /media/{key}` ahead of the
+uploads directory), so no frontend files are needed. They are flat-colour
+placeholders rendered in memory on first use; the URLs are built from
+`MEDIA_BASE_URL` (default `{BASE_URL}/media`). If `MEDIA_BASE_URL` points at
+a separate file host, that host must route `/default/*` to the API. An
+uploaded file cannot shadow them: the `default/` key prefix is answered
+before the uploads directory is read.
 
-| Path | Advertised as |
+| Path under `MEDIA_BASE_URL` | Advertised as |
 |---|---|
-| `/images/avi.png` | Default avatar: the `avatar`/`avatar_static` fallback on accounts, and the `icon` fallback of a Web Push notification |
-| `/images/banner.png` | Default banner: the `header`/`header_static` fallback on accounts |
-| `/images/thumbnail.jpg` | Instance thumbnail on `GET /api/v1/instance` and `GET /api/v2/instance` |
-| `/images/mascot.png` | Default mascot on `GET /api/v1/pleroma/mascot` |
+| `/default/avi.png` | Default avatar: the `avatar`/`avatar_static` fallback on accounts, and the `icon` fallback of a Web Push notification |
+| `/default/banner.png` | Default banner: the `header`/`header_static` fallback on accounts |
+| `/default/thumbnail.jpg` | Instance thumbnail on `GET /api/v1/instance` and `GET /api/v2/instance` |
+| `/default/mascot.png` | Default mascot on `GET /api/v1/pleroma/mascot` |
 
 Every setting in that table is a `pub const NAME_VAR` in `src/config.rs`
 (the one place an environment variable name is spelled), and

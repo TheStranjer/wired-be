@@ -28,7 +28,7 @@ use crate::common;
 
 /// The fallback push icon: the same default the `Account` entity renders,
 /// spelled here because the constant is crate-private.
-const DEFAULT_AVATAR: &str = "/images/avi.png";
+const DEFAULT_AVATAR: &str = "/media/default/avi.png";
 
 // ──────────────────────────  Scenario 2: Web Push  ──────────────────────────
 

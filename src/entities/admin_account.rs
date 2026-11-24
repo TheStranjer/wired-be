@@ -454,7 +454,7 @@ mod tests {
             json!({
                 "id": ACCOUNT_ID,
                 "email": null,
-                "avatar": format!("{TEST_BASE_URL}/images/avi.png"),
+                "avatar": format!("{TEST_BASE_URL}/media/default/avi.png"),
                 "nickname": "alice",
                 "display_name": "alice",
                 "is_active": true,
@@ -732,8 +732,8 @@ mod tests {
                 "raw_fields": [],
                 "is_discoverable": false,
                 "actor_type": "Person",
-                "avatar": format!("{TEST_BASE_URL}/images/avi.png"),
-                "banner": format!("{TEST_BASE_URL}/images/banner.png"),
+                "avatar": format!("{TEST_BASE_URL}/media/default/avi.png"),
+                "banner": format!("{TEST_BASE_URL}/media/default/banner.png"),
                 "background": null,
             }),
             "the column defaults, spelled out"
