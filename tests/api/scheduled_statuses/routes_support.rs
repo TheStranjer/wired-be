@@ -76,10 +76,12 @@ pub(super) async fn seeded(
             user_id: who.id,
             scheduled_at: when,
             params,
+            idempotency_key: None,
         },
     )
     .await
     .expect("the seed schedule inserts")
+    .expect("a keyless seed never conflicts")
 }
 
 /// A seeded schedule parking nothing but `text`, for the listings.

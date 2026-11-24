@@ -28,7 +28,8 @@
 //! `scheduled_at` and `poll` keys pinned to `null`), its
 //! `media_attachments` read back in the order the body submitted them.
 //! Form and query bodies schedule the same post as JSON, the schedule
-//! ignores an `Idempotency-Key` beyond echoing it, and the gate is
+//! answers a replayed `Idempotency-Key` with the schedule it first parked
+//! (WBE-669), and the gate is
 //! `write:statuses` like the create itself (401 anonymous, 403 without
 //! the scope).
 //!
@@ -67,6 +68,9 @@ mod routes_support;
 /// The scheduling arm's own answers: the entity, the window, the create's
 /// refusals, the gate and the body shapes.
 mod schedule_create;
+/// `Idempotency-Key` on the scheduling arm: a replayed key answers the
+/// schedule it first parked.
+mod schedule_idempotency;
 /// The scheduling arm's limits: the total cap, the per-day cap and the
 /// media reservation.
 mod schedule_limits;

@@ -51,10 +51,16 @@
 //! keys the [`ScheduledStatus`] entity echoes. Those extra keys are inert
 //! to the publish, which reads
 //! the params back as a [`CreateStatusParams`] and ignores what it is not.
-//! A scheduled create claims no replay key at all, and neither does its
-//! fire: the publish posts through the plain
-//! [`create_status`](crate::services::create_status::create_status), so the
-//! parked `idempotency` value is only ever the entity's echo.
+//! The `Idempotency-Key` is honoured here, as Mastodon's
+//! `PostStatusService` does: it is stored on the row's own
+//! `idempotency_key` column (unique per account), and a create whose key
+//! already names one of the account's pending schedules answers that
+//! schedule — nothing is written, no second fire is queued and no limit is
+//! counted. Two concurrent creates of one key meet at the unique index; the
+//! loser's insert stores nothing and it answers the winner. The fire is
+//! keyless: the publish posts through the plain
+//! [`create_status`](crate::services::create_status::create_status), and the
+//! `idempotency` params value remains the entity's echo.
 //!
 //! [`MEDIA_NOT_FOUND`]: crate::models::media_attachment::MEDIA_NOT_FOUND
 
@@ -89,6 +95,10 @@ const INVALID_SCHEDULED_AT: &str = "Invalid scheduled_at";
 /// `:schedule_activities_limit_reached` / per-day arm, one wording).
 const TOO_MANY_SCHEDULED: &str = "Too many scheduled statuses";
 
+/// 409 body for a keyed schedule whose winning row vanished before the
+/// loser could read it back.
+const KEY_RACE_LOST: &str = "The scheduled status for this Idempotency-Key is no longer pending";
+
 /// Seconds in one minute, for the window refusal's wording.
 const SECONDS_PER_MINUTE: usize = 60;
 
@@ -100,7 +110,9 @@ const SECONDS_PER_MINUTE: usize = 60;
 /// written is only the `scheduled_statuses` row: no `statuses` row, no
 /// `media_attachments` change, no `after_status_created` hook, no
 /// expiration job. `idempotency` — the request's `Idempotency-Key`, when
-/// it had one — is stored into the params purely for the entity's echo.
+/// it had one — is stored on the row's `idempotency_key` column, which
+/// answers an already-parked schedule of that key instead of parking a
+/// second, and into the params for the entity's echo.
 /// The entity's `media_attachments` come back empty here: loading the
 /// reserved rows in the order the request submitted them is the
 /// endpoint's read.
@@ -137,6 +149,12 @@ pub async fn schedule_status(
     idempotency: Option<&str>,
     params: CreateStatusParams,
 ) -> AppResult<(ScheduledStatus, StoredRow)> {
+    if let Some(key) = idempotency
+        && let Some(existing) =
+            scheduled_status::find_by_idempotency(&state.db, user.id, key).await?
+    {
+        return Ok(replayed(state, existing));
+    }
     let at = parse_schedule(&params)?;
     // The checked poll is not stored on its own: the submitted `poll`
     // shape rides along in the serialised params below, and the publish
@@ -146,15 +164,15 @@ pub async fn schedule_status(
     check_window(&state.config, at)?;
     check_media(state, user.id, &new.media_ids).await?;
     let stored = stored_params(&params, &new, idempotency, app)?;
-    let row = insert_within_limits(
-        state,
-        &NewScheduledStatus {
-            user_id: user.id,
-            scheduled_at: at,
-            params: stored,
-        },
-    )
-    .await?;
+    let new_status = NewScheduledStatus {
+        user_id: user.id,
+        scheduled_at: at,
+        params: stored,
+        idempotency_key: idempotency.map(str::to_owned),
+    };
+    let Some(row) = insert_within_limits(state, &new_status).await? else {
+        return replay_winner(state, &new_status).await;
+    };
     crate::jobs::scheduled_statuses::schedule(state, &row).await;
     debug!(
         scheduled = %row.id,
@@ -163,6 +181,47 @@ pub async fn schedule_status(
         "status scheduled"
     );
     Ok((ScheduledStatus::from_row(&row, &[], &state.config), row))
+}
+
+/// The answer for a schedule that already exists under the request's key.
+///
+/// Its entity comes beside its row, nothing is written and no second fire is
+/// queued: the first create queued the one fire. The attachments come back
+/// empty, as on a fresh schedule; the endpoint loads them.
+fn replayed(state: &AppState, row: StoredRow) -> (ScheduledStatus, StoredRow) {
+    debug!(
+        scheduled = %row.id,
+        user = %row.user_id,
+        "schedule replayed for its idempotency key"
+    );
+    (ScheduledStatus::from_row(&row, &[], &state.config), row)
+}
+
+/// The conflict arm: answers the winner of a lost idempotency-key race.
+///
+/// The insert of `new_status` lost the `(user_id, idempotency_key)` race to a
+/// concurrent create of the same key, so the winner's row is read back and
+/// answered like any replay.
+///
+/// # Errors
+///
+/// [`AppError::Conflict`] when the winner is already gone again (fired or
+/// cancelled between the two statements) or the status carries no key at
+/// all (unreachable: only a keyed insert can conflict); any database
+/// failure as [`AppError::Database`].
+async fn replay_winner(
+    state: &AppState,
+    new_status: &NewScheduledStatus,
+) -> AppResult<(ScheduledStatus, StoredRow)> {
+    let winner = match new_status.idempotency_key.as_deref() {
+        Some(key) => {
+            scheduled_status::find_by_idempotency(&state.db, new_status.user_id, key).await?
+        }
+        None => None,
+    };
+    winner
+        .map(|row| replayed(state, row))
+        .ok_or_else(|| AppError::Conflict(KEY_RACE_LOST.to_owned()))
 }
 
 /// The fire moment the body names, read as [`parse_time`] reads RFC3339
@@ -226,11 +285,13 @@ pub fn check_window(config: &Config, at: DateTime<Utc>) -> AppResult<()> {
 /// # Errors
 ///
 /// [`AppError::Unprocessable`] with [`TOO_MANY_SCHEDULED`] for either limit,
-/// plus any database failure as [`AppError::Database`].
+/// plus any database failure as [`AppError::Database`]. `None` is not an
+/// error: the insert hit the account's unique idempotency key, and the
+/// caller answers the winner.
 async fn insert_within_limits(
     state: &AppState,
     new_status: &NewScheduledStatus,
-) -> AppResult<StoredRow> {
+) -> AppResult<Option<StoredRow>> {
     let mut tx = state.db.begin().await?;
     scheduled_status::lock_user(&mut tx, new_status.user_id).await?;
     check_limits(
@@ -446,6 +507,124 @@ mod tests {
     /// Whether `result` is the limit's 422.
     fn is_too_many<T>(result: &AppResult<T>) -> bool {
         matches!(result, Err(AppError::Unprocessable(text)) if text == TOO_MANY_SCHEDULED)
+    }
+
+    /// A state over a fresh slot and a local user named `nick`.
+    async fn state_and_user(db: &crate::test_db::TestDb, nick: &str) -> (AppState, User) {
+        let state = AppState::for_tests(db.pool().clone(), Config::for_tests());
+        let user = insert_user(
+            &state.db,
+            &NewUser::local(nick, &local_ap_id(TEST_BASE_URL, nick)),
+        )
+        .await
+        .expect("the user inserts");
+        (state, user)
+    }
+
+    /// A parked row for `user` under `key`, to feed the insert directly.
+    fn keyed_row(user: &User, key: &str) -> NewScheduledStatus {
+        NewScheduledStatus {
+            user_id: user.id,
+            scheduled_at: Utc::now() + ChronoDuration::hours(1),
+            params: serde_json::json!({ "status": "keyed" }),
+            idempotency_key: Some(key.to_owned()),
+        }
+    }
+
+    /// The same key scheduled twice answers the first row, stores one, and
+    /// queues one fire.
+    #[tokio::test]
+    async fn a_replayed_key_answers_the_existing_schedule() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let (state, user) = state_and_user(&db, "carol").await;
+
+        let (first_entity, first_row) =
+            schedule_status(&state, &user, None, Some("k"), body("first"))
+                .await
+                .expect("the first schedule stores");
+        let (second_entity, second_row) =
+            schedule_status(&state, &user, None, Some("k"), body("retry"))
+                .await
+                .expect("the replay answers");
+
+        assert_eq!(second_row.id, first_row.id, "the replay is the first row");
+        assert_eq!(second_entity.id, first_entity.id, "and its entity");
+        assert_eq!(
+            first_row.idempotency_key.as_deref(),
+            Some("k"),
+            "the key is stored on the row"
+        );
+        let stored = scheduled_status::count_pending_for_user(&state.db, user.id)
+            .await
+            .expect("the count runs");
+        assert_eq!(stored, 1, "one row is stored");
+    }
+
+    /// The conflict arm: an insert that loses the unique index stores
+    /// nothing, and the winner is read back as the answer.
+    #[tokio::test]
+    async fn a_lost_insert_race_answers_the_winner() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let (state, user) = state_and_user(&db, "dave").await;
+        let new_status = keyed_row(&user, "race");
+
+        let winner = insert_within_limits(&state, &new_status)
+            .await
+            .expect("the first insert runs")
+            .expect("the first insert stores");
+        let lost = insert_within_limits(&state, &new_status)
+            .await
+            .expect("the second insert runs");
+        assert!(lost.is_none(), "the conflicting insert stores nothing");
+
+        let (entity, row) = replay_winner(&state, &new_status)
+            .await
+            .expect("the loser answers the winner");
+        assert_eq!(row.id, winner.id, "the winner's row");
+        assert_eq!(entity.id, winner.id.to_string(), "and its entity");
+        let stored = scheduled_status::count_pending_for_user(&state.db, user.id)
+            .await
+            .expect("the count runs");
+        assert_eq!(stored, 1, "exactly one row is stored");
+    }
+
+    /// A loser whose winner is gone again is a 409, and an unkeyed status
+    /// has no winner to answer.
+    #[tokio::test]
+    async fn a_vanished_winner_is_a_conflict() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let (state, user) = state_and_user(&db, "erin").await;
+
+        let gone = replay_winner(&state, &keyed_row(&user, "gone")).await;
+        assert!(
+            matches!(gone, Err(AppError::Conflict(_))),
+            "no row under the key"
+        );
+        let mut unkeyed = keyed_row(&user, "unused");
+        unkeyed.idempotency_key = None;
+        let none = replay_winner(&state, &unkeyed).await;
+        assert!(matches!(none, Err(AppError::Conflict(_))), "no key at all");
+    }
+
+    /// Two concurrent schedules of one key: whichever insert runs second
+    /// meets the unique index, and both answer one row.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn concurrent_schedules_of_one_key_answer_one_row() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let (state, user) = state_and_user(&db, "frank").await;
+
+        let (first, second) = tokio::join!(
+            schedule_status(&state, &user, None, Some("same"), body("first")),
+            schedule_status(&state, &user, None, Some("same"), body("second")),
+        );
+
+        let first = first.expect("the first call answers");
+        let second = second.expect("the second call answers");
+        assert_eq!(first.1.id, second.1.id, "both answer the one row");
+        let stored = scheduled_status::count_pending_for_user(&state.db, user.id)
+            .await
+            .expect("the count runs");
+        assert_eq!(stored, 1, "exactly one row is stored");
     }
 
     /// Two concurrent schedules under a cap of one: the account lock makes the
