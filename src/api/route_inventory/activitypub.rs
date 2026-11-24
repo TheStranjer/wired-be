@@ -162,16 +162,6 @@ pub(super) const ROWS: &[RouteSpec] = &[
     },
     RouteSpec {
         method: "GET",
-        path: "/ostatus_subscribe",
-        auth: AuthClass::Public,
-    },
-    RouteSpec {
-        method: "POST",
-        path: "/ostatus_subscribe",
-        auth: AuthClass::Public,
-    },
-    RouteSpec {
-        method: "GET",
         path: "/authorize_interaction",
         auth: AuthClass::Public,
     },
