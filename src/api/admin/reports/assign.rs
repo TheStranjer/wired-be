@@ -17,10 +17,10 @@ use crate::{
     error::AppResult,
     extract::ApiBody,
     models::{
-        moderation_log,
-        report::{self, Report as ReportRow},
+        report::Report as ReportRow,
         user::{self, User},
     },
+    services::report_moderation::assign_report,
     state::AppState,
     util::id::parse_id,
 };
@@ -127,26 +127,13 @@ async fn assign_one(pool: &PgPool, actor: &User, change: &ReportAssignment) -> A
             let Some(found) = user::get_by_nickname(pool, nickname).await? else {
                 return Ok(Assigned::Refused(NOT_FOUND));
             };
-            Some((found.id, found.nickname))
+            Some(found)
         }
         None => None,
     };
-    let row = report::assign(pool, id, assignee.as_ref().map(|(found, _)| *found)).await?;
-    let Some(row) = row else {
+    let Some(row) = assign_report(pool, actor, id, assignee.as_ref()).await? else {
         return Ok(Assigned::Refused(NOT_FOUND));
     };
-    let target = user::get_by_id(pool, row.target_id).await?;
-    let logged = match assignee.as_ref() {
-        Some((_id, nickname)) => {
-            moderation_log::report_assigned(pool, actor, row.id, nickname, target.as_ref()).await?
-        }
-        None => moderation_log::report_unassigned(pool, actor, row.id, target.as_ref()).await?,
-    };
-    debug!(
-        log = %logged.id,
-        report = %row.id,
-        "admin report assignment recorded"
-    );
     Ok(Assigned::Row(row))
 }
 
