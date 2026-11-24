@@ -188,14 +188,46 @@ pub async fn targets(
     if reblog_without_original(&state.db, row).await? {
         return Ok(None);
     }
-    let outcome = match row.visibility {
-        Visibility::Public => public_targets(state, row, author).await?,
-        Visibility::Unlisted => unlisted_targets(state, row, author).await?,
-        Visibility::Private => private_targets(state, row, author).await?,
-        Visibility::Direct => direct_targets(state, row, author).await?,
-        Visibility::Local => local_targets(state, row).await?,
-    };
-    Ok(Some(outcome))
+    Ok(Some(visibility_targets(state, row, author).await?))
+}
+
+/// [`targets`] for the `delete` push of a reblog row: the same answer, minus
+/// the refusal for a reblog whose original is gone.
+///
+/// A status deletion tombstones the original and every reblog of it in one
+/// transaction, so by the time the reblogs' `delete` events are computed their
+/// original is already a tombstone — exactly the case [`targets`] refuses —
+/// yet those events are what tell the boosters' followers to drop the boost.
+/// A deactivated author still publishes nothing.
+///
+/// # Errors
+///
+/// Any database failure (connection, encoding) arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub(super) async fn delete_targets(
+    state: &AppState,
+    row: &Status,
+    author: &User,
+) -> AppResult<Option<(Vec<String>, Audience, bool)>> {
+    if !author.is_active.get() {
+        return Ok(None);
+    }
+    Ok(Some(visibility_targets(state, row, author).await?))
+}
+
+/// The per-visibility answer shared by [`targets`] and [`delete_targets`].
+async fn visibility_targets(
+    state: &AppState,
+    row: &Status,
+    author: &User,
+) -> AppResult<(Vec<String>, Audience, bool)> {
+    match row.visibility {
+        Visibility::Public => public_targets(state, row, author).await,
+        Visibility::Unlisted => unlisted_targets(state, row, author).await,
+        Visibility::Private => private_targets(state, row, author).await,
+        Visibility::Direct => direct_targets(state, row, author).await,
+        Visibility::Local => local_targets(state, row).await,
+    }
 }
 
 #[cfg(test)]

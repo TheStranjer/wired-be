@@ -37,24 +37,32 @@ use crate::{
 /// the caller's gate and this write — the whole operation is idempotent, so
 /// an already deleted row moves nothing and fires nothing.
 ///
+/// Every reblog the write tombstoned also gets its own streaming `delete`
+/// (Mastodon's `RemoveStatusService` per reblog), after the original's hook,
+/// since its followers received the boost as an `update` carrying the reblog
+/// row's id. Nothing federates for them: the original's `Delete` covers the
+/// network.
+///
 /// # Errors
 ///
 /// Any database failure arrives through `?` as [`AppError::Database`].
 ///
 /// [`AppError::Database`]: crate::error::AppError
 pub async fn delete_status(state: &AppState, row: &status::Status) -> AppResult<bool> {
-    if status::soft_delete_with_reblogs(&state.db, row.id)
-        .await?
-        .is_none()
-    {
+    let Some((_tombstone, reblogs)) = status::soft_delete_with_reblogs(&state.db, row.id).await?
+    else {
         return Ok(false);
-    }
+    };
     debug!(
         status = %row.id,
         user = %row.user_id,
+        reblogs = reblogs.len(),
         "status deleted"
     );
     after_status_deleted(state, row).await;
+    for reblog in &reblogs {
+        streaming::status_deleted(state, reblog).await;
+    }
     Ok(true)
 }
 
@@ -291,6 +299,103 @@ mod tests {
                 Err(tokio::sync::broadcast::error::TryRecvError::Empty)
             ),
             "the no-op delete fires no second event"
+        );
+    }
+
+    /// `booster`'s public boost of `original`.
+    async fn boost(pool: &PgPool, booster: &User, original: &status::Status) -> status::Status {
+        let (reblog, created) = status::create_reblog(
+            pool,
+            TEST_BASE_URL,
+            booster,
+            original,
+            status::Visibility::Public,
+        )
+        .await
+        .expect("the reblog fixture writes");
+        assert!(created, "the boost row is new");
+        reblog
+    }
+
+    /// The next hub event, failing the test rather than hanging when none
+    /// was published.
+    async fn next_event(
+        rx: &mut tokio::sync::broadcast::Receiver<
+            std::sync::Arc<crate::streaming::hub::StreamEvent>,
+        >,
+    ) -> std::sync::Arc<crate::streaming::hub::StreamEvent> {
+        tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .expect("an event was published in time")
+            .expect("the hub is open")
+    }
+
+    #[tokio::test]
+    async fn deleting_a_boosted_status_streams_a_delete_for_each_reblog() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let state = app_state(&pool);
+        let alice = user(&pool, "alice").await;
+        let bob = user(&pool, "bob").await;
+        let row = post(&pool, &alice, "boosted then deleted").await;
+        let reblog = boost(&pool, &bob, &row).await;
+        let mut rx = state.hub.subscribe();
+
+        assert!(
+            delete_status(&state, &row).await.expect("the delete runs"),
+            "the live row reports its deletion"
+        );
+
+        let first = next_event(&mut rx).await;
+        assert_eq!(first.event, "delete", "the original's withdrawal");
+        assert_eq!(
+            first.payload.as_deref(),
+            Some(row.id.to_string().as_str()),
+            "names the original"
+        );
+        let second = next_event(&mut rx).await;
+        assert_eq!(second.event, "delete", "then the boost's withdrawal");
+        assert_eq!(
+            second.payload.as_deref(),
+            Some(reblog.id.to_string().as_str()),
+            "names the reblog row's id, the one the boosters' followers saw"
+        );
+        assert!(
+            matches!(
+                rx.try_recv(),
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+            ),
+            "and nothing else is published"
+        );
+    }
+
+    #[tokio::test]
+    async fn deleting_an_unboosted_status_streams_exactly_one_delete() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let state = app_state(&pool);
+        let alice = user(&pool, "alice").await;
+        let row = post(&pool, &alice, "never boosted").await;
+        let mut rx = state.hub.subscribe();
+
+        assert!(
+            delete_status(&state, &row).await.expect("the delete runs"),
+            "the live row reports its deletion"
+        );
+
+        let event = next_event(&mut rx).await;
+        assert_eq!(event.event, "delete", "the original's withdrawal");
+        assert_eq!(
+            event.payload.as_deref(),
+            Some(row.id.to_string().as_str()),
+            "names the original"
+        );
+        assert!(
+            matches!(
+                rx.try_recv(),
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+            ),
+            "and it is the only one"
         );
     }
 }
