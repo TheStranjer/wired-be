@@ -35,9 +35,6 @@
 //! [`misc::router`] joins that list at the root: the `MongooseIM` auth
 //! endpoints live at `/…`, the addresses `MongooseIM`'s `extauth` http
 //! contract fixes.
-//! [`html_pages::router`] joins it at the root too: the shared HTML helper
-//! pages live at the top-level path Pleroma routes them on,
-//! `/mailer/unsubscribe/{token}`.
 //! [`remote_interaction::pleroma_router`] rides on [`v1`] for
 //! `POST /api/v1/pleroma/remote_interaction`.
 //! [`password_reset::auth_router`] joins it at `POST /auth/password`, the
@@ -65,7 +62,6 @@ pub mod federation_status;
 pub mod filters;
 pub mod follow_requests;
 pub mod helpers;
-pub mod html_pages;
 pub mod instance;
 pub mod lists;
 pub mod markers;

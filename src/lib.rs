@@ -60,8 +60,7 @@ use crate::{
 /// ([`api::oauth_external`]), `POST /auth/password` ([`api::password_reset`],
 /// Pleroma routes the reset request outside `/api`), and the `MongooseIM`
 /// auth endpoints ([`api::misc`]) — are merged at the
-/// top level, together with the HTML helper pages of
-/// [`api::html_pages`] (`/mailer/unsubscribe/{token}`).
+/// top level.
 /// Paths no route matches get the standard JSON error response (decision 8),
 /// marked with `x-wired-fallback: 1` so a test can tell the fallback's own
 /// 404 from a handler's.
@@ -87,7 +86,6 @@ pub fn app(state: AppState) -> Router {
             .merge(media_proxy::router())
             .merge(api::emoji_packs::files_router())
             .merge(api::misc::router())
-            .merge(api::html_pages::router())
             .fallback(not_found)
             .with_state(state),
     )

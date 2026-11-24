@@ -107,11 +107,6 @@ pub(super) const ROWS: &[RouteSpec] = &[
     },
     RouteSpec {
         method: "GET",
-        path: "/mailer/unsubscribe/:token",
-        auth: AuthClass::Public,
-    },
-    RouteSpec {
-        method: "GET",
         path: "/api/ap/whoami",
         auth: AuthClass::User,
     },
