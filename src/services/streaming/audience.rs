@@ -57,9 +57,9 @@ pub(super) async fn unlisted_targets(
     Ok((sorted_names(streams), users_audience(home, &owners), false))
 }
 
-/// The `private` visibility's answer: the author's and the accepted local
-/// followers' `user:{id}` streams — the home rule without the mentioned
-/// users, because a mention grants no visibility on a followers-only post.
+/// The `private` visibility's answer: the `user:{id}` streams of the author,
+/// the accepted local followers and the mentioned local users, matching
+/// `status_visibility` rule 5 (a remote mention holds no socket here).
 pub(super) async fn private_targets(
     state: &AppState,
     row: &Status,
@@ -67,6 +67,7 @@ pub(super) async fn private_targets(
 ) -> AppResult<(Vec<String>, Audience, bool)> {
     let mut ids = vec![author.id];
     ids.extend(followers_of(&state.db, row, author).await?);
+    ids.extend(mentioned_local_ids(&state.db, row.id).await?);
     ids.sort_unstable();
     ids.dedup();
     let streams = user_streams(&ids);
@@ -281,7 +282,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn private_post_streams_the_author_and_accepted_local_followers_only() {
+    async fn private_post_streams_author_followers_and_mentioned_local_users() {
         let db = crate::test_db::test_db().await.expect("test database slot");
         let pool = db.pool().clone();
         let state = app_state(&pool);
@@ -307,16 +308,51 @@ mod tests {
 
         assert_eq!(
             streams,
-            canonical(vec![user_stream(alice.id), user_stream(bob.id)]),
-            "the author and the one local active accepted follower — not the remote \
-             mirror, not the deactivated account, not the mentioned non-follower"
+            canonical(vec![
+                user_stream(alice.id),
+                user_stream(bob.id),
+                user_stream(erin.id),
+            ]),
+            "the author, the one local active accepted follower and the mentioned local \
+             non-follower — not the remote mirror, not the deactivated account"
         );
         assert_eq!(
             users_ids(&audience),
-            sorted_ids(vec![alice.id, bob.id]),
-            "and the audience is exactly those two"
+            sorted_ids(vec![alice.id, bob.id, erin.id]),
+            "and the audience is exactly those three"
         );
         assert!(!local_only, "private is still a federated post");
+    }
+
+    #[tokio::test]
+    async fn private_post_does_not_stream_to_a_mentioned_remote_user() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let state = app_state(&pool);
+        let alice = local_user(&pool, "alice").await;
+        let carol = remote_user(&pool, "carol").await;
+
+        let row = post_vis(
+            &pool,
+            &alice,
+            "followers only",
+            Visibility::Private,
+            &[carol.id],
+        )
+        .await;
+
+        let (streams, audience, _) = published(&state, &row, &alice).await;
+
+        assert_eq!(
+            streams,
+            canonical(vec![user_stream(alice.id)]),
+            "a remote mention holds no socket here, so only the author is streamed to"
+        );
+        assert_eq!(
+            users_ids(&audience),
+            sorted_ids(vec![alice.id]),
+            "and the audience holds local ids only"
+        );
     }
 
     #[tokio::test]

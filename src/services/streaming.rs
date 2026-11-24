@@ -53,10 +53,10 @@
 //!   gated by `Audience::Users` over the home ids plus the list owners:
 //!   the post stays out of the public view, and the event's audience is
 //!   the circle its streams name.
-//! - **`private`**: the author's and every accepted local follower's
-//!   `user:{id}` stream, `Audience::Users` over exactly those ids — the
-//!   home rule without the mentioned users, since a mention grants nothing
-//!   on a followers-only post (see [`crate::models::status_visibility`]).
+//! - **`private`**: the `user:{id}` stream of the author, every accepted
+//!   local follower and every mentioned local user, `Audience::Users` over
+//!   exactly those ids — the same set as the home rule, matching the
+//!   mention rule of [`crate::models::status_visibility`].
 //! - **`direct`**: the author's and each mentioned LOCAL user's `user:{id}`
 //!   and `direct:{id}` streams, `Audience::Users` over those ids — never
 //!   a public, hashtag or list stream.
