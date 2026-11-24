@@ -406,7 +406,7 @@ mod tests {
                 .unwrap()
         }
 
-        /// An MFA detour request, whose query carries the MFA token.
+        /// A request whose query carries an MFA challenge token.
         fn mfa_request() -> Request<Body> {
             Request::get(format!("/oauth/mfa?mfa_token={SECRET}&lang=en").as_str())
                 .body(Body::empty())

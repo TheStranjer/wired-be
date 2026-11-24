@@ -29,9 +29,8 @@
 //! is a 400.
 //!
 //! The helpers below also serve the external-login callback
-//! ([`crate::api::oauth_external`]) and the MFA verification ([`mfa`]),
-//! which finish an authorization on their own: `grant_code` mints the
-//! code (or `mfa_detour` parks it behind a second factor) and
+//! ([`crate::api::oauth_external`]), which finishes an authorization on
+//! its own: `grant_code` mints the code and
 //! `deliver_code` hands it to the client — a 302 to `redirect_uri` with
 //! `code` (and `state`), or `{"code": …}` JSON for the
 //! `urn:ietf:wg:oauth:2.0:oob` out-of-band URI.
@@ -53,7 +52,7 @@ use serde_json::{Value, json};
 use sqlx::PgPool;
 use url::form_urlencoded;
 
-use super::{NO_STORE, json_media::wants_json, mfa};
+use super::{NO_STORE, json_media::wants_json};
 use crate::{
     error::{AppError, AppResult},
     extract::{ApiBody, ApiParams},
@@ -205,39 +204,6 @@ fn frontend_location(base: &str, query: &str) -> AppResult<HeaderValue> {
     })
 }
 
-/// The MFA detour of a valid login (Pleroma's
-/// `handle_create_authorization_error({:mfa_required, user, auth, _})`):
-/// the authorization is created as a direct approval would, the
-/// challenge links it, and the browser goes to the code page instead of
-/// receiving the code. The external-login callback takes it for an
-/// MFA-enabled account.
-///
-/// # Errors
-///
-/// Any database failure arrives as [`AppError::Database`]; a redirect
-/// URI that cannot become a header value is a 400
-/// [`INVALID_REDIRECT_URI`].
-pub(crate) async fn mfa_detour(
-    state: &AppState,
-    user: &User,
-    app: &OauthApp,
-    scopes: &Scopes,
-    delivery: &Delivery<'_>,
-) -> AppResult<AuthorizeReply> {
-    let challenge = mfa::start_challenge(state, user, app, scopes, delivery.redirect_uri).await?;
-    let scope_text = scopes.to_string();
-    let mut params: Vec<(&str, &str)> = vec![
-        ("mfa_token", challenge.as_str()),
-        ("client_id", app.client_id.as_str()),
-        ("scope", scope_text.as_str()),
-        ("redirect_uri", delivery.redirect_uri),
-    ];
-    if let Some(client_state) = delivery.state {
-        params.push(("state", client_state));
-    }
-    redirect_to(mfa::MFA_PATH, &params)
-}
-
 /// The request parameters of `GET /oauth/authorize`. Every field is
 /// optional at the shape level — the endpoint answers the missing ones
 /// with its own 400 bodies (Pleroma matches on the keys), so the handler
@@ -361,7 +327,7 @@ pub(crate) fn check_scopes_subset(requested: &Scopes, app: &OauthApp) -> AppResu
 /// Mints the authorization code for the approved scopes and answers with
 /// it (Pleroma's `after_create_authorization`). The external-login
 /// callback of a login without a second factor ends here; an MFA-enabled
-/// account is parked through [`mfa_detour`] instead.
+/// account is refused before it gets this far.
 ///
 /// # Errors
 ///
@@ -389,9 +355,7 @@ pub(crate) async fn grant_code(
 /// The answer that hands a finished authorization's code to the client
 /// (Pleroma's `after_create_authorization`): `{"code": …}` JSON for the
 /// `urn:ietf:wg:oauth:2.0:oob` client, the 302 carrying `code` (and
-/// `state`) for every other URI. [`crate::api::oauth::mfa`] delivers
-/// through here too, which is what makes a completed MFA verification's
-/// answer *exactly* the external login's.
+/// `state`) for every other URI.
 ///
 /// # Errors
 ///

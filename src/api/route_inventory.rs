@@ -23,7 +23,9 @@
 //! The table holds one row per Pleroma route this backend replicates, in the
 //! order of the router file's scopes. Routes Pleroma has and Wired does not —
 //! the frontend uploader's `POST /api/v1/pleroma/uploader_callback/:upload_path`,
-//! Phoenix's dev and test routes, `/phoenix/live_dashboard`, the SPA
+//! the OAuth MFA code-entry page `GET /oauth/mfa` and its
+//! `POST /oauth/mfa/verify` form, Phoenix's dev and test routes,
+//! `/phoenix/live_dashboard`, the SPA
 //! fallbacks (`GET /:maybe_nickname_or_id` and `GET /*path`) and the Shout
 //! channel socket (`/socket`) — are deliberately absent; the README's
 //! "API coverage" section names them.
@@ -110,7 +112,7 @@ mod tests {
     use super::{AuthClass, ROUTES, RouteSpec, routes};
 
     /// The assembled table is exactly the one that lived in this file before
-    /// the split: twelve sections, none of them empty, 373 rows, opening
+    /// the split: twelve sections, none of them empty, 368 rows, opening
     /// with the instance metadata route and closing with the custom emoji
     /// files.
     #[test]
@@ -123,7 +125,7 @@ mod tests {
         let rows: Vec<&RouteSpec> = routes().collect();
         assert_eq!(
             rows.len(),
-            370,
+            368,
             "the assembled table holds every row exactly once"
         );
         assert_eq!(

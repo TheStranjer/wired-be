@@ -153,10 +153,11 @@ const NO_STORE: &str = "no-store";
 /// `Pragma` value of every answer (RFC 6749 §5.1).
 const NO_CACHE: &str = "no-cache";
 
-/// The `/oauth` router, merged at the top level of [`crate::app`]: the
-/// paths are fixed by OAuth (`/oauth/token`, `/oauth/revoke`,
-/// `/oauth/authorize`, `/oauth/mfa` and the rest in later tickets), not
-/// nested under `/api`.
+/// The `/oauth` router, merged at the top level of [`crate::app`].
+///
+/// The paths are fixed by OAuth (`/oauth/token`, `/oauth/revoke`,
+/// `/oauth/authorize`, `/oauth/mfa/challenge` and the rest in later
+/// tickets), not nested under `/api`.
 ///
 /// `POST /oauth/token` and the `/oauth/authorize` half it merges run in
 /// the limiter's `authentication` bucket (Pleroma throttles both paths in

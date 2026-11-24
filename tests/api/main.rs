@@ -450,7 +450,8 @@ mod oauth;
 /// The external OAuth login endpoints.
 mod oauth_external;
 
-/// The OAuth MFA challenge flow (`/oauth/mfa` and the token grant's challenge).
+/// The OAuth MFA challenge flow (`/oauth/mfa/challenge`, the token grant's
+/// challenge and the retired `/oauth/mfa` pages).
 mod oauth_mfa;
 
 /// OAuth token management (`/api/oauth_tokens` and the pleroma apps).

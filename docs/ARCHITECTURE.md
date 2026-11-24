@@ -60,7 +60,9 @@ cite these decisions by number.
    `{FRONTEND_BASE_URL}/oauth/external/consent?state=…&confirm_token=…`; the
    frontend talks to `GET /oauth/registration_details`, `POST
    /oauth/register` and `GET`/`POST /oauth/external/consent`, which answer
-   JSON only.
+   JSON only. The second factor is likewise API-only: an MFA-enabled
+   account's password grant answers 403 `mfa_required`, and the client
+   finishes it at `POST /oauth/mfa/challenge`; there is no `/oauth/mfa` page.
 
 10. **Request bodies**: Mastodon clients send JSON,
     `application/x-www-form-urlencoded` (with `ids[]=1&ids[]=2` arrays and
