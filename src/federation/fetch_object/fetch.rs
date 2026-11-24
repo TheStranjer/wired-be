@@ -13,6 +13,7 @@ use crate::{
     },
     http_client::{HttpClient, user_agent},
     state::AppState,
+    util::url::same_origin,
 };
 
 /// Cap on one fetched object document: 2 MiB. Notes carry content, tags
@@ -127,8 +128,8 @@ fn declared_id(document: &Value) -> Result<&str, FetchError> {
 /// authority (`host:port`) compared on the parsed URL, the same measure
 /// [`is_local_ap_id`] keeps. An unparsable side matches nothing.
 fn same_authority(left: &str, right: &str) -> bool {
-    let Ok(parsed_left) = Url::parse(left) else {
+    let (Ok(parsed_left), Ok(parsed_right)) = (Url::parse(left), Url::parse(right)) else {
         return false;
     };
-    Url::parse(right).is_ok_and(|parsed_right| parsed_left.authority() == parsed_right.authority())
+    same_origin(&parsed_left, &parsed_right)
 }
