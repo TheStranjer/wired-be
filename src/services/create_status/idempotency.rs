@@ -11,7 +11,7 @@ use tracing::{debug, warn};
 
 use super::{
     CreateStatusParams,
-    build::prepared_new_status,
+    build::{Prepared, prepared_new_status},
     create::{created_entity, store_poll},
 };
 use crate::{
@@ -65,7 +65,7 @@ pub async fn create_status_idempotent(
         );
         return replayed_entity(state, user, &row).await;
     }
-    let (new, poll) = prepared_new_status(state, user, app, &params).await?;
+    let Prepared { new, poll, .. } = prepared_new_status(state, user, app, &params).await?;
     let mut tx = state.db.begin().await?;
     let row = status::insert_conn(&mut tx, &state.config.base_url, &new).await?;
     store_poll(&mut tx, row.id, poll.as_ref()).await?;

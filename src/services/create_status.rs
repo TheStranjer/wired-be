@@ -96,7 +96,7 @@
 //! creates under one key leaves exactly one status (the loser rolls its
 //! write back and restates the winner — see
 //! [`crate::models::idempotency_key`]). [`preview_status`] is the `preview`
-//! arm: the whole `check_body`/`rendered_fields` pipeline runs, but
+//! arm: the create's own `prepared_new_status` step runs, but
 //! nothing is written and no hook fires — the [`Status`] entity a create
 //! would have answered is built in memory from a minted id, `now()` and
 //! zero counters, and its `poll` is the `null` of a question nothing was
@@ -150,8 +150,8 @@ pub mod validate_poll;
 pub mod validate_text;
 
 pub(crate) use after_create::after_status_created;
-pub(crate) use build::prepared_new_status;
-pub use build::render_status_fields;
+pub(crate) use build::{Prepared, prepared_new_status};
+pub use build::{render_status_fields, render_status_fields_with_mentions};
 pub use create::{RenderedFields, create_status};
 pub use edit::{EditStatusParams, edit_status};
 pub use idempotency::create_status_idempotent;

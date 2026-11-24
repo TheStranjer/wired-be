@@ -1,6 +1,6 @@
 //! The `preview` arm of `POST /api/v1/statuses`: [`preview_status`] runs
-//! the whole check-and-render pipeline of a create and answers the entity
-//! a create would have, writing nothing.
+//! the same `prepared_new_status` step a create runs and answers the
+//! entity a create would have, writing nothing.
 //!
 //! The in-memory row (`preview_row`) carries a freshly minted id,
 //! `now()` and zero counters, and its fabricated tags (`preview_tags`)
@@ -9,19 +9,19 @@
 use chrono::Utc;
 use tracing::debug;
 
-use super::{
-    CreateStatusParams, RenderedFields,
-    build::rendered_fields,
-    validate::{Checked, check_body},
-};
+use super::{CreateStatusParams, Prepared, prepared_new_status};
 use crate::{
     entities::{
         account::JsonBool,
         status::{Status, StatusSource},
     },
     error::AppResult,
-    models::{hashtag::Hashtag, oauth_app::OauthApp, status, user::User},
-    services::mentions::resolve_mentions,
+    models::{
+        hashtag::Hashtag,
+        oauth_app::OauthApp,
+        status::{self, NewStatus},
+        user::{self, User},
+    },
     state::AppState,
     util::id::{new_id, object_ap_id},
 };
@@ -29,47 +29,48 @@ use crate::{
 /// Builds the [`Status`] entity `params` describes **without writing
 /// anything**.
 ///
-/// Every check [`crate::services::create_status::create_status`] runs, the same render with its mentions
-/// resolved and its tags extracted, and an entity whose `id` is a freshly
-/// minted `UUIDv7` (decision 4), whose `created_at` is now and whose
-/// counters are zero — Pleroma's `preview` parameter, whose
-/// `ActivityPub.create(changes, true)` answers the draft activity and
-/// persists none of it.
+/// The very pipeline [`crate::services::create_status::create_status`]
+/// runs before its write — the checks, the reply's parent and its
+/// visibility cap, the conversation participation, the quote target, the
+/// render with its mentions resolved and its tags extracted — and an entity
+/// whose `id` is a freshly minted `UUIDv7` (decision 4), whose `created_at`
+/// is now and whose counters are zero — Pleroma's `preview` parameter,
+/// whose `ActivityPub.create(changes, true)` answers the draft activity and
+/// persists none of it. A preview of a reply therefore answers the
+/// parent-capped visibility, lists the inherited mentions and is a 404 for
+/// a parent the poster cannot see, exactly as the create would.
 ///
 /// Nothing touches `statuses`, `status_mentions`, the hashtag tables or
 /// the poll tables, no counter moves, no key is claimed and
 /// `after_status_created` never fires. A body carrying a poll is checked
 /// the way a post's is and its entity answers `poll: null` — the question
-/// is previewed, never stored. The one read the preview does perform is
-/// the mention lookup —
-/// [`crate::services::create_status::render_status_fields`]'s own, network fetch of
-/// an unknown remote account included, since the rendered content is only
-/// honest if the mention links are. A body naming a `quote_id` previews
-/// the same way: the in-memory row quotes nothing, the original is not
-/// gated, and no `quotes_count` moves.
+/// is previewed, never stored. The reads the preview does perform are the
+/// create's own: the mention lookup — network fetch of an unknown remote
+/// account included, since the rendered content is only honest if the
+/// mention links are — and the reply parent and quote target lookups. A
+/// body naming a `quote_id` has its target gated like a create's, but the
+/// in-memory row quotes nothing and no `quotes_count` moves.
 ///
 /// # Errors
 ///
-/// Those of [`crate::services::create_status::create_status`]'s checks and render: every refusal
-/// [`check_body`] owes the submitted body arrives unchanged, so a preview
-/// that would not post is refused exactly as the post would be.
+/// Those of [`crate::services::create_status::create_status`]'s
+/// preparation: every refusal the submitted body is owed — its 422s, the
+/// 404 of an unseen parent, participation or quote target — arrives
+/// unchanged, so a preview that would not post is refused exactly as the
+/// post would be.
 pub async fn preview_status(
     state: &AppState,
     user: &User,
     app: Option<&OauthApp>,
     params: &CreateStatusParams,
 ) -> AppResult<Status> {
-    let checked = check_body(
-        &state.config,
-        &user.default_scope,
-        user.sensitive_default.get(),
-        params,
-    )?;
-    let found = resolve_mentions(state, checked.text).await?;
-    let fields = rendered_fields(state, checked.text, checked.content_type, &found);
-    let mentioned: Vec<User> = found.into_iter().map(|(_, account)| account).collect();
-    let tags = preview_tags(&fields.hashtags);
-    let row = preview_row(state, user, app, &checked, &fields);
+    let Prepared { new, mentioned, .. } = prepared_new_status(state, user, app, params).await?;
+    let reply_author = match new.in_reply_to_account_id {
+        Some(id) => user::get_by_id(&state.db, id).await?,
+        None => None,
+    };
+    let tags = preview_tags(&new.hashtags);
+    let row = preview_row(&state.config.base_url, &new);
     debug!(
         status = %row.id,
         user = %user.id,
@@ -79,7 +80,7 @@ pub async fn preview_status(
         StatusSource {
             row: &row,
             author: user,
-            reply_author: None,
+            reply_author: reply_author.as_ref(),
             media: &[],
             mentions: &mentioned,
             tags: &tags,
@@ -123,51 +124,47 @@ fn preview_tags(names: &[String]) -> Vec<Hashtag> {
         .collect()
 }
 
-/// The in-memory row a preview renders: a fresh id with the `uri`, `url` and
-/// `conversation_id` [`status::insert`] would derive from it (decision 6),
-/// every column the checked body decided, zero counters, no links to any
-/// other status and `now()` for both timestamps. It is the row a create of
-/// this body would have stored — except that it will never be stored.
-fn preview_row(
-    state: &AppState,
-    user: &User,
-    app: Option<&OauthApp>,
-    checked: &Checked<'_>,
-    fields: &RenderedFields,
-) -> status::Status {
+/// The in-memory row a preview renders: a fresh id with the `uri` and `url`
+/// [`status::insert`] would derive from it (decision 6), every column the
+/// prepared `new` decided — its reply links, its thread (the new id when it
+/// names none, as the insert takes), its visibility and language after the
+/// reply rules — zero counters and `now()` for both timestamps. It is the
+/// row a create of this body would have stored — except that it will never
+/// be stored, and that it quotes nothing: `quote_of_id` stays empty because
+/// the entity would render a quote the preview never fetched.
+fn preview_row(base_url: &str, new: &NewStatus) -> status::Status {
     let id = new_id();
     let now = Utc::now();
-    let base = state.config.base_url.as_str();
     status::Status {
         id,
-        uri: object_ap_id(base, id),
-        url: Some(format!("{base}/notice/{id}")),
-        user_id: user.id,
-        content: fields.content.clone(),
-        raw_text: checked.text.to_owned(),
-        content_type: checked.content_type.to_owned(),
-        spoiler_text: checked.spoiler_text.to_owned(),
-        sensitive: checked.sensitive,
-        visibility: checked.visibility,
-        language: checked.language.map(str::to_owned),
-        in_reply_to_id: None,
-        in_reply_to_account_id: None,
-        in_reply_to_ap_id: None,
-        conversation_id: id,
-        ap_context: None,
-        direct_conversation_id: None,
+        uri: object_ap_id(base_url, id),
+        url: Some(format!("{base_url}/notice/{id}")),
+        user_id: new.user_id,
+        content: new.content.clone(),
+        raw_text: new.raw_text.clone(),
+        content_type: new.content_type.clone(),
+        spoiler_text: new.spoiler_text.clone(),
+        sensitive: new.sensitive,
+        visibility: new.visibility,
+        language: new.language.clone(),
+        in_reply_to_id: new.in_reply_to_id,
+        in_reply_to_account_id: new.in_reply_to_account_id,
+        in_reply_to_ap_id: new.in_reply_to_ap_id.clone(),
+        conversation_id: new.conversation_id.unwrap_or(id),
+        ap_context: new.ap_context.clone(),
+        direct_conversation_id: new.direct_conversation_id,
         reblog_of_id: None,
         quote_of_id: None,
-        local: true,
-        application_name: app.map(|found| found.client_name.clone()),
-        application_website: app.and_then(|found| found.website.clone()),
+        local: new.local,
+        application_name: new.application_name.clone(),
+        application_website: new.application_website.clone(),
         replies_count: 0,
         reblogs_count: 0,
         favourites_count: 0,
         quotes_count: 0,
         edited_at: None,
         deleted_at: None,
-        expires_at: checked.expires_at,
+        expires_at: new.expires_at,
         inserted_at: now,
         updated_at: now,
     }
@@ -184,7 +181,8 @@ mod tests {
             BAD_MEDIA_ID, EMPTY_STATUS, INVALID_CONTENT_TYPE, INVALID_VISIBILITY,
             MAX_SPOILER_CHARS, TOO_MANY_ATTACHMENTS,
             test_support::{
-                BASE, key_rows, live_ids, params, poll_rows, refused, state, user, wire,
+                BASE, key_rows, live_ids, mention_ids, missed, params, plain_post, poll_rows,
+                refused, replying, state, user, wire,
             },
         },
         util::entities::{hashtag_html, mention_html},
@@ -295,7 +293,7 @@ mod tests {
             "no mention link, no tag row and no tag link were written — \
              the mentions and tags the entity answers are resolved, not stored"
         );
-        let counted = crate::models::user::get_by_id(pool, alice.id)
+        let counted = user::get_by_id(pool, alice.id)
             .await
             .unwrap()
             .expect("the author exists");
@@ -381,6 +379,115 @@ mod tests {
         assert_eq!(key_rows(pool).await, 0, "or claimed a key");
     }
 
+    /// A preview of a reply runs the create's reply rules: under a
+    /// `private` parent a body naming no `visibility` answers `private`,
+    /// and the entity carries the reply links, with nothing written.
+    #[tokio::test]
+    async fn a_reply_preview_takes_the_parent_capped_visibility() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool();
+        let app_state = state(pool);
+        let alice = user(pool, "replier").await;
+        let parent = status::insert(
+            pool,
+            BASE,
+            &NewStatus {
+                visibility: status::Visibility::Private,
+                ..NewStatus::local(&alice, "for my followers")
+            },
+        )
+        .await
+        .expect("the private parent inserts");
+
+        let entity = preview_status(&app_state, &alice, None, &replying("an answer", parent.id))
+            .await
+            .expect("the reply previews");
+
+        let value = serde_json::to_value(&entity).expect("the entity serializes");
+        assert_eq!(
+            value["visibility"], "private",
+            "the default scope is capped by the parent, as a create would"
+        );
+        assert_eq!(value["in_reply_to_id"], parent.id.to_string());
+        assert_eq!(value["in_reply_to_account_id"], alice.id.to_string());
+        assert_eq!(
+            live_ids(pool).await,
+            vec![parent.id],
+            "the preview wrote nothing beside the parent"
+        );
+    }
+
+    /// A reply preview lists the parent's author in `mentions` and names
+    /// them in `in_reply_to_account_acct`, as the stored reply would.
+    #[tokio::test]
+    async fn a_reply_preview_lists_the_parent_author_in_mentions() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool();
+        let app_state = state(pool);
+        let alice = user(pool, "answerer").await;
+        let bob = user(pool, "bob").await;
+        let parent = plain_post(pool, &bob, "question").await;
+
+        let entity = preview_status(&app_state, &alice, None, &replying("answer", parent.id))
+            .await
+            .expect("the reply previews");
+
+        let value = serde_json::to_value(&entity).expect("the entity serializes");
+        assert_eq!(
+            value["mentions"],
+            json!([{ "id": bob.id.to_string(), "username": "bob",
+                     "url": bob.ap_id, "acct": "bob" }]),
+            "the parent's author is auto-mentioned"
+        );
+        assert_eq!(value["pleroma"]["in_reply_to_account_acct"], "bob");
+        assert_eq!(
+            value["content"], "<p>answer</p>",
+            "the text itself is not modified"
+        );
+        assert_eq!(
+            live_ids(pool).await,
+            vec![parent.id],
+            "and nothing was stored"
+        );
+        assert!(
+            mention_ids(pool, parent.id).await.is_empty(),
+            "no mention link was written"
+        );
+    }
+
+    /// A preview naming a parent the poster cannot see is the create's 404,
+    /// the same for an unknown id.
+    #[tokio::test]
+    async fn a_reply_preview_to_an_unseen_parent_is_not_found() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool();
+        let app_state = state(pool);
+        let alice = user(pool, "outsider").await;
+        let bob = user(pool, "bob").await;
+        let hidden = status::insert(
+            pool,
+            BASE,
+            &NewStatus {
+                visibility: status::Visibility::Private,
+                ..NewStatus::local(&bob, "followers only")
+            },
+        )
+        .await
+        .expect("the private parent inserts");
+
+        for parent_id in [hidden.id, new_id()] {
+            let err = preview_status(&app_state, &alice, None, &replying("peek", parent_id))
+                .await
+                .expect_err("the parent is not visible to the poster");
+            missed(err).await;
+        }
+        assert_eq!(
+            live_ids(pool).await,
+            vec![hidden.id],
+            "the refused previews wrote nothing"
+        );
+    }
+
     /// A preview whose body carries a poll runs the whole check and render
     /// and stores nothing: the entity answers `poll: null`, the `polls`
     /// and `poll_options` tables stay as empty as the `statuses` one, and
@@ -423,7 +530,7 @@ mod tests {
             .expect("the option count reads");
         assert_eq!(options.0, 0, "and no option rows either");
         assert_eq!(key_rows(pool).await, 0, "and no key was claimed");
-        let counted = crate::models::user::get_by_id(pool, alice.id)
+        let counted = user::get_by_id(pool, alice.id)
             .await
             .unwrap()
             .expect("the author exists");

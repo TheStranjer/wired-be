@@ -17,7 +17,8 @@ use tracing::debug;
 use uuid::Uuid;
 
 use super::{
-    CheckedPoll, CreateStatusParams, QUOTE_NOT_ALLOWED, after_status_created, prepared_new_status,
+    CheckedPoll, CreateStatusParams, Prepared, QUOTE_NOT_ALLOWED, after_status_created,
+    prepared_new_status,
 };
 use crate::{
     entities::status::Status,
@@ -101,7 +102,7 @@ pub async fn create_status(
     app: Option<&OauthApp>,
     params: CreateStatusParams,
 ) -> AppResult<Status> {
-    let (new, poll) = prepared_new_status(state, user, app, &params).await?;
+    let Prepared { new, poll, .. } = prepared_new_status(state, user, app, &params).await?;
     let mut tx = state.db.begin().await?;
     let row = status::insert_conn(&mut tx, &state.config.base_url, &new).await?;
     store_poll(&mut tx, row.id, poll.as_ref()).await?;
