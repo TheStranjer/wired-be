@@ -128,18 +128,53 @@ pub async fn soft_delete_with_reblogs(
 /// short and large enough that most accounts tombstone in one pass.
 const SOFT_DELETE_BATCH: i64 = 100;
 
-/// The `UPDATE` behind [`soft_delete_all_for_user`]: the tombstone
-/// [`soft_delete`] writes, applied to at most [`SOFT_DELETE_BATCH`] of the
-/// account's live rows per pass, oldest id first.
+/// The statement behind [`soft_delete_all_for_user`]: one pass, in one
+/// statement, over at most [`SOFT_DELETE_BATCH`] of the account's live rows,
+/// oldest id first.
+///
+/// `gone` writes the tombstone [`soft_delete`] writes and hands back the links
+/// of the rows it turned. `pins` removes every pin of those rows. `targets`
+/// counts, per linked status, how many of the tombstoned rows answered,
+/// reblogged or quoted it, and `stepped` takes those counts off the linked
+/// statuses in **one** `UPDATE` (a row written twice by one statement keeps
+/// only one of the writes, so the three counters cannot be three updates).
+/// Rows that are themselves in this batch are left out of `stepped`: they
+/// are tombstoned by `gone`. The answer is the number of rows tombstoned.
 const SOFT_DELETE_BATCH_FOR_USER_SQL: &str = concat!(
-    "UPDATE statuses ",
+    "WITH gone AS (
+         UPDATE statuses ",
     tombstone_set!(),
     " WHERE id IN (
-         SELECT id FROM statuses
-          WHERE user_id = $1 AND deleted_at IS NULL
-          ORDER BY id
-          LIMIT $2
-     )"
+             SELECT id FROM statuses
+              WHERE user_id = $1 AND deleted_at IS NULL
+              ORDER BY id
+              LIMIT $2
+         )
+         RETURNING id, in_reply_to_id, reblog_of_id, quote_of_id
+     ), pins AS (
+         DELETE FROM pinned_statuses WHERE status_id IN (SELECT id FROM gone)
+     ), targets AS (
+         SELECT id, sum(replies)::int AS replies, sum(reblogs)::int AS reblogs,
+                sum(quotes)::int AS quotes
+           FROM (
+                SELECT in_reply_to_id AS id, 1 AS replies, 0 AS reblogs, 0 AS quotes
+                  FROM gone WHERE in_reply_to_id IS NOT NULL
+                UNION ALL
+                SELECT reblog_of_id, 0, 1, 0 FROM gone WHERE reblog_of_id IS NOT NULL
+                UNION ALL
+                SELECT quote_of_id, 0, 0, 1 FROM gone WHERE quote_of_id IS NOT NULL
+           ) links
+          GROUP BY id
+     ), stepped AS (
+         UPDATE statuses s
+            SET replies_count = GREATEST(0, s.replies_count - t.replies),
+                reblogs_count = GREATEST(0, s.reblogs_count - t.reblogs),
+                quotes_count = GREATEST(0, s.quotes_count - t.quotes),
+                updated_at = now()
+           FROM targets t
+          WHERE s.id = t.id AND s.id NOT IN (SELECT id FROM gone)
+     )
+     SELECT count(*) FROM gone"
 );
 
 /// Soft-deletes every status authored by user `user_id`: the status step of
@@ -151,11 +186,13 @@ const SOFT_DELETE_BATCH_FOR_USER_SQL: &str = concat!(
 /// retry the step safely. Returns the total number of rows the passes
 /// tombstoned.
 ///
-/// What the per-status [`soft_delete`] does around the tombstone — counter
-/// steps and pin clearing — is deliberately left out: the author's row is
-/// purged and deactivated by the same job, so its denormalised counters
-/// describe nothing anyone will read, and a pin of a tombstone renders
-/// nowhere, exactly like the tombstone itself.
+/// What the per-status [`soft_delete`] does around the tombstone is done in
+/// the same statement as the tombstone, per batch: every tombstoned reply,
+/// reblog and quote steps `replies_count`, `reblogs_count` or `quotes_count`
+/// of the live status it fed back down, and every pin of a tombstoned row is
+/// removed. Only the author's own `statuses_count` is left alone: the
+/// author's row is purged and deactivated by the same job, so its
+/// denormalised counters describe nothing anyone will read.
 ///
 /// # Errors
 ///
@@ -164,12 +201,12 @@ const SOFT_DELETE_BATCH_FOR_USER_SQL: &str = concat!(
 pub async fn soft_delete_all_for_user(pool: &PgPool, user_id: Uuid) -> AppResult<u64> {
     let mut total = 0_u64;
     loop {
-        let tombstoned = sqlx::query(SOFT_DELETE_BATCH_FOR_USER_SQL)
+        let tombstoned = sqlx::query_scalar::<_, i64>(SOFT_DELETE_BATCH_FOR_USER_SQL)
             .bind(user_id)
             .bind(SOFT_DELETE_BATCH)
-            .execute(pool)
-            .await?
-            .rows_affected();
+            .fetch_one(pool)
+            .await?;
+        let tombstoned = u64::try_from(tombstoned).unwrap_or(0);
         if tombstoned == 0 {
             return Ok(total);
         }
