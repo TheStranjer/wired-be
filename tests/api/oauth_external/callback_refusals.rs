@@ -253,8 +253,8 @@ async fn dotted_field_names_read_a_nested_document() {
     .await;
     assert_eq!(
         location(&unlinked),
-        format!("https://test.example/oauth/registration_details?state={stranger}"),
-        "the nested-field hand-off goes to the same form"
+        format!("https://fe.example/oauth/external/register?state={stranger}"),
+        "the nested-field hand-off goes to the same screen"
     );
     let (_, nested) = stored_params(&pool, &stranger).await;
     assert_eq!(
@@ -335,8 +335,8 @@ async fn a_link_to_a_remote_actor_is_not_a_login() {
     );
     assert_eq!(
         location(&response),
-        format!("https://test.example/oauth/registration_details?state={state}"),
-        "so the account goes to the registration form"
+        format!("https://fe.example/oauth/external/register?state={state}"),
+        "so the account goes to the registration screen"
     );
     assert_eq!(
         count_codes(&pool).await,

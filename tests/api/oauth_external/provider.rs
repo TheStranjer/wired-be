@@ -34,6 +34,8 @@ pub(super) const PROVIDER_CLIENT_ID: &str = "provider-client-id";
 pub(super) const PROVIDER_CLIENT_SECRET: &str = "provider-client-secret";
 /// The scopes the fixture provider asks the provider for.
 pub(super) const PROVIDER_SCOPES: &str = "read:user user:email";
+/// The frontend the callback hands the browser to, apart from `BASE_URL`.
+pub(super) const FRONTEND: &str = "https://fe.example";
 /// The uid the happy path links to a local user.
 pub(super) const LINKED_UID: &str = "4242";
 /// A uid nobody has linked.
@@ -103,10 +105,12 @@ impl MockProvider {
         }
     }
 
-    /// [`common::test_config`] with `providers` configured.
+    /// [`common::test_config`] with `providers` configured and the
+    /// frontend on [`FRONTEND`].
     pub(super) fn config_with(providers: Vec<OauthProvider>) -> Config {
         let mut config = common::test_config();
         config.oauth_providers = providers;
+        config.frontend_base_url = FRONTEND.to_owned();
         config
     }
 

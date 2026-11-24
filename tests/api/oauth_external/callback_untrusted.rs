@@ -36,8 +36,8 @@ async fn an_untrusted_app_is_sent_to_consent_for_a_linked_account() {
     assert_no_store(&response);
     let url = location(&response);
     assert!(
-        url.contains("/oauth/external/consent?"),
-        "to the consent screen: {url}"
+        url.starts_with("https://fe.example/oauth/external/consent?"),
+        "to the frontend's consent screen: {url}"
     );
     assert!(
         !url.starts_with(REDIRECT),
@@ -50,6 +50,11 @@ async fn an_untrusted_app_is_sent_to_consent_for_a_linked_account() {
     );
     let token = query_param(&url, "confirm_token").expect("a confirm_token on the redirect");
     assert_eq!(token.len(), 43, "32 random bytes, base64url");
+    assert_eq!(
+        url,
+        format!("https://fe.example/oauth/external/consent?state={state}&confirm_token={token}"),
+        "the state and the token, nothing else"
+    );
 
     assert_eq!(count_codes(&pool).await, 0, "no authorization was created");
     assert_eq!(count_states(&pool).await, 1, "the state waits for consent");

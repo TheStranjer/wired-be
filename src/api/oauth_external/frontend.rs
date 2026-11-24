@@ -1,13 +1,12 @@
-//! The JSON half of an external login, for a frontend that renders the
-//! registration and consent screens itself: `GET /oauth/registration_details`
-//! with `Accept: application/json` ([`details_json`]), `POST /oauth/register`
-//! with a JSON body ([`registered_json`]), and the consent pair
+//! The JSON side of an external login, for the frontend that renders the
+//! registration and consent screens (`{FRONTEND_BASE_URL}/oauth/external/register`
+//! and `/oauth/external/consent`, where the callback sends the browser):
+//! `GET /oauth/registration_details` ([`details_json`]), `POST
+//! /oauth/register` ([`registered_json`]), and the consent pair
 //! `GET`/`POST /oauth/external/consent` ([`consent_details`],
-//! [`consent_decided`]) a linked account of an untrusted application is sent
-//! to.
+//! [`consent_decided`]). All of them answer JSON only.
 //!
-//! The registration answers are the HTML page's outcomes spelled as JSON: a
-//! finished login is 200 `{"redirect_uri": "<app redirect>?code=…&state=…"}`
+//! The registration answers: a finished login is 200 `{"redirect_uri": "<app redirect>?code=…&state=…"}`
 //! (`{"code": …}` for the out-of-band URI), an account waiting for staff or
 //! for its email is 200 `{"pending": "approval"|"confirmation"}`, a refused
 //! submission is `POST /api/v1/accounts`'s 422 (`error` carrying the JSON
@@ -23,7 +22,6 @@
 
 use axum::{
     Json,
-    http::{HeaderMap, header::CONTENT_TYPE},
     response::{IntoResponse as _, Response},
 };
 use serde::Deserialize;
@@ -32,10 +30,7 @@ use subtle::ConstantTimeEq as _;
 use uuid::Uuid;
 
 use crate::{
-    api::oauth::{
-        authorize::{self, AuthorizeReply},
-        json_media::is_json_media_type,
-    },
+    api::oauth::authorize::{self, AuthorizeReply},
     error::{AppError, AppResult},
     models::{
         oauth_login_state::{self, OauthLoginState},
@@ -107,15 +102,6 @@ impl Confirmation {
     }
 }
 
-/// Whether the request body is declared `application/json`: what tells the
-/// frontend's registration from the HTML form's.
-pub(super) fn is_json_body(headers: &HeaderMap) -> bool {
-    headers
-        .get(CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(is_json_media_type)
-}
-
 /// The response of a JSON endpoint: 200 with the body, or the error.
 pub(super) fn json_response(outcome: AppResult<Value>) -> Response {
     match outcome {
@@ -141,8 +127,8 @@ pub(super) async fn details_json(state: &AppState, presented: Option<&str>) -> A
     }))
 }
 
-/// `POST /oauth/register` as JSON: the account created exactly as the form
-/// creates it, and the outcome as JSON (see the module docs).
+/// `POST /oauth/register`: the account created from the submission, and
+/// the outcome as JSON (see the module docs).
 ///
 /// # Errors
 ///
@@ -160,7 +146,7 @@ pub(super) async fn registered_json(state: &AppState, form: RegisterForm) -> App
 }
 
 /// What a finished registration is answered with: which wait the account
-/// is in — approval weighed first, as the HTML page does — or the login.
+/// is in — approval weighed first — or the login.
 async fn finished_json(state: &AppState, user: &User, params: &StoredParams) -> AppResult<Value> {
     if user.approval_pending.get() {
         return Ok(json!({ "pending": PENDING_APPROVAL }));
@@ -187,8 +173,7 @@ async fn granted_json(state: &AppState, user: &User, params: &StoredParams) -> A
 ///
 /// # Errors
 ///
-/// [`AppError::Internal`] for a reply that is a page, which no finished
-/// login answers.
+/// 400 for a `Location` that is not text.
 fn reply_json(reply: AuthorizeReply) -> AppResult<Value> {
     match reply {
         AuthorizeReply::Found(location) => {
@@ -198,9 +183,6 @@ fn reply_json(reply: AuthorizeReply) -> AppResult<Value> {
             Ok(json!({ "redirect_uri": url }))
         }
         AuthorizeReply::Code(code) => Ok(json!({ "code": code })),
-        AuthorizeReply::Page(_) => Err(AppError::Internal(
-            "an external login answered a page where a redirect belongs".to_owned(),
-        )),
     }
 }
 
@@ -326,26 +308,7 @@ mod tests {
     }
 
     #[test]
-    fn only_a_json_content_type_is_a_json_body() {
-        let with = |value: &'static str| {
-            let mut headers = HeaderMap::new();
-            let _absent = headers.insert(CONTENT_TYPE, HeaderValue::from_static(value));
-            headers
-        };
-        assert!(is_json_body(&with("application/json")), "plain");
-        assert!(
-            is_json_body(&with("Application/JSON; charset=utf-8")),
-            "any case, with parameters"
-        );
-        assert!(
-            !is_json_body(&with("application/x-www-form-urlencoded")),
-            "a form is not"
-        );
-        assert!(!is_json_body(&HeaderMap::new()), "no header, no JSON");
-    }
-
-    #[test]
-    fn a_redirect_is_the_location_a_code_is_the_code_and_a_page_is_a_fault() {
+    fn a_redirect_is_the_location_and_a_code_is_the_code() {
         let found = reply_json(AuthorizeReply::Found(HeaderValue::from_static(
             "https://client.example/cb?code=c",
         )))
@@ -361,10 +324,6 @@ mod tests {
             code,
             json!({"code": "oob-code"}),
             "the out-of-band code, under `code`"
-        );
-        assert!(
-            reply_json(AuthorizeReply::Page("<p>x</p>".to_owned())).is_err(),
-            "a page has no redirect to give"
         );
     }
 

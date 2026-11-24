@@ -1,7 +1,7 @@
 //! The callback's successes: the linked user logged in with a
 //! single-use code on the app's redirect, the echo of exactly what the
 //! client sent, the out-of-band code, and the unlinked account
-//! handed to the registration form under `pending`.
+//! handed to the frontend's registration screen under `pending`.
 
 use axum::http::StatusCode;
 use serde_json::json;
@@ -167,7 +167,7 @@ async fn the_callback_answers_the_out_of_band_code() {
 
 /// An unlinked provider account is not a login: the state keeps its authorize
 /// parameters, gains the provider's account info under `pending`, and the
-/// browser is sent to the registration form. No code is minted, and a repeat
+/// browser is sent to the frontend's registration screen. No code is minted, and a repeat
 /// callback rewrites one `pending` instead of stacking another.
 #[tokio::test]
 async fn the_callback_hands_an_unlinked_account_to_registration() {
@@ -185,8 +185,8 @@ async fn the_callback_hands_an_unlinked_account_to_registration() {
     assert_no_store(&response);
     assert_eq!(
         location(&response),
-        format!("https://test.example/oauth/registration_details?state={state}"),
-        "the registration form, with the state that earned it"
+        format!("https://fe.example/oauth/external/register?state={state}"),
+        "the frontend's registration screen, with the state that earned it"
     );
 
     let (_, first) = stored_params(&pool, &state).await;
@@ -301,8 +301,8 @@ async fn a_denied_callback_burns_its_state() {
     site.provider.stop();
 }
 
-/// An unlinked callback leaves the state for the registration form, which
-/// still reads it afterwards.
+/// An unlinked callback leaves the state for the registration screen, whose
+/// details endpoint still reads it afterwards.
 #[tokio::test]
 async fn an_unlinked_callback_keeps_its_state_for_registration() {
     let db = common::test_db().await;
@@ -320,6 +320,6 @@ async fn an_unlinked_callback_keeps_its_state_for_registration() {
     let form = common::TestRequest::get(&format!("/oauth/registration_details?state={state}"))
         .send(&site.http)
         .await;
-    assert_eq!(form.status, StatusCode::OK, "the form still reads it");
+    assert_eq!(form.status, StatusCode::OK, "the details still read it");
     site.provider.stop();
 }
