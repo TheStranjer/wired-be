@@ -15,7 +15,7 @@ use serde_json::{Value, json};
 #[cfg(doc)]
 use super::Account;
 
-use super::{AccountViewer, JsonBool};
+use super::{AccountViewer, JsonBool, helpers::is_owner_of};
 use crate::{
     entities::relationship::RelationshipMap,
     models::user::{User, notification_settings::NotificationSettings},
@@ -37,8 +37,10 @@ pub struct PleromaMetadata {
     /// `background_image`: the profile background URL, or `null` when
     /// unset (unlike the avatar and banner, there is no instance default).
     pub background_image: Option<String>,
-    /// `tags`: the profile tags as stored.
-    pub tags: Vec<String>,
+    /// `tags`: the moderation tags as stored; own viewer and staff only,
+    /// since they tell how staff classified the account.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tags: Option<Vec<String>>,
     /// `relationship`: the viewer's
     /// [`Relationship`](crate::entities::relationship::Relationship) to
     /// this account when one is embedded — an authenticated viewer looking
@@ -73,11 +75,15 @@ pub struct PleromaMetadata {
     pub favicon: Option<String>,
     /// `skip_thread_containment`: whether this account's statuses skip it.
     pub skip_thread_containment: JsonBool,
-    /// `allow_following_move`: whether a move takes the following list.
-    pub allow_following_move: JsonBool,
+    /// `allow_following_move`: whether a move takes the following list;
+    /// own viewer only (Pleroma's `maybe_put_allow_following_move`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allow_following_move: Option<JsonBool>,
     /// `deactivated`: the inverse of [`is_active`](User::is_active), which
-    /// the top-level `suspended` key carries the same way.
-    pub deactivated: JsonBool,
+    /// the top-level `suspended` key carries the same way; staff viewers
+    /// only (Pleroma gates it on `:users_manage_activation_state`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deactivated: Option<JsonBool>,
     /// `ap_id`: the `ActivityPub` actor id, the same string as the
     /// top-level `uri`.
     pub ap_id: String,
@@ -174,14 +180,22 @@ pub(super) fn embedded_relationship(
     )
 }
 
-/// Builds the `pleroma` block for `user` as seen by a viewer who is the
-/// account (`is_self`) or someone else; `relationship` is the
-/// [`embedded_relationship`] value the caller's viewer gets.
-pub(super) fn pleroma_metadata(user: &User, is_self: bool, relationship: Value) -> PleromaMetadata {
+/// Builds the `pleroma` block for `user` as seen by `viewer`, who may be
+/// the account itself, staff (an admin or moderator) or anyone else;
+/// `relationships` is the preload [`embedded_relationship`] reads.
+pub(super) fn pleroma_metadata(
+    user: &User,
+    viewer: AccountViewer<'_>,
+    relationships: Option<&RelationshipMap>,
+) -> PleromaMetadata {
+    let is_self = is_owner_of(viewer, user);
+    let viewer_is_staff =
+        viewer.is_some_and(|account| account.is_admin.get() || account.is_moderator.get());
+    let relationship = embedded_relationship(viewer, user, is_self, relationships);
     let (is_admin, is_moderator) = visible_roles(user, is_self);
     PleromaMetadata {
         background_image: user.background_image_url.clone(),
-        tags: user.tags.clone(),
+        tags: (is_self || viewer_is_staff).then(|| user.tags.clone()),
         relationship,
         is_admin: JsonBool(is_admin),
         is_moderator: JsonBool(is_moderator),
@@ -194,8 +208,8 @@ pub(super) fn pleroma_metadata(user: &User, is_self: bool, relationship: Value) 
         accepts_chat_messages: accepts_chat_messages(user),
         favicon: None,
         skip_thread_containment: JsonBool(user.skip_thread_containment.get()),
-        allow_following_move: JsonBool(user.allow_following_move.get()),
-        deactivated: JsonBool(!user.is_active.get()),
+        allow_following_move: is_self.then(|| JsonBool(user.allow_following_move.get())),
+        deactivated: viewer_is_staff.then(|| JsonBool(!user.is_active.get())),
         ap_id: user.ap_id.clone(),
         // Chat and the notification markers are not implemented here, so
         // the owner sees zeroes and the chat token is the empty
@@ -223,8 +237,9 @@ mod tests {
         let value = render_for(Some(&alice), &alice, &config);
         assert_eq!(
             json_keys(&pleroma_of(&value)),
-            ALL_PLEROMA_KEYS,
-            "the account's own user sees every key of the block"
+            PLEROMA_KEYS_FOR_OWNER,
+            "the account's own user sees every key of the block but the \
+             staff-only `deactivated`"
         );
         assert_eq!(
             pleroma_of(&value),
@@ -244,7 +259,6 @@ mod tests {
                 "favicon": null,
                 "skip_thread_containment": false,
                 "allow_following_move": true,
-                "deactivated": false,
                 "ap_id": format!("{BASE}/users/alice"),
                 "unread_conversation_count": 0,
                 "unread_notifications_count": 0,
@@ -287,12 +301,57 @@ mod tests {
             "settings_store",
             "chat_token",
             "show_birthday",
+            "allow_following_move",
+            "deactivated",
+            "tags",
         ] {
             assert!(
                 pleroma.get(hidden).is_none(),
-                "`{hidden}` is only ever rendered for the account itself"
+                "`{hidden}` is never rendered for a non-owner, non-staff viewer"
             );
         }
+    }
+
+    #[test]
+    fn staff_see_deactivated_and_tags_but_not_allow_following_move() {
+        let config = Config::for_tests();
+        let mut alice = alice_with_pleroma_profile();
+        alice.is_active = Flag::new(false);
+        for staff in [staff_admin(), staff_moderator()] {
+            let pleroma = pleroma_of(&render_for(Some(&staff), &alice, &config));
+            assert_eq!(
+                json_keys(&pleroma),
+                PLEROMA_KEYS_FOR_STAFF,
+                "a staff viewer adds `deactivated` and `tags` to the public keys"
+            );
+            assert_eq!(pleroma["deactivated"], true, "the inverted is_active");
+            assert_eq!(
+                pleroma["tags"],
+                json!(["rust", "gnw"]),
+                "the stored moderation tags"
+            );
+        }
+    }
+
+    #[test]
+    fn owner_sees_allow_following_move_and_tags_but_deactivated_only_as_staff() {
+        let config = Config::for_tests();
+        let alice = alice_with_pleroma_profile();
+        let own = pleroma_of(&render_for(Some(&alice), &alice, &config));
+        assert_eq!(own["allow_following_move"], true, "the owner's own switch");
+        assert_eq!(own["tags"], json!(["rust", "gnw"]), "the owner's tags");
+        assert!(
+            own.get("deactivated").is_none(),
+            "a non-staff owner does not see `deactivated`"
+        );
+
+        let mut staff_alice = alice_with_pleroma_profile();
+        staff_alice.is_moderator = Flag::new(true);
+        let own_staff = pleroma_of(&render_for(Some(&staff_alice), &staff_alice, &config));
+        assert_eq!(
+            own_staff["deactivated"], false,
+            "an owner who is staff sees `deactivated` too"
+        );
     }
 
     #[test]
@@ -339,15 +398,16 @@ mod tests {
     fn confirmation_pending_and_deactivated_are_the_inverted_columns() {
         let config = Config::for_tests();
         let mut alice = alice_with_pleroma_profile();
+        let admin = staff_admin();
         assert_eq!(
-            pleroma_of(&render(&alice, &config))["confirmation_pending"],
+            pleroma_of(&render_for(Some(&admin), &alice, &config))["confirmation_pending"],
             false,
             "a confirmed email is not a pending confirmation"
         );
 
         alice.email_confirmed = Flag::new(false);
         alice.is_active = Flag::new(false);
-        let pleroma = pleroma_of(&render(&alice, &config));
+        let pleroma = pleroma_of(&render_for(Some(&admin), &alice, &config));
         assert_eq!(
             pleroma["confirmation_pending"], true,
             "an unconfirmed email renders confirmation_pending"
@@ -448,7 +508,7 @@ mod tests {
         let config = Config::for_tests();
         let mut alice = base_user("alice", &format!("{BASE}/users/alice"));
         alice.local = Flag::new(true);
-        let pleroma = pleroma_of(&render(&alice, &config));
+        let pleroma = pleroma_of(&render_for(Some(&alice), &alice, &config));
         assert_eq!(
             pleroma["background_image"],
             Value::Null,
@@ -473,7 +533,7 @@ mod tests {
 
         alice.tags = vec!["one".to_owned()];
         alice.background_image_url = Some(format!("{BASE}/bg.png"));
-        let filled = pleroma_of(&render(&alice, &config));
+        let filled = pleroma_of(&render_for(Some(&alice), &alice, &config));
         assert_eq!(filled["tags"], json!(["one"]), "tags render as stored");
         assert_eq!(
             filled["background_image"],

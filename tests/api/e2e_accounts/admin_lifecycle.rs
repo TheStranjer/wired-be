@@ -118,12 +118,18 @@ async fn created_then_tagged(world: &World, admin: &str) -> (String, String) {
     )
     .await;
     common::assert_answer(&tagged, StatusCode::NO_CONTENT, "the tag write");
-    let shown = common::api_get(&world.app, None, &format!("{ACCOUNTS}/{id}")).await;
+    let anonymous = common::api_get(&world.app, None, &format!("{ACCOUNTS}/{id}")).await;
+    common::assert_answer(&anonymous, StatusCode::OK, "the anonymous profile read");
+    assert!(
+        anonymous.json_value()["pleroma"].get("tags").is_none(),
+        "the public profile keeps the moderation tags to itself"
+    );
+    let shown = common::api_get(&world.app, Some(admin), &format!("{ACCOUNTS}/{id}")).await;
     common::assert_answer(&shown, StatusCode::OK, "the tagged profile read");
     assert_eq!(
         shown.json_value()["pleroma"]["tags"],
         json!(["beta testers"]),
-        "the public profile carries the stored, lowercased tag"
+        "a staff viewer reads the stored, lowercased tag"
     );
     (id, token)
 }
