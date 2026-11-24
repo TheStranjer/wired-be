@@ -79,7 +79,7 @@ const METADATA_KEYS: [&str; 17] = [
 
 /// The feature list Pleroma 2.10.2 advertises with its shipped defaults,
 /// spelled out here so the shared builder is checked, not echoed.
-const EXPECTED_FEATURES: [&str; 26] = [
+const EXPECTED_FEATURES: [&str; 25] = [
     "pleroma_api",
     "mastodon_api",
     "mastodon_api_grouped_notifications",
@@ -102,7 +102,6 @@ const EXPECTED_FEATURES: [&str; 26] = [
     "pleroma:pin_chats",
     "exposable_reactions",
     "profile_directory",
-    "pleroma:get:main/ostatus",
     "pleroma:group_actors",
     "pleroma:bookmark_folders",
     "pleroma:block_expiration",

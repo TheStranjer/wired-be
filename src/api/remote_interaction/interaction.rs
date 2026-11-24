@@ -1,8 +1,7 @@
 //! The interaction endpoints: `POST /api/v1/pleroma/remote_interaction`
-//! and `GET /authorize_interaction`. The subscribe lookup shared with
-//! `POST /main/ostatus`, its `WebFinger` template reading and macro
-//! expansion, and the frontend redirect for whatever a `uri` resolves
-//! to.
+//! and `GET /authorize_interaction`. The subscribe lookup, its
+//! `WebFinger` template reading and macro expansion, and the frontend
+//! redirect for whatever a `uri` resolves to.
 
 use axum::{
     Json,
@@ -70,8 +69,7 @@ pub(super) async fn interaction_answer(
     Ok(Json(InteractionReply { url }))
 }
 
-/// The whole subscribe lookup shared by the JSON endpoint and
-/// `POST /main/ostatus`: `WebFinger`s `profile` and expands `target` into
+/// The whole subscribe lookup of the JSON endpoint: `WebFinger`s `profile` and expands `target` into
 /// its subscribe template. `webfinger_base` replaces the spec-fixed
 /// `https://{domain}` origin of the lookup — [`None`] in production, a
 /// loopback mock's origin in the tests (the override

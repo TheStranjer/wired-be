@@ -57,8 +57,8 @@ use crate::{
 /// auth endpoints plus `/manifest.json` ([`api::misc`]) — are merged at the
 /// top level, together with the HTML helper pages of
 /// [`api::html_pages`] (`/mailer/unsubscribe/{token}`), the
-/// remote-interaction pages of [`api::remote_interaction`]
-/// (`/authorize_interaction` and `/main/ostatus`)
+/// remote-interaction page of [`api::remote_interaction`]
+/// (`/authorize_interaction`)
 /// and the public instance documents of [`api::admin::apps_docs::public_router`]
 /// (`/instance/{name}.html`, the terms-of-service pages an admin
 /// uploads).
