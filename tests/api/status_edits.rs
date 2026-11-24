@@ -22,7 +22,7 @@
 //! (`read:statuses` on a presented user token): the superseded versions
 //! oldest-authored-first with the current one last, each entry a
 //! `StatusEdit` — content, warning, flag, authored time, author account,
-//! media, and the still-empty `emojis` and `poll` placeholders. A never-
+//! media, the custom `emojis` its text used and the still-`null` `poll`. A never-
 //! edited status is the one-element array. The source is Pleroma's
 //! `show_source` under this ticket's author-only gate: the stored raw text,
 //! the warning and the `MIME` type, as `{"id", "text", "spoiler_text",

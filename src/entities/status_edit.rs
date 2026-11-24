@@ -6,15 +6,15 @@
 //! authored, its author as the [`Account`] entity, and the media it wore.
 //! `media_attachments` here renders the stored ids of a
 //! [`models::status_edit`](crate::models::status_edit) row through the same
-//! [`MediaAttachment`] entity the status renderer uses, and this instance
-//! answers the two keys its status renderer still leaves empty — `emojis`
-//! as `[]` and `poll` as `null` (decision 3: one placeholder per part no
-//! ticket has stored yet).
+//! [`MediaAttachment`] entity the status renderer uses, `emojis` renders the
+//! custom emojis that version's text used, as the status renderer does, and
+//! `poll` is still `null` (decision 3: one placeholder per part no ticket
+//! has stored yet).
 //!
 //! Pure (decision 3): [`StatusEdit::from_source`] consumes the parts the
 //! endpoint batch-loaded — the revision row's own fields, the author's
-//! [`Account`] and the resolved attachments — and nothing here touches the
-//! database.
+//! [`Account`], the resolved attachments and the rendered custom emojis —
+//! and nothing here touches the database.
 //!
 //! [`models::status_edit`]: crate::models::status_edit
 
@@ -25,6 +25,7 @@ use serde_json::Value;
 use crate::{
     entities::{
         account::{Account, JsonBool},
+        custom_emoji::CustomEmoji,
         media_attachment::MediaAttachment,
     },
     util::time::serde_mastodon_time,
@@ -50,6 +51,9 @@ pub struct StatusEditSource<'a> {
     pub account: Account,
     /// The attachments the version wore, in order.
     pub media: Vec<MediaAttachment>,
+    /// The custom emojis the version's content and warning used, already
+    /// rendered, in the order the texts first use them.
+    pub emojis: Vec<CustomEmoji>,
 }
 
 /// One element of `GET /api/v1/statuses/{id}/history`: one version of the
@@ -71,10 +75,10 @@ pub struct StatusEdit {
     pub account: Account,
     /// The media attachments, in order.
     pub media_attachments: Vec<MediaAttachment>,
-    /// Custom emojis used in the version; `[]` — the same placeholder the
-    /// [`Status`](crate::entities::status::Status) entity carries until the
-    /// emoji-in-statuses ticket fills it.
-    pub emojis: Vec<Value>,
+    /// The custom emojis the version's content and warning used, as the
+    /// same [`CustomEmoji`] entities the
+    /// [`Status`](crate::entities::status::Status) entity carries.
+    pub emojis: Vec<CustomEmoji>,
     /// The poll attached to the version; `null` until the polls ticket
     /// renders it, and `null` for this instance's statuses regardless.
     pub poll: Option<Value>,
@@ -91,6 +95,7 @@ impl StatusEdit {
             created_at,
             account,
             media,
+            emojis,
         } = source;
         Self {
             content: content.to_owned(),
@@ -99,7 +104,7 @@ impl StatusEdit {
             created_at,
             account,
             media_attachments: media,
-            emojis: Vec::new(),
+            emojis,
             poll: None,
         }
     }
@@ -115,6 +120,7 @@ mod tests {
         config::Config,
         entities::media_attachment::MediaAttachment as MediaEntity,
         models::{
+            custom_emoji::CustomEmoji as EmojiRow,
             media_attachment::MediaAttachment as AttachmentRow, user::Flag, user::User, user::mfa,
         },
         test_fixtures::json_keys,
@@ -233,6 +239,28 @@ mod tests {
 
     /// The entity's JSON, rendered from one hand-built source.
     fn rendered(media_ids: &[Uuid]) -> Value {
+        rendered_with(media_ids, &[])
+    }
+
+    /// A stored local emoji row named `shortcode`.
+    fn emoji(shortcode: &str) -> EmojiRow {
+        EmojiRow {
+            id: Uuid::nil(),
+            shortcode: shortcode.to_owned(),
+            domain: None,
+            image_url: format!("https://test.example/emoji/{shortcode}.png"),
+            static_url: None,
+            category: None,
+            tags: Vec::new(),
+            visible_in_picker: true,
+            disabled: false,
+            inserted_at: stamped(),
+            updated_at: stamped(),
+        }
+    }
+
+    /// [`rendered`] with the custom emojis `emojis` found for the version.
+    fn rendered_with(media_ids: &[Uuid], emojis: &[EmojiRow]) -> Value {
         let config = Config::for_tests();
         let account = Account::from_user_for(None, &author(), &config, None);
         let media = media_ids
@@ -246,6 +274,10 @@ mod tests {
             created_at: stamped(),
             account,
             media,
+            emojis: emojis
+                .iter()
+                .map(|found| CustomEmoji::from_model(found, &config))
+                .collect(),
         }))
         .expect("the entity serializes")
     }
@@ -274,8 +306,39 @@ mod tests {
         assert_eq!(value["created_at"], "2024-01-31T12:34:56.789Z");
         assert_eq!(value["account"]["acct"], "alice");
         assert_eq!(value["media_attachments"], json!([]));
-        assert_eq!(value["emojis"], json!([]), "emojis are a later ticket");
+        assert_eq!(
+            value["emojis"],
+            json!([]),
+            "a version using no custom emoji renders the empty array"
+        );
         assert_eq!(value["poll"], Value::Null, "polls are a later ticket");
+    }
+
+    #[test]
+    fn the_history_item_lists_the_emojis_its_text_used() {
+        let value = rendered_with(&[], &[emoji("wiredcat"), emoji("blob")]);
+        assert_eq!(
+            value["emojis"],
+            json!([
+                {
+                    "shortcode": "wiredcat",
+                    "url": "https://test.example/emoji/wiredcat.png",
+                    "static_url": null,
+                    "visible_in_picker": true,
+                    "category": null,
+                    "tags": [],
+                },
+                {
+                    "shortcode": "blob",
+                    "url": "https://test.example/emoji/blob.png",
+                    "static_url": null,
+                    "visible_in_picker": true,
+                    "category": null,
+                    "tags": [],
+                },
+            ]),
+            "the CustomEmoji entities, in the order given"
+        );
     }
 
     #[test]

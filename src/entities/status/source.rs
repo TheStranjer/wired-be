@@ -15,9 +15,9 @@ use super::Status;
 use crate::{
     entities::{account::JsonBool, poll::Poll},
     models::{
-        emoji_reaction::ReactionSummary as SummaryRow, hashtag::Hashtag, link_card::LinkCard,
-        media_attachment::MediaAttachment as AttachmentRow, status::Status as StatusRow,
-        user::User,
+        custom_emoji::CustomEmoji as EmojiRow, emoji_reaction::ReactionSummary as SummaryRow,
+        hashtag::Hashtag, link_card::LinkCard, media_attachment::MediaAttachment as AttachmentRow,
+        status::Status as StatusRow, user::User,
     },
 };
 
@@ -86,6 +86,14 @@ pub struct StatusSource<'a> {
     pub mentions: &'a [User],
     /// The hashtags this row carries, in name order.
     pub tags: &'a [Hashtag],
+    /// The custom emojis this row's content, warning and poll options use,
+    /// in the order they first appear: the rows of the batch's one
+    /// [`custom_emojis`] read per author domain, enabled ones only. Feeds
+    /// the entity's [`emojis`](Status::emojis); a row using none (and a
+    /// preview that looked none up) comes in with the empty slice.
+    ///
+    /// [`custom_emojis`]: crate::models::custom_emoji
+    pub emojis: &'a [EmojiRow],
     /// This row's emoji reactions, one roll-up per emoji in the roll-up's
     /// order; feeds `pleroma.emoji_reactions`. A row nobody reacted to (and a
     /// nested original nobody reacted to) comes in with the empty slice.

@@ -18,6 +18,7 @@ use crate::{
     },
     error::AppResult,
     models::{
+        custom_emoji::CustomEmoji as EmojiRow,
         emoji_reaction::ReactionSummary,
         hashtag::Hashtag,
         link_card::LinkCard,
@@ -36,6 +37,7 @@ use super::{
         load_pins, load_quotes, load_reactions, load_reblogs, load_statuses_by_id, load_tags,
         load_thread_mutes, load_users, load_visible_parents,
     },
+    loaders_emojis::{load_row_emojis, rendered_rows},
     loaders_polls_cards::{load_cards, load_poll_options, load_poll_votes, load_polls},
     page_ids::{PageIds, distinct},
 };
@@ -53,6 +55,13 @@ pub(super) struct Batch<'a> {
     viewer: Option<&'a User>,
     /// Every author and replied-to author on the page, keyed by id.
     users: HashMap<Uuid, User>,
+    /// The custom emojis each rendered row uses, keyed by status id in the
+    /// order the row's texts first use them — one
+    /// [`custom_emoji::get_by_shortcodes`] read per distinct author domain,
+    /// none when no text holds a shortcode. A row using none has no entry.
+    ///
+    /// [`custom_emoji::get_by_shortcodes`]: crate::models::custom_emoji::get_by_shortcodes
+    emojis: HashMap<Uuid, Vec<EmojiRow>>,
     /// The reblogged originals, keyed by id.
     originals: HashMap<Uuid, StatusRow>,
     /// The page's quoted originals, keyed by id — the module-docs step 2
@@ -180,10 +189,19 @@ impl<'a> Batch<'a> {
             votes = poll_votes.len(),
             "polls batch-loaded with their options and the viewer's marks"
         );
+        let users = load_users(pool, &ids.accounts).await?;
+        let shown = rendered_rows(rows, &originals, &quoted, &visible_quotes);
+        let emojis = load_row_emojis(pool, &shown, &users, &poll_options).await?;
+        debug!(
+            rows = shown.len(),
+            with_emojis = emojis.len(),
+            "custom emojis batch-loaded for the rows that use them"
+        );
         Ok(Self {
             config: state.config.as_ref(),
             viewer,
-            users: load_users(pool, &ids.accounts).await?,
+            users,
+            emojis,
             originals,
             quoted,
             visible_quotes,
@@ -344,6 +362,7 @@ impl<'a> Batch<'a> {
             media: self.media.get(&row.id).map_or(&[], Vec::as_slice),
             mentions: self.mentions.get(&row.id).map_or(&[], Vec::as_slice),
             tags: self.tags.get(&row.id).map_or(&[], Vec::as_slice),
+            emojis: self.emojis.get(&row.id).map_or(&[], Vec::as_slice),
             reactions: self.reactions.get(&row.id).map_or(&[], Vec::as_slice),
             card: self.cards.get(&row.id),
             favourited: self.favourites.contains(&subject_id),

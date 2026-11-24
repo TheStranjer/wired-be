@@ -28,7 +28,11 @@
 //!
 //! Keys a later ticket fills in, each from exactly one more batched
 //! loader in [`crate::services::render_status`] (see its module docs):
-//! `emojis` (custom emojis).
+//! `emojis` is filled by the emoji-in-statuses ticket, from the batch's
+//! one [`get_by_shortcodes`](crate::models::custom_emoji::get_by_shortcodes)
+//! read per author domain: the enabled emojis the row's content, warning or
+//! poll options name under its *author's* domain, each rendered as the
+//! [`CustomEmoji`](crate::entities::custom_emoji::CustomEmoji) entity.
 //! `pleroma.direct_conversation_id` is filled by the
 //! conversation-participations ticket, from
 //! [`participation_ids`](crate::models::conversation::participation_ids)

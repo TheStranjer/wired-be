@@ -3,6 +3,7 @@
 //! `use super::*`.
 
 mod edits;
+mod emojis;
 mod history_source_gates;
 mod media;
 mod media_attributes;
