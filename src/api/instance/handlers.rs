@@ -61,7 +61,10 @@ pub(super) async fn show_instance(State(state): State<AppState>) -> AppResult<Js
 /// fixed keys. The configuration read is the pipeline's own cached one,
 /// and [`crate::api::nodeinfo`] builds its block from the same answer.
 async fn federation_block(state: &AppState) -> Federation {
-    Federation::with_mrf(&mrf::describe(state).await)
+    Federation::with_mrf(
+        state.config.federation_enabled.get(),
+        &mrf::describe(state).await,
+    )
 }
 
 /// The `Instance::contact_account` user row: the first active local
