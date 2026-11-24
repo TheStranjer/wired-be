@@ -71,8 +71,7 @@ pub use local::handle_delete;
 pub use remote::handle_delete_remote;
 
 use crate::{
-    error::AppError,
-    jobs::JobError,
+    jobs::{JobError, retry},
     models::{bookmark, chat, emoji_reaction, favourite, follow, notification, status, user},
     state::AppState,
 };
@@ -105,22 +104,12 @@ pub fn job_args(user_id: Uuid) -> Value {
     json!({ "user_id": user_id })
 }
 
-/// Reads [`DeleteArgs`] out of a claimed job's payload; arguments this
-/// shape cannot deserialize are permanent — the job is discarded, never
-/// retried.
-fn parse_args(args: &Value) -> Result<Uuid, JobError> {
-    serde_json::from_value::<DeleteArgs>(args.clone())
-        .map(|parsed| parsed.user_id)
-        .map_err(|err| {
-            JobError::Discard(format!("account delete job arguments are unusable: {err}"))
-        })
-}
+/// The job name in the discard text of unusable [`DeleteArgs`].
+const DELETE_JOB: &str = "account delete";
 
-/// Lifts a database failure into the queue's retry arm; every step is
+/// The job name in the retry text of a failed pass; every step is
 /// idempotent, so another pass costs nothing but the wait.
-fn retry(err: &AppError) -> JobError {
-    JobError::Retry(format!("account delete pass failed: {err}"))
-}
+const PASS_JOB: &str = "account delete pass";
 
 /// How many rows each step of [`clear_shared`] took, for the debug line of
 /// the job that ran it.
@@ -155,25 +144,25 @@ async fn clear_shared(state: &AppState, account: &user::User) -> Result<SweepCou
     let id = account.id;
     let statuses = status::soft_delete_all_for_user(db, id)
         .await
-        .map_err(|err| retry(&err))?;
+        .map_err(|err| retry(PASS_JOB, &err))?;
     let chat_messages = chat::withdraw_all_from_sender(db, id)
         .await
-        .map_err(|err| retry(&err))?;
+        .map_err(|err| retry(PASS_JOB, &err))?;
     let follows = follow::delete_all_for_user_with_counts(db, id)
         .await
-        .map_err(|err| retry(&err))?;
+        .map_err(|err| retry(PASS_JOB, &err))?;
     let favourites = favourite::delete_all_for_user(db, id)
         .await
-        .map_err(|err| retry(&err))?;
+        .map_err(|err| retry(PASS_JOB, &err))?;
     let reactions = emoji_reaction::delete_all_for_user(db, id)
         .await
-        .map_err(|err| retry(&err))?;
+        .map_err(|err| retry(PASS_JOB, &err))?;
     let bookmarks = bookmark::delete_all_for_user(db, id)
         .await
-        .map_err(|err| retry(&err))?;
+        .map_err(|err| retry(PASS_JOB, &err))?;
     let notifications = notification::delete_all_for_user(db, id)
         .await
-        .map_err(|err| retry(&err))?;
+        .map_err(|err| retry(PASS_JOB, &err))?;
     Ok(SweepCounts {
         statuses,
         chat_messages,

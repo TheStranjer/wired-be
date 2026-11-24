@@ -43,7 +43,7 @@ use crate::{
     api::{accounts::after_follow_changed, blocks::after_block_changed},
     error::AppError,
     federation::fetch_actor::get_or_fetch_by_acct,
-    jobs::{AttemptInfo, HandlerFuture, JobError, QUEUE_BACKGROUND},
+    jobs::{AttemptInfo, HandlerFuture, JobError, QUEUE_BACKGROUND, parse_args},
     models::{
         block,
         follow::{self, FollowToggles},
@@ -69,6 +69,8 @@ const IMPORT_CHUNK: usize = 50;
 /// How long the re-enqueued remainder of an import waits before its next
 /// chunk may run (the 5 s throttle).
 const IMPORT_CHUNK_DELAY: TimeDelta = TimeDelta::seconds(5);
+/// The job name in the discard text of unusable [`ImportArgs`].
+const IMPORT_JOB: &str = "import";
 
 /// The `{user_id, accts, options}` arguments of an import job.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -97,13 +99,6 @@ pub struct ImportOption {
 }
 
 impl ImportArgs {
-    /// Reads the arguments of a claimed job; a payload this shape cannot
-    /// deserialize is permanent — the job is discarded, never retried.
-    fn from_value(args: &Value) -> Result<Self, JobError> {
-        serde_json::from_value(args.clone())
-            .map_err(|err| JobError::Discard(format!("import job arguments are unusable: {err}")))
-    }
-
     /// The same arguments with [`options`](Self::options) padded or
     /// truncated to exactly one entry per acct, so the two lists always
     /// zip, and always split at the same index.
@@ -183,7 +178,7 @@ async fn handle_chunked(
     action: Action,
     kind: &'static str,
 ) -> Result<(), JobError> {
-    let parsed = ImportArgs::from_value(args)?.with_options_aligned();
+    let parsed = parse_args::<ImportArgs>(args, IMPORT_JOB)?.with_options_aligned();
     let importer = load_importer(state, parsed.user_id).await?;
     let head_count = parsed.accts.len().min(IMPORT_CHUNK);
     let mut head = parsed;
