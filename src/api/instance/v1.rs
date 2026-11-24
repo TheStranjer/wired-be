@@ -5,6 +5,7 @@ use serde::Serialize;
 
 use crate::{
     config::{Config, Toggle},
+    default_assets,
     entities::account::Account,
     models::{instance_rule::InstanceRule, user::User},
     services::instance_meta::{
@@ -110,7 +111,7 @@ impl Instance {
                 streaming_api: streaming_api_url(config),
             },
             stats: *stats,
-            thumbnail: format!("{}{THUMBNAIL_PATH}", config.frontend_base_url),
+            thumbnail: default_assets::url(config, THUMBNAIL_PATH),
             languages: config.instance_languages.clone(),
             registrations: config.registrations_open,
             approval_required: config.registrations_approval_required.get(),

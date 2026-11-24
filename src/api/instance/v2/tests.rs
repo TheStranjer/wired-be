@@ -100,7 +100,7 @@ fn the_v2_document_holds_the_instance_identity() {
         "https://github.com/TheStranjer/wired-be"
     );
     assert_eq!(
-        document["thumbnail"]["url"], "https://test.example/images/thumbnail.jpg",
+        document["thumbnail"]["url"], "https://test.example/media/default/thumbnail.jpg",
         "the wrapped thumbnail URL"
     );
     assert_eq!(document["languages"], json!(["en"]), "the config languages");
@@ -170,7 +170,7 @@ fn the_v2_document_follows_the_config() {
     config.contact_email = Some("admin@example.org".to_owned());
     config.instance_languages = vec!["en".to_owned(), "de".to_owned()];
     config.base_url = "http://snatter.example:4000".to_owned();
-    config.frontend_base_url = "http://snatter.example:4000".to_owned();
+    config.media_base_url = "http://snatter.example:4000/media".to_owned();
     config.max_status_chars = 300;
     config.max_media_attachments = 6;
     config.max_poll_options = 12;
@@ -193,7 +193,7 @@ fn the_v2_document_follows_the_config() {
     assert_eq!(document["languages"], json!(["en", "de"]));
     assert_eq!(
         document["thumbnail"]["url"],
-        "http://snatter.example:4000/images/thumbnail.jpg"
+        "http://snatter.example:4000/media/default/thumbnail.jpg"
     );
     assert_eq!(
         document["configuration"]["urls"]["streaming"],

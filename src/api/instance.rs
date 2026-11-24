@@ -93,14 +93,13 @@ impl Default for TimedCache<InstanceStats> {
 /// The Mastodon API level this endpoint claims compatibility with
 /// (Pleroma's `@mastodon_api_level`, `instance_view.ex`).
 const MASTODON_API_LEVEL: &str = "2.7.2";
-/// Path appended to [`Config::frontend_base_url`] for the instance
-/// thumbnail (Pleroma's `[:instance, :instance_thumbnail]`, whose default
-/// is an image under the static root; wired-be serves API only, so the
-/// frontend ships the file and the URL is advertised whether or not it
-/// sits behind it).
+/// Path appended to [`Config::media_base_url`] for the instance thumbnail
+/// (Pleroma's `[:instance, :instance_thumbnail]`, whose default is an image
+/// under the static root); the backend serves it from `/media/default`
+/// (see [`crate::default_assets`]).
 ///
-/// [`Config::frontend_base_url`]: crate::config::Config::frontend_base_url
-const THUMBNAIL_PATH: &str = "/images/thumbnail.jpg";
+/// [`Config::media_base_url`]: crate::config::Config::media_base_url
+const THUMBNAIL_PATH: &str = crate::default_assets::THUMBNAIL_PATH;
 /// Characters the instance description (and a profile note) may hold
 /// (Pleroma's `[:instance, :description_limit]`).
 const DESCRIPTION_LIMIT: usize = 5_000;

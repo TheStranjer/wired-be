@@ -170,7 +170,7 @@ pub(super) fn expected_document(vapid_key: &str) -> Value {
         "version": instance_version(),
         "urls": { "streaming_api": "wss://test.example" },
         "stats": { "user_count": 0, "status_count": 0, "domain_count": 0 },
-        "thumbnail": format!("{BASE}/images/thumbnail.jpg"),
+        "thumbnail": format!("{BASE}/media/default/thumbnail.jpg"),
         "languages": ["en"],
         "registrations": true,
         "approval_required": false,
@@ -230,7 +230,7 @@ pub(super) fn other_config() -> Config {
     config.contact_email = Some("admin@example.org".to_owned());
     config.instance_languages = vec!["en".to_owned(), "de".to_owned()];
     config.base_url = "http://snatter.example:4000".to_owned();
-    config.frontend_base_url = "http://snatter.example:4000".to_owned();
+    config.media_base_url = "http://snatter.example:4000/media".to_owned();
     config.max_status_chars = 300;
     config.max_media_attachments = 6;
     config.max_poll_options = 12;

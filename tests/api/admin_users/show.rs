@@ -36,7 +36,7 @@ async fn the_show_renders_the_admin_account_entity() {
         json!({
             "id": seeded.root.id.to_string(),
             "email": "root@example.org",
-            "avatar": format!("{}{DEFAULT_AVATAR}", config.frontend_base_url),
+            "avatar": format!("{}{DEFAULT_AVATAR}", config.base_url),
             "nickname": "root",
             "display_name": "root",
             "is_active": true,

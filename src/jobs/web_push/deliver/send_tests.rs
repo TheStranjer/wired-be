@@ -116,7 +116,7 @@ async fn a_follow_wakes_the_subscription_with_a_signed_encrypted_payload() {
     assert_eq!(payload["preferred_locale"], "en", "the fixed locale");
     assert_eq!(
         payload["icon"],
-        format!("{TEST_BASE_URL}{DEFAULT_AVATAR_PATH}"),
+        format!("{TEST_BASE_URL}/media{DEFAULT_AVATAR_PATH}"),
         "an actor with no avatar wakes with the instance default"
     );
     assert_eq!(
@@ -308,16 +308,16 @@ async fn a_local_actors_icon_is_the_stored_url_even_with_the_proxy_on() {
 }
 
 /// The fallback icon for an avatar-less actor hangs under
-/// `FRONTEND_BASE_URL`, where the frontend ships the file, not under
-/// the API's own origin;
+/// `MEDIA_BASE_URL`, where the backend serves the file, not under
+/// `FRONTEND_BASE_URL`;
 /// [`a_follow_wakes_the_subscription_with_a_signed_encrypted_payload`]
-/// keeps the unchanged URL pinned for the default config, where the
-/// variable is unset and the origins are equal.
+/// pins the URL for the default config.
 #[tokio::test]
-async fn the_default_icon_hangs_off_the_frontend_origin() {
+async fn the_default_icon_hangs_off_the_media_base_url() {
     let db = crate::test_db::test_db().await.expect("test database slot");
     let pool = db.pool().clone();
     let mut config = Config::for_tests();
+    config.media_base_url = "https://cdn.example/files".to_owned();
     config.frontend_base_url = "https://fe.example".to_owned();
     let actor = remote_actor(&pool, "Bob", None).await;
 
@@ -325,8 +325,8 @@ async fn the_default_icon_hangs_off_the_frontend_origin() {
 
     assert_eq!(
         payload["icon"],
-        format!("https://fe.example{DEFAULT_AVATAR_PATH}"),
-        "the fallback icon is the default avatar on the frontend origin"
+        format!("https://cdn.example/files{DEFAULT_AVATAR_PATH}"),
+        "the fallback icon is the default avatar under the media base URL"
     );
 }
 

@@ -48,7 +48,7 @@ async fn the_credentials_read_answers_the_pinned_form() {
             "is_discoverable": false,
             "actor_type": "Person",
             "avatar": format!("{TEST_BASE_URL}{DEFAULT_AVATAR}"),
-            "banner": format!("{TEST_BASE_URL}/images/banner.png"),
+            "banner": format!("{TEST_BASE_URL}/media/default/banner.png"),
             "background": null,
         }),
         "the moderation form, key for key"

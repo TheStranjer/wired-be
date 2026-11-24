@@ -59,7 +59,7 @@ fn expected_v2_document(vapid_key: &str) -> Value {
         "source_url": "https://github.com/TheStranjer/wired-be",
         "description": "A Wired instance, compatible with Pleroma clients",
         "usage": { "users": { "active_month": 0 } },
-        "thumbnail": { "url": format!("{BASE}/images/thumbnail.jpg") },
+        "thumbnail": { "url": format!("{BASE}/media/default/thumbnail.jpg") },
         "languages": ["en"],
         "configuration": expected_v2_configuration(vapid_key),
         "registrations": {
@@ -148,8 +148,8 @@ async fn the_v2_document_follows_the_config_and_fixtures() {
         "the shipped repository URL"
     );
     assert_eq!(
-        document["thumbnail"]["url"], "http://snatter.example:4000/images/thumbnail.jpg",
-        "the wrapped thumbnail follows FRONTEND_BASE_URL"
+        document["thumbnail"]["url"], "http://snatter.example:4000/media/default/thumbnail.jpg",
+        "the wrapped thumbnail follows MEDIA_BASE_URL"
     );
     assert_eq!(
         document["configuration"]["urls"]["streaming"], "ws://snatter.example:4000",

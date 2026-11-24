@@ -31,9 +31,9 @@
 //! - `GET /api/v1/pleroma/mascot` (scope `read:accounts`) — the account's
 //!   mascot attachment (`settings_store["mascot"]`, the keys `id`, `url`,
 //!   `type` and `pleroma.mime_type`) or the instance default:
-//!   `{"id":"default-mascot","url":"{FRONTEND_BASE_URL}/images/mascot.png",…}`
+//!   `{"id":"default-mascot","url":"{MEDIA_BASE_URL}/default/mascot.png",…}`
 //!   (Pleroma's `[:assets, :default_mascot]`, renamed to Wired's own
-//!   mascot path, served by the frontend).
+//!   mascot path, served by [`crate::default_assets`]).
 //! - `PUT /api/v1/pleroma/mascot` (scope `write:accounts`) — a multipart
 //!   `file` part whose bytes [`infer`] names an `image/*` type; anything
 //!   else is 415 `{"error":"mascots can only be images"}` (no bytes read
@@ -102,10 +102,10 @@ const FILE_FIELD: &str = "file";
 const MASCOT_KEY: &str = "mascot";
 /// `id` of the instance default mascot (Pleroma's `User.get_mascot`).
 const DEFAULT_MASCOT_ID: &str = "default-mascot";
-/// Path appended to `FRONTEND_BASE_URL` for the default mascot's URL:
+/// Path appended to `MEDIA_BASE_URL` for the default mascot's URL:
 /// Wired's own mascot (the shape Pleroma serves from `[:assets, :mascots]`,
 /// under its `[:assets, :default_mascot]` key).
-const DEFAULT_MASCOT_PATH: &str = "/images/mascot.png";
+const DEFAULT_MASCOT_PATH: &str = crate::default_assets::MASCOT_PATH;
 /// `pleroma.mime_type` of the default mascot.
 const DEFAULT_MASCOT_MIME: &str = "image/png";
 /// 422 body for a `frontend_name` the operator did not make pickable, the
@@ -219,7 +219,7 @@ async fn get_mascot(State(state): State<AppState>, auth: AuthUser) -> AppResult<
         .filter(|value| value.is_object())
         .cloned();
     Ok(Json(stored.unwrap_or_else(|| {
-        default_mascot(&state.config.frontend_base_url)
+        default_mascot(&state.config.media_base_url)
     })))
 }
 
@@ -484,8 +484,8 @@ fn mascot_attachment(id: &str, url: &str, mime_type: &str) -> Value {
     })
 }
 
-/// The instance default mascot: Wired's own mascot, served by the frontend
-/// at [`DEFAULT_MASCOT_PATH`] under `origin` (the answer Pleroma's
+/// The instance default mascot: Wired's own mascot, served by the backend
+/// at [`DEFAULT_MASCOT_PATH`] under `origin`, the media base URL (the answer Pleroma's
 /// `[:assets, :default_mascot]` gives for an account that stored none).
 fn default_mascot(origin: &str) -> Value {
     mascot_attachment(
@@ -723,14 +723,14 @@ mod tests {
     #[test]
     fn the_default_mascot_is_the_instance_mascot() {
         assert_eq!(
-            default_mascot("https://test.example"),
+            default_mascot("https://test.example/media"),
             json!({
                 "id": "default-mascot",
-                "url": "https://test.example/images/mascot.png",
+                "url": "https://test.example/media/default/mascot.png",
                 "type": "image",
                 "pleroma": { "mime_type": "image/png" },
             }),
-            "Wired's default mascot, hung off the given frontend origin"
+            "Wired's default mascot, hung off the given media base URL"
         );
     }
 

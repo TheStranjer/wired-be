@@ -260,8 +260,8 @@ async fn identity_fields_mirror_the_config() {
         "an http origin gets the plain ws scheme"
     );
     assert_eq!(
-        document["thumbnail"], "http://snatter.example:4000/images/thumbnail.jpg",
-        "the thumbnail follows FRONTEND_BASE_URL"
+        document["thumbnail"], "http://snatter.example:4000/media/default/thumbnail.jpg",
+        "the thumbnail follows MEDIA_BASE_URL"
     );
     assert_eq!(
         document["registrations"], false,

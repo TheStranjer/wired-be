@@ -276,7 +276,7 @@ mod tests {
             account.avatar,
             format!(
                 "{}{}",
-                state.config.frontend_base_url,
+                state.config.media_base_url,
                 crate::entities::account::DEFAULT_AVATAR_PATH
             ),
             "the avatar is the default"
@@ -285,7 +285,7 @@ mod tests {
             account.header,
             format!(
                 "{}{}",
-                state.config.frontend_base_url,
+                state.config.media_base_url,
                 crate::entities::account::DEFAULT_BANNER_PATH
             ),
             "the header is the default"

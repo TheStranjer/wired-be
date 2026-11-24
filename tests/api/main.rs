@@ -178,6 +178,10 @@ mod conversations;
 /// The custom emoji list (`GET /api/v1/custom_emojis`).
 mod custom_emojis;
 
+/// The built-in default avatar, banner, thumbnail and mascot served under
+/// `/media/default` (`src/default_assets.rs`).
+mod default_assets;
+
 /// Domain blocks (`/api/v1/domain_blocks`).
 mod domain_blocks;
 
