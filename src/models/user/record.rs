@@ -318,6 +318,14 @@ impl User {
         }
         AccountStatus::Active
     }
+
+    /// The URL a profile links to: the stored
+    /// [`profile_url`](User::profile_url) when set, else the actor id every
+    /// row is guaranteed to carry.
+    #[must_use]
+    pub fn profile_url_or_ap_id(&self) -> &str {
+        self.profile_url.as_deref().unwrap_or(&self.ap_id)
+    }
 }
 
 #[cfg(test)]
@@ -329,6 +337,33 @@ mod tests {
         NewUser, featured, followers, following, get_by_nickname, inbox, insert, outbox,
         test_support::*,
     };
+
+    #[tokio::test]
+    async fn profile_url_or_ap_id_prefers_the_stored_profile_url() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let bare = insert(&pool, &local_new("plain")).await.unwrap();
+        assert_eq!(
+            bare.profile_url_or_ap_id(),
+            bare.ap_id,
+            "without a profile_url the actor id stands in"
+        );
+        let profile = format!("{BASE}/@fancy");
+        let with_url = insert(
+            &pool,
+            &NewUser {
+                profile_url: Some(profile.clone()),
+                ..local_new("fancy")
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            with_url.profile_url_or_ap_id(),
+            profile,
+            "a stored profile_url wins over the actor id"
+        );
+    }
 
     #[tokio::test]
     async fn remote_user_nickname_carries_the_host() {

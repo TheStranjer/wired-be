@@ -40,10 +40,7 @@ impl Mention {
         Self {
             id: user.id.to_string(),
             username: nickname_part(&user.nickname).to_owned(),
-            url: user
-                .profile_url
-                .clone()
-                .unwrap_or_else(|| user.ap_id.clone()),
+            url: user.profile_url_or_ap_id().to_owned(),
             acct: user.nickname.clone(),
         }
     }

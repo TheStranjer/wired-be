@@ -127,10 +127,7 @@ impl AdminAccount {
             is_confirmed: JsonBool(user.email_confirmed.get()),
             is_approved: JsonBool(!user.approval_pending.get()),
             is_suggested: JsonBool(user.is_suggested.get()),
-            url: user
-                .profile_url
-                .clone()
-                .unwrap_or_else(|| user.ap_id.clone()),
+            url: user.profile_url_or_ap_id().to_owned(),
             registration_reason: user.registration_reason.clone(),
             actor_type: user.actor_type.clone(),
             created_at: mastodon_time(&user.inserted_at),

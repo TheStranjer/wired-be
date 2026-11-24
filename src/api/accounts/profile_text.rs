@@ -12,7 +12,6 @@ use sqlx::PgPool;
 
 use crate::{
     config::Config,
-    entities::account::local_url,
     error::{AppError, AppResult},
     extract::index_map_to_vec,
     models::user::{self, User},
@@ -158,7 +157,10 @@ async fn local_mention_urls(
             .await?
             .filter(|found| found.local.get())
         {
-            let _seen = urls.insert(mention_key(&mention), local_url(config, &found.nickname));
+            let _seen = urls.insert(
+                mention_key(&mention),
+                found.profile_url_or_ap_id().to_owned(),
+            );
         }
     }
     Ok(urls)
