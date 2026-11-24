@@ -154,10 +154,12 @@ pub(super) async fn seed_schedule(pool: &PgPool, who: &User, when: DateTime<Utc>
             user_id: who.id,
             scheduled_at: when,
             params: json!({ "status": "seeded" }),
+            idempotency_key: None,
         },
     )
     .await
-    .expect("the seed schedule inserts");
+    .expect("the seed schedule inserts")
+    .expect("a keyless seed never conflicts");
     assert_eq!(row.user_id, who.id, "the seed row is its account's");
 }
 

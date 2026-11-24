@@ -15,12 +15,19 @@ use crate::{error::AppResult, util::id::new_id};
 
 use super::{NewScheduledStatus, ScheduledStatus};
 
-/// The `INSERT` behind [`insert`]: the minted id plus the three payload
-/// fields, with `RETURNING *` so the row comes back with its database-side
-/// timestamps.
-const INSERT_SQL: &str = "INSERT INTO scheduled_statuses (id, user_id, scheduled_at, params)
-     VALUES ($1, $2, $3, $4)
+/// The `INSERT` behind [`insert`]: the minted id plus the payload fields,
+/// with `RETURNING *` so the row comes back with its database-side
+/// timestamps. A second schedule under one `(user_id, idempotency_key)` hits
+/// the partial unique index, inserts nothing and returns no row.
+const INSERT_SQL: &str = "INSERT INTO scheduled_statuses
+            (id, user_id, scheduled_at, params, idempotency_key)
+     VALUES ($1, $2, $3, $4, $5)
+ON CONFLICT (user_id, idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING
   RETURNING *";
+
+/// [`find_by_idempotency`]: the account's schedule parked under one key.
+const FIND_BY_IDEMPOTENCY_SQL: &str =
+    "SELECT * FROM scheduled_statuses WHERE user_id = $1 AND idempotency_key = $2";
 
 /// [`get_owned`]: one row, only for the account it belongs to — the join-free
 /// form of Pleroma's `ScheduledActivity.get(user, id)`, whose `nil` is the
@@ -49,7 +56,12 @@ const LOCK_DUE_SQL: &str = "SELECT * FROM scheduled_statuses
     WHERE id = $1 AND scheduled_at <= now()
       FOR UPDATE SKIP LOCKED";
 
-/// Inserts one schedule and returns the stored row.
+/// Inserts one schedule and returns the stored row, `None` on a key conflict.
+///
+/// `None` means the account already holds a schedule under the same
+/// [`idempotency_key`](NewScheduledStatus::idempotency_key): nothing is
+/// written and the caller reads the winner with [`find_by_idempotency`]. A
+/// schedule with no key never conflicts.
 ///
 /// The id is a fresh `UUIDv7` (decision 4); the timestamps come from the
 /// column defaults. `params` is stored exactly as handed in.
@@ -59,7 +71,10 @@ const LOCK_DUE_SQL: &str = "SELECT * FROM scheduled_statuses
 /// Any database failure (connection, constraint, encoding) arrives as
 /// [`AppError::Database`](crate::error::AppError). The `user_id` foreign key
 /// is the failure reachable here: an unknown account.
-pub async fn insert(pool: &PgPool, new_status: &NewScheduledStatus) -> AppResult<ScheduledStatus> {
+pub async fn insert(
+    pool: &PgPool,
+    new_status: &NewScheduledStatus,
+) -> AppResult<Option<ScheduledStatus>> {
     let mut conn = pool.acquire().await?;
     insert_conn(&mut conn, new_status).await
 }
@@ -74,15 +89,42 @@ pub async fn insert(pool: &PgPool, new_status: &NewScheduledStatus) -> AppResult
 pub async fn insert_conn(
     conn: &mut PgConnection,
     new_status: &NewScheduledStatus,
-) -> AppResult<ScheduledStatus> {
+) -> AppResult<Option<ScheduledStatus>> {
     let stored = sqlx::query_as::<_, ScheduledStatus>(INSERT_SQL)
         .bind(new_id())
         .bind(new_status.user_id)
         .bind(new_status.scheduled_at)
         .bind(&new_status.params)
-        .fetch_one(conn)
+        .bind(new_status.idempotency_key.as_deref())
+        .fetch_optional(conn)
         .await?;
     Ok(stored)
+}
+
+/// The schedule `user_id` parked under `key`, if any.
+///
+/// `None` also covers a schedule that has since fired or been cancelled,
+/// which delete the row.
+///
+/// Mastodon's `@account.scheduled_statuses.find(@idempotency_duplicate)`:
+/// the key is scoped to the account, so another account's schedule under the
+/// same text is not found.
+///
+/// # Errors
+///
+/// Any database failure (connection, decoding) arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn find_by_idempotency(
+    pool: &PgPool,
+    user_id: Uuid,
+    key: &str,
+) -> AppResult<Option<ScheduledStatus>> {
+    let found = sqlx::query_as::<_, ScheduledStatus>(FIND_BY_IDEMPOTENCY_SQL)
+        .bind(user_id)
+        .bind(key)
+        .fetch_optional(pool)
+        .await?;
+    Ok(found)
 }
 
 /// Fetches the schedule whose primary key is `id`, `None` when no row
@@ -329,6 +371,100 @@ mod tests {
             .await
             .expect("the repeat delete runs");
         assert!(!again, "deleting what is already gone reports nothing went");
+    }
+
+    /// A schedule due `when` for `who` under `key`, to insert directly.
+    fn keyed(who: Uuid, key: Option<&str>) -> NewScheduledStatus {
+        NewScheduledStatus {
+            user_id: who,
+            scheduled_at: at(9, 0, 0),
+            params: json!({ "status": "keyed" }),
+            idempotency_key: key.map(str::to_owned),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_second_insert_under_one_key_stores_nothing() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = user(&pool, "alice").await;
+        let bob = user(&pool, "bob").await;
+
+        let first = insert(&pool, &keyed(alice.id, Some("k")))
+            .await
+            .expect("the first insert runs")
+            .expect("the first insert stores");
+        assert_eq!(first.idempotency_key.as_deref(), Some("k"), "key stored");
+        assert!(
+            insert(&pool, &keyed(alice.id, Some("k")))
+                .await
+                .expect("the conflicting insert runs")
+                .is_none(),
+            "the same account and key conflicts and stores nothing"
+        );
+        assert!(
+            insert(&pool, &keyed(bob.id, Some("k")))
+                .await
+                .expect("the other account's insert runs")
+                .is_some(),
+            "another account may use the same key text"
+        );
+        for _ in 0..2 {
+            assert!(
+                insert(&pool, &keyed(alice.id, None))
+                    .await
+                    .expect("the keyless insert runs")
+                    .is_some(),
+                "rows with no key never conflict"
+            );
+        }
+        assert_eq!(
+            count_pending_for_user(&pool, alice.id)
+                .await
+                .expect("the count runs"),
+            3,
+            "the key row and the two keyless rows"
+        );
+    }
+
+    #[tokio::test]
+    async fn find_by_idempotency_reads_the_accounts_own_row() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = user(&pool, "alice").await;
+        let bob = user(&pool, "bob").await;
+        let parked = insert(&pool, &keyed(alice.id, Some("k")))
+            .await
+            .expect("the insert runs")
+            .expect("the insert stores");
+
+        let found = find_by_idempotency(&pool, alice.id, "k")
+            .await
+            .expect("the read runs")
+            .expect("the owner finds the row");
+        assert_eq!(found.id, parked.id, "the row parked under the key");
+        assert!(
+            find_by_idempotency(&pool, bob.id, "k")
+                .await
+                .expect("the stranger's read runs")
+                .is_none(),
+            "another account's key is not found"
+        );
+        assert!(
+            find_by_idempotency(&pool, alice.id, "other")
+                .await
+                .expect("the unknown read runs")
+                .is_none(),
+            "nor is a key nobody used"
+        );
+        assert!(delete(&pool, parked.id).await.expect("the delete runs"));
+        assert!(
+            find_by_idempotency(&pool, alice.id, "k")
+                .await
+                .expect("the read after delete runs")
+                .is_none(),
+            "a fired or cancelled schedule frees its key"
+        );
     }
 
     #[tokio::test]

@@ -459,10 +459,12 @@ mod tests {
                 user_id: who.id,
                 scheduled_at: when,
                 params,
+                idempotency_key: None,
             },
         )
         .await
         .expect("the schedule fixture inserts")
+        .expect("a keyless fixture never conflicts")
     }
 
     /// The scheduled row behind `id`, fired or cancelled rows come back `None`.
@@ -676,6 +678,7 @@ mod tests {
             params: row.params.clone(),
             inserted_at: row.inserted_at,
             updated_at: row.updated_at,
+            idempotency_key: row.idempotency_key.clone(),
         };
 
         let mut tx = pool.begin().await.expect("the claim transaction opens");
@@ -719,6 +722,7 @@ mod tests {
             params: json!({ "status": 42 }),
             inserted_at: row.inserted_at,
             updated_at: row.updated_at,
+            idempotency_key: None,
         };
 
         let mut tx = pool.begin().await.expect("the claim transaction opens");

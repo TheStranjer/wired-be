@@ -226,6 +226,7 @@ mod tests {
             params,
             inserted_at: due(),
             updated_at: due(),
+            idempotency_key: None,
         }
     }
 

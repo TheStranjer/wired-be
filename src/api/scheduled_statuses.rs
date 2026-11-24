@@ -394,6 +394,7 @@ mod tests {
             params,
             inserted_at: due(),
             updated_at: due(),
+            idempotency_key: None,
         }
     }
 
@@ -408,6 +409,7 @@ mod tests {
                 params: json!({ "status": "x" }),
                 inserted_at: due(),
                 updated_at: due(),
+                idempotency_key: None,
             })
             .collect()
     }

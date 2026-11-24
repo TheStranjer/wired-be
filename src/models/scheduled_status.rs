@@ -64,8 +64,8 @@ pub use limits_due::{
 };
 pub use pages::page_for_user;
 pub use rows::{
-    delete, delete_all_for_user, delete_on, delete_owned, get_by_id, get_owned, insert,
-    insert_conn, lock_due, reschedule,
+    delete, delete_all_for_user, delete_on, delete_owned, find_by_idempotency, get_by_id,
+    get_owned, insert, insert_conn, lock_due, reschedule,
 };
 
 /// One row of `scheduled_statuses`: a create-status request waiting for its
@@ -87,6 +87,12 @@ pub struct ScheduledStatus {
     /// while the schedule stands as it was created, and later than it once
     /// [`reschedule`] has moved its fire moment.
     pub updated_at: DateTime<Utc>,
+    /// The `Idempotency-Key` of the request that parked this schedule, if any.
+    ///
+    /// `None` for a request without one and for rows older than the column.
+    /// Unique per account: a retry carrying it finds this row
+    /// ([`find_by_idempotency`]) instead of parking a second.
+    pub idempotency_key: Option<String>,
 }
 
 /// What to insert: everything [`insert`] needs beyond the id it mints and
@@ -101,4 +107,8 @@ pub struct NewScheduledStatus {
     pub scheduled_at: DateTime<Utc>,
     /// The params to store verbatim for the eventual replay.
     pub params: Value,
+    /// The request's `Idempotency-Key`, when it had one; [`insert`] stores
+    /// nothing and answers `None` if the account already holds a schedule
+    /// under it.
+    pub idempotency_key: Option<String>,
 }

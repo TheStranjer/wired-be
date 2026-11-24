@@ -25,10 +25,12 @@ pub(super) async fn schedule(
             user_id: who.id,
             scheduled_at: when,
             params,
+            idempotency_key: None,
         },
     )
     .await
     .expect("the fixture schedule inserts")
+    .expect("a keyless fixture never conflicts")
 }
 
 /// A schedule written and left behind: these tests assert through the

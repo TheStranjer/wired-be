@@ -394,10 +394,12 @@ pub(super) async fn scheduled_with_job(state: &AppState, owner: &User) -> Schedu
             user_id: owner.id,
             scheduled_at: Utc::now() + chrono::TimeDelta::days(1),
             params: serde_json::json!({ "status": "later" }),
+            idempotency_key: None,
         },
     )
     .await
-    .expect("the schedule fixture inserts");
+    .expect("the schedule fixture inserts")
+    .expect("a keyless fixture never conflicts");
     scheduled_statuses::schedule(state, &row).await;
     row
 }

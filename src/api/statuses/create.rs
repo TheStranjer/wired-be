@@ -59,11 +59,12 @@
 //! [`ScheduledStatus`] entity — its `media_attachments` read back from
 //! `media_attachments` in the order the body submitted them, though no
 //! attachment row is touched — and nothing else happens: no `statuses`
-//! row, no `after_status_created` hook, no expiration job, and an
-//! `Idempotency-Key` on the request is only echoed into the stored params
-//! and the entity — claimed by nobody, here or at the fire, because the
-//! publish replays through [`create_status::create_status`] rather than
-//! its replayable twin.
+//! row, no `after_status_created` hook, no expiration job. An
+//! `Idempotency-Key` on the request is stored on the schedule's row (and
+//! echoed into the params and the entity): a retry carrying the same key
+//! answers the schedule it first parked rather than parking another. The
+//! fire itself claims no key, because the publish replays through
+//! [`create_status::create_status`] rather than its replayable twin.
 //!
 //! [`Config::max_media_attachments`]: crate::config::Config::max_media_attachments
 //!
@@ -126,9 +127,10 @@ use super::history::media_entities;
 /// as a pending schedule and queues its fire ([`ScheduledStatus`] answers,
 /// with the reserved attachments loaded from their untouched rows in
 /// submission order; see [`scheduled_media`]); the request's
-/// `Idempotency-Key` rides along as the entity's echo only — a scheduled
-/// create claims no replay key, and neither does its publish, which posts
-/// through [`create_status::create_status`] like any other fire. The
+/// `Idempotency-Key` is stored on the schedule, so a replayed key answers
+/// the schedule it first parked (nothing new is written or queued); the
+/// publish claims no key and posts through
+/// [`create_status::create_status`] like any other fire. The
 /// body's `preview` (a [`flex`] boolean, body or query, default false)
 /// answers the entity a create would have
 /// returned — validated, rendered, mentions and tags resolved, a fresh
@@ -200,8 +202,8 @@ pub(super) async fn create_status(
 
 /// The `scheduled_at` arm of the create: park the request through
 /// [`schedule_status::schedule_status`] — the request's `Idempotency-Key`,
-/// if it had one, travels along for the stored params' echo only, claimed
-/// by nobody — and finish the [`ScheduledStatus`] entity with the
+/// if it had one, travels along to be stored on the row and a replay of it
+/// answers the schedule already parked — and finish the [`ScheduledStatus`] entity with the
 /// schedule's reserved attachments, read by
 /// [`media_attachment::get_many`] and answered in the order the body
 /// submitted them (the read is id-ordered; this one is not). No media
