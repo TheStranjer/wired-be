@@ -13,7 +13,8 @@
 //! status, [`quotes`] for the `QuoteRequest` a remote account sends to quote
 //! a local post, [`follow`] for the `Follow`, `Accept`, `Reject` and `Undo` of a
 //! `Follow` that carry the follow handshake across the wire, with the
-//! create and note tickets adding their files in turn.
+//! create and note tickets adding their files in turn, and [`listen`] for the
+//! `Listen` (and its `Undo`) that carries a remote account's scrobble.
 //!
 //! A handler is a plain
 //! [`HandlerFn`](crate::federation::dispatch::HandlerFn): it gets the shared
@@ -34,6 +35,7 @@ pub mod chat;
 pub mod create;
 pub mod follow;
 pub mod interactions;
+pub mod listen;
 pub mod misc;
 pub mod note;
 pub mod quotes;
@@ -62,6 +64,7 @@ pub fn registry() -> Handlers {
     chat::register(&mut handlers);
     vote::register(&mut handlers);
     quotes::register(&mut handlers);
+    listen::register(&mut handlers);
     // Last, because its `Delete` fallback answers for every object the
     // earlier `register_delete_fallback` calls left unrouted: it hands the
     // actor's own id back to the actor handler and folds the rest.
