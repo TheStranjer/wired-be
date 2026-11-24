@@ -138,11 +138,11 @@ const MAX_SPOILER_CHARS: usize = 1000;
 const MAX_TAGS: usize = 100;
 /// How many attachments are kept at most; the rest of the array is ignored.
 const MAX_ATTACHMENTS: usize = 20;
-/// The fewest poll options a `Question` may carry (Mastodon's client-side
-/// two-option minimum, enforced here on the remote document).
-const MIN_POLL_OPTIONS: usize = 2;
-/// The most poll options a `Question` may carry.
-const MAX_POLL_OPTIONS: usize = 20;
+/// How many poll options of a remote `Question` are kept; the rest of the
+/// list is dropped, not an error. A federated cap, deliberately above the
+/// local posting limit (`MAX_POLL_OPTIONS` in the config): Pleroma, Akkoma
+/// and Misskey allow larger polls than this server lets users create.
+const MAX_POLL_OPTIONS: usize = 100;
 /// How far into the future a `published` timestamp may lead [`now`] before
 /// it is treated as clock skew and clamped (Pleroma's
 /// `ObjectValidators.Utils`-style tolerance, the Mastodon-family norm).
@@ -169,7 +169,7 @@ const DEFAULT_HTML_CONTENT_TYPE: &str = "text/html";
 /// or not an absolute `http(s)` url; [`ParseError::Containment`] when
 /// `attributedTo` fails the authorship or host rules;
 /// [`ParseError::InvalidPoll`] when a `Question`'s option list is missing or
-/// holds fewer than two or more than twenty options.
+/// holds no usable option. A list past the option cap is truncated.
 pub fn parse_note(
     json: &Value,
     author: &User,

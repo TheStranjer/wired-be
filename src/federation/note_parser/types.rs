@@ -23,8 +23,8 @@ pub enum ParseError {
     /// `attributedTo` is unusable or names someone else, or its host differs
     /// from the object id's host (Pleroma's `validate_host_match`).
     Containment(String),
-    /// A `Question` whose `oneOf`/`anyOf` is absent or holds fewer than
-    /// two or more than twenty options.
+    /// A `Question` whose `oneOf`/`anyOf` is absent or holds no option with
+    /// a name. A list that is merely too long is truncated, not rejected.
     InvalidPoll(String),
     /// The document, serialized, is larger than two mebibytes.
     TooLarge,
