@@ -27,7 +27,8 @@
 
 use std::time::Duration;
 
-use chrono::{TimeDelta, Utc};
+use chrono::{DateTime, TimeDelta, Utc};
+use futures::{StreamExt as _, future, stream};
 use serde_json::Value;
 use tracing::{info, warn};
 
@@ -52,6 +53,15 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long a mark must have stood before its host becomes probe material:
 /// one day, the rule this module's [docs][self] state.
 const PROBE_AFTER: TimeDelta = TimeDelta::days(1);
+
+/// The most hosts one sweep probes: 64. With [`PROBE_CONCURRENCY`] requests in
+/// flight and [`PROBE_TIMEOUT`] each, a sweep ends within
+/// `64 / 8 * 5 s = 40 s` however many hosts are dead, far inside the worker's
+/// stuck-lock age. Hosts past the batch wait for the next six-hourly run.
+const PROBE_BATCH: usize = 64;
+
+/// How many probes of one sweep run at the same time: 8.
+const PROBE_CONCURRENCY: usize = 8;
 
 /// The body cap the probe reads under: 64 KiB. A `nodeinfo` discovery
 /// document is a small JSON list of links, so this is orders of magnitude
@@ -97,6 +107,10 @@ pub fn handle_probe(state: AppState, _attempt: AttemptInfo, _args: Value) -> Han
 /// [`PROBE_TIMEOUT`], a timeout test passes a tiny one to watch the guard
 /// fire against a mock that never answers.
 ///
+/// The eligible hosts are sorted by mark age, oldest first, and only the first
+/// [`PROBE_BATCH`] are probed, [`PROBE_CONCURRENCY`] at a time; the rest wait
+/// for the next run, so one sweep always fits the job deadline.
+///
 /// Each host is probed on its own and no host's outcome but the ledger read
 /// aborts the sweep: a host that stays silent costs one `warn!`.
 ///
@@ -116,14 +130,30 @@ pub(crate) async fn probe_unreachable(
         .await
         .map_err(|err| JobError::Retry(format!("unreachable-host ledger read failed: {err}")))?;
     let cutoff = Utc::now() - PROBE_AFTER;
-    let mut probed = 0_usize;
-    let mut cleared = 0_usize;
-    for (host, _) in ledger.iter().filter(|(_, since)| *since < cutoff) {
-        probed += 1;
-        if probe_host(state, host, base_override, probe_timeout).await {
-            cleared += 1;
-        }
-    }
+    let mut eligible: Vec<(&str, DateTime<Utc>)> = ledger
+        .iter()
+        .filter(|(_, since)| *since < cutoff)
+        .map(|(host, since)| (host.as_str(), *since))
+        .collect();
+    eligible.sort_by_key(|(_, since)| *since);
+    let batch: Vec<String> = eligible
+        .iter()
+        .take(PROBE_BATCH)
+        .map(|(host, _)| (*host).to_owned())
+        .collect();
+    let probed = batch.len();
+    // Owned hosts: a closure over borrowed `&str` items makes the future
+    // higher-ranked over the borrow, which the `Send` check of
+    // `handle_probe`'s boxed future cannot prove.
+    let cleared =
+        stream::iter(batch)
+            .map(|host: String| async move {
+                probe_host(state, &host, base_override, probe_timeout).await
+            })
+            .buffer_unordered(PROBE_CONCURRENCY)
+            .filter(|live| future::ready(*live))
+            .count()
+            .await;
     info!(
         marked = ledger.len(),
         probed, cleared, "unreachable host probe sweep finished"
@@ -660,6 +690,103 @@ mod tests {
             [None, None, fresh],
             "the eligible marks cleared and the fresh one stands"
         );
+        server.abort();
+    }
+
+    /// How many eligible hosts the batch tests mark: six past the batch.
+    const OVERFLOW_HOSTS: usize = PROBE_BATCH + 6;
+
+    /// The `i`th batch-test host name.
+    fn batch_host(i: usize) -> String {
+        format!("h{i}.example")
+    }
+
+    /// Marks [`OVERFLOW_HOSTS`] eligible hosts; host `i` is marked
+    /// `2 * DAY + 60 * i` seconds ago, so a higher index is an older mark.
+    async fn mark_overflow_hosts(pool: &PgPool) {
+        for i in 0..OVERFLOW_HOSTS {
+            let extra = i64::try_from(i).expect("a small index fits") * 60;
+            marked_ago(pool, &batch_host(i), 2 * DAY + extra).await;
+        }
+    }
+
+    /// With more eligible hosts than the batch, one sweep makes exactly
+    /// [`PROBE_BATCH`] requests, the oldest marks are the ones probed, and the
+    /// live ones among them are cleared while the youngest eligible marks stand.
+    #[tokio::test]
+    async fn a_sweep_probes_only_the_oldest_batch_and_clears_live_hosts() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let (origin, seen, server) = mock_nodeinfo(StatusCode::OK).await;
+        mark_overflow_hosts(&pool).await;
+        let skipped = OVERFLOW_HOSTS - PROBE_BATCH;
+        let mut waiting = Vec::new();
+        for i in 0..skipped {
+            waiting.push(mark_of(&pool, &batch_host(i)).await);
+        }
+
+        let outcome = probe_unreachable(&app_state(&pool), Some(&origin), PROBE_TIMEOUT).await;
+
+        assert_eq!(outcome, Ok(()), "a capped sweep succeeds");
+        assert_eq!(seen.count(), PROBE_BATCH, "exactly one batch was probed");
+        for i in skipped..OVERFLOW_HOSTS {
+            assert!(
+                mark_of(&pool, &batch_host(i)).await.is_none(),
+                "the old host {i} was probed and its live answer cleared the mark"
+            );
+        }
+        for (i, before) in waiting.into_iter().enumerate() {
+            assert!(
+                before.is_some(),
+                "the young host {i} was marked to begin with"
+            );
+            assert_eq!(
+                mark_of(&pool, &batch_host(i)).await,
+                before,
+                "the young host {i} waits for the next run"
+            );
+        }
+        server.abort();
+    }
+
+    /// The cap holds when nobody answers `2xx` too: still [`PROBE_BATCH`]
+    /// requests, and every mark, probed or not, stands.
+    #[tokio::test]
+    async fn a_sweep_of_dead_hosts_still_makes_at_most_one_batch_of_requests() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let (origin, seen, server) = mock_nodeinfo(StatusCode::SERVICE_UNAVAILABLE).await;
+        mark_overflow_hosts(&pool).await;
+
+        let outcome = probe_unreachable(&app_state(&pool), Some(&origin), PROBE_TIMEOUT).await;
+
+        assert_eq!(outcome, Ok(()), "dead hosts are absorbed");
+        assert_eq!(
+            seen.count(),
+            PROBE_BATCH,
+            "no more than one batch of requests"
+        );
+        for i in 0..OVERFLOW_HOSTS {
+            assert!(
+                mark_of(&pool, &batch_host(i)).await.is_some(),
+                "host {i} stays marked"
+            );
+        }
+        server.abort();
+    }
+
+    /// An empty ledger has nothing eligible: the sweep is a no-op that
+    /// succeeds and sends no request.
+    #[tokio::test]
+    async fn no_eligible_hosts_is_a_no_op() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let (origin, seen, server) = mock_nodeinfo(StatusCode::OK).await;
+
+        let outcome = probe_unreachable(&app_state(&pool), Some(&origin), PROBE_TIMEOUT).await;
+
+        assert_eq!(outcome, Ok(()), "an empty ledger is a clean pass");
+        assert_eq!(seen.count(), 0, "nothing was probed");
         server.abort();
     }
 
