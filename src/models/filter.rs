@@ -327,10 +327,7 @@ mod tests {
     use chrono::Duration;
 
     use super::*;
-    use crate::{
-        config::TEST_BASE_URL,
-        models::user::{NewUser, User, insert, local_ap_id},
-    };
+    use crate::{models::user::User, test_fixtures::local_user as user};
 
     /// An instant `days` from now, negative ones for the past, with the
     /// sub-microsecond part dropped so it survives PostgreSQL's
@@ -375,16 +372,6 @@ mod tests {
         )
         .await
         .unwrap();
-    }
-
-    /// Inserts a local user named `nickname`.
-    async fn user(pool: &PgPool, nickname: &str) -> User {
-        insert(
-            pool,
-            &NewUser::local(nickname, &local_ap_id(TEST_BASE_URL, nickname)),
-        )
-        .await
-        .expect("the local fixture inserts")
     }
 
     /// The phrases of `rows`, in row order — what a list test compares

@@ -182,22 +182,13 @@ mod tests {
         error::AppError,
         models::{
             status::{NewStatus, Status, insert as insert_status},
-            user::{NewUser, User, insert as insert_user, local_ap_id},
+            user::User,
         },
+        test_fixtures::local_user as user,
     };
 
     /// The instance origin the fixtures post under.
     const BASE: &str = TEST_BASE_URL;
-
-    /// A local user named `nickname`.
-    async fn user(pool: &PgPool, nickname: &str) -> User {
-        insert_user(
-            pool,
-            &NewUser::local(nickname, &local_ap_id(BASE, nickname)),
-        )
-        .await
-        .expect("the fixture user inserts")
-    }
 
     /// A local status by `author`.
     async fn status(pool: &PgPool, author: &User) -> Status {

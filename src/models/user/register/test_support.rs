@@ -8,10 +8,12 @@ use sqlx::PgPool;
 
 use super::RegisterParams;
 use crate::{
-    config::{Config, TEST_BASE_URL},
-    models::user::{NewUser, User, insert, local_ap_id},
+    config::Config,
+    models::user::{NewUser, User, insert},
     state::AppState,
 };
+
+pub(super) use crate::test_fixtures::local_new;
 
 /// The password every registration test submits (24 characters).
 pub(super) const PASSWORD: &str = "correct horse battery staple";
@@ -39,11 +41,6 @@ pub(super) fn params_for(nickname: &str) -> RegisterParams {
         reason: None,
         provider_email_verified: false,
     }
-}
-
-/// A local [`NewUser`] named `nickname` on the test instance.
-pub(super) fn local_new(nickname: &str) -> NewUser {
-    NewUser::local(nickname, &local_ap_id(TEST_BASE_URL, nickname))
 }
 
 /// Inserts a local user with `email` and `password_hash` straight

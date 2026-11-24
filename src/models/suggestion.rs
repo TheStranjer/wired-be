@@ -146,22 +146,13 @@ mod tests {
         models::{
             block, follow,
             mute::{self, MuteOptions},
-            user::{Flag, NewUser, insert, local_ap_id},
+            user::{Flag, NewUser, insert},
         },
+        test_fixtures::{local_new, local_user as user},
     };
 
     /// The instance origin the fixtures pretend to serve.
     const BASE: &str = TEST_BASE_URL;
-
-    /// Inserts a plain local user named `nickname`: not in the pool.
-    async fn user(pool: &PgPool, nickname: &str) -> User {
-        insert(
-            pool,
-            &NewUser::local(nickname, &local_ap_id(BASE, nickname)),
-        )
-        .await
-        .expect("the local fixture inserts")
-    }
 
     /// Inserts a local user named `nickname` and puts it in the pool.
     async fn suggested(pool: &PgPool, nickname: &str) -> User {
@@ -169,7 +160,7 @@ mod tests {
             pool,
             &NewUser {
                 is_suggested: Flag::new(true),
-                ..NewUser::local(nickname, &local_ap_id(BASE, nickname))
+                ..local_new(nickname)
             },
         )
         .await
@@ -455,7 +446,7 @@ mod tests {
             &NewUser {
                 locked: Flag::new(true),
                 is_suggested: Flag::new(true),
-                ..NewUser::local("locked", &local_ap_id(BASE, "locked"))
+                ..local_new("locked")
             },
         )
         .await

@@ -8,24 +8,16 @@ use uuid::Uuid;
 use crate::{
     config::TEST_BASE_URL,
     error::AppError,
-    models::user::{self, NewUser, User, insert as insert_user, local_ap_id},
+    models::user::{self, NewUser, User, insert as insert_user},
     pagination::PageParams,
 };
 
 use super::{Counter, NewStatus, Status, get_by_id_including_deleted, insert};
 
+pub(super) use crate::test_fixtures::local_user as user;
+
 /// The instance origin the fixtures pretend to serve.
 pub(super) const BASE: &str = TEST_BASE_URL;
-
-/// Inserts a local user named `nickname`.
-pub(super) async fn user(pool: &PgPool, nickname: &str) -> User {
-    insert_user(
-        pool,
-        &NewUser::local(nickname, &local_ap_id(BASE, nickname)),
-    )
-    .await
-    .expect("fixture user inserts")
-}
 
 /// Inserts `text` as a local public status of `author`.
 pub(super) async fn post(pool: &PgPool, author: &User, text: &str) -> Status {

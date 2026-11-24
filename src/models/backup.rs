@@ -345,14 +345,7 @@ mod tests {
     use chrono::{SubsecRound as _, TimeZone as _};
 
     use super::*;
-    use crate::{
-        config::TEST_BASE_URL,
-        models::user::{NewUser, insert as insert_user, local_ap_id},
-        uploads,
-    };
-
-    /// The instance origin the fixtures post under.
-    const BASE: &str = TEST_BASE_URL;
+    use crate::{test_fixtures::local_user as user, uploads};
 
     /// How far apart two fixtures must be made for their `UUIDv7`s to order
     /// by creation (the ids are stamped to the millisecond, decision 4).
@@ -360,16 +353,6 @@ mod tests {
 
     /// The retention window the expiry tests use, in days.
     const DAYS: i64 = 30;
-
-    /// A local user named `nickname`.
-    async fn user(pool: &PgPool, nickname: &str) -> User {
-        insert_user(
-            pool,
-            &NewUser::local(nickname, &local_ap_id(BASE, nickname)),
-        )
-        .await
-        .expect("the fixture user inserts")
-    }
 
     /// A backup requested by `owner`.
     async fn seed(pool: &PgPool, owner: &User) -> Backup {

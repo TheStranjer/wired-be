@@ -4,22 +4,11 @@
 
 use sqlx::PgPool;
 
-use crate::{
-    config::TEST_BASE_URL,
-    models::user::{NewUser, User, insert, local_ap_id},
-};
+use crate::models::user::User;
 
 use super::{List, NewList, add_members, create};
 
-/// Inserts a local user named `nickname`.
-pub(super) async fn user(pool: &PgPool, nickname: &str) -> User {
-    insert(
-        pool,
-        &NewUser::local(nickname, &local_ap_id(TEST_BASE_URL, nickname)),
-    )
-    .await
-    .expect("the local fixture inserts")
-}
+pub(super) use crate::test_fixtures::local_user as user;
 
 /// A list titled `title` with the defaults otherwise.
 pub(super) fn titled(title: &str) -> NewList {
