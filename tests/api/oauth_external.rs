@@ -28,7 +28,7 @@
 
 #![cfg(test)]
 
-/// The callback's successes: the login, the echo, the oob page and the
+/// The callback's successes: the login, the echo, the oob code and the
 /// unlinked hand-off.
 mod callback;
 /// The callback of an MFA-enabled linked account: the detour and the

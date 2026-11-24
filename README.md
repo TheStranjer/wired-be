@@ -37,7 +37,7 @@ below.
 |---|---|---|---|
 | `DATABASE_URL` | yes | | PostgreSQL URL, e.g. `postgres://user:pass@localhost:5432/wired` |
 | `BASE_URL` | yes | | Public origin of this instance, e.g. `https://social.example` (http(s) with a host, no path or query; trailing slash stripped) |
-| `FRONTEND_BASE_URL` | no | `BASE_URL` | Origin the frontend pages are served from; the source of browser redirects such as `/notice/{id}` and of the default-asset URLs (see "Default assets" below; no trailing slash) |
+| `FRONTEND_BASE_URL` | no | `BASE_URL` | Origin the frontend pages are served from; the source of browser redirects such as `/notice/{id}` and `/oauth/authorize` (the consent screen) and of the default-asset URLs (see "Default assets" below; no trailing slash) |
 | `BIND_ADDR` | no | `127.0.0.1:4000` | Address the HTTP server listens on |
 | `INSTANCE_NAME` | no | `Wired` | Instance display name |
 | `INSTANCE_DESCRIPTION` | no | `A Wired instance, compatible with Pleroma clients` | Short instance description |
@@ -439,9 +439,15 @@ peer list.
 ## OAuth
 
 Third-party clients use the authorization-code flow at `/oauth/authorize`
-and `POST /oauth/token`. A browser `GET`/`POST` of `/oauth/authorize` still
-gets the server-rendered login and consent page. A frontend that renders the
-consent page itself uses the JSON half of the same path instead:
+and `POST /oauth/token`. The consent screen lives at
+`{FRONTEND_BASE_URL}/oauth/authorize`: a browser `GET` of `/oauth/authorize`
+validates the request (`response_type=code`, a registered `client_id` and
+`redirect_uri`, scopes inside the registration) and answers
+`302 Location: {FRONTEND_BASE_URL}/oauth/authorize?<the same query>`, or the
+JSON 400 error with no redirect when validation fails. The server renders no
+login or consent HTML, and a form `POST` (`authorization[name]` and friends)
+is a 400. The frontend logs in with the password grant and then uses the JSON
+half of the path:
 
 - `GET /oauth/authorize?response_type=code&client_id=…&redirect_uri=…&scope=…&state=…`
   with `Accept: application/json` answers

@@ -25,12 +25,11 @@
 //! unknown tokens and second revocations, the "Missing parameter:
 //! `token`" refusal and the HTTP Basic and form request shapes
 //! (Pleroma's `OAuthController.token_revoke`). The authorize
-//! half covers the consent page and its escaping, the "Invalid client",
-//! "Invalid `redirect_uri`" and "Invalid scope" refusals, the code
-//! redirect with its exact `Location` (state round trip and an existing
-//! query string included), the out-of-band code page, the failed-login
-//! re-render, the denial redirect and the stored code row (Pleroma's
-//! `OAuthController.authorize` and `create_authorization`).
+//! half covers the browser `GET`'s 302 to the frontend's consent screen
+//! with its query intact, the JSON 400 "Invalid client", "Invalid
+//! `redirect_uri`" and "Invalid scope" refusals that never redirect, the
+//! refusal of the retired form `POST`, and the JSON half the frontend
+//! drives (`OAuthController.authorize` and `create_authorization`).
 //!
 //! The area lives below `tests/api/oauth/`, one submodule per section:
 //! `support` holds the consts, the fixture pair and the request helpers
@@ -38,17 +37,18 @@
 //! run the `password` grant's successes, credential refusals, scope
 //! rules and the grant-type refusals; `client_credentials` the app-only
 //! grant and what its token may do; `revoke` the revocation endpoint;
-//! `refresh` the rotating `refresh_token` grant; and `authorize_get` and
-//! `authorize_post` the consent page and the approval half of
-//! `/oauth/authorize`.
+//! `refresh` the rotating `refresh_token` grant; and `authorize_get`,
+//! `authorize_post` and `json_authorize` the browser redirect, the
+//! refused form post and the frontend's JSON verdict.
 
 #![cfg(test)]
 
-/// The `GET /oauth/authorize` consent page: its render, escaping and
-/// refusals, plus the form and query helpers the approval tests share.
+/// The browser `GET /oauth/authorize`: the redirect to the frontend and
+/// the refusals, plus the app, query and code helpers the other authorize
+/// tests share.
 mod authorize_get;
-/// The `POST /oauth/authorize` approval: the code redirect, the oob
-/// page, the re-render, the denial and the stored code row.
+/// The retired form `POST /oauth/authorize`: refused with a 400 that
+/// mints nothing.
 mod authorize_post;
 /// The `client_credentials` grant and the app-only token it mints.
 mod client_credentials;

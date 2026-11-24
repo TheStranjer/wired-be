@@ -232,8 +232,7 @@ impl Scopes {
     }
 
     /// The scope names, in parse order, duplicates already dropped: what
-    /// the consent page renders one checkbox for
-    /// (`crate::oauth::authorize_page`).
+    /// the authorize endpoint's JSON description lists.
     #[must_use]
     pub fn names(&self) -> &[String] {
         &self.0

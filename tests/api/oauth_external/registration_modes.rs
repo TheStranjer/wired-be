@@ -3,7 +3,7 @@
 //! trading the code for the approval page, `activation_required` for the
 //! confirmation page — unless the submitted email is the provider's own,
 //! which stands as confirmed — and the out-of-band client reading its
-//! code off the OOB page.
+//! code from the JSON answer.
 
 use axum::http::StatusCode;
 use wired_be::{
@@ -218,10 +218,10 @@ async fn the_provider_email_counts_as_confirmed() {
     site.provider.stop();
 }
 
-/// An out-of-band client gets the OOB code page from registration, the
+/// An out-of-band client gets the OOB code from registration, the
 /// very answer the callback gives a linked out-of-band user.
 #[tokio::test]
-async fn registration_answers_the_out_of_band_code_page() {
+async fn registration_answers_the_out_of_band_code() {
     let db = common::test_db().await;
     let pool = db.pool().clone();
     let site = fixture(pool.clone(), "eve", "read").await;
@@ -243,20 +243,21 @@ async fn registration_answers_the_out_of_band_code_page() {
         ],
     )
     .await;
-    assert_eq!(response.status, StatusCode::OK, "a page, not a redirect");
+    assert_eq!(response.status, StatusCode::OK, "an answer, not a redirect");
     assert_eq!(
         response.header("content-type"),
-        Some("text/html; charset=utf-8"),
-        "the OOB page"
+        Some("application/json"),
+        "the OOB code as JSON"
     );
     assert_no_store(&response);
     let code: String = sqlx::query_scalar("SELECT token FROM oauth_authorizations")
         .fetch_one(&pool)
         .await
         .expect("the code was minted for the out-of-band client");
-    assert!(
-        response.text().contains(code.as_str()),
-        "and shows the code the client will read off it"
+    assert_eq!(
+        response.json_value(),
+        serde_json::json!({ "code": code }),
+        "carrying the code the client will redeem"
     );
     site.provider.stop();
 }

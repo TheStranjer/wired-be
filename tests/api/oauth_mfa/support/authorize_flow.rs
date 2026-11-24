@@ -1,63 +1,10 @@
-//! The authorize page's detour through the MFA page.
+//! The browser half of the MFA flow: the code page a parked challenge
+//! renders and the verification that delivers its code. The detour that
+//! parks the challenge belongs to the external-login callback
+//! (`oauth_external/callback_mfa.rs`); these tests park it through
+//! [`park_detour`].
 
 use super::*;
-
-/// A valid consent login from an MFA-enabled account redirects to the
-/// code page instead of issuing the code: the detour parks the challenge
-/// and its Location round-trips every value escaped — the 43-char token,
-/// the delivery target, the urlencoded state, the client id and the
-/// approved scope — while nothing reaches the client yet. The page's own
-/// shape and its two verify arms are the next two tests.
-#[tokio::test]
-async fn the_authorize_flow_detours_through_the_mfa_page() {
-    let db = common::test_db().await;
-    let pool = db.pool().clone();
-    let fix = mfa_account(&pool, "gina").await;
-    let app = common::create_app(&pool, "read write").await;
-    let http = common::test_app(pool.clone());
-
-    let detour = post_authorize(&http, &authorize_form(&app, "gina", "read", Some("st&ate"))).await;
-    assert_eq!(detour.status, StatusCode::FOUND, "the login redirects");
-    assert_eq!(
-        detour.header("cache-control"),
-        Some("no-store"),
-        "not even the detour is cacheable"
-    );
-    let location = detour.header("location").expect("a Location header");
-    assert!(
-        location.starts_with("/oauth/mfa?"),
-        "the redirect aims at the MFA page: {location}"
-    );
-    let token = query_param(location, "mfa_token").expect("the challenge token rides along");
-    assert_eq!(token.len(), 43, "its 43-char shape");
-    assert_eq!(
-        query_param(location, "redirect_uri").as_deref(),
-        Some(REDIRECT),
-        "the delivery target round-trips"
-    );
-    assert_eq!(
-        query_param(location, "state").as_deref(),
-        Some("st&ate"),
-        "the urlencoded state survives the trip"
-    );
-    assert_eq!(
-        query_param(location, "client_id").as_deref(),
-        Some(app.client_id.as_str()),
-        "so does the client id"
-    );
-    assert_eq!(
-        query_param(location, "scope").as_deref(),
-        Some("read"),
-        "and the approved scope"
-    );
-    let (_challenge_id, _authorization_id) =
-        assert_challenge_stored(&pool, &token, &fix.user).await;
-    assert_eq!(
-        token_count(&pool, fix.user.id).await,
-        0,
-        "no token and no client-visible code yet"
-    );
-}
 
 /// The parked challenge answers with Pleroma's code page: HTML, not one
 /// byte cacheable, its title above a verify form that carries the
@@ -66,15 +13,14 @@ async fn the_authorize_flow_detours_through_the_mfa_page() {
 async fn the_mfa_page_renders_the_challenge_into_a_verify_form() {
     let db = common::test_db().await;
     let pool = db.pool().clone();
-    let _fix = mfa_account(&pool, "gina").await;
+    let fix = mfa_account(&pool, "gina").await;
     let app = common::create_app(&pool, "read write").await;
     let http = common::test_app(pool.clone());
 
-    let detour = post_authorize(&http, &authorize_form(&app, "gina", "read", Some("st&ate"))).await;
-    let location = detour.header("location").expect("a Location header");
-    let token = query_param(location, "mfa_token").expect("the challenge token rides along");
+    let location = park_detour(&pool, &app, &fix.user, REDIRECT, Some("st&ate")).await;
+    let token = query_param(&location, "mfa_token").expect("the challenge token rides along");
 
-    let page = common::TestRequest::get(location).send(&http).await;
+    let page = common::TestRequest::get(&location).send(&http).await;
     assert_eq!(page.status, StatusCode::OK, "the code page renders");
     assert_eq!(
         page.header("content-type"),
@@ -116,9 +62,8 @@ async fn the_mfa_page_refuses_a_wrong_code_and_delivers_the_right_one() {
     let app = common::create_app(&pool, "read write").await;
     let http = common::test_app(pool.clone());
 
-    let detour = post_authorize(&http, &authorize_form(&app, "gina", "read", Some("st&ate"))).await;
-    let location = detour.header("location").expect("a Location header");
-    let token = query_param(location, "mfa_token").expect("the challenge token rides along");
+    let location = park_detour(&pool, &app, &fix.user, REDIRECT, Some("st&ate")).await;
+    let token = query_param(&location, "mfa_token").expect("the challenge token rides along");
     let (_challenge_id, authorization_id) = assert_challenge_stored(&pool, &token, &fix.user).await;
 
     let real = current_code(&fix.secret);
@@ -199,8 +144,7 @@ async fn assert_parked_code_redeems(
 }
 
 /// The verification honours the out-of-band client: no redirect, the
-/// code page instead — Pleroma's `oob_authorization_created.html`
-/// through the same door the consent flow uses.
+/// code in a JSON body instead.
 #[tokio::test]
 async fn the_verification_delivers_the_code_to_an_oob_client() {
     let db = common::test_db().await;
@@ -209,13 +153,10 @@ async fn the_verification_delivers_the_code_to_an_oob_client() {
     let app = register_app(&pool, &format!("{REDIRECT} {OOB}"), "read").await;
     let http = common::test_app(pool.clone());
 
-    let mut fields = authorize_form(&app, "heidi", "read", None);
-    fields[1] = ("authorization[redirect_uri]", OOB);
-    let detour = post_authorize(&http, &fields).await;
-    let location = detour.header("location").expect("a Location header");
-    let token = query_param(location, "mfa_token").expect("the challenge token");
+    let location = park_detour(&pool, &app, &fix.user, OOB, None).await;
+    let token = query_param(&location, "mfa_token").expect("the challenge token");
     assert_eq!(
-        query_param(location, "redirect_uri").as_deref(),
+        query_param(&location, "redirect_uri").as_deref(),
         Some(OOB),
         "the out-of-band target round-trips"
     );
@@ -225,23 +166,19 @@ async fn the_verification_delivers_the_code_to_an_oob_client() {
         &verify_form(&token, "totp", &current_code(&fix.secret), OOB, None),
     )
     .await;
-    assert_eq!(
-        finished.status,
-        StatusCode::OK,
-        "the oob client gets a page"
-    );
+    assert_eq!(finished.status, StatusCode::OK, "the oob client gets 200");
+    assert!(finished.header("location").is_none(), "and no redirect");
     assert_eq!(
         finished.header("content-type"),
-        Some("text/html; charset=utf-8"),
-        "of HTML"
+        Some("application/json"),
+        "of JSON"
     );
-    let body = finished.text();
-    assert!(
-        body.contains("<h1>Successfully authorized</h1>"),
-        "Pleroma's oob page"
-    );
-    let code = oob_page_code(&body).to_owned();
-    assert_eq!(code.len(), 43, "showing the 43-char code");
+    let body = finished.json_value();
+    let code = body["code"]
+        .as_str()
+        .expect("the answer carries the code")
+        .to_owned();
+    assert_eq!(code.len(), 43, "the 43-char code");
     let parked: OauthAuthorization =
         sqlx::query_as("SELECT * FROM oauth_authorizations WHERE token = $1")
             .bind(&code)
