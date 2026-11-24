@@ -70,8 +70,8 @@ async fn the_reset_token_endpoint_issues_a_spendable_link() {
     let secret = body["token"].as_str().expect("the issued token text");
     assert_eq!(
         body["link"],
-        json!(format!("{TEST_BASE_URL}{RESET_FORM}/{secret}")),
-        "the absolute link the answer pins, hung on the instance origin"
+        json!(format!("{TEST_BASE_URL}/password_reset/{secret}")),
+        "the absolute link the answer pins, hung on the frontend origin"
     );
     assert_eq!(
         body.as_object().expect("an object").len(),
@@ -114,7 +114,7 @@ async fn the_reset_token_endpoint_issues_a_spendable_link() {
         ])
         .send(&seeded.app)
         .await;
-    common::assert_answer(&completed, StatusCode::OK, "the completion");
+    common::assert_answer(&completed, StatusCode::NO_CONTENT, "the completion");
     assert!(
         wired_be::models::user::register::authenticate(
             &seeded.pool,

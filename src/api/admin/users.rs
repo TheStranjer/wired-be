@@ -54,8 +54,9 @@
 //!   put on pending reset: the admin just set the password itself.
 //! - `GET /users/{nickname}/password_reset` — Pleroma's
 //!   `get_password_reset`: mints a reset token for the LOCAL account and
-//!   answers `{token, link}`, the link the `POST
-//!   /api/v1/pleroma/password_reset` form spends like the emailed one.
+//!   answers `{token, link}`, the frontend reset-screen link (`{FRONTEND_BASE_URL}
+//!   /password_reset/{token}`) whose token the `POST
+//!   /api/v1/pleroma/password_reset` call spends like the emailed one's.
 //!   Gated `admin:write:accounts` as Pleroma's scope pair has it, and
 //!   logged nowhere: it is a read-shaped mint, and Pleroma does not log it.
 //! - `PATCH /users/force_password_reset` (Pleroma's path) and its alias
