@@ -76,6 +76,11 @@ pub(super) async fn big() -> &'static [u8] {
     &BIG_BODY
 }
 
+/// Answers with 2 KiB of body whatever the method.
+pub(super) async fn two_kib() -> Vec<u8> {
+    vec![b'y'; 2048]
+}
+
 /// Sleeps far past [`SHORT_TIMEOUT`] before answering.
 pub(super) async fn slow() -> &'static str {
     tokio::time::sleep(Duration::from_secs(30)).await;

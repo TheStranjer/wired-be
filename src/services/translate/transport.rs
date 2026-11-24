@@ -7,7 +7,7 @@ use serde::de::DeserializeOwned;
 use serde_json::{Map, Value};
 
 use super::{FORM_MIME, JSON_MIME, LanguagePair, MAX_RESPONSE_BYTES, TranslateError};
-use crate::http_client::{HttpClient, HttpError, HttpResponse};
+use crate::http_client::{DEFAULT_RESPONSE_BYTES, HttpClient, HttpError, HttpResponse};
 
 /// The pairs of `sources` into `targets`: one [`LanguagePair`] per source, each
 /// carrying every target that is not that source itself, both sides
@@ -95,7 +95,12 @@ async fn post_raw<T: DeserializeOwned>(
         headers.push(("authorization", token));
     }
     let sent = http
-        .post_bytes(url, &headers, body.as_bytes().to_vec())
+        .post_bytes(
+            url,
+            &headers,
+            body.as_bytes().to_vec(),
+            DEFAULT_RESPONSE_BYTES,
+        )
         .await;
     read_json(&checked(sent)?)
 }
