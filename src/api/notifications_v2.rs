@@ -80,7 +80,7 @@ use crate::{
     entities::{
         account::{Account, AccountViewer},
         notification::{GroupedNotifications, NotificationGroup},
-        relationship::{Relationship, RelationshipMap},
+        relationship::Relationship,
         status::Status as StatusEntity,
     },
     error::{AppError, AppResult},
@@ -523,37 +523,13 @@ async fn expand_accounts(
     }
     let users = user::get_many(&state.db, ids).await?;
     let mut by_id: HashMap<Uuid, User> = users.into_iter().map(|found| (found.id, found)).collect();
-    let relationships = expand_relationships(state, viewer, ids).await?;
+    let relationships = Relationship::load_map(&state.db, viewer, ids).await?;
     let accounts = ids
         .iter()
         .filter_map(|id| by_id.remove(id))
         .map(|found| Account::from_user_for(viewer, &found, &state.config, relationships.as_ref()))
         .collect();
     Ok(accounts)
-}
-
-/// The viewer's [`RelationshipMap`] for `ids`, or `None` for an anonymous
-/// expansion (every grouped endpoint is authenticated, but the helpers
-/// stay honest about the optional viewer).
-///
-/// # Errors
-///
-/// [`Database`](crate::error::AppError::Database) from the batched loader.
-async fn expand_relationships(
-    state: &AppState,
-    viewer: AccountViewer<'_>,
-    ids: &[Uuid],
-) -> AppResult<Option<RelationshipMap>> {
-    let Some(who) = viewer else {
-        return Ok(None);
-    };
-    let loaded = Relationship::load_many(&state.db, who.id, ids).await?;
-    let map = loaded
-        .into_iter()
-        .zip(ids.iter().copied())
-        .map(|(relationship, target)| (target, relationship))
-        .collect();
-    Ok(Some(map))
 }
 
 /// Expands status ids into [`StatusEntity`]s as seen by `viewer`: every

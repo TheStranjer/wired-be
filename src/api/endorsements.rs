@@ -69,7 +69,7 @@ use crate::{
     auth::{AuthUser, MaybeAuthUser},
     entities::{
         account::{Account, AccountViewer},
-        relationship::{Relationship, RelationshipMap},
+        relationship::Relationship,
     },
     error::{AppError, AppResult},
     models::{endorsement, follow},
@@ -157,7 +157,9 @@ async fn endorse_account(
         target = %target.id,
         "account endorsed"
     );
-    one_relationship(&state, auth.0.id, target.id).await
+    Ok(Json(
+        Relationship::load_one(&state.db, auth.0.id, target.id).await?,
+    ))
 }
 
 /// `POST /api/v1/accounts/{id}/unendorse` (and its `/unpin` alias) —
@@ -190,7 +192,9 @@ async fn unendorse_account(
         target = %target.id,
         "endorsement withdrawn"
     );
-    one_relationship(&state, auth.0.id, target.id).await
+    Ok(Json(
+        Relationship::load_one(&state.db, auth.0.id, target.id).await?,
+    ))
 }
 
 /// `GET /api/v1/endorsements` — the accounts the caller pins to their own
@@ -262,29 +266,6 @@ async fn list_endorsements(
     page_response(&state, viewer, &entries, uri.path()).await
 }
 
-/// The caller's [`Relationship`] to one account, rendered after a pin
-/// write: [`Relationship::load_many`] over the single target, so the
-/// answer states the stored fact rather than trusting the request (the
-/// write-behind read of Pleroma's `relationship.json`, the shape
-/// [`crate::api::accounts`] uses for its writes).
-///
-/// # Errors
-///
-/// Any database failure arrives through `?` as [`AppError::Database`]; the
-/// [`AppError::Internal`] arm only documents that the loader answers one
-/// row per requested id, which a single-target batch always does.
-async fn one_relationship(
-    state: &AppState,
-    viewer_id: Uuid,
-    target_id: Uuid,
-) -> AppResult<Json<Relationship>> {
-    let loaded = Relationship::load_many(&state.db, viewer_id, &[target_id]).await?;
-    let relationship = loaded.into_iter().next().ok_or_else(|| {
-        AppError::Internal("the relationship loader skipped its only target".to_owned())
-    })?;
-    Ok(Json(relationship))
-}
-
 /// The answer to a hidden endorsement listing: the empty array as a plain
 /// 200 with no `Link` header at all — the followers/following listings'
 /// hidden branch, where the page never got a cursor to link from.
@@ -294,7 +275,7 @@ fn empty_page() -> (HeaderMap, Json<Vec<Account>>) {
 
 /// Renders one fetched endorsement page for `viewer`: every entry's
 /// [`User`] as an [`Account`] with the viewer's relationship embedded
-/// where one is preloaded (see [`preload_page_relationships`]), under the
+/// where one is preloaded (see [`Relationship::load_map`]), under the
 /// `Link` header [`page_link`] derives from the endorsement ids.
 async fn page_response(
     state: &AppState,
@@ -302,7 +283,8 @@ async fn page_response(
     entries: &[endorsement::EndorsementPageEntry],
     path: &str,
 ) -> AppResult<(HeaderMap, Json<Vec<Account>>)> {
-    let relationships = preload_page_relationships(state, viewer, entries).await?;
+    let targets: Vec<Uuid> = entries.iter().map(|entry| entry.user.id).collect();
+    let relationships = Relationship::load_map(&state.db, viewer, &targets).await?;
     let link = page_link(&state.config.base_url, path, entries);
     let mut headers = HeaderMap::new();
     set_link_header(&mut headers, link.as_deref())?;
@@ -313,30 +295,6 @@ async fn page_response(
         })
         .collect();
     Ok((headers, Json(accounts)))
-}
-
-/// The [`RelationshipMap`] for one endorsement page: the viewer's
-/// relationship to every listed account in a single batched
-/// [`Relationship::load_many`], keyed by target id (which is how
-/// [`Account::from_user_for`] reads its preload). [`None`] only for an
-/// anonymous viewer, whose entries keep Pleroma's empty
-/// `pleroma.relationship` object and so need no query at all.
-async fn preload_page_relationships(
-    state: &AppState,
-    viewer: AccountViewer<'_>,
-    entries: &[endorsement::EndorsementPageEntry],
-) -> AppResult<Option<RelationshipMap>> {
-    let Some(who) = viewer else {
-        return Ok(None);
-    };
-    let targets: Vec<Uuid> = entries.iter().map(|entry| entry.user.id).collect();
-    let loaded = Relationship::load_many(&state.db, who.id, &targets).await?;
-    let map = loaded
-        .into_iter()
-        .zip(targets)
-        .map(|(relationship, target)| (target, relationship))
-        .collect();
-    Ok(Some(map))
 }
 
 /// The `Link` header value for a fetched endorsement page: Pleroma's
