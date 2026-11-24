@@ -8,10 +8,11 @@ use crate::{
     config::{Config, Toggle},
     entities::account::Account,
     models::{instance_rule::InstanceRule, user::User},
+    services::instance_meta::SOURCE_URL,
 };
 
 use super::{
-    MAX_FEATURED_TAGS, MAX_PINNED_STATUSES, MONTHLY_ACTIVE_USERS, SOURCE_URL, THUMBNAIL_PATH,
+    MAX_FEATURED_TAGS, MAX_PINNED_STATUSES, MONTHLY_ACTIVE_USERS, THUMBNAIL_PATH,
     handlers::{streaming_api_url, version_string},
     pleroma::PleromaBlock,
     v1::{MediaAttachmentsConfiguration, PollsConfiguration, Rule, StatusesConfiguration},

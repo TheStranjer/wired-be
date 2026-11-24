@@ -456,10 +456,6 @@ mod oauth_mfa;
 /// OAuth token management (`/api/oauth_tokens` and the pleroma apps).
 mod oauth_tokens;
 
-/// `GET /api/openapi` (WBE-227): the `OpenAPI` 3.0 document generated from
-/// the route inventory, its per-row operations and its `oAuth2` scheme.
-mod openapi;
-
 /// Password reset (`/auth/password` and `/api/v1/pleroma/password_reset`).
 mod password_reset;
 
@@ -509,6 +505,9 @@ mod rate_limit;
 /// `…/reblogged_by` lists only distributable (public / unlisted) boosts.
 mod reblogged_by_visibility;
 
+/// `…/reblogged_by` drops deactivated and viewer-blocked accounts.
+mod reblogged_by_filters;
+
 /// Reblogs over HTTP (`/api/v1/statuses/{id}/reblog`, its `…/unreblog`
 /// twin and the `…/reblogged_by` listing).
 mod reblogs;
@@ -532,9 +531,8 @@ pub mod remote;
 
 /// Remote interaction over HTTP (`src/api/remote_interaction.rs`): the
 /// `POST /api/v1/pleroma/remote_interaction` refusals, the
-/// `/ostatus_subscribe` form and follow write, the
-/// `/authorize_interaction` frontend redirects and the `/main/ostatus`
-/// pair.
+/// retired `/ostatus_subscribe` pair, the `/authorize_interaction`
+/// frontend redirects and the retired `/main/ostatus` pair.
 mod remote_interaction;
 
 /// `POST /api/v1/accounts/{id}/remove_from_followers`.

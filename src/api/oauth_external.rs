@@ -40,12 +40,12 @@
 //!      (and the client's `state`); no authorization is created. This is
 //!      interim, until the frontend consent flow exists. For a trusted app
 //!      the readiness gate ([`crate::api::oauth`]'s `check_account_ready`,
-//!      the one the token endpoint applies) runs, and the answer is exactly
-//!      the one `POST /oauth/authorize` gives for the *stored* parameters: a
+//!      the one the token endpoint applies) runs, and the answer is
+//!      the authorization code for the *stored* parameters: a
 //!      302 to the app's `redirect_uri` with `code` (and the client's
-//!      `state`), or the out-of-band code page. No password is asked for:
-//!      the provider authenticated the user, and the scopes were validated
-//!      when the round trip was prepared.
+//!      `state`), or the JSON `{"code": …}` for the out-of-band URI. No
+//!      password is asked for: the provider authenticated the user, and the
+//!      scopes were validated when the round trip was prepared.
 //!    * not linked → the provider's account info is stored under the
 //!      `pending` key of the state's parameters and the browser is
 //!      redirected 302 to `{BASE_URL}/oauth/registration_details?state=…`,
@@ -358,7 +358,7 @@ mod tests {
         assert!(ok.is_ok(), "a plain URL redirects");
         let header = match ok {
             Ok(AuthorizeReply::Found(value)) => value,
-            Ok(AuthorizeReply::Page(_)) | Err(_) => {
+            Ok(AuthorizeReply::Page(_) | AuthorizeReply::Code(_)) | Err(_) => {
                 panic!("a URL redirect, not a page")
             }
         };

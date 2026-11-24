@@ -6,7 +6,7 @@ use chrono::{DateTime, Utc};
 use serde_json::Value;
 
 use crate::{
-    federation::json::value_or_id,
+    federation::json::{clamped_time, value_or_id},
     util::{
         format::truncate_chars,
         sanitize::{escape_html, sanitize_html, strip_html},
@@ -15,8 +15,8 @@ use crate::{
 };
 
 use super::{
-    CLOCK_SKEW, DEFAULT_HTML_CONTENT_TYPE, MAX_CONTENT_CHARS, TYPE_ARTICLE, TYPE_AUDIO, TYPE_EVENT,
-    TYPE_IMAGE, TYPE_PAGE, TYPE_VIDEO,
+    DEFAULT_HTML_CONTENT_TYPE, MAX_CONTENT_CHARS, TYPE_ARTICLE, TYPE_AUDIO, TYPE_EVENT, TYPE_IMAGE,
+    TYPE_PAGE, TYPE_VIDEO,
     types::{NoteText, NoteTimes},
 };
 
@@ -86,6 +86,55 @@ fn title_of(json: &Value) -> Option<String> {
         .map(str::to_owned)
 }
 
+/// The longest language tag stored.
+const MAX_LANGUAGE_CHARS: usize = 16;
+
+/// The language tag of the post's words: the `contentMap` key whose value
+/// equals `content` (Pleroma's rule), else the first `contentMap` key
+/// (Mastodon's), else a non-`und` `@language` of an object in `@context`.
+/// The first candidate that looks like a BCP 47 tag wins, so a hostile key
+/// falls through to the next source and never reaches the database.
+pub(super) fn parse_language(json: &Value) -> Option<String> {
+    let body = json.get("content").and_then(Value::as_str);
+    let map = json.get("contentMap").and_then(Value::as_object);
+    let matching = map.into_iter().flatten().find_map(|(key, value)| {
+        let text = value.as_str()?;
+        (body == Some(text)).then_some(key.as_str())
+    });
+    let first = map
+        .and_then(|entries| entries.keys().next())
+        .map(String::as_str);
+    let ld_scope = json.get("@context");
+    let declared = ld_scope
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .chain(ld_scope.filter(|value| value.is_object()))
+        .filter_map(|entry| entry.get("@language")?.as_str())
+        .find(|tag| !tag.eq_ignore_ascii_case("und"));
+    [matching, first, declared]
+        .into_iter()
+        .flatten()
+        .find(|tag| is_language_tag(tag))
+        .map(str::to_owned)
+}
+
+/// Whether `tag` looks like a BCP 47 tag: a two- or three-letter primary
+/// subtag followed by `-` and one to eight alphanumerics, repeated, within
+/// [`MAX_LANGUAGE_CHARS`].
+fn is_language_tag(tag: &str) -> bool {
+    if tag.len() > MAX_LANGUAGE_CHARS {
+        return false;
+    }
+    let mut parts = tag.split('-');
+    let primary = parts.next().unwrap_or_default();
+    (2..=3).contains(&primary.len())
+        && primary.chars().all(|c| c.is_ascii_alphabetic())
+        && parts.all(|part| {
+            (1..=8).contains(&part.len()) && part.chars().all(|c| c.is_ascii_alphanumeric())
+        })
+}
+
 /// The header converted documents render in front of their body:
 /// the title as a bold first paragraph, then the post's url as a link. A
 /// titleless article gets only the link paragraph. The result goes through
@@ -102,13 +151,11 @@ fn article_header(title: Option<&str>, url: &str) -> String {
 }
 
 /// The timestamps: `published` clamped to `now` when it leads `now` by more
-/// than [`CLOCK_SKEW`] (a remote clock cannot push a post into the future),
-/// and `updated` kept as the edit time only when it postdates that.
+/// than [`CLOCK_SKEW`](crate::federation::json::CLOCK_SKEW) (a remote clock
+/// cannot push a post into the future), and `updated` kept as the edit time
+/// only when it postdates that.
 pub(super) fn parse_times(json: &Value, now: DateTime<Utc>) -> NoteTimes {
-    let ceiling = now.checked_add_signed(CLOCK_SKEW).unwrap_or(now);
-    let inserted_at = timestamp_field(json, "published")
-        .filter(|published| *published <= ceiling)
-        .unwrap_or(now);
+    let inserted_at = clamped_time(json.get("published"), now).unwrap_or(now);
     let edited_at = timestamp_field(json, "updated").filter(|updated| *updated > inserted_at);
     NoteTimes {
         inserted_at,
@@ -134,11 +181,23 @@ pub(super) fn parse_sensitive(json: &Value, has_spoiler: bool) -> bool {
 /// The reference carried by the first of `keys` that yields one: values are
 /// read through [`value_or_id`], so a `null` (or any reference-less value)
 /// under an earlier key falls through to a later one, like Pleroma's `||`
-/// chains in `fix_object_defaults` and `fix_quote_url` do.
+/// chains in `fix_object_defaults` and `fix_quote_url` do. An object value
+/// of `type` `Tombstone` (a deleted target) is no reference, so the next
+/// key is tried instead.
 pub(super) fn field_reference(json: &Value, keys: &[&str]) -> Option<String> {
     keys.iter()
         .filter_map(|key| json.get(*key))
+        .filter(|value| !is_tombstone(value))
         .find_map(value_or_id)
+}
+
+/// Whether `value` is an object whose `type` is, or lists, `Tombstone`.
+fn is_tombstone(value: &Value) -> bool {
+    match value.get("type") {
+        Some(Value::String(kind)) => kind == "Tombstone",
+        Some(Value::Array(kinds)) => kinds.iter().any(|kind| kind.as_str() == Some("Tombstone")),
+        _ => false,
+    }
 }
 
 #[cfg(test)]
@@ -434,6 +493,63 @@ mod tests {
             parsed.ap_context.as_deref(),
             Some("https://x.example/thread/9"),
             "a null context falls through to conversation"
+        );
+    }
+
+    #[test]
+    fn language_prefers_the_content_map_key_matching_content() {
+        let mut document = minimal_note();
+        document["content"] = json!("<p>Hallo</p>");
+        document["contentMap"] = json!({"en": "<p>Hello</p>", "de": "<p>Hallo</p>"});
+        assert_eq!(parse_language(&document).as_deref(), Some("de"));
+        assert_eq!(
+            parse(&document).status.language.as_deref(),
+            Some("de"),
+            "parse_note stores it"
+        );
+    }
+
+    #[test]
+    fn language_falls_back_to_the_first_key_then_the_context() {
+        let mut document = minimal_note();
+        document["contentMap"] = json!({"pt-BR": "<p>Olá</p>"});
+        assert_eq!(parse_language(&document).as_deref(), Some("pt-BR"));
+        remove(&mut document, "contentMap");
+        document["@context"] =
+            json!(["https://www.w3.org/ns/activitystreams", {"@language": "fr"}]);
+        assert_eq!(parse_language(&document).as_deref(), Some("fr"));
+        document["@context"] = json!({"@language": "es"});
+        assert_eq!(parse_language(&document).as_deref(), Some("es"));
+        document["@context"] =
+            json!(["https://www.w3.org/ns/activitystreams", {"@language": "und"}]);
+        assert_eq!(parse_language(&document), None, "und is no language");
+        remove(&mut document, "@context");
+        assert_eq!(parse_language(&document), None, "nothing declared");
+        assert_eq!(parse(&document).status.language, None);
+    }
+
+    #[test]
+    fn language_rejects_anything_but_a_tag() {
+        let mut document = minimal_note();
+        document["contentMap"] = json!({"<script>": "<p>hello</p>"});
+        assert_eq!(parse_language(&document), None, "garbage key");
+        for bad in [
+            "e",
+            "english",
+            "en-",
+            "en--US",
+            "en-toolongsubtag",
+            "de-1234567-1234567",
+        ] {
+            document["contentMap"] = json!({ (bad): "<p>x</p>" });
+            assert_eq!(parse_language(&document), None, "{bad} is no tag");
+        }
+        document["contentMap"] = json!({"<script>": "<p>x</p>"});
+        document["@context"] = json!([{"@language": "ja"}]);
+        assert_eq!(
+            parse_language(&document).as_deref(),
+            Some("ja"),
+            "a bad key falls through to the context"
         );
     }
 }

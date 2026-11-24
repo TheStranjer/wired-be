@@ -17,28 +17,30 @@
 //! 2. a `Signature` header — or the same parameters under
 //!    `Authorization: Signature ...` — must carry parseable parameters
 //!    (401 `Missing signature`);
-//! 3. the `Digest` header must describe the bytes actually received
-//!    (401 `Invalid digest`, [`verify_digest`] and its body rule);
-//! 4. the `keyId` minus its fragment is the signer's actor URL (Mastodon's
-//!    `#main-key`): the stored mirror answers, else the actor is fetched
-//!    (401 `Unknown key` when neither works); a `keyId` naming a standalone
-//!    key object is resolved by fetching that document and following its
-//!    `owner`;
-//! 5. the signature verifies against the stored `public_key` (the
-//!    [`verify`] rules, `Date` skew included); on failure the actor is
-//!    refetched at most once per 60 s and the check retried, then 401
-//!    `Invalid signature`;
-//! 6. the activity's `actor` must equal the signer's `ap_id` — forwarded
-//!    activities authenticated by an `LD` signature are not supported and
-//!    are rejected the same way (401 `Signature actor does not match
-//!    activity actor`). A `Delete` of an actor that answers `410 Gone` and
-//!    is about itself is answered `202 Accepted` and dropped;
-//! 7. a signer whose host the instance refuses — a row of the
+//! 3. a signer whose host the instance refuses — a row of the
 //!    instance-policy `reject` list
 //!    ([`crate::models::instance_policy_domain`]) or a host the
 //!    [`mrf`] configuration's domain lists reject
 //!    ([`MrfConfig::rejected`](crate::federation::mrf::MrfConfig::rejected))
-//!    — is refused (403 `Rejected`).
+//!    — is refused (403 `Rejected`). The host is the `keyId`'s, known
+//!    before anything is fetched, so a rejected peer costs no outbound
+//!    request;
+//! 4. the `Digest` header must describe the bytes actually received
+//!    (401 `Invalid digest`, [`verify_digest`] and its body rule);
+//! 5. the `keyId` minus its fragment is the signer's actor URL (Mastodon's
+//!    `#main-key`): the stored mirror answers, else the actor is fetched
+//!    (401 `Unknown key` when neither works); a `keyId` naming a standalone
+//!    key object is resolved by fetching that document and following its
+//!    `owner`;
+//! 6. the signature verifies against the stored `public_key` (the
+//!    [`verify`] rules, `Date` skew included); on failure the actor is
+//!    refetched at most once per 60 s and the check retried, then 401
+//!    `Invalid signature`;
+//! 7. the activity's `actor` must equal the signer's `ap_id` — forwarded
+//!    activities authenticated by an `LD` signature are not supported and
+//!    are rejected the same way (401 `Signature actor does not match
+//!    activity actor`). A `Delete` of an actor that answers `410 Gone` and
+//!    is about itself is answered `202 Accepted` and dropped.
 //!
 //! Every failure is an [`AppError`], rendered by [`InboxAuthError`]; the
 //! request body is never logged.
@@ -100,7 +102,7 @@ const ACTOR_MISMATCH: &str = "Signature actor does not match activity actor";
 /// own table or the [`mrf`](crate::federation::mrf) domain lists.
 const REJECTED: &str = "Rejected";
 /// The `ActivityStreams` type of the one activity accepted while unsigned:
-/// an actor's own deletion (see the [module docs](self) step 6).
+/// an actor's own deletion (see the [module docs](self) step 7).
 const DELETE_TYPE: &str = "Delete";
 /// The `Authorization` scheme an inbox `Signature` header may hide under.
 const SIGNATURE_SCHEME: &str = "Signature";
@@ -190,6 +192,7 @@ async fn authenticate(
     }
     let json = parse_json_body(&body)?;
     let parsed = present_signature(&parts.headers)?;
+    require_unblocked(state, &parsed.key_id).await?;
     verify_digest(&parts.headers, &body).map_err(|_err| InboxAuthError::invalid_digest())?;
     let signer = resolve_signer(state, &parsed.key_id, &json).await?;
     let target = request_target(&parts.uri);
@@ -202,7 +205,6 @@ async fn authenticate(
     };
     let signer = verify_signature(state, &inbound, signer).await?;
     require_containment(&json, &signer)?;
-    require_unblocked(state, &parsed.key_id).await?;
     Ok(SignedActivity { body, json, signer })
 }
 
@@ -216,8 +218,9 @@ mod tests {
     use crate::{
         config::Config,
         federation::inbox_auth::test_support::{
-            BODY, activity, bind, deliver, drop_header, header_value, inbox_app, origin, peer,
-            peer_app, replace_header, send, spawn, test_state, test_state_with_config,
+            BODY, activity, bind, block_domain, deliver, drop_header, header_value, inbox_app,
+            origin, peer, peer_app, replace_header, send, spawn, test_state,
+            test_state_with_config,
         },
         util::keys::{FIXTURE_PRIVATE_PKCS1_PEM, FIXTURE_PUBLIC_PKCS1_PEM},
     };
@@ -350,6 +353,45 @@ mod tests {
             hits.load(Ordering::SeqCst),
             0,
             "neither delivery reached the network"
+        );
+        server.abort();
+    }
+
+    /// A rejected domain is refused before its key is fetched: the peer
+    /// sees no request, for a valid delivery and for a garbage one alike.
+    #[tokio::test]
+    async fn a_rejected_domain_is_refused_without_fetching_its_key() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let listener = bind().await;
+        let base = origin(&listener);
+        let ap_id = format!("{base}/users/alice");
+        let peer = peer(base.clone(), FIXTURE_PUBLIC_PKCS1_PEM.to_owned());
+        let hits = Arc::clone(&peer.hits);
+        let server = spawn(listener, peer_app(peer));
+        block_domain(&pool, "127.0.0.1").await;
+        let app = inbox_app(test_state(pool.clone()));
+        let key_id = format!("{ap_id}#main-key");
+
+        let body = activity(&ap_id, "https://test.example/users/bob");
+        let valid = send(&app, &deliver(&key_id, FIXTURE_PRIVATE_PKCS1_PEM, &body)).await;
+        assert_eq!(valid.status, StatusCode::FORBIDDEN, "the block answers");
+        assert_eq!(valid.error, REJECTED, "with the ticket wording");
+
+        let mut lying = deliver(&key_id, FIXTURE_PRIVATE_PKCS1_PEM, &body);
+        replace_header(
+            &mut lying,
+            "digest",
+            "SHA-256=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_owned(),
+        );
+        let garbage = send(&app, &lying).await;
+        assert_eq!(garbage.status, StatusCode::FORBIDDEN, "garbage is refused");
+        assert_eq!(garbage.error, REJECTED, "by the same gate");
+
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            0,
+            "the rejected peer was never fetched"
         );
         server.abort();
     }

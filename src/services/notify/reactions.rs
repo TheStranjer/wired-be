@@ -8,13 +8,13 @@ use crate::{
     error::AppResult,
     models::{
         emoji_reaction::EmojiReaction as ReactionRow,
-        notification::{self, NewNotification, TYPE_EMOJI_REACTION, Telling},
+        notification::{self, TYPE_EMOJI_REACTION, Telling},
         status, user,
     },
     state::AppState,
 };
 
-use super::announce;
+use super::{announce, told_row};
 
 /// The reaction routes' notification, landed from `after_reaction_changed`
 /// in [`crate::api::emoji_reactions`].
@@ -69,20 +69,7 @@ async fn reaction_telling(
     if author.id == reaction.user_id {
         return Ok(());
     }
-    announce(
-        state,
-        &author,
-        &NewNotification {
-            user_id: author.id,
-            from_account_id: reaction.user_id,
-            notification_type: TYPE_EMOJI_REACTION,
-            status_id: Some(reaction.status_id),
-            emoji: Some(reaction.emoji.as_str()),
-            report_id: None,
-            chat_message_id: None,
-        },
-    )
-    .await
+    announce(state, &author, &told_row(&telling)).await
 }
 
 #[cfg(test)]

@@ -18,7 +18,9 @@ jobs:
   check:
     runs-on: ubuntu-latest
     env:
-      CARGO_TERM_COLOR: always
+      # Plain text: the log's main reader is an agent, colour codes cost it
+      # characters, and they hide the `= help:` lines scripts/ci.sh filters out.
+      CARGO_TERM_COLOR: never
       # Reduce artifact size
       CARGO_INCREMENTAL: "0"
       CARGO_PROFILE_DEV_DEBUG: "0"
@@ -36,7 +38,7 @@ jobs:
         ports:
           - 5432:5432
         options: >-
-          --health-cmd pg_isready
+          --health-cmd "pg_isready -U postgres"
           --health-interval 10s
           --health-timeout 5s
           --health-retries 5
@@ -76,12 +78,17 @@ jobs:
       # reloadable, and `pg_reload_conf()` applies them without a restart.
       # See the README's "Making a local test database fast" for the same
       # settings on a development database — never point this at real data.
+      # The server's own log is silenced too: GitHub prints it at teardown,
+      # and every error a test provokes on purpose would land there; failing
+      # tests already report the errors that matter.
       - name: Run Postgres without durability (throwaway test databases)
         run: |
           psql "$DATABASE_URL" -v ON_ERROR_STOP=1 <<'SQL'
           ALTER SYSTEM SET fsync = off;
           ALTER SYSTEM SET full_page_writes = off;
           ALTER SYSTEM SET synchronous_commit = off;
+          ALTER SYSTEM SET log_min_messages = panic;
+          ALTER SYSTEM SET log_min_error_statement = panic;
           SELECT pg_reload_conf();
           SQL
           # Confirm the reload landed before the suite starts paying for it.

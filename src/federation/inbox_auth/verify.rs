@@ -1,7 +1,7 @@
-//! The gate after resolution: the cryptographic verification and its
-//! once-per-window refetch retry (step 5 of the
-//! [module docs](super)), the signer-containment rule (step 6) and the
-//! domain reject lists (step 7) the authenticated delivery must still pass.
+//! The signature gates: the domain reject lists (step 3 of the
+//! [module docs](super)), checked before anything is fetched, then after
+//! resolution the cryptographic verification and its once-per-window
+//! refetch retry (step 6) and the signer-containment rule (step 7).
 
 use chrono::Utc;
 use serde_json::Value;
@@ -23,7 +23,7 @@ use crate::{
 };
 
 /// Verifies the signature against the signer's stored key, retrying once
-/// after a key refetch on failure (step 5 of the [module docs](super)).
+/// after a key refetch on failure (step 6 of the [module docs](super)).
 ///
 /// The retry refetches `signer`'s actor document — the peer may have
 /// rotated its key since the mirror was written — but at most once per
@@ -78,7 +78,7 @@ fn verifies(inbound: &Inbound<'_>, request: &SignedRequestParts<'_>, public_pem:
     verify(inbound.parsed, request, public_pem, Utc::now()).is_ok()
 }
 
-/// Step 6 of the [module docs](super): the activity's `actor` (string or
+/// Step 7 of the [module docs](super): the activity's `actor` (string or
 /// object id) must name the authenticated signer's `ap_id`. An absent
 /// `actor` names nobody and fails the same way; forwarding authenticated
 /// by an `LD` signature is not supported yet, so a different server's
@@ -96,11 +96,12 @@ pub(super) fn require_containment(json: &Value, signer: &User) -> Result<(), Inb
     Err(InboxAuthError::actor_mismatch())
 }
 
-/// Step 7 of the [module docs](super): the signer's instance may not be on
+/// Step 3 of the [module docs](super): the signer's instance may not be on
 /// a reject list — neither the instance-policy table nor the domain lists
-/// of the [`mrf`](crate::federation::mrf) configuration. An unparsable `keyId` names no
-/// host to check — such a signer never got past resolution anyway, so it
-/// cannot smuggle a blocked delivery in.
+/// of the [`mrf`](crate::federation::mrf) configuration. Runs before any
+/// fetch, since the decision depends only on the `keyId` host. An
+/// unparsable `keyId` names no host to check — such a signer never gets
+/// past resolution anyway, so it cannot smuggle a blocked delivery in.
 pub(super) async fn require_unblocked(
     state: &AppState,
     key_id: &str,

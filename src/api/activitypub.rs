@@ -165,7 +165,7 @@ use crate::{
     error::{AppError, AppResult},
     extract::multipart::upload_body_limit,
     federation::{authorized_fetch::fetch_allowed, note::LITEPUB_SCHEMA_PATH},
-    models::user::{User, get_by_nickname},
+    models::user::{User, require_local_active},
     state::AppState,
 };
 
@@ -177,7 +177,7 @@ use self::{
     },
     c2s_misc::{ap_upload_media, whoami},
     inbox::{inbox, read_inbox, user_inbox},
-    negotiation::{html_redirect, wants_activity_json, wants_html},
+    negotiation::{frontend_redirect, wants_activity_json, wants_html},
     objects::{get_notice, get_object, get_replies, get_scoped_object},
     outbox_create::update_outbox,
 };
@@ -350,21 +350,13 @@ pub(super) async fn gate_actor_read(
 ) -> AppResult<Reader> {
     if !wants_activity_json(headers) {
         if wants_html(headers) {
-            let redirect = html_redirect(&state.config, nickname)?;
+            let redirect = frontend_redirect(&state.config, nickname)?;
             return Ok(Reader::Redirect(redirect));
         }
         return Err(AppError::RouteNotFound);
     }
     fetch_allowed(state, &Method::GET, uri, headers).await?;
-    let Some(user) = get_by_nickname(&state.db, nickname).await? else {
-        return Err(AppError::RouteNotFound);
-    };
-    if !user.local.get() {
-        return Err(AppError::RouteNotFound);
-    }
-    if !user.is_active.get() {
-        return Err(AppError::Gone);
-    }
+    let user = require_local_active(&state.db, nickname).await?;
     Ok(Reader::Account(Box::new(user)))
 }
 

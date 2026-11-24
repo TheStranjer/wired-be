@@ -79,7 +79,7 @@ const METADATA_KEYS: [&str; 17] = [
 
 /// The feature list Pleroma 2.10.2 advertises with its shipped defaults,
 /// spelled out here so the shared builder is checked, not echoed.
-const EXPECTED_FEATURES: [&str; 26] = [
+const EXPECTED_FEATURES: [&str; 25] = [
     "pleroma_api",
     "mastodon_api",
     "mastodon_api_grouped_notifications",
@@ -102,7 +102,6 @@ const EXPECTED_FEATURES: [&str; 26] = [
     "pleroma:pin_chats",
     "exposable_reactions",
     "profile_directory",
-    "pleroma:get:main/ostatus",
     "pleroma:group_actors",
     "pleroma:bookmark_folders",
     "pleroma:block_expiration",
@@ -140,7 +139,12 @@ fn expected_document(version: &str) -> Value {
             "staffAccounts": [],
             "federation": {
                 "enabled": true,
-                "mrf_policies": [],
+                "mrf_policies": ["HashtagPolicy"],
+                "mrf_hashtag": {
+                    "sensitive": ["nsfw"],
+                    "reject": [],
+                    "federated_timeline_removal": [],
+                },
                 "quarantined_instances": [],
                 "exclusions": false,
             },
@@ -175,8 +179,9 @@ fn expected_document(version: &str) -> Value {
             "skipThreadContainment": true,
             "markup": {
                 "allow_inline_images": true,
-                "allow_headings": false,
+                "allow_headings": true,
                 "allow_tables": false,
+                "allow_fonts": false,
             },
         },
     });
@@ -552,7 +557,7 @@ async fn federation_reports_the_enabled_mrf_policies() {
     let federation = &document["metadata"]["federation"];
     assert_eq!(
         federation["mrf_policies"],
-        json!(["NoOpPolicy"]),
+        json!(["NoOpPolicy", "HashtagPolicy"]),
         "the chain's names in Pleroma formatting"
     );
     assert_eq!(
@@ -604,7 +609,7 @@ async fn federation_is_the_same_answer_the_instance_documents_give() {
         if transparency {
             assert_eq!(
                 federation["mrf_policies"],
-                json!(["SimplePolicy"]),
+                json!(["SimplePolicy", "HashtagPolicy"]),
                 "the running policy is named"
             );
             assert_eq!(

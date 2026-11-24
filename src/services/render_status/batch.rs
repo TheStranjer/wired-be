@@ -14,7 +14,7 @@ use crate::{
     entities::{
         account::JsonBool,
         poll::Poll as PollEntity,
-        relationship::RelationshipMap,
+        relationship::{Relationship, RelationshipMap},
         status::{Status, StatusSource},
     },
     error::AppResult,
@@ -35,11 +35,9 @@ use super::{
     loaders::{
         load_bookmarks, load_direct_participations, load_favourites, load_media, load_mentions,
         load_pins, load_quotes, load_reactions, load_reblogs, load_statuses_by_id, load_tags,
-        load_thread_mutes, load_users,
+        load_thread_mutes, load_users, load_visible_parents,
     },
-    loaders_polls_cards::{
-        load_cards, load_poll_options, load_poll_votes, load_polls, load_relationships,
-    },
+    loaders_polls_cards::{load_cards, load_poll_options, load_poll_votes, load_polls},
     page_ids::{PageIds, distinct},
 };
 
@@ -69,6 +67,14 @@ pub(super) struct Batch<'a> {
     /// with `pleroma.quote_visible` false while `quote_id` still names
     /// it.
     visible_quotes: HashSet<Uuid>,
+    /// Which of the statuses the page (and its nested rows) reply to this
+    /// viewer may see — one
+    /// [`filter_visible`](crate::models::status_visibility::filter_visible)
+    /// over the loaded parents, run once per page and skipped when nothing on it is
+    /// a reply. A parent outside this set (hidden, or gone) makes its
+    /// replies render `pleroma.parent_visible` false; a root post has no
+    /// parent and renders it true.
+    visible_parents: HashSet<Uuid>,
     /// Media attachments, keyed by status, in position order.
     media: HashMap<Uuid, Vec<AttachmentRow>>,
     /// Mentions, keyed by status, in mention order.
@@ -165,6 +171,7 @@ impl<'a> Batch<'a> {
         let quote_ids = distinct(rows.iter().copied().filter_map(|row| row.quote_of_id));
         let (quoted, visible_quotes) = load_quotes(pool, &quote_ids, mode).await?;
         let ids = PageIds::of(rows, &originals, &quoted);
+        let visible_parents = load_visible_parents(pool, &ids.parents, mode).await?;
         let polls = load_polls(pool, &ids.rendered).await?;
         let poll_options = load_poll_options(pool, &ids.rendered).await?;
         let poll_votes = load_poll_votes(pool, &ids.rendered, viewer).await?;
@@ -181,6 +188,7 @@ impl<'a> Batch<'a> {
             originals,
             quoted,
             visible_quotes,
+            visible_parents,
             media: load_media(pool, &ids.rendered).await?,
             mentions: load_mentions(pool, &ids.rendered).await?,
             tags: load_tags(pool, &ids.rendered).await?,
@@ -194,7 +202,7 @@ impl<'a> Batch<'a> {
             polls,
             poll_options,
             poll_votes,
-            relationships: load_relationships(pool, viewer, &ids.authors).await?,
+            relationships: Relationship::load_map(pool, viewer, &ids.authors).await?,
             cards: load_cards(pool, &ids.rendered).await?,
         })
     }
@@ -289,7 +297,11 @@ impl<'a> Batch<'a> {
     /// `quote` is the batch's serialized nested quote render —
     /// `pleroma.quote` mirrors it and `pleroma.quote_visible` is its
     /// presence, which is why the three can never disagree, while
-    /// `quote_id` names the target whatever the render answered.
+    /// `quote_id` names the target whatever the render answered. The
+    /// `pleroma.parent_visible` flag is `true` for a row that replies to
+    /// nothing and otherwise membership of the parent's id in the page's
+    /// visible-parents set — the viewer's access to the parent, which the
+    /// page filter on the rendered row says nothing about.
     fn render_entity(
         &self,
         row: &StatusRow,
@@ -325,6 +337,10 @@ impl<'a> Batch<'a> {
             quote,
             reblog,
             poll: self.render_poll(row),
+            parent_visible: JsonBool(
+                row.in_reply_to_id
+                    .is_none_or(|parent| self.visible_parents.contains(&parent)),
+            ),
         };
         Some(Status::from_source(
             source,

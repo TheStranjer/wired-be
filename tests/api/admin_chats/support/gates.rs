@@ -4,12 +4,13 @@ use super::*;
 
 // --- the gate ---------------------------------------------------------------------------------
 
-/// The five roles the gate answers before any record or scope: no
-/// credentials and an unknown token are the 401s, an app-only token, a
-/// non-admin and a moderator are the 403s — Pleroma's `UserIsAdminPlug`
-/// order — walked across all four routes.
+/// The roles the gate answers before any record or scope: no credentials
+/// and an unknown token are the 401s, an app-only token and a plain user
+/// are the 403s on all four routes; a moderator is refused the three reads
+/// (`NOT_ADMIN`) but is staff enough for the delete, which is walked
+/// separately in `a_moderator_deletes_a_chat_message_but_cannot_read_chats`.
 #[tokio::test]
-async fn every_admin_chat_route_demands_an_admin_user_token() {
+async fn every_admin_chat_route_demands_a_user_token_of_the_right_role() {
     let db = common::test_db().await;
     let pool = db.pool().clone();
     let app = common::test_app(pool.clone());
@@ -53,11 +54,17 @@ async fn every_admin_chat_route_demands_an_admin_user_token() {
         common::assert_answer(&bogus, StatusCode::UNAUTHORIZED, "a bogus token");
         assert_eq!(error_message(&bogus).as_deref(), Some(INVALID_TOKEN));
 
-        for (token, reason) in [
+        let mut refusals = vec![
             (app_only.as_str(), USER_REQUIRED),
-            (plain.as_str(), NOT_ADMIN),
-            (staff.as_str(), NOT_ADMIN),
-        ] {
+            (
+                plain.as_str(),
+                if *is_delete { NOT_STAFF } else { NOT_ADMIN },
+            ),
+        ];
+        if !*is_delete {
+            refusals.push((staff.as_str(), NOT_ADMIN));
+        }
+        for (token, reason) in refusals {
             let refused = chat_request(*is_delete, path)
                 .bearer(token)
                 .send(&app)
@@ -164,4 +171,63 @@ async fn the_chats_scopes_gate_reads_and_write_apart() {
         json!([]),
         "and the narrow write scope left the tombstone too"
     );
+}
+
+/// A moderator holds Pleroma's `messages_delete` but not `messages_read`:
+/// with `admin:write:chats` the withdrawal succeeds and its log entry names
+/// the moderator, while the message listing stays the 403 `NOT_ADMIN` even
+/// for a token that carries the read scope.
+#[tokio::test]
+async fn a_moderator_deletes_a_chat_message_but_cannot_read_chats() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let app = common::test_app(pool.clone());
+    let alice = common::create_local_user(&pool, "alice").await;
+    let bob = common::create_local_user(&pool, "bob").await;
+    let (_, alice_ref, _) = send(&pool, &alice, &bob, "abusive").await;
+    let chat_id = alice_ref.chat_id.to_string();
+    let message_id = alice_ref.id.to_string();
+
+    let (_mod, token) = moderator(&pool, "mod", "admin:write:chats admin:read:chats").await;
+    let refused = get(&app, &token, &messages_path(&chat_id)).await;
+    common::assert_answer(&refused, StatusCode::FORBIDDEN, "a moderator read");
+    assert_eq!(error_message(&refused).as_deref(), Some(NOT_ADMIN));
+
+    let deleted = delete(&app, &token, &message_path(&chat_id, &message_id)).await;
+    common::assert_answer(&deleted, StatusCode::OK, "a moderator deletes");
+
+    let entry: (String, String) =
+        sqlx::query_as("SELECT actor_nickname, message FROM moderation_log WHERE action = $1")
+            .bind("chat_message_delete")
+            .fetch_one(&pool)
+            .await
+            .expect("the log entry stands");
+    assert_eq!(entry.0, "mod", "the entry names the moderator");
+    assert_eq!(
+        entry.1,
+        format!("@mod deleted chat message ##{}", alice_ref.id),
+        "and its sentence does too"
+    );
+}
+
+/// The moderator's delete is still behind the scope: a moderator whose token
+/// carries only the read scope is refused the delete, and the message stays.
+#[tokio::test]
+async fn a_moderator_without_the_write_scope_deletes_nothing() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let app = common::test_app(pool.clone());
+    let alice = common::create_local_user(&pool, "alice").await;
+    let bob = common::create_local_user(&pool, "bob").await;
+    let (_, alice_ref, _) = send(&pool, &alice, &bob, "kept").await;
+    let (_mod, token) = moderator(&pool, "mod", "admin:read:chats").await;
+
+    let refused = delete(
+        &app,
+        &token,
+        &message_path(&alice_ref.chat_id.to_string(), &alice_ref.id.to_string()),
+    )
+    .await;
+    common::assert_answer(&refused, StatusCode::FORBIDDEN, "no write scope");
+    assert_eq!(error_message(&refused).as_deref(), Some(NO_ADMIN_WRITE));
 }

@@ -1,12 +1,11 @@
 //! Telling a recipient something happened: the one raw insert
 //! ([`create`]) computing its [`grouped_key`] on the way in,
 //! [`maybe_notify`] — the insert that honours the recipient's
-//! `block_from_strangers` setting — and [`already_notified`], the
-//! three-part deduplication read [`crate::services::notify`] asks
-//! before telling a recipient the same fact twice.
+//! `block_from_strangers` setting. The deduplication read
+//! [`crate::services::notify`] asks before telling a recipient the same
+//! fact twice is [`already_told`](super::already_told).
 
 use sqlx::{Executor, PgPool, Postgres, QueryBuilder};
-use uuid::Uuid;
 
 use crate::{
     error::AppResult,
@@ -153,46 +152,15 @@ async fn withholds_stranger(pool: &PgPool, new: &NewNotification<'_>) -> AppResu
     Ok(!followed)
 }
 
-/// Whether `user_id` already holds a live (undismissed) notification of
-/// `notification_type` caused by `from_account_id`.
-///
-/// The deduplication read Pleroma's `recently_followed` skip is: a fact the
-/// recipient was already told about is not told again, and the repeated
-/// write that reaches here — a second `POST …/follow` of the same pair,
-/// whose row [`follow::follow`] found already open — is what makes it
-/// necessary. A dismissed row does not count: the recipient cleared that
-/// telling, so a fresh event may tell again.
-///
-/// # Errors
-///
-/// Any database failure arrives as [`AppError::Database`](crate::error::AppError).
-pub async fn already_notified(
-    pool: &PgPool,
-    user_id: Uuid,
-    from_account_id: Uuid,
-    notification_type: &str,
-) -> AppResult<bool> {
-    let (found,): (bool,) = sqlx::query_as(
-        "SELECT EXISTS (SELECT 1 FROM notifications \
-          WHERE user_id = $1 AND from_account_id = $2 AND type = $3 \
-            AND dismissed_at IS NULL)",
-    )
-    .bind(user_id)
-    .bind(from_account_id)
-    .bind(notification_type)
-    .fetch_one(pool)
-    .await?;
-    Ok(found)
-}
-
 #[cfg(test)]
 mod tests {
     use chrono::Utc;
+    use uuid::Uuid;
 
     use super::*;
-    use crate::models::notification::{
-        TYPE_FAVOURITE, dismiss,
-        test_support::{note, solo, trio},
+    use crate::{
+        models::notification::{TYPE_FAVOURITE, test_support::trio},
+        test_fixtures::local_user as solo_user,
     };
 
     #[tokio::test]
@@ -240,50 +208,6 @@ mod tests {
         .await
         .expect("the follow inserts");
         assert_eq!(follow.group_key, None, "a follow stores no group key");
-    }
-
-    #[tokio::test]
-    async fn already_notified_answers_only_live_tellings_of_one_actor_and_type() {
-        let db = crate::test_db::test_db().await.expect("test database slot");
-        let pool = db.pool();
-        let (recipient, actor, _) = trio(pool).await;
-        let other = solo(pool, "dup-other").await;
-        assert!(
-            !already_notified(pool, recipient, actor, "follow")
-                .await
-                .expect("the read runs"),
-            "a fresh recipient has been told nothing"
-        );
-
-        let row = note(pool, recipient, actor, "follow", None).await;
-        assert!(
-            already_notified(pool, recipient, actor, "follow")
-                .await
-                .expect("the read runs"),
-            "the live telling counts"
-        );
-        assert!(
-            !already_notified(pool, recipient, actor, "favourite")
-                .await
-                .expect("the read runs"),
-            "another type was never told"
-        );
-        assert!(
-            !already_notified(pool, recipient, other.id, "follow")
-                .await
-                .expect("the read runs"),
-            "one actor's telling does not speak for another's"
-        );
-
-        let _dismissed = dismiss(pool, recipient, row.id)
-            .await
-            .expect("the dismissal runs");
-        assert!(
-            !already_notified(pool, recipient, actor, "follow")
-                .await
-                .expect("the repeat read runs"),
-            "a dismissed row does not hold the next telling back"
-        );
     }
 
     /// The `maybe_notify` fixtures' account pair: a recipient named
@@ -659,17 +583,6 @@ mod tests {
                 .expect("the read runs"),
             "the poll closing on one's own post is never refused"
         );
-    }
-
-    /// A plain local user named `nickname`.
-    async fn solo_user(pool: &PgPool, nickname: &str) -> user::User {
-        use crate::{config::TEST_BASE_URL, models::user::local_ap_id};
-        user::insert(
-            pool,
-            &user::NewUser::local(nickname, &local_ap_id(TEST_BASE_URL, nickname)),
-        )
-        .await
-        .expect("local user fixture")
     }
 
     #[tokio::test]

@@ -220,6 +220,12 @@ pub(super) async fn write_token(seeded: &Seeded) -> String {
     mint(&seeded.pool, &seeded.root, "admin:write:accounts").await
 }
 
+/// A token of the fixture's admin holding only `admin:write:follows`, the
+/// grant of the forced follow pair.
+pub(super) async fn follows_token(seeded: &Seeded) -> String {
+    mint(&seeded.pool, &seeded.root, "admin:write:follows").await
+}
+
 /// A `PATCH` of `path` as `token` with the JSON `body`.
 pub(super) async fn patch_json(
     app: &Router,

@@ -32,6 +32,7 @@ use uuid::Uuid;
 use wired_be::{
     config::TEST_BASE_URL,
     models::{
+        block,
         status::{self, NewStatus, Visibility},
         user::User,
     },
@@ -746,4 +747,94 @@ async fn the_favourite_routes_spend_their_bucket() {
         1,
         "the refused withdrawal never reached the handler"
     );
+}
+
+/// Marks `user` deactivated, the way moderation does.
+async fn deactivate(pool: &PgPool, user: &User) {
+    let _done: sqlx::postgres::PgQueryResult =
+        sqlx::query("UPDATE users SET is_active = false WHERE id = $1")
+            .bind(user.id)
+            .execute(pool)
+            .await
+            .expect("the fixture deactivates the account");
+}
+
+#[tokio::test]
+async fn favourited_by_omits_deactivated_accounts() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let app = common::test_app(pool.clone());
+    let author = common::create_local_user(&pool, "author").await;
+    let status = post(&pool, &author).await;
+    let status_id = status.id.to_string();
+    let (dave, dave_token) = liker(&pool, "dave").await;
+    let (bob, bob_token) = liker(&pool, "bob").await;
+    like_ok(&app, &dave_token, &status_id).await;
+    like_ok(&app, &bob_token, &status_id).await;
+    deactivate(&pool, &dave).await;
+
+    let page = favourited_by(&app, None, &status_id, "").await;
+    common::assert_answer(&page, StatusCode::OK, "the list answers");
+    assert_eq!(
+        account_ids(&page.json_value()),
+        vec![bob.id.to_string()],
+        "the deactivated favouriter is absent"
+    );
+}
+
+#[tokio::test]
+async fn favourited_by_omits_the_viewers_blocked_accounts() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let app = common::test_app(pool.clone());
+    let author = common::create_local_user(&pool, "author").await;
+    let status = post(&pool, &author).await;
+    let status_id = status.id.to_string();
+    let (alice, alice_token) = liker(&pool, "alice").await;
+    let (bob, bob_token) = liker(&pool, "bob").await;
+    let (carol, carol_token) = liker(&pool, "carol").await;
+    like_ok(&app, &bob_token, &status_id).await;
+    like_ok(&app, &carol_token, &status_id).await;
+    let _blocked: block::Block = block::block(&pool, TEST_BASE_URL, &alice, &carol)
+        .await
+        .expect("alice blocks carol");
+
+    let as_alice = favourited_by(&app, Some(&alice_token), &status_id, "").await;
+    common::assert_answer(&as_alice, StatusCode::OK, "the list answers the blocker");
+    assert_eq!(
+        account_ids(&as_alice.json_value()),
+        vec![bob.id.to_string()],
+        "the blocked account is absent for the blocker"
+    );
+
+    let anonymous = favourited_by(&app, None, &status_id, "").await;
+    assert_eq!(
+        account_ids(&anonymous.json_value()),
+        vec![carol.id.to_string(), bob.id.to_string()],
+        "an anonymous request still sees both"
+    );
+}
+
+#[tokio::test]
+async fn favourited_by_link_names_the_raw_page_edges() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let app = common::test_app(pool.clone());
+    let author = common::create_local_user(&pool, "author").await;
+    let status = post(&pool, &author).await;
+    let status_id = status.id.to_string();
+    let path = format!("/api/v1/statuses/{status_id}/favourited_by");
+    let (alice, alice_token) = liker(&pool, "alice").await;
+    let (_bob, bob_token) = liker(&pool, "bob").await;
+    let (carol, carol_token) = liker(&pool, "carol").await;
+    like_ok(&app, &carol_token, &status_id).await;
+    like_ok(&app, &bob_token, &status_id).await;
+    let _blocked: block::Block = block::block(&pool, TEST_BASE_URL, &alice, &carol)
+        .await
+        .expect("alice blocks carol");
+    let likes = likes_of(&pool, status.id).await;
+
+    let page = favourited_by(&app, Some(&alice_token), &status_id, "").await;
+    assert_eq!(account_ids(&page.json_value()).len(), 1, "only bob renders");
+    assert_like_keyed_link(page.header("link"), &path, likes[0].0, likes[1].0);
 }

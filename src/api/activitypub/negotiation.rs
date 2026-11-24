@@ -50,37 +50,16 @@ fn accept_text(headers: &HeaderMap) -> Option<&str> {
         .and_then(|value| value.to_str().ok())
 }
 
-/// The 302 an HTML client gets instead of a document: Pleroma sends
-/// browsers to the frontend profile page, `{BASE_URL}/{nickname}` (this
-/// instance serves no HTML of its own, decision 1), and lets the frontend
-/// decide whether that page exists. A nickname whose text cannot ride a
-/// `Location` header names no page either, and answers the 404.
-pub(super) fn html_redirect(config: &Config, nickname: &str) -> AppResult<Response> {
-    frontend_redirect(config.base_url.as_str(), nickname)
-}
-
-/// The 302 to the frontend at `{base_url}/{path}`, shared by the actor
-/// route's profile redirect and the replies route's redirect to the post
-/// page. Text that cannot ride a `Location` header names no page, and
-/// answers the plain 404.
-pub(super) fn frontend_redirect(base_url: &str, path: &str) -> AppResult<Response> {
-    let location = format!("{base_url}/{path}");
-    let value = HeaderValue::from_str(&location)
-        .ok()
-        .ok_or(AppError::RouteNotFound)?;
-    Ok((StatusCode::FOUND, [(header::LOCATION, value)]).into_response())
-}
-
-/// The 302 a browser gets on `GET /notice/{id}`: the same path on the
-/// frontend origin, `{FRONTEND_BASE_URL}/notice/{id}` — the notice lives
-/// on the frontend, and this instance serves no HTML of its own
-/// (decision 1). `FRONTEND_BASE_URL` defaults to `BASE_URL`, so without a
-/// separate frontend this is the redirect to this server's own path, and
-/// the frontend decides whether that notice exists. An `{id}` whose text
-/// cannot ride a `Location` header names no page either, and answers the
-/// 404.
-pub(super) fn notice_redirect(config: &Config, id: &str) -> AppResult<Response> {
-    let location = format!("{}/notice/{id}", config.frontend_base_url);
+/// The 302 an HTML client gets instead of a document:
+/// `{FRONTEND_BASE_URL}/{path}` — the actor route sends browsers to the
+/// profile page (`path` is the nickname), the replies and notice routes to
+/// the post page (`notice/{id}`). This instance serves no HTML of its own
+/// (decision 1), so every browser redirect leaves for the frontend origin,
+/// which decides whether that page exists. `FRONTEND_BASE_URL` defaults to
+/// `BASE_URL`. A `path` whose text cannot ride a `Location` header names no
+/// page either, and answers the plain 404.
+pub(super) fn frontend_redirect(config: &Config, path: &str) -> AppResult<Response> {
+    let location = format!("{}/{path}", config.frontend_base_url);
     let value = HeaderValue::from_str(&location)
         .ok()
         .ok_or(AppError::RouteNotFound)?;
@@ -232,10 +211,17 @@ mod tests {
         );
     }
 
+    /// A test config whose frontend origin differs from its base URL.
+    fn separate_frontend_config() -> Config {
+        let mut config = Config::for_tests();
+        config.frontend_base_url = "https://fe.example".to_owned();
+        config
+    }
+
     #[test]
-    fn browsers_are_redirected_to_the_frontend_profile_url() {
-        let config = Config::for_tests();
-        let response = html_redirect(&config, "alice").expect("a plain nickname redirects");
+    fn browsers_are_redirected_to_the_frontend_origin() {
+        let config = separate_frontend_config();
+        let response = frontend_redirect(&config, "alice").expect("a plain nickname redirects");
         assert_eq!(
             response.status(),
             StatusCode::FOUND,
@@ -243,47 +229,40 @@ mod tests {
         );
         assert_eq!(
             response.headers().get(header::LOCATION),
-            Some(&HeaderValue::from_static("https://test.example/alice")),
-            "the Location is the frontend profile URL built from the base URL"
+            Some(&HeaderValue::from_static("https://fe.example/alice")),
+            "the Location is built from the frontend origin, not the base URL"
         );
     }
 
     #[test]
-    fn a_nickname_no_header_can_carry_is_the_plain_404() {
-        let config = Config::for_tests();
-        let err = html_redirect(&config, "bad\nnickname")
-            .expect_err("no Location header can carry a newline");
-        assert_eq!(
-            err.to_string(),
-            "Not found",
-            "and then the route answers like any other unrouted request"
-        );
-    }
-
-    #[test]
-    fn browsers_on_the_notice_route_are_redirected_to_the_frontend_origin() {
-        let config = Config::for_tests();
-        let response = notice_redirect(&config, "01934568-1111-7000-8000-abcdef012345")
+    fn the_notice_path_rides_the_frontend_origin() {
+        let config = separate_frontend_config();
+        let response = frontend_redirect(&config, "notice/01934568-1111-7000-8000-abcdef012345")
             .expect("a uuid redirects");
-        assert_eq!(
-            response.status(),
-            StatusCode::FOUND,
-            "the redirect is a 302"
-        );
         assert_eq!(
             response.headers().get(header::LOCATION),
             Some(&HeaderValue::from_static(
-                "https://test.example/notice/01934568-1111-7000-8000-abcdef012345"
+                "https://fe.example/notice/01934568-1111-7000-8000-abcdef012345"
             )),
-            "the Location is the same path on the frontend origin, which the \
-             test config defaults onto the base URL"
+            "the notice page lives on the frontend origin"
         );
     }
 
     #[test]
-    fn a_notice_id_no_header_can_carry_is_the_plain_404() {
+    fn the_frontend_origin_defaults_onto_the_base_url() {
         let config = Config::for_tests();
-        let err = notice_redirect(&config, "bad\nid")
+        let response = frontend_redirect(&config, "alice").expect("a plain nickname redirects");
+        assert_eq!(
+            response.headers().get(header::LOCATION),
+            Some(&HeaderValue::from_static("https://test.example/alice")),
+            "without a separate frontend the redirect stays on the base URL"
+        );
+    }
+
+    #[test]
+    fn a_path_no_header_can_carry_is_the_plain_404() {
+        let config = separate_frontend_config();
+        let err = frontend_redirect(&config, "bad\nnickname")
             .expect_err("no Location header can carry a newline");
         assert_eq!(
             err.to_string(),

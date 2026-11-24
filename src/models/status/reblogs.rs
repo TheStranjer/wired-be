@@ -12,13 +12,13 @@ use crate::{
     error::{AppError, AppResult},
     models::user::User,
     pagination::PageParams,
-    util::id::new_id,
+    util::id::{activity_ap_id, new_id},
 };
 
 use super::{
     ReblogPageEntry, Status, Visibility,
     counters::{count_new_post, uncount_deleted},
-    delete::clear_pins,
+    delete::{clear_pins, tombstone_set},
 };
 
 /// The `INSERT` behind [`create_reblog`]: a reblog row is decision 6's
@@ -48,14 +48,11 @@ const LIVE_REBLOG_SQL: &str = "SELECT * FROM statuses
 /// which is what the write hook reports and the counter steps run on; a
 /// pair that never reblogged (or already withdrew) matches nothing, which
 /// is what makes the write idempotent.
-const TOMBSTONE_REBLOG_SQL: &str = "UPDATE statuses
-      SET content = '',
-          raw_text = '',
-          spoiler_text = '',
-          deleted_at = now(),
-          updated_at = now()
-     WHERE user_id = $1 AND reblog_of_id = $2 AND deleted_at IS NULL
-   RETURNING *";
+pub(super) const TOMBSTONE_REBLOG_SQL: &str = concat!(
+    "UPDATE statuses ",
+    tombstone_set!(),
+    " WHERE user_id = $1 AND reblog_of_id = $2 AND deleted_at IS NULL RETURNING *"
+);
 
 /// [`reblogged_status_ids`]: which of a batch of originals the viewer has
 /// a live reblog of. Only the ids that *have* a row come back; the caller's
@@ -68,9 +65,11 @@ const REBLOGGED_IDS_SQL: &str = "SELECT reblog_of_id FROM statuses
 /// on. The text stops where its one placeholder belongs, because that is
 /// where [`reblogger_page`] pushes its bind; the live-row and distributable
 /// visibility filters and the keyset then run on the reblog row `s`.
+/// Deactivated accounts (`u.is_active` false) are left out, the way
+/// Mastodon's `without_suspended` scope drops them.
 pub(super) const REBLOGGERS_PAGE_SQL: &str = "SELECT s.id AS reblog_id, u.* FROM statuses s
      JOIN users u ON u.id = s.user_id
-      WHERE s.reblog_of_id = ";
+      WHERE u.is_active AND s.reblog_of_id = ";
 
 /// Records `user`'s reblog of `original` at `visibility` and answers the
 /// reblog row with a flag saying whether this call wrote it.
@@ -111,7 +110,7 @@ pub async fn create_reblog(
     let id = new_id();
     let written = sqlx::query_as::<_, Status>(INSERT_REBLOG_SQL)
         .bind(id)
-        .bind(format!("{base_url}/activities/{id}"))
+        .bind(activity_ap_id(base_url, id))
         .bind(format!("{base_url}/notice/{id}"))
         .bind(user.id)
         .bind(visibility)

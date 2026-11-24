@@ -48,7 +48,7 @@ use axum::{
 use serde::de::DeserializeOwned;
 use serde_json::{Map, Value};
 
-use crate::{error::AppError, middleware::MAX_BODY_BYTES};
+use crate::{error::AppError, middleware::MAX_BODY_BYTES, util::media_type::essence};
 use form::parse_form;
 pub use form::{index_map_to_vec, parse_pairs};
 
@@ -161,7 +161,7 @@ fn parse_body(text: &str, content_type: &str) -> Result<Value, AppError> {
     if text.is_empty() {
         return Ok(Value::Object(Map::new()));
     }
-    let media_type = media_type_of(content_type);
+    let media_type = essence(content_type);
     if media_type == FORM_MIME {
         parse_form(text)
     } else if media_type == JSON_MIME {
@@ -170,17 +170,6 @@ fn parse_body(text: &str, content_type: &str) -> Result<Value, AppError> {
     } else {
         Err(AppError::UnsupportedMediaType(UNSUPPORTED_TYPE.to_owned()))
     }
-}
-
-/// The media type of a `content-type` header value: everything before the
-/// first `;`, trimmed and lowercased.
-pub(crate) fn media_type_of(content_type: &str) -> String {
-    content_type
-        .split(';')
-        .next()
-        .unwrap_or_default()
-        .trim()
-        .to_ascii_lowercase()
 }
 
 /// Deserializes the parameters value into `T`.

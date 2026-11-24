@@ -16,7 +16,7 @@ use crate::{
         status::{Status, Visibility},
         user::{User, followers},
     },
-    util::time::mastodon_time,
+    util::{id::activity_ap_id, time::mastodon_time},
 };
 
 use super::{
@@ -98,7 +98,7 @@ pub fn litepub_context_json() -> Value {
 pub fn create_activity_json(note: &Value, status: &Status, config: &Config) -> Value {
     json!({
         "@context": wrapped_context(note, config),
-        "id": format!("{}/activities/{}", config.base_url, status.id),
+        "id": activity_ap_id(&config.base_url, status.id),
         "type": TYPE_CREATE,
         "actor": note.get("actor").cloned().unwrap_or(Value::Null),
         "to": note.get("to").cloned().unwrap_or_else(|| json!([])),
@@ -129,7 +129,7 @@ pub fn create_activity_json(note: &Value, status: &Status, config: &Config) -> V
 pub fn update_activity_json(note: &Value, id: Uuid, config: &Config) -> Value {
     json!({
         "@context": wrapped_context(note, config),
-        "id": format!("{}/activities/{id}", config.base_url),
+        "id": activity_ap_id(&config.base_url, id),
         "type": TYPE_UPDATE,
         "actor": note.get("actor").cloned().unwrap_or(Value::Null),
         "to": note.get("to").cloned().unwrap_or_else(|| json!([])),

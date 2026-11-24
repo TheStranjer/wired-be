@@ -6,27 +6,17 @@ use uuid::Uuid;
 
 use super::*;
 use crate::{
-    config::TEST_BASE_URL,
-    models::user::{NewUser, insert, local_ap_id},
     pagination::{MAX_LIMIT, PageParams},
     util::id::new_id,
 };
+
+pub(super) use crate::test_fixtures::local_user as user;
 
 /// The options of the timeline-only mute the notification checks use.
 pub(super) const TIMELINE_ONLY: MuteOptions = MuteOptions {
     notifications: false,
     expires_in: None,
 };
-
-/// Inserts a local user named `nickname`.
-pub(super) async fn user(pool: &PgPool, nickname: &str) -> User {
-    insert(
-        pool,
-        &NewUser::local(nickname, &local_ap_id(TEST_BASE_URL, nickname)),
-    )
-    .await
-    .expect("the local fixture inserts")
-}
 
 /// Mutes `target` for `muter` with `options`, checks the row it wrote and
 /// hands it back: the fixture a read below starts from and asserts on.

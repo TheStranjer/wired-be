@@ -41,8 +41,12 @@ use uuid::Uuid;
 
 use self::{assemble::assemble, sources::flag_sources};
 use crate::{
-    entities::{account::JsonBool, relationship::Relationship},
-    error::AppResult,
+    entities::{
+        account::JsonBool,
+        relationship::{Relationship, RelationshipMap},
+    },
+    error::{AppError, AppResult},
+    models::user::User,
 };
 
 mod assemble;
@@ -52,6 +56,8 @@ mod block_mute_tests;
 mod flag_tests;
 #[cfg(test)]
 mod follow_tests;
+#[cfg(test)]
+mod load_tests;
 mod sources;
 #[cfg(test)]
 mod test_support;
@@ -116,5 +122,48 @@ impl Relationship {
             .iter()
             .map(|&target_id| assemble(target_id, &sources))
             .collect())
+    }
+
+    /// Loads the relationship of `viewer_id` to the one account `target_id`:
+    /// [`load_many`](Self::load_many) over a single target.
+    ///
+    /// # Errors
+    ///
+    /// Any database failure arrives as
+    /// [`AppError::Database`](crate::error::AppError); the loader answers one
+    /// row per requested id, so [`AppError::Internal`](crate::error::AppError)
+    /// is only the guard for a loader that skipped its only target.
+    pub async fn load_one(pool: &PgPool, viewer_id: Uuid, target_id: Uuid) -> AppResult<Self> {
+        let loaded = Self::load_many(pool, viewer_id, &[target_id]).await?;
+        loaded.into_iter().next().ok_or_else(|| {
+            AppError::Internal("the relationship loader skipped its only target".to_owned())
+        })
+    }
+
+    /// Loads `viewer`'s relationship to every one of `targets` as a
+    /// [`RelationshipMap`] keyed by target id, the preload shape
+    /// [`Account::from_user_for`](crate::entities::account::Account::from_user_for)
+    /// reads. `None` for an anonymous viewer, who needs no query at all.
+    ///
+    /// # Errors
+    ///
+    /// Any database failure arrives as
+    /// [`AppError::Database`](crate::error::AppError).
+    pub async fn load_map(
+        pool: &PgPool,
+        viewer: Option<&User>,
+        targets: &[Uuid],
+    ) -> AppResult<Option<RelationshipMap>> {
+        let Some(who) = viewer else {
+            return Ok(None);
+        };
+        let loaded = Self::load_many(pool, who.id, targets).await?;
+        Ok(Some(
+            targets
+                .iter()
+                .copied()
+                .zip(loaded)
+                .collect::<RelationshipMap>(),
+        ))
     }
 }

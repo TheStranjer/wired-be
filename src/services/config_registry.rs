@@ -12,7 +12,7 @@
 //! (`config/config.exs`) — the list `Pleroma.Web.AdminAPI.ConfigController`
 //! gates every `POST /api/pleroma/admin/config` entry against — with the
 //! registry itself spelled out here because wired-be whitelists exactly
-//! these six keys, all in group `:pleroma`:
+//! these seven keys, all in group `:pleroma`:
 //!
 //! - `:instance` — the instance's public identity and registration gates,
 //!   whitelist-subkeyed to `name`, `description`, `email`,
@@ -20,8 +20,8 @@
 //!   `account_activation_required`, `invites_enabled`, `limit` and
 //!   `max_media_attachments`;
 //! - `:mrf` — the moderation pipeline, whitelist-subkeyed to `policies`;
-//! - `:mrf_simple`, `:mrf_keyword`, `:mrf_hellthread` and
-//!   `:mrf_object_age` — one whole parameter object per policy.
+//! - `:mrf_simple`, `:mrf_keyword`, `:mrf_hellthread`, `:mrf_object_age`
+//!   and `:mrf_hashtag` — one whole parameter object per policy.
 //!
 //! A key is whitelisted only while a runtime consumer reads its stored
 //! row. `:media_proxy` and `:restrict_unauthenticated` are deliberately
@@ -48,6 +48,8 @@ pub const KEY_MRF_KEYWORD: &str = ":mrf_keyword";
 pub const KEY_MRF_HELLTHREAD: &str = ":mrf_hellthread";
 /// The `object_age` policy's age gates.
 pub const KEY_MRF_OBJECT_AGE: &str = ":mrf_object_age";
+/// The always-on `hashtag` policy's tag lists.
+pub const KEY_MRF_HASHTAG: &str = ":mrf_hashtag";
 /// Pleroma's `[:instance, :limit]` is the status text length; the
 /// instance document spells it `max_toot_chars`.
 const INSTANCE_LIMIT: &str = "limit";

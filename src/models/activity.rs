@@ -245,20 +245,7 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
-    use crate::{
-        models::user::{NewUser, User, insert, local_ap_id},
-        util::id::new_id,
-    };
-
-    /// Inserts a local user named `nickname`.
-    async fn user(pool: &PgPool, nickname: &str) -> User {
-        insert(
-            pool,
-            &NewUser::local(nickname, &local_ap_id("https://test.example", nickname)),
-        )
-        .await
-        .expect("the local fixture inserts")
-    }
+    use crate::{models::user::User, test_fixtures::local_user as user, util::id::new_id};
 
     /// Inserts `id` into `statuses` with `uri`, `local`, and `reblog_of_id`
     /// as given; `actor` authors it.

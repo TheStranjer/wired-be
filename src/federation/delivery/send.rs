@@ -11,15 +11,19 @@ use url::Url;
 use uuid::Uuid;
 
 use super::{
-    ACTIVITY_JSON, DeliveryArgs, KEY_ID_SUFFIX,
+    ACTIVITY_JSON, DeliveryArgs,
     outcome::{delivery_outcome, note_answer, note_transport_failure, transport_error},
 };
 use crate::{
     error::{AppError, AppResult},
-    federation::signature::{SignedHeaders, SigningKey, sign_request},
+    federation::{
+        actor::MAIN_KEY_FRAGMENT,
+        signature::{SignedHeaders, SigningKey, sign_request},
+    },
     jobs::{AttemptInfo, HandlerFuture, JobError},
     models::user::{self, User},
     state::AppState,
+    util::url::same_origin,
 };
 
 /// Most response-body bytes a delivery buffers from the peer's inbox: only
@@ -68,7 +72,7 @@ async fn deliver(state: AppState, attempt: AttemptInfo, args: Value) -> Result<(
     })?;
     let body = serde_json::to_vec(&strip_bto_bcc(&args.body))
         .map_err(|err| JobError::Discard(format!("the activity is not serializable: {err}")))?;
-    let key_id = format!("{}{KEY_ID_SUFFIX}", actor.ap_id);
+    let key_id = format!("{}{MAIN_KEY_FRAGMENT}", actor.ap_id);
     let signed = sign_request(
         "POST",
         &args.inbox,
@@ -103,16 +107,15 @@ async fn deliver(state: AppState, attempt: AttemptInfo, args: Value) -> Result<(
     outcome
 }
 
-/// Whether `inbox` is served by this very instance: its authority (host,
-/// plus the port when it is not the scheme's default) is the authority of
-/// the local signing actor's own id, which lives on this instance's origin
-/// (`docs/ARCHITECTURE.md` decision 6). Delivering to it would mean asking
-/// this process to `POST` an activity to itself.
-pub(super) fn is_local_inbox(inbox: &Url, actor_ap_id: &str) -> bool {
-    let Ok(id) = Url::parse(actor_ap_id) else {
-        return false;
-    };
-    id.authority().eq_ignore_ascii_case(inbox.authority())
+/// Whether `inbox` is served by this very instance.
+///
+/// Its origin (host, plus the port when it is not the scheme's default) is
+/// the origin of the local signing actor's own id, which lives on this
+/// instance's origin (`docs/ARCHITECTURE.md` decision 6). Delivering to it
+/// would mean asking this process to `POST` an activity to itself.
+#[must_use]
+pub fn is_local_inbox(inbox: &Url, actor_ap_id: &str) -> bool {
+    Url::parse(actor_ap_id).is_ok_and(|id| same_origin(&id, inbox))
 }
 
 /// The `ActivityPub` id an activity carries: the identity a delivery is for,
@@ -155,19 +158,12 @@ fn strip_bto_bcc(activity: &Value) -> Value {
 }
 
 /// The headers of a signed delivery: the activity media type in both
-/// directions, then the four headers [`sign_request`] signed. `Host` is
-/// deliberately not among them: the client fills it from the URL, whose
-/// authority is exactly what was signed into `host`.
+/// directions, then the headers [`sign_request`] signed (see
+/// [`SignedHeaders::header_pairs`]), `Host` included so the peer sees
+/// exactly the authority that was signed.
 fn delivery_headers(signed: &SignedHeaders) -> Vec<(&str, &str)> {
-    let mut headers = vec![
-        ("content-type", ACTIVITY_JSON),
-        ("accept", ACTIVITY_JSON),
-        ("date", signed.date.as_str()),
-    ];
-    if let Some(digest) = signed.digest.as_deref() {
-        headers.push(("digest", digest));
-    }
-    headers.push(("signature", signed.signature.as_str()));
+    let mut headers = vec![("content-type", ACTIVITY_JSON), ("accept", ACTIVITY_JSON)];
+    headers.extend(signed.header_pairs());
     headers
 }
 
@@ -235,11 +231,12 @@ mod tests {
             vec![
                 ("content-type", ACTIVITY_JSON),
                 ("accept", ACTIVITY_JSON),
+                ("host", "peer.example"),
                 ("date", "Tue, 07 Jun 2022 20:51:35 GMT"),
                 ("digest", "SHA-256=abc"),
                 ("signature", r#"keyId="k",signature="s""#),
             ],
-            "both media types and the signed values, and no Host"
+            "both media types and the signed values, Host included"
         );
         let bodyless = SignedHeaders {
             digest: None,

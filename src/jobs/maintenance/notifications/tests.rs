@@ -10,7 +10,7 @@ use uuid::Uuid;
 use super::*;
 use crate::{
     jobs::{
-        QUEUE_BACKGROUND,
+        JobError, QUEUE_BACKGROUND,
         maintenance::test_support::{DAY, EVERY, FIRST_ATTEMPT, app_state, broken_state, user},
         scheduler::periodic_jobs,
     },
@@ -112,7 +112,7 @@ async fn an_unreachable_database_retries_the_sweep() {
 
     match outcome {
         Err(JobError::Retry(detail)) => assert!(
-            detail.starts_with("dismissed notification sweep failed"),
+            detail.starts_with("dismissed notifications deleted failed"),
             "the retry states what failed: {detail}"
         ),
         Ok(()) => panic!("a closed pool must not read as a successful sweep"),

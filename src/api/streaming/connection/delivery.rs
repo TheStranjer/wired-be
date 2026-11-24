@@ -3,7 +3,7 @@
 //! own body, or the entity a render hint answers to for this socket's
 //! viewer), and the filter context its phrase filters judge it in.
 //!
-//! [`Connection::frame_for`] is the entry point that calls these; the
+//! [`Connection::frames_for`] is the entry point that calls these; the
 //! per-kind renders are the four `*_hints` children's.
 
 use crate::{
@@ -23,12 +23,12 @@ use crate::{
 /// carries one (the pre-serialized path, unchanged), the hinted entity
 /// rendered for this socket's viewer when it carries a [`RenderSpec`]
 /// hint without a body, and no body for an event that carries neither.
-/// The outer `None` is the drop signal that [`frame_for`] reads: a
+/// The outer `None` is the drop signal that [`frames_for`] reads: a
 /// hint the socket cannot answer for its reader has no entity to show,
 /// and Mastodon's `update` *is* its entity — silence beats an
 /// entity-less frame.
 ///
-/// [`frame_for`]: Connection::frame_for
+/// [`frames_for`]: Connection::frames_for
 pub(super) async fn payload_for(
     connection: &Connection,
     event: &StreamEvent,
@@ -145,8 +145,8 @@ mod tests {
             filters::Filters,
             names::{DIRECT, PUBLIC, USER, USER_NOTIFICATION},
             test_support::{
-                account, event, for_reader, hinted_update, mute_author, state, status_payload,
-                watching,
+                FrameFor as _, account, event, for_reader, hinted_update, mute_author, state,
+                status_payload, watching,
             },
         },
         config::TEST_BASE_URL,
@@ -306,10 +306,8 @@ mod tests {
 
         assert_eq!(
             owner.frame_for(&filters_changed).await,
-            Some(format!(
-                r#"{{"stream":["{own_stream}"],"event":"filters_changed"}}"#
-            )),
-            "the owner's socket writes the bare envelope, no payload key"
+            Some(r#"{"stream":["user"],"event":"filters_changed"}"#.to_owned()),
+            "the owner's socket writes the bare envelope under the public name, no payload key"
         );
         assert!(
             holding_stranger.frame_for(&filters_changed).await.is_none(),
@@ -318,6 +316,98 @@ mod tests {
         assert!(
             anonymous.frame_for(&filters_changed).await.is_none(),
             "and neither does an anonymous socket"
+        );
+    }
+
+    /// The streams of a frame, read back from its JSON text.
+    fn streams_of(frame: &str) -> Vec<String> {
+        let envelope: serde_json::Value = serde_json::from_str(frame).expect("the frame is JSON");
+        serde_json::from_value(envelope["stream"].clone()).expect("the stream is a string array")
+    }
+
+    #[tokio::test]
+    async fn a_follower_gets_one_public_named_frame_per_matched_subscription() {
+        let (_db, state) = state().await;
+        let author = account(&state, "frames-author").await;
+        let follower = account(&state, "frames-follower").await;
+        let other_follower = account(&state, "frames-other-follower").await;
+        let own_stream = format!("{USER}:{}", follower.id);
+        let socket = for_reader(&state, &follower, &[own_stream.as_str(), PUBLIC]).await;
+        let internal = [
+            PUBLIC.to_owned(),
+            format!("{USER}:{}", author.id),
+            own_stream.clone(),
+            format!("{USER}:{}", other_follower.id),
+        ];
+        let post = StreamEvent {
+            streams: internal.to_vec(),
+            audience: Audience::Public,
+            ..event(&[], r#"{"id":"1"}"#)
+        };
+
+        let frames = socket.frames_for(&post).await;
+
+        let streams: Vec<Vec<String>> = frames.iter().map(|frame| streams_of(frame)).collect();
+        assert_eq!(
+            streams,
+            vec![vec!["user".to_owned()], vec!["public".to_owned()]],
+            "one frame for `user`, one for `public`, in the order the socket subscribed"
+        );
+        let ids = [author.id, follower.id, other_follower.id].map(|id| id.to_string());
+        assert!(
+            frames
+                .iter()
+                .all(|frame| ids.iter().all(|id| !frame.contains(id.as_str()))),
+            "no frame carries a uuid: {frames:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_frame_never_names_a_stream_the_socket_did_not_subscribe_to() {
+        let (_db, state) = state().await;
+        let socket = watching(&state, &[PUBLIC]).await;
+
+        let frames = socket
+            .frames_for(&event(&["public", "public:local", "hashtag:rust"], "{}"))
+            .await;
+
+        let streams: Vec<Vec<String>> = frames.iter().map(|frame| streams_of(frame)).collect();
+        assert_eq!(
+            streams,
+            vec![vec!["public".to_owned()]],
+            "one subscription is one frame, and only the subscribed name rides it"
+        );
+    }
+
+    #[tokio::test]
+    async fn hashtag_and_list_frames_carry_the_family_and_its_parameter() {
+        let (_db, state) = state().await;
+        let reader = account(&state, "frames-list-reader").await;
+        let list_id = Uuid::now_v7();
+        let list_stream = format!("list:{list_id}");
+        let socket = for_reader(
+            &state,
+            &reader,
+            &["hashtag:rust", "hashtag:local:rust", list_stream.as_str()],
+        )
+        .await;
+
+        let frames = socket
+            .frames_for(&event(
+                &["hashtag:rust", "hashtag:local:rust", list_stream.as_str()],
+                "{}",
+            ))
+            .await;
+
+        let streams: Vec<Vec<String>> = frames.iter().map(|frame| streams_of(frame)).collect();
+        assert_eq!(
+            streams,
+            vec![
+                vec!["hashtag".to_owned(), "rust".to_owned()],
+                vec!["hashtag:local".to_owned(), "rust".to_owned()],
+                vec!["list".to_owned(), list_id.to_string()],
+            ],
+            "Mastodon's `[family, parameter]` shape"
         );
     }
 

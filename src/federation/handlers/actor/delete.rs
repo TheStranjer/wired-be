@@ -3,7 +3,6 @@
 
 use tracing::debug;
 
-use super::transient;
 use crate::{
     federation::dispatch::{ActivityView, FederationError, Outcome},
     jobs::{
@@ -48,7 +47,9 @@ pub(super) async fn apply_delete(
     }
     user::mark_deleted(&state.db, signer.id)
         .await
-        .map_err(|err| transient("deletion mark", &err))?;
+        .map_err(|err| {
+            FederationError::transient("could not store the remote actor's deletion mark", &err)
+        })?;
     let queued = enqueue(
         &state.db,
         NewJob {
@@ -61,7 +62,9 @@ pub(super) async fn apply_delete(
         },
     )
     .await
-    .map_err(|err| transient("delete sweep", &err))?;
+    .map_err(|err| {
+        FederationError::transient("could not store the remote actor's delete sweep", &err)
+    })?;
     debug!(
         account = %signer.nickname,
         queued = queued.is_some(),
@@ -99,7 +102,7 @@ mod tests {
         let alice = mirror(&pool).await;
         let alice_id = alice.id;
         let bob = local_user(&pool, "bob").await;
-        let _following = accepted_follow(&pool, &bob, &alice).await;
+        accepted_follow(&pool, &bob, &alice).await;
         let posted = mirror_post(&pool, &alice, "farewell").await;
 
         let gone = delete_actor(

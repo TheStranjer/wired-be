@@ -12,7 +12,10 @@ use serde_json::Value;
 use super::AccountSource;
 
 use super::{AccountViewer, Field};
-use crate::{config::Config, models::user::User, services::media_proxy};
+use crate::{
+    config::Config, models::user::User, services::media_proxy,
+    util::sanitize::sanitize_display_name,
+};
 
 /// Whether `viewer` is looking at their own account — Pleroma's
 /// `self = opts[:for] == user`, compared by primary key.
@@ -41,15 +44,6 @@ pub(super) const fn visible_following_count(user: &User, is_self: bool) -> i32 {
     }
 }
 
-/// The web profile URL of the local account `nickname` on this instance:
-/// `{base_url}/users/{nickname}`, the same shape as
-/// [`local_ap_id`](crate::models::user::local_ap_id) but built from the
-/// config instead of a raw base url.
-#[must_use]
-pub fn local_url(config: &Config, nickname: &str) -> String {
-    format!("{}/users/{nickname}", config.base_url)
-}
-
 /// The avatar/banner URL a remote user's profile renders with: the stored
 /// `stored_url`, or `{frontend_base_url}{default_path}` when unset, then
 /// through the media proxy helper — remote users only (ticket), so a local
@@ -74,6 +68,21 @@ pub(crate) fn profile_image(
     } else {
         media_proxy::proxy_url(config, url)
     }
+}
+
+/// Pleroma's `strip_tags(user.name || user.nickname)`: the display name
+/// when the account has one, the handle when it does not, and either way
+/// reduced to one line of plain text (the column holds sanitized markup, so
+/// a name fetched from a remote actor can still carry tags). Crate-visible
+/// because the admin API's account entity and the push job's notification
+/// title both render this one rule.
+pub(crate) fn plain_display_name(user: &User) -> String {
+    let stored = if user.name.is_empty() {
+        user.nickname.as_str()
+    } else {
+        user.name.as_str()
+    };
+    sanitize_display_name(stored)
 }
 
 /// The part of `nickname` before the first `@` — Pleroma's
@@ -222,16 +231,6 @@ mod tests {
             malformed["fields"],
             serde_json::json!([]),
             "jsonb of another shape renders as the empty list"
-        );
-    }
-
-    #[test]
-    fn local_url_builds_the_profile_url_from_the_config() {
-        let config = Config::for_tests();
-        assert_eq!(
-            local_url(&config, "alice"),
-            "https://test.example/users/alice",
-            "the profile url is the base url plus the users path and nickname"
         );
     }
 

@@ -1,18 +1,17 @@
 //! The `metadata` block of the `NodeInfo` document: Pleroma's extensions
-//! and the limit and markup blocks they carry.
+//! and the limit and markup blocks they carry. The federation, poll-limit,
+//! field-limit and markup blocks are the ones the instance documents publish
+//! too, defined in [`crate::services::instance_meta`].
 
 use serde::Serialize;
-use serde_json::{Map, Value};
+use serde_json::Value;
 
-use super::{
-    ACCOUNT_FIELD_NAME_LENGTH, ACCOUNT_FIELD_VALUE_LENGTH, AVATAR_UPLOAD_LIMIT,
-    BACKGROUND_UPLOAD_LIMIT, BANNER_UPLOAD_LIMIT, MAX_ACCOUNT_FIELDS, MAX_POLL_EXPIRATION_SECS,
-    MAX_POLL_OPTION_CHARS, MAX_REMOTE_ACCOUNT_FIELDS, MIN_POLL_EXPIRATION_SECS, POST_FORMATS,
-};
 use crate::{
     config::{Config, Toggle},
-    federation::mrf,
-    services::instance_meta,
+    services::instance_meta::{
+        self, AVATAR_UPLOAD_LIMIT, BACKGROUND_UPLOAD_LIMIT, BANNER_UPLOAD_LIMIT, Federation,
+        FieldsLimits, Markup, POST_FORMATS, PollLimits,
+    },
 };
 
 /// The `metadata` block: Pleroma's extensions, in Pleroma's key order.
@@ -41,8 +40,9 @@ pub(super) struct Metadata {
     post_formats: &'static [&'static str],
     /// Upload size limits, in bytes.
     upload_limits: UploadLimits,
-    /// Profile-field limits.
-    fields_limits: FieldsLimits,
+    /// Profile-field limits: the shared [`FieldsLimits`] under `NodeInfo`'s
+    /// camelCase key spelling ([`FieldsLimits::camel_case`]).
+    fields_limits: Value,
     /// Whether a new account needs an email confirmation before it works
     /// (`ACCOUNT_ACTIVATION_REQUIRED`); Pleroma's
     /// `account_activation_required` mirror.
@@ -65,7 +65,9 @@ pub(super) struct Metadata {
     /// Whether threads from other instances keep only what addresses this
     /// one; Pleroma 2.10 ships `skip_thread_containment: true`.
     skip_thread_containment: Toggle,
-    /// The markup allowances behind the scrubbing policy ([`crate::util::sanitize`]).
+    /// The markup allowances behind the scrubbing policy
+    /// ([`crate::util::sanitize`]), the same block the instance documents
+    /// publish.
     markup: Markup,
 }
 
@@ -90,14 +92,14 @@ impl Metadata {
             poll_limits: PollLimits::for_config(config),
             post_formats: &POST_FORMATS,
             upload_limits: UploadLimits::for_config(config),
-            fields_limits: FieldsLimits::pleroma_defaults(),
+            fields_limits: FieldsLimits::pleroma_defaults().camel_case(),
             account_activation_required: config.account_activation_required,
             invites_enabled: config.invites_enabled,
             mailer_enabled: Toggle::new(false),
             features: instance_meta::features(),
             restrict_unauthenticated: instance_meta::restrict_unauthenticated(config),
             skip_thread_containment: Toggle::new(true),
-            markup: Markup::pleroma_defaults(),
+            markup: Markup::sanitizer_allowances(),
         }
     }
 }
@@ -107,89 +109,6 @@ impl Metadata {
 struct Suggestions {
     /// Whether the suggested-accounts endpoints serve anything.
     enabled: Toggle,
-}
-
-/// The `metadata.federation` block.
-#[derive(Debug, Serialize)]
-pub(super) struct Federation {
-    /// Whether this instance federates.
-    enabled: bool,
-    /// The moderation filters in force, Pleroma-style names in chain
-    /// order (Pleroma's `mrf, transparency` answer lists its policy
-    /// modules; this server reports the [MRF
-    /// chain](crate::federation::mrf)'s own names) — empty when
-    /// transparency is off, which publishes no policy at all.
-    mrf_policies: Vec<String>,
-    /// Instances whose posts are held back; none is configured. Absent
-    /// from the transparency-off answer, which keeps only the three keys
-    /// the switch leaves standing.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    quarantined_instances: Option<Vec<&'static str>>,
-    /// Whether the published lists hold back any host
-    /// (`MRF_TRANSPARENCY_EXCLUSIONS` in use, Pleroma deriving the same
-    /// flag from its `[:mrf, :transparency_exclusions]`); with
-    /// transparency off, false.
-    exclusions: bool,
-    /// Each policy's transparency blocks under the keys they name
-    /// themselves — `mrf_simple`, `mrf_simple_info`, `mrf_<name>` —
-    /// flattened into this object beside the fixed keys.
-    #[serde(flatten)]
-    mrf_descriptions: Map<String, Value>,
-}
-
-impl Federation {
-    /// A plain federating instance with no moderation filters and
-    /// transparency on: what an empty chain publishes, which is the answer
-    /// [`federation_block`] collapses to when nothing is configured. Test
-    /// support for the document builders; production always reads the live
-    /// chain and the live settings.
-    #[cfg(test)]
-    pub(super) fn federating() -> Self {
-        let published = mrf::ChainTransparency {
-            published: true,
-            ..mrf::ChainTransparency::default()
-        };
-        Self::with_mrf(&published)
-    }
-
-    /// The block of an instance whose chain published `described` (see
-    /// [`federation_block`]).
-    pub(super) fn with_mrf(described: &mrf::ChainTransparency) -> Self {
-        Self {
-            enabled: true,
-            mrf_policies: described.policies.clone(),
-            quarantined_instances: described.quarantined_instances(),
-            exclusions: described.exclusions,
-            mrf_descriptions: described.descriptions.clone(),
-        }
-    }
-}
-
-/// The `metadata.pollLimits` block; its keys keep Pleroma's `snake_case`
-/// config names, which is what a `NodeInfo` consumer of this block reads.
-#[derive(Debug, Serialize)]
-struct PollLimits {
-    /// Options one poll may offer (`MAX_POLL_OPTIONS`).
-    max_options: usize,
-    /// Characters one option may hold.
-    max_option_chars: usize,
-    /// Shortest poll duration, in seconds.
-    min_expiration: usize,
-    /// Longest poll duration, in seconds.
-    max_expiration: usize,
-}
-
-impl PollLimits {
-    /// The limits this instance enforces: its configured option count with
-    /// Pleroma's shipped values around it.
-    const fn for_config(config: &Config) -> Self {
-        Self {
-            max_options: config.max_poll_options,
-            max_option_chars: MAX_POLL_OPTION_CHARS,
-            min_expiration: MIN_POLL_EXPIRATION_SECS,
-            max_expiration: MAX_POLL_EXPIRATION_SECS,
-        }
-    }
 }
 
 /// The `metadata.uploadLimits` block, in bytes.
@@ -215,64 +134,6 @@ impl UploadLimits {
             avatar: AVATAR_UPLOAD_LIMIT,
             banner: BANNER_UPLOAD_LIMIT,
             background: BACKGROUND_UPLOAD_LIMIT,
-        }
-    }
-}
-
-/// The `metadata.fieldsLimits` block (camelCase keys, as Pleroma renders
-/// them from its `snake_case` config names).
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct FieldsLimits {
-    /// Fields one local account may set.
-    max_fields: usize,
-    /// Fields a remote account may carry before they are dropped.
-    max_remote_fields: usize,
-    /// Characters a field name may hold.
-    name_length: usize,
-    /// Characters a field value may hold.
-    value_length: usize,
-}
-
-impl FieldsLimits {
-    /// Pleroma 2.10.2's shipped values; wired-be enforces no stricter
-    /// profile-field settings.
-    const fn pleroma_defaults() -> Self {
-        Self {
-            max_fields: MAX_ACCOUNT_FIELDS,
-            max_remote_fields: MAX_REMOTE_ACCOUNT_FIELDS,
-            name_length: ACCOUNT_FIELD_NAME_LENGTH,
-            value_length: ACCOUNT_FIELD_VALUE_LENGTH,
-        }
-    }
-}
-
-/// The `metadata.markup` block: the formatting Pleroma's
-/// `[:markup]` config allows by default, which [`crate::util::sanitize`]
-/// implements to the same effect. The field names drop Pleroma's `allow_`
-/// config prefix for Clippy's `struct_field_names`; `serde` restores it on
-/// the wire, so consumers still read `allow_inline_images` and friends.
-#[derive(Debug, Serialize)]
-struct Markup {
-    /// Whether a status may show remote images inline (Pleroma's default
-    /// yes, because custom emoji are inline images).
-    #[serde(rename = "allow_inline_images")]
-    inline_images: Toggle,
-    /// Whether heading markup survives; it does not.
-    #[serde(rename = "allow_headings")]
-    headings: Toggle,
-    /// Whether tables survive; they do not.
-    #[serde(rename = "allow_tables")]
-    tables: Toggle,
-}
-
-impl Markup {
-    /// Pleroma 2.10's shipped `[:markup]` defaults.
-    const fn pleroma_defaults() -> Self {
-        Self {
-            inline_images: Toggle::new(true),
-            headings: Toggle::new(false),
-            tables: Toggle::new(false),
         }
     }
 }
@@ -331,5 +192,26 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(off["accountActivationRequired"], false, "and off stays off");
+    }
+
+    /// Both documents publish the same markup and the same field limits.
+    #[test]
+    fn markup_and_field_limits_match_the_instance_documents() {
+        let value = serde_json::to_value(Metadata::build(
+            &Config::for_tests(),
+            Vec::new(),
+            Federation::federating(),
+        ))
+        .unwrap();
+        assert_eq!(
+            value["markup"],
+            serde_json::to_value(Markup::sanitizer_allowances()).unwrap(),
+            "the shared markup block"
+        );
+        assert_eq!(
+            value["fieldsLimits"],
+            FieldsLimits::pleroma_defaults().camel_case(),
+            "the shared field limits"
+        );
     }
 }

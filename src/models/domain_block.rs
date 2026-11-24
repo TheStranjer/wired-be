@@ -211,22 +211,7 @@ mod tests {
     use sqlx::PgPool;
 
     use super::*;
-    use crate::{
-        config::TEST_BASE_URL,
-        error::AppError,
-        models::user::{NewUser, User, insert, local_ap_id},
-        pagination::MAX_LIMIT,
-    };
-
-    /// Inserts a local user named `nickname`.
-    async fn user(pool: &PgPool, nickname: &str) -> User {
-        insert(
-            pool,
-            &NewUser::local(nickname, &local_ap_id(TEST_BASE_URL, nickname)),
-        )
-        .await
-        .expect("the local fixture inserts")
-    }
+    use crate::{error::AppError, pagination::MAX_LIMIT, test_fixtures::local_user as user};
 
     /// The ids of the rows of the table, descending — the expected cursor
     /// order for the pagination assertions, read straight from storage so

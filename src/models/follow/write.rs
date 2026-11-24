@@ -8,14 +8,14 @@ use uuid::Uuid;
 use crate::{
     error::{AppError, AppResult},
     models::user::User,
-    util::id::new_id,
+    util::id::{new_activity_ap_id, new_id},
 };
 
 use super::{
     counters::counted,
     guards::{SELF_FOLLOW, blocked_between, blocked_error},
     lookup::{by_id, get, required},
-    types::{Follow, FollowState, initial_state, local_activity_id},
+    types::{Follow, FollowState, initial_state},
 };
 
 /// [`follow`]'s write when the pair has no row yet. `ON CONFLICT DO NOTHING`
@@ -84,7 +84,8 @@ pub async fn follow(
         return Err(blocked_error(pool, follower, target).await?);
     }
     let state = initial_state(target);
-    let ap_id = local_activity_id(base_url, follower);
+    // A remote follower's own `Follow` id is recorded by the federation layer.
+    let ap_id = follower.local.get().then(|| new_activity_ap_id(base_url));
     match get(pool, follower.id, target.id).await? {
         // Already open: this follow changes nothing, so the stored row is
         // the answer and no counter moves.
@@ -107,18 +108,24 @@ async fn insert_follow(
     state: FollowState,
     ap_id: Option<String>,
 ) -> AppResult<Follow> {
+    let mut tx = pool.begin().await?;
     let created = sqlx::query_as::<_, Follow>(INSERT_SQL)
         .bind(new_id())
         .bind(follower_id)
         .bind(target_id)
         .bind(state)
         .bind(ap_id.as_deref())
-        .fetch_optional(pool)
+        .fetch_optional(&mut *tx)
         .await?;
-    match created {
-        Some(follow) => counted(pool, follow).await,
-        None => required(get(pool, follower_id, target_id).await?),
-    }
+    let Some(follow) = created else {
+        // The insert wrote nothing; the empty transaction ends with the
+        // connection and the winner's committed row is read from the pool.
+        drop(tx);
+        return required(get(pool, follower_id, target_id).await?);
+    };
+    let follow = counted(&mut tx, follow).await?;
+    tx.commit().await?;
+    Ok(follow)
 }
 
 /// Reopens the `rejected` row `previous_id` at `state` and returns it,
@@ -130,16 +137,21 @@ async fn reopen(
     state: FollowState,
     ap_id: Option<String>,
 ) -> AppResult<Follow> {
+    let mut tx = pool.begin().await?;
     let reopened = sqlx::query_as::<_, Follow>(REOPEN_SQL)
         .bind(previous_id)
         .bind(state)
         .bind(ap_id.as_deref())
-        .fetch_optional(pool)
+        .fetch_optional(&mut *tx)
         .await?;
-    match reopened {
-        Some(follow) => counted(pool, follow).await,
-        None => required(by_id(pool, previous_id).await?),
-    }
+    let Some(follow) = reopened else {
+        // Nothing was written; read the concurrent winner's committed row.
+        drop(tx);
+        return required(by_id(pool, previous_id).await?);
+    };
+    let follow = counted(&mut tx, follow).await?;
+    tx.commit().await?;
+    Ok(follow)
 }
 
 #[cfg(test)]
@@ -305,6 +317,32 @@ mod tests {
             fresh_user(&pool, carol.id).await.followers_count,
             0,
             "and a waiting request still counts nothing"
+        );
+    }
+
+    /// Two follows of one unlocked local target race: the unique key lets one
+    /// insert win, so there is one row and the counters step up once.
+    #[tokio::test]
+    async fn following_at_the_same_time_makes_one_row_and_one_step() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = local_user(&pool, "alice").await;
+        let bob = local_user(&pool, "bob").await;
+
+        let (first, second) = tokio::join!(
+            follow(&pool, TEST_BASE_URL, &alice, &bob),
+            follow(&pool, TEST_BASE_URL, &alice, &bob)
+        );
+        let (first, second) = (first.unwrap(), second.unwrap());
+        assert_eq!(first.id, second.id, "both calls answer the one row");
+        assert_eq!(follow_count(&pool).await, 1, "one row for the pair");
+        assert_eq!(
+            (
+                fresh_user(&pool, bob.id).await.followers_count,
+                fresh_user(&pool, alice.id).await.following_count
+            ),
+            (1, 1),
+            "and the counters stepped once"
         );
     }
 

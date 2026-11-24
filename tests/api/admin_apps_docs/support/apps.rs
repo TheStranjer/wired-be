@@ -235,7 +235,7 @@ async fn index_windows_pages_and_filters_on_trusted() {
         "the count ignores the window"
     );
 
-    let junk = TestRequest::get(&format!("{APPS}?trusted=yes"))
+    let junk = TestRequest::get(&format!("{APPS}?trusted=maybe"))
         .bearer(&token)
         .send(&app)
         .await;

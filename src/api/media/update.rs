@@ -30,8 +30,8 @@ use crate::{
 };
 
 use super::{
-    DESCRIPTION_TOO_LONG, MAX_AXIS, MIN_AXIS, THUMBNAIL_FIELD, UPDATE_FOCUS_INVALID,
-    analyze::detect_media_type,
+    MAX_AXIS, MIN_AXIS, THUMBNAIL_FIELD, UPDATE_FOCUS_INVALID, analyze::detect_media_type,
+    check_description,
 };
 
 /// `GET /api/v1/media/{id}` and `GET /api/v2/media/{id}` — the entity of
@@ -64,7 +64,7 @@ pub(super) async fn get_media(
 /// [`AppError::Unauthorized`] / [`AppError::Forbidden`] from [`AuthUser`] and
 /// the `write:media` check; [`AppError::NotFound`] as in [`get_media`],
 /// attached media included: only the status edit reaches it;
-/// [`AppError::Unprocessable`] with [`DESCRIPTION_TOO_LONG`] or
+/// [`AppError::Unprocessable`] with [`DESCRIPTION_TOO_LONG`](super::DESCRIPTION_TOO_LONG) or
 /// [`UPDATE_FOCUS_INVALID`] for a body field [`edited_metadata`] refuses, or
 /// with [`UNSUPPORTED_FILE_TYPE`](super::UNSUPPORTED_FILE_TYPE) for
 /// thumbnail bytes [`detect_media_type`] cannot name;
@@ -135,7 +135,7 @@ pub(super) struct UpdateParams {
 
 /// The metadata an update writes: [`UpdateParams`] merged over the stored
 /// `current` row, the body's present fields winning, `description` measured
-/// first: an over-long one reports [`DESCRIPTION_TOO_LONG`] before a bad
+/// first: an over-long one reports [`DESCRIPTION_TOO_LONG`](super::DESCRIPTION_TOO_LONG) before a bad
 /// `focus` reports [`UPDATE_FOCUS_INVALID`].
 ///
 /// # Errors
@@ -161,7 +161,7 @@ fn edited_metadata(
 ///
 /// # Errors
 ///
-/// [`AppError::Unprocessable`] with [`DESCRIPTION_TOO_LONG`] when `sent` is
+/// [`AppError::Unprocessable`] with [`DESCRIPTION_TOO_LONG`](super::DESCRIPTION_TOO_LONG) when `sent` is
 /// longer than `config.max_media_description` characters.
 fn updated_description(
     config: &Config,
@@ -169,10 +169,10 @@ fn updated_description(
     sent: Option<&str>,
 ) -> AppResult<Option<String>> {
     match sent {
-        Some(text) if text.chars().count() > config.max_media_description => {
-            Err(AppError::Unprocessable(DESCRIPTION_TOO_LONG.to_owned()))
+        Some(text) => {
+            check_description(config, text)?;
+            Ok(Some(text.to_owned()))
         }
-        Some(text) => Ok(Some(text.to_owned())),
         None => Ok(current.description.clone()),
     }
 }
@@ -265,6 +265,7 @@ fn invalid_focus(message: &str) -> AppError {
 
 #[cfg(test)]
 mod tests {
+    use super::super::DESCRIPTION_TOO_LONG;
     use super::*;
 
     /// A stored row an update merges over: alt text, a focal point and a

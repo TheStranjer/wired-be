@@ -1,10 +1,10 @@
 //! The `status_hashtags` edge: which status carries which tag.
 //!
-//! A link is written by [`link_to_status`] (or its connection face
-//! [`link_conn`]) and is idempotent: the pair the status already has is
-//! skipped, so linking twice changes nothing and the edge carries no
-//! position — the entity renders [`for_statuses`]' name order. An edit
-//! rewrites the whole set through [`replace_for_status`], and
+//! A link is written by [`link_names_conn`] (on the caller's connection, in
+//! the status's own transaction) and is idempotent: the pair the status
+//! already has is skipped, so linking twice changes nothing and the edge
+//! carries no position — the entity renders [`for_statuses`]' name order. An
+//! edit rewrites the whole set through [`replace_names_conn`], and
 //! [`for_statuses`] is the batched read that renders a page of statuses
 //! without one query per row.
 
@@ -17,14 +17,14 @@ use crate::error::AppResult;
 
 use super::{Hashtag, StatusHashtagRow, tags::upsert_many_conn};
 
-/// The statement behind [`link_to_status`]: one pair per id, and a pair the
-/// status already has is skipped, so linking twice changes nothing.
+/// The statement behind `link_conn`: one pair per id, and a pair the status
+/// already has is skipped, so linking twice changes nothing.
 const LINK_SQL: &str = "INSERT INTO status_hashtags (status_id, hashtag_id)
      SELECT $1::uuid, t.hashtag_id FROM unnest($2::uuid[]) AS t(hashtag_id)
 ON CONFLICT (status_id, hashtag_id) DO NOTHING";
 
-/// The statement behind [`replace_for_status`]: the old set goes first, and
-/// the freshly upserted names are linked after it, in the same transaction.
+/// The statement behind [`replace_names_conn`]: the old set goes first, and
+/// the freshly upserted names are linked after it, on the same connection.
 const DELETE_FOR_STATUS_SQL: &str = "DELETE FROM status_hashtags WHERE status_id = $1";
 
 /// The leading text of [`for_statuses`]: every tag of the given statuses,
@@ -35,30 +35,22 @@ const FOR_STATUSES_SQL: &str = "SELECT sh.status_id, h.* FROM status_hashtags sh
      WHERE sh.status_id = ANY($1)
      ORDER BY sh.status_id, h.name";
 
-/// Links the tags in `hashtag_ids` to status `status_id`.
+/// Links the tags in `hashtag_ids` to status `status_id`, on `conn`: the
+/// statement runs on the caller's transaction.
 ///
 /// Pairs the status already has are skipped, so linking twice changes
 /// nothing, and an id repeated within one call is folded by the key. Order
 /// is not kept: the entity renders [`for_statuses`]' name order.
 ///
+/// An empty batch short-circuits: no statement, no round trip, and no
+/// foreign-key check either (nothing is written, so an unknown `status_id`
+/// with nothing to link is no error).
+///
 /// # Errors
 ///
 /// Any database failure (connection, encoding) arrives as
 /// [`AppError::Database`](crate::error::AppError); an unknown status or tag
-/// arrives as the foreign-key violation the database reports, unless the
-/// call links nothing at all (an empty `hashtag_ids` touches no row and
-/// checks no key).
-pub async fn link_to_status(pool: &PgPool, status_id: Uuid, hashtag_ids: &[Uuid]) -> AppResult<()> {
-    let mut conn = pool.acquire().await?;
-    link_conn(&mut conn, status_id, hashtag_ids).await
-}
-
-/// [`link_to_status`] on an open connection: the statement runs on the
-/// caller's transaction.
-///
-/// An empty batch short-circuits: no statement, no round trip, and no
-/// foreign-key check either (nothing is written, so an unknown `status_id`
-/// with nothing to link is no error).
+/// arrives as the foreign-key violation the database reports.
 pub(super) async fn link_conn(
     conn: &mut PgConnection,
     status_id: Uuid,
@@ -96,10 +88,11 @@ pub async fn link_names_conn(
     link_conn(conn, status_id, &ids).await
 }
 
-/// Replaces the whole tag set of status `status_id` with `names`, in one
-/// transaction.
+/// Replaces the whole tag set of status `status_id` with `names`, on `conn`.
 ///
-/// This is the shape an edit of a post needs: every link the status has is
+/// The replacement runs on the caller's transaction, which is how
+/// [`crate::models::status_edit::update_status`] rewrites a status and its
+/// tags together. This is the shape an edit of a post needs: every link the status has is
 /// deleted and the upserted names of `names` are linked in their place.
 ///
 /// # Errors
@@ -107,23 +100,7 @@ pub async fn link_names_conn(
 /// Any database failure (connection, encoding) arrives as
 /// [`AppError::Database`](crate::error::AppError); an unknown `status_id`
 /// with at least one usable name is the foreign-key violation the database
-/// reports, and the transaction rolls every part of the replacement back
-/// with it.
-pub async fn replace_for_status(pool: &PgPool, status_id: Uuid, names: &[String]) -> AppResult<()> {
-    let mut tx = pool.begin().await?;
-    replace_names_conn(&mut tx, status_id, names).await?;
-    tx.commit().await?;
-    Ok(())
-}
-
-/// [`replace_for_status`] on an open connection: the whole replacement runs
-/// on the caller's transaction, which is how
-/// [`crate::models::status_edit::update_status`] rewrites a status and its
-/// tags together.
-///
-/// # Errors
-///
-/// Those of [`replace_for_status`].
+/// reports, which rolls the replacement back when `conn` is a transaction.
 pub async fn replace_names_conn(
     conn: &mut PgConnection,
     status_id: Uuid,
@@ -197,17 +174,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn link_to_status_is_idempotent() {
+    async fn link_conn_is_idempotent() {
         let db = crate::test_db::test_db().await.expect("test database slot");
         let pool = db.pool().clone();
         let status = post(&pool, "alice", "hello").await;
         let foo = find_or_create(&pool, "#foo").await.unwrap().expect("foo");
         let bar = find_or_create(&pool, "bar").await.unwrap().expect("bar");
+        let mut conn = pool.acquire().await.expect("a pooled connection");
 
-        link_to_status(&pool, status.id, &[foo.id, bar.id, foo.id])
+        link_conn(&mut conn, status.id, &[foo.id, bar.id, foo.id])
             .await
             .expect("the first link stores");
-        link_to_status(&pool, status.id, &[bar.id])
+        link_conn(&mut conn, status.id, &[bar.id])
             .await
             .expect("a repeat link changes nothing");
         assert_eq!(
@@ -216,9 +194,34 @@ mod tests {
             "one row per pair, the doubled id folded"
         );
 
-        link_to_status(&pool, status.id, &[])
+        link_conn(&mut conn, status.id, &[])
             .await
             .expect("linking nothing is no work");
+    }
+
+    #[tokio::test]
+    async fn link_names_conn_upserts_and_links_idempotently() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let status = post(&pool, "alice", "hello").await;
+        let mut conn = pool.acquire().await.expect("a pooled connection");
+
+        link_names_conn(&mut conn, status.id, &tags(&["#Foo", "bar", "FOO", " "]))
+            .await
+            .expect("the names are upserted and linked");
+        link_names_conn(&mut conn, status.id, &tags(&["foo"]))
+            .await
+            .expect("a repeat changes nothing");
+        assert_eq!(
+            stored_links(&pool, status.id).await,
+            vec!["bar", "foo"],
+            "one link per usable name, spellings folded, the blank dropped"
+        );
+        assert_eq!(stored_tags(&pool).await.len(), 2, "two tag rows");
+
+        link_names_conn(&mut conn, status.id, &[])
+            .await
+            .expect("linking no names is no work");
     }
 
     #[tokio::test]
@@ -226,7 +229,8 @@ mod tests {
         let db = crate::test_db::test_db().await.expect("test database slot");
         let pool = db.pool().clone();
         let status = post(&pool, "alice", "hello").await;
-        let err = link_to_status(&pool, status.id, &[Uuid::now_v7()])
+        let mut conn = pool.acquire().await.expect("a pooled connection");
+        let err = link_conn(&mut conn, status.id, &[Uuid::now_v7()])
             .await
             .expect_err("the foreign key refuses an unknown tag");
         assert_eq!(sqlstate_of(err), "23503", "a missing tag is an FK");
@@ -235,7 +239,7 @@ mod tests {
             "nothing stored"
         );
 
-        let status_err = link_to_status(&pool, Uuid::now_v7(), &[status.id])
+        let status_err = link_conn(&mut conn, Uuid::now_v7(), &[status.id])
             .await
             .expect_err("and so is an unknown status");
         assert_eq!(
@@ -246,17 +250,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn replace_rewrites_the_whole_set() {
+    async fn replace_names_conn_rewrites_the_whole_set() {
         let db = crate::test_db::test_db().await.expect("test database slot");
         let pool = db.pool().clone();
         let status = post(&pool, "alice", "#old #shared").await;
+        let mut conn = pool.acquire().await.expect("a pooled connection");
         assert_eq!(
             stored_links(&pool, status.id).await,
             vec!["old", "shared"],
             "the fixture came tagged"
         );
 
-        replace_for_status(&pool, status.id, &tags(&["new", "SHARED"]))
+        replace_names_conn(&mut conn, status.id, &tags(&["new", "SHARED"]))
             .await
             .expect("the replacement runs");
         assert_eq!(
@@ -270,7 +275,7 @@ mod tests {
             "the abandoned `old` tag row itself stays"
         );
 
-        replace_for_status(&pool, status.id, &[])
+        replace_names_conn(&mut conn, status.id, &[])
             .await
             .expect("replacing with nothing runs");
         assert!(

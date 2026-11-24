@@ -32,8 +32,8 @@ async fn subscribe_and_unsubscribe_frames_move_a_stream_in_and_out() {
     let tagged = read_until(&mut client, "public-control").await;
     assert_eq!(
         tagged.first().expect("the hashtag event"),
-        r#"{"stream":["hashtag:rust"],"event":"update","payload":"{\"id\":\"tagged\"}"}"#,
-        "the hashtag stream the frame opened, delivered — and the tag was normalized"
+        r#"{"stream":["hashtag","rust"],"event":"update","payload":"{\"id\":\"tagged\"}"}"#,
+        "the hashtag stream the frame opened, delivered under Mastodon's name — and the tag was normalized"
     );
 
     send(

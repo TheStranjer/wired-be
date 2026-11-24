@@ -504,3 +504,49 @@ async fn the_actor_address_still_serves_activity_json() {
         "alice's own document"
     );
 }
+
+/// A frontend on its own origin: a browser on `/users/alice` is sent to
+/// `FRONTEND_BASE_URL`, not `BASE_URL`, while an `ActivityPub` client still
+/// gets the JSON document, and both answers vary on `Accept`.
+#[tokio::test]
+async fn the_actor_redirect_follows_the_frontend_origin() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let _alice = common::create_local_user(&pool, "alice").await;
+    let mut config = common::test_config();
+    config.frontend_base_url = "https://fe.example".to_owned();
+    let app = common::test_app_with_config(pool, config);
+
+    let browser = common::TestRequest::get("/users/alice")
+        .header("accept", "text/html")
+        .send(&app)
+        .await;
+    assert_eq!(browser.status, StatusCode::FOUND, "a browser redirects");
+    assert_eq!(
+        browser.header("location"),
+        Some("https://fe.example/alice"),
+        "to the frontend origin, not the base URL"
+    );
+    assert_eq!(
+        browser.header("vary"),
+        Some("Accept"),
+        "the redirect varies on Accept"
+    );
+
+    let federating = fetch_activity_json(&app, "/users/alice").await;
+    assert_eq!(
+        federating.status,
+        StatusCode::OK,
+        "an ActivityPub client still gets the document"
+    );
+    assert_eq!(
+        federating.header("vary"),
+        Some("Accept"),
+        "the document varies on Accept"
+    );
+    assert_eq!(
+        federating.json_value()["id"],
+        format!("{BASE}/users/alice"),
+        "whose id stays on the base URL"
+    );
+}

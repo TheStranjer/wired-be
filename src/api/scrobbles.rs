@@ -9,9 +9,9 @@
 //! is what the two routes below read and write — no federation, no
 //! notifications, no streaming.
 //!
-//! - `POST /api/v1/pleroma/scrobble` requires a user token with the `write`
-//!   scope (Pleroma's `write:scrobbles`, of which a `write` token is the
-//!   parent) and answers the created [`Scrobble`] with 200, as Pleroma's
+//! - `POST /api/v1/pleroma/scrobble` requires a user token with the
+//!   `write:scrobbles` scope (of which a `write` token is the parent) and
+//!   answers the created [`Scrobble`] with 200, as Pleroma's
 //!   `render("show.json", …)` does. Its parameters (decision 10: through
 //!   [`ApiBody`], so the form spellings work) are `title` (required, at most
 //!   255 characters), `artist`, `album`, `length` in milliseconds,
@@ -29,8 +29,9 @@
 //!   [`MAX_LIMIT`](crate::pagination::MAX_LIMIT) at most) with the `Link`
 //!   header Pleroma's `add_link_headers` writes. Authentication is optional —
 //!   Pleroma's
-//!   `OAuthScopesPlug … fallback: :proceed_unauthenticated` — and the token,
-//!   when there is one, names the reader: the account itself sees all of its
+//!   `OAuthScopesPlug … fallback: :proceed_unauthenticated` — and a token
+//!   that grants `read:scrobbles` names the reader (one without the scope
+//!   reads as no token): the account itself sees all of its
 //!   scrobbles, anyone else only the `public` and `unlisted` ones, which is
 //!   what Pleroma's address filter leaves of a `private` or `direct` `Listen`
 //!   for a stranger. An id that is malformed, unknown or deactivated is the
@@ -52,7 +53,7 @@ use tracing::debug;
 
 use crate::{
     api::helpers::account_or_404,
-    auth::{AuthUser, MaybeAuthUser},
+    auth::{AuthUser, MaybeAuthUser, require_scope},
     entities::scrobble::Scrobble,
     error::{AppError, AppResult},
     extract::{ApiBody, flex},
@@ -60,13 +61,20 @@ use crate::{
         scrobble::{self, NewScrobble},
         status::Visibility,
     },
-    oauth::scopes::WRITE,
-    pagination::{PageParams, link_header, set_link_header},
+    oauth::scopes::{READ_SCROBBLES, WRITE_SCROBBLES},
+    pagination::{NO_EXTRA_QUERY, PageParams, keyset_link, set_link_header},
     state::AppState,
+    util::url::is_http_url,
 };
 
 /// The longest title the endpoint accepts (the ticket's 255).
 const MAX_TITLE_CHARS: usize = 255;
+/// The longest artist or album the endpoint accepts.
+const MAX_TEXT_CHARS: usize = 255;
+/// The longest external link the endpoint accepts.
+const MAX_LINK_CHARS: usize = 2048;
+/// 422 body for an external link that is too long or not an `http(s)` URL.
+const LINK_INVALID: &str = "externalLink: is invalid";
 /// 422 body for an absent or blank title, in Pleroma's changeset wording
 /// (`"title: can't be blank"`, the `validate_required` message its
 /// `ApiSpec`-style errors are reported with).
@@ -76,9 +84,6 @@ const TITLE_BLANK: &str = "title: can't be blank";
 const VISIBILITIES: [&str; 4] = ["public", "unlisted", "private", "direct"];
 /// 422 body for a visibility outside [`VISIBILITIES`], in the same wording.
 const VISIBILITY_INVALID: &str = "visibility: is not included in the list";
-/// The `Link` header's query parameters carry nothing but the cursor: this
-/// listing has no filter to repeat on either link.
-const NO_EXTRA_QUERY: [(String, String); 0] = [];
 
 /// The `/api/v1/pleroma` scrobble router, merged into [`crate::api::v1`].
 pub fn router() -> Router<AppState> {
@@ -94,7 +99,7 @@ pub fn router() -> Router<AppState> {
 /// # Errors
 ///
 /// [`AppError::Unauthorized`] / [`AppError::Forbidden`] from [`AuthUser`] and
-/// the `write` check; [`AppError::Unprocessable`] for a blank, absent or
+/// the `write:scrobbles` check; [`AppError::Unprocessable`] for a blank, absent or
 /// too-long title, an unknown `visibility` or a `length` that is not an
 /// integer. Any database failure arrives through `?` as
 /// [`AppError::Database`].
@@ -103,7 +108,7 @@ async fn create_scrobble(
     auth: AuthUser,
     ApiBody(params): ApiBody<ScrobbleParams>,
 ) -> AppResult<Json<Scrobble>> {
-    auth.require(WRITE)?;
+    auth.require(WRITE_SCROBBLES)?;
     let new = params.into_new_scrobble()?;
     let row = scrobble::insert(&state.db, auth.0.id, &new).await?;
     debug!(
@@ -126,7 +131,7 @@ async fn create_scrobble(
 /// The entity's `account` is the listed account, rendered for whoever asks
 /// (Pleroma's `for: reading_user`), and `private`/`direct` rows appear only
 /// for their owner (see [`page_for_user`]). An empty page answers the empty
-/// array with no `Link` header, [`link_header`]'s rule.
+/// array with no `Link` header, [`keyset_link`]'s rule.
 ///
 /// The `Link` header's path is the request's own [`OriginalUri`], not the
 /// [`Uri`] the router hands a nested handler: axum strips the `/api/v1`
@@ -145,11 +150,17 @@ async fn create_scrobble(
 /// [`Uri`]: axum::http::Uri
 async fn list_scrobbles(
     State(state): State<AppState>,
-    MaybeAuthUser(viewer, _): MaybeAuthUser,
+    auth: MaybeAuthUser,
     Path(id): Path<String>,
     page: PageParams,
     OriginalUri(uri): OriginalUri,
 ) -> AppResult<(HeaderMap, Json<Vec<Scrobble>>)> {
+    // Pleroma's `fallback: :proceed_unauthenticated`: a token without
+    // `read:scrobbles` reads as no token at all.
+    let viewer = match (auth.0, auth.1) {
+        (Some(user), Some(token)) if require_scope(&token, READ_SCROBBLES).is_ok() => Some(user),
+        _ => None,
+    };
     let owner = account_or_404(&state, &id).await?;
     let rows = scrobble::page_for_user(
         &state.db,
@@ -158,7 +169,13 @@ async fn list_scrobbles(
         page,
     )
     .await?;
-    let link = page_link(&state.config.base_url, uri.path(), &rows);
+    let link = keyset_link(
+        &state.config.base_url,
+        uri.path(),
+        &NO_EXTRA_QUERY,
+        &rows,
+        |row| row.id,
+    );
     let mut headers = HeaderMap::new();
     set_link_header(&mut headers, link.as_deref())?;
     debug!(
@@ -174,15 +191,6 @@ async fn list_scrobbles(
                 .collect(),
         ),
     ))
-}
-
-/// The `Link` header value for a fetched page: Pleroma's `add_link_headers`
-/// over the first (newest) and last (oldest) row's id, `None` for an empty
-/// page.
-fn page_link(base_url: &str, path: &str, rows: &[scrobble::Scrobble]) -> Option<String> {
-    let newest = rows.first()?.id.to_string();
-    let oldest = rows.last()?.id.to_string();
-    link_header(base_url, path, &NO_EXTRA_QUERY, &newest, &oldest)
 }
 
 /// The request parameters of `POST /api/v1/pleroma/scrobble`.
@@ -231,13 +239,53 @@ impl ScrobbleParams {
     fn into_new_scrobble(self) -> AppResult<NewScrobble> {
         Ok(NewScrobble {
             title: validate_title(self.title)?,
-            artist: self.artist,
-            album: self.album,
+            artist: validate_optional_text("artist", self.artist, MAX_TEXT_CHARS)?,
+            album: validate_optional_text("album", self.album, MAX_TEXT_CHARS)?,
             length: self.length,
-            external_link: self.external_link.or(self.external_link_camel),
+            external_link: validate_link(self.external_link.or(self.external_link_camel))?,
             visibility: validate_visibility(self.visibility)?,
         })
     }
+}
+
+/// An optional free-text field, checked: blank or absent is `None`, longer
+/// than `max` characters is 422 `"<field>: is too long (maximum is <max>
+/// characters)"`; a kept value is stored verbatim.
+///
+/// # Errors
+///
+/// [`AppError::Unprocessable`] as described above.
+fn validate_optional_text(
+    field: &str,
+    value: Option<String>,
+    max: usize,
+) -> AppResult<Option<String>> {
+    let Some(text) = value.filter(|text| !text.trim().is_empty()) else {
+        return Ok(None);
+    };
+    if text.chars().count() > max {
+        return Err(AppError::Unprocessable(format!(
+            "{field}: is too long (maximum is {max} characters)"
+        )));
+    }
+    Ok(Some(text))
+}
+
+/// The external link, checked: blank or absent is `None`; otherwise at most
+/// [`MAX_LINK_CHARS`] characters and an absolute `http(s)` URL, else 422
+/// [`LINK_INVALID`]. A kept link is stored verbatim.
+///
+/// # Errors
+///
+/// [`AppError::Unprocessable`] as described above.
+fn validate_link(link: Option<String>) -> AppResult<Option<String>> {
+    let Some(text) = link.filter(|text| !text.trim().is_empty()) else {
+        return Ok(None);
+    };
+    if text.chars().count() > MAX_LINK_CHARS || !is_http_url(&text) {
+        return Err(AppError::Unprocessable(LINK_INVALID.to_owned()));
+    }
+    Ok(Some(text))
 }
 
 /// The title, checked: absent or blank is 422 [`TITLE_BLANK`], longer than
@@ -307,7 +355,7 @@ mod tests {
             .to_string()
     }
 
-    /// Three stored scrobbles of one account in the order [`page_link`]
+    /// Three stored scrobbles of one account in the order [`keyset_link`]
     /// receives them: newest first, ids ascending by text.
     fn rows() -> Vec<scrobble::Scrobble> {
         [NEWEST_ID, MIDDLE_ID, OLDEST_ID]
@@ -472,6 +520,92 @@ mod tests {
     }
 
     #[test]
+    fn artist_and_album_are_capped_at_the_maximum_length() {
+        for field in ["artist", "album"] {
+            let edge = "x".repeat(MAX_TEXT_CHARS);
+            let new = new_scrobble(json!({"title": "x", field: edge.as_str()}))
+                .unwrap_or_else(|err| panic!("255 characters of {field} fit: {err}"));
+            let kept = if field == "artist" {
+                new.artist
+            } else {
+                new.album
+            };
+            assert_eq!(kept.as_deref(), Some(edge.as_str()), "{field} is verbatim");
+
+            assert_eq!(
+                rejection(json!({"title": "x", field: "x".repeat(MAX_TEXT_CHARS + 1)})),
+                format!("{field}: is too long (maximum is 255 characters)"),
+                "256 characters of {field} do not"
+            );
+        }
+    }
+
+    #[test]
+    fn a_blank_artist_or_album_becomes_none() {
+        let new = new_scrobble(json!({"title": "x", "artist": "  ", "album": ""}))
+            .expect("blank metadata validates");
+        assert!(new.artist.is_none(), "a blank artist is NULL");
+        assert!(new.album.is_none(), "a blank album is NULL");
+    }
+
+    #[test]
+    fn a_non_http_link_is_rejected() {
+        for link in [
+            "javascript:alert(1)",
+            "data:text/html,x",
+            "ftp://music.example/t/1",
+            "music.example/t/1",
+            "not a url",
+        ] {
+            for key in ["externalLink", "external_link"] {
+                assert_eq!(
+                    rejection(json!({"title": "x", key: link})),
+                    LINK_INVALID,
+                    "`{link}` under `{key}` is no http(s) link"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_http_link_passes_and_a_blank_one_becomes_none() {
+        for link in ["https://music.example/t/1", "http://music.example/t/1"] {
+            let new = new_scrobble(json!({"title": "x", "externalLink": link}))
+                .unwrap_or_else(|err| panic!("`{link}` is valid: {err}"));
+            assert_eq!(new.external_link.as_deref(), Some(link), "kept verbatim");
+        }
+        for blank in [json!(""), json!("   "), json!(null)] {
+            let new = new_scrobble(json!({"title": "x", "externalLink": blank}))
+                .expect("a blank link validates");
+            assert!(new.external_link.is_none(), "`{blank}` is NULL");
+        }
+    }
+
+    #[test]
+    fn a_link_longer_than_the_maximum_is_rejected() {
+        let prefix = "https://music.example/";
+        let edge = format!("{prefix}{}", "a".repeat(MAX_LINK_CHARS - prefix.len()));
+        assert_eq!(
+            edge.chars().count(),
+            MAX_LINK_CHARS,
+            "the fixture is at the cap"
+        );
+        let new = new_scrobble(json!({"title": "x", "externalLink": edge.as_str()}))
+            .expect("2048 characters fit");
+        assert_eq!(
+            new.external_link.as_deref(),
+            Some(edge.as_str()),
+            "verbatim"
+        );
+
+        assert_eq!(
+            rejection(json!({"title": "x", "externalLink": format!("{edge}a")})),
+            LINK_INVALID,
+            "2049 do not"
+        );
+    }
+
+    #[test]
     fn a_length_that_is_not_an_integer_is_a_parameter_error() {
         for value in [
             json!("abc"),
@@ -493,8 +627,14 @@ mod tests {
 
     #[test]
     fn the_link_header_walks_from_both_ends_of_the_page() {
-        let link = page_link("https://h", "/api/v1/pleroma/accounts/1/scrobbles", &rows())
-            .expect("a full page links");
+        let link = keyset_link(
+            "https://h",
+            "/api/v1/pleroma/accounts/1/scrobbles",
+            &NO_EXTRA_QUERY,
+            &rows(),
+            |row| row.id,
+        )
+        .expect("a full page links");
         assert_eq!(
             link,
             format!(
@@ -507,13 +647,17 @@ mod tests {
 
     #[test]
     fn an_empty_page_links_nowhere() {
+        let none: [scrobble::Scrobble; 0] = [];
         assert_eq!(
-            page_link("https://h", "/p", &[]),
+            keyset_link("https://h", "/p", &NO_EXTRA_QUERY, &none, |row| row.id),
             None,
             "no rows, no Link header"
         );
         let oldest_only = vec![rows().pop().expect("the fixture has rows")];
-        let link = page_link("https://h", "/p", &oldest_only).expect("a one-row page links");
+        let link = keyset_link("https://h", "/p", &NO_EXTRA_QUERY, &oldest_only, |row| {
+            row.id
+        })
+        .expect("a one-row page links");
         assert!(
             link.contains(&format!("max_id={OLDEST_ID}"))
                 && link.contains(&format!("min_id={OLDEST_ID}")),

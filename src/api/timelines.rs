@@ -121,6 +121,20 @@ const TIMELINES_LOCAL: &str = "timelines_local";
 /// public timeline (Pleroma's `timelines: %{federated: …}`).
 const TIMELINES_FEDERATED: &str = "timelines_federated";
 
+/// The `RESTRICT_UNAUTHENTICATED` area an anonymous read of the public
+/// timeline falls under: [`TIMELINES_LOCAL`] for the local page, and
+/// [`TIMELINES_FEDERATED`] for every other one.
+///
+/// The REST gate and the streaming gate both choose their area here, so the
+/// two cannot drift apart.
+pub(crate) const fn timeline_area(local: bool) -> &'static str {
+    if local {
+        TIMELINES_LOCAL
+    } else {
+        TIMELINES_FEDERATED
+    }
+}
+
 /// The `/api/v1/timelines` router, merged into [`crate::api::v1`].
 pub fn router() -> Router<AppState> {
     Router::new()

@@ -67,7 +67,7 @@ use crate::{
         status_visibility,
     },
     oauth::scopes::{READ_STATUSES, WRITE_STATUSES},
-    pagination::{PageParams, set_link_header},
+    pagination::{PageParams, link_for_page, set_link_header},
     services::{
         federation_out, notify,
         render_status::{ViewerMode, render_statuses},
@@ -75,7 +75,7 @@ use crate::{
     state::AppState,
 };
 
-use super::{CANNOT_REBLOG, INVALID_VISIBILITY, action_target_id, current_entity, page_link};
+use super::{CANNOT_REBLOG, INVALID_VISIBILITY, action_target_id, current_entity, without_blocked};
 
 /// `POST /api/v1/statuses/{id}/reblog` — reblog the status `id` and answer
 /// the **reblog row's** entity: the outer [`Status`] whose `reblog` is the
@@ -191,6 +191,9 @@ pub(super) async fn unreblog_status(
 /// — a reblog row's id answers its original's list. Only `public` and
 /// `unlisted` boosts are listed; a followers-only or direct boost never
 /// appears, even to an anonymous caller who may see the original.
+/// Deactivated accounts are left out by the query, and the accounts the
+/// presented viewer has blocked by [`without_blocked`]; the `Link` header is
+/// built from the unfiltered page so paging never stalls.
 ///
 /// # Errors
 ///
@@ -221,10 +224,13 @@ pub(super) async fn list_reblogged_by(
     let mut headers = HeaderMap::new();
     set_link_header(
         &mut headers,
-        page_link(&state.config.base_url, uri.path(), &ids).as_deref(),
+        link_for_page(&state.config.base_url, uri.path(), &ids, |cursor| *cursor).as_deref(),
     )?;
     // The list names no relationship of the viewer to the rebloggers;
     // Pleroma's `reblogged_by` renders plain `show.json` accounts.
+    // The `Link` above came from the raw page; the viewer's blocked
+    // accounts leave only the rendered list.
+    let entries = without_blocked(&state, auth.0.as_ref(), entries, |entry| entry.user.id).await?;
     let viewer: AccountViewer<'_> = auth.0.as_ref();
     let accounts = entries
         .iter()
@@ -282,7 +288,7 @@ pub(super) async fn list_quotes(
     let mut headers = HeaderMap::new();
     set_link_header(
         &mut headers,
-        page_link(&state.config.base_url, uri.path(), &ids).as_deref(),
+        link_for_page(&state.config.base_url, uri.path(), &ids, |cursor| *cursor).as_deref(),
     )?;
     Ok((
         headers,

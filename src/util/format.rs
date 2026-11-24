@@ -36,7 +36,7 @@ mod plain;
 mod renderer;
 #[cfg(test)]
 mod test_support;
-mod urls;
+pub mod urls;
 
 /// The `rel` attribute every linkified URL carries, spelled exactly as
 /// [`sanitize_html`] will force it so the sanitizer pass changes nothing.

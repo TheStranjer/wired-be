@@ -1,14 +1,15 @@
 //! The `hashtags` rows: the idempotent, case-insensitive upsert and the
 //! reads one stored name answers.
 //!
-//! [`upsert_many`] is the module's only writer of a tag row: every name goes
+//! `upsert_many` is the module's only writer of a tag row: every name goes
 //! through `normalize_name` first, unusable names are dropped, repeats within
 //! one call are folded, and a name the table already holds answers its
 //! stored row instead of raising the unique violation. Its connection face,
 //! `upsert_many_conn`, is what [`crate::models::status::insert`] writes a
 //! status's tags through, inside the status's own transaction.
-//! [`find_or_create`] and [`get_by_name`] are the single-name reads of the
-//! rows those writes leave behind.
+//! [`find_or_create`] is the pool-taking single-name face of `upsert_many`
+//! (the module's only caller of it), and [`get_by_name`] reads the rows
+//! those writes leave behind.
 
 use std::collections::HashSet;
 
@@ -19,7 +20,7 @@ use crate::{error::AppResult, util::id::new_id};
 
 use super::{Hashtag, normalize_name};
 
-/// The statement behind [`upsert_many`]: one row per given `(id, name)`
+/// The statement behind `upsert_many`: one row per given `(id, name)`
 /// pair, and on a name that already exists the no-op update of
 /// `name = EXCLUDED.name` — the shape the ticket prescribes, and what makes
 /// `RETURNING` answer with the stored row (its original `id` and
@@ -46,12 +47,12 @@ const BY_NAME_SQL: &str = "SELECT * FROM hashtags WHERE name = $1";
 ///
 /// Any database failure (connection, encoding) arrives as
 /// [`AppError::Database`](crate::error::AppError).
-pub async fn upsert_many(pool: &PgPool, names: &[String]) -> AppResult<Vec<Hashtag>> {
+async fn upsert_many(pool: &PgPool, names: &[String]) -> AppResult<Vec<Hashtag>> {
     let mut conn = pool.acquire().await?;
     upsert_many_conn(&mut conn, names).await
 }
 
-/// [`upsert_many`] on an open connection: the statement runs on the
+/// `upsert_many` on an open connection: the statement runs on the
 /// caller's transaction, which is how [`crate::models::status::insert`]
 /// writes a status and its tags together.
 ///
@@ -78,7 +79,7 @@ pub(super) async fn upsert_many_conn(
 
 /// Finds or creates the one tag `name` names.
 ///
-/// The single-name face of [`upsert_many`]: `#Foo` finds `foo`, and an
+/// The single-name face of the tag upsert: `#Foo` finds `foo`, and an
 /// unknown usable name gets a row. A name that normalization rejects
 /// (blank, or longer than the 100-character stored-name bound) is `None` —
 /// there is no tag to find and none to store.
@@ -158,6 +159,22 @@ mod tests {
             vec![("foo".to_owned(), first[0].id)],
             "and the table still holds exactly one tag"
         );
+    }
+
+    #[tokio::test]
+    async fn upsert_folds_nfkc_equivalent_spellings_into_one_row() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let stored = upsert_many(&pool, &tags(&["ＲＵＳＴ", "rust"]))
+            .await
+            .expect("the upsert runs");
+        assert_eq!(names(&stored), vec!["rust"], "one row, the folded name");
+        assert_eq!(stored_tags(&pool).await.len(), 1, "and one stored tag");
+
+        let composed = upsert_many(&pool, &tags(&["cafe\u{301}", "caf\u{e9}"]))
+            .await
+            .expect("the accent upsert runs");
+        assert_eq!(composed.len(), 1, "composed and decomposed are one tag");
     }
 
     #[tokio::test]

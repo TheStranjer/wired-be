@@ -9,8 +9,8 @@
 //! (`lib/pleroma/web/admin_api/controllers/admin_api_controller.ex`).
 //! Every route takes the [`AdminUser`] extractor, and the scope half of
 //! the gate is the [`AdminUser::require`] call each handler makes first:
-//! `admin:read:relays` / `admin:write:relays` on the relay trio (the
-//! ticket's areas; Pleroma splits the same controller across
+//! `admin:read:relays` on the relay listing and `admin:write:follows` on
+//! the relay follow and unfollow (Pleroma's `relay_controller.ex` asks
 //! `admin:read` and `admin:write:follows`), `admin:write:federation` on
 //! the instance deletion (Pleroma asks its `admin:write:accounts` +
 //! `admin:write:statuses` pair), and `admin:write:emoji` on the reload
@@ -86,9 +86,12 @@ use crate::{
 const CLASS_READ: &str = "read";
 /// The write endpoint class of [`AdminUser::require`].
 const CLASS_WRITE: &str = "write";
-/// The admin scope area of the relay routes
-/// (`admin:read:relays` / `admin:write:relays`).
+/// The admin scope area of the relay listing (`admin:read:relays`).
 const AREA_RELAYS: &str = "relays";
+/// The admin scope area of the relay follow and unfollow writes
+/// (`admin:write:follows`, Pleroma's `OAuthScopesPlug` for `follow` and
+/// `unfollow`); the listing stays on [`AREA_RELAYS`].
+const AREA_FOLLOWS: &str = "follows";
 /// The admin scope area of the instance deletion.
 const AREA_FEDERATION: &str = "federation";
 /// The admin scope area of the emoji reload — the same `emoji` area the
@@ -163,7 +166,7 @@ async fn list(State(state): State<AppState>, admin: AdminUser) -> AppResult<Json
 /// # Errors
 ///
 /// [`AppError::Unauthorized`] / [`AppError::Forbidden`] from [`AdminUser`]
-/// and its `admin:write:relays` gate; [`AppError::BadRequest`] with the
+/// and its `admin:write:follows` gate; [`AppError::BadRequest`] with the
 /// refusal's message for any failure of the follow itself;
 /// [`AppError::Database`] from the log write and the followed-back read.
 async fn follow(
@@ -171,7 +174,7 @@ async fn follow(
     admin: AdminUser,
     ApiBody(body): ApiBody<RelayBody>,
 ) -> AppResult<Json<AdminRelay>> {
-    admin.require(CLASS_WRITE, AREA_RELAYS)?;
+    admin.require(CLASS_WRITE, AREA_FOLLOWS)?;
     let subscription = relay_service::follow_relay(&state, &body.relay_url)
         .await
         .map_err(client_refusal)?;
@@ -197,7 +200,7 @@ async fn follow(
 /// # Errors
 ///
 /// [`AppError::Unauthorized`] / [`AppError::Forbidden`] from [`AdminUser`]
-/// and its `admin:write:relays` gate; [`AppError::BadRequest`] with
+/// and its `admin:write:follows` gate; [`AppError::BadRequest`] with
 /// [`NOT_FOUND`] for a relay that is not followed and with the refusal's
 /// message for any other failed withdrawal; [`AppError::Database`] from
 /// the log write.
@@ -206,7 +209,7 @@ async fn unfollow(
     admin: AdminUser,
     ApiBody(body): ApiBody<RelayUnfollowBody>,
 ) -> AppResult<Json<String>> {
-    admin.require(CLASS_WRITE, AREA_RELAYS)?;
+    admin.require(CLASS_WRITE, AREA_FOLLOWS)?;
     relay_service::unfollow_relay(&state, &body.relay_url)
         .await
         .map_err(unfollow_refusal)?;

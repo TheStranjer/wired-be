@@ -2,6 +2,8 @@
 //! ([`alert_enabled`]), the title verb [`verb_for`] looks up, and the
 //! Mastodon-shaped JSON [`payload_json`] stitches from a [`PushPayload`].
 
+use std::fmt;
+
 use serde_json::{Value, json};
 use uuid::Uuid;
 
@@ -58,7 +60,7 @@ pub fn verb_for(notification_type: &str) -> &'static str {
 
 /// Everything [`payload_json`] stitches into the delivered document, read
 /// from the database by the [`push.deliver` job](crate::jobs::web_push).
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct PushPayload<'a> {
     /// The subscription's access token string (`oauth_tokens.token`): what
     /// the client wakes with to fetch what changed.
@@ -75,6 +77,20 @@ pub struct PushPayload<'a> {
     /// The status's plain text, or empty — hidden contents and status-less
     /// types both send `""`.
     pub body: &'a str,
+}
+
+/// The payload's `Debug` never prints the live bearer token.
+impl fmt::Debug for PushPayload<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PushPayload")
+            .field("access_token", &"<redacted>")
+            .field("notification_id", &self.notification_id)
+            .field("notification_type", &self.notification_type)
+            .field("icon", &self.icon)
+            .field("actor_display_name", &self.actor_display_name)
+            .field("body", &self.body)
+            .finish()
+    }
 }
 
 /// The Mastodon-shaped push payload as compact JSON.
@@ -104,6 +120,24 @@ pub fn payload_json(parts: &PushPayload<'_>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn debug_output_redacts_the_access_token() {
+        let id = Uuid::from_u128(0x1234);
+        let payload = PushPayload {
+            access_token: "tok123",
+            notification_id: id,
+            notification_type: "follow",
+            icon: "https://example.test/a.png",
+            actor_display_name: "Alice",
+            body: "hello",
+        };
+        let shown = format!("{payload:?}");
+        assert!(!shown.contains("tok123"), "token leaked: {shown}");
+        assert!(shown.contains("<redacted>"), "marks the token: {shown}");
+        assert!(shown.contains(&id.to_string()), "keeps the id: {shown}");
+        assert!(shown.contains("Alice"), "keeps the other fields: {shown}");
+    }
 
     #[test]
     fn alert_flags_read_the_stored_object_with_a_default_on() {

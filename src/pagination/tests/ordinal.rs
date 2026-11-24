@@ -66,6 +66,20 @@ fn ordinal_keyset_orders_on_the_given_column() {
 }
 
 #[test]
+fn ordinal_keyset_with_all_three_cursors_has_exact_sql() {
+    let mut qb = QueryBuilder::new("SELECT position FROM list_members WHERE 1=1");
+    OrdinalPageParams::from_query(Some("max_id=9&min_id=4&since_id=7&limit=5"), MAX_LIMIT)
+        .unwrap()
+        .apply_keyset(&mut qb, "lm.position");
+    assert_eq!(
+        qb.into_sql(),
+        "SELECT position FROM list_members WHERE 1=1 AND lm.position < $1 \
+             AND lm.position > $2 AND lm.position > $3 ORDER BY lm.position ASC LIMIT $4",
+        "max, min and since conditions in order, ascending because min_id is present"
+    );
+}
+
+#[test]
 fn an_ordinal_page_without_a_limit_fetches_every_row() {
     let mut qb = QueryBuilder::new("SELECT position FROM list_members WHERE 1=1");
     OrdinalPageParams::from_query(Some("limit=0"), MAX_LIMIT)

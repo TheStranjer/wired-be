@@ -37,8 +37,6 @@
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
-use crate::util::id::new_id;
-
 mod delete;
 mod groups;
 mod read;
@@ -117,46 +115,4 @@ pub struct ReactionSummary {
     /// The reactors, earliest reaction first, at most
     /// [`MAX_SUMMARY_REACTORS`] of them.
     pub account_ids: Vec<Uuid>,
-}
-
-/// The `ap_id` [`react`] stores: a freshly minted
-/// `{base_url}/activities/{uuid}` (decision 6). Every reaction this model
-/// writes comes from a local account through the API; the federation ticket
-/// that mirrors a remote `EmojiReact` records that activity's own id.
-fn local_activity_id(base_url: &str) -> String {
-    format!("{base_url}/activities/{}", new_id())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::test_support::{CAT, CAT_URL};
-    use super::*;
-
-    #[test]
-    fn a_summary_counts_every_reactor_and_lists_the_first_five() {
-        let me = Uuid::now_v7();
-        let listed: Vec<Uuid> = (0..MAX_SUMMARY_REACTORS).map(|_| Uuid::now_v7()).collect();
-        let late = Uuid::now_v7();
-        let group = ReactorGroup {
-            name: CAT.to_owned(),
-            url: Some(CAT_URL.to_owned()),
-            reactor_ids: [listed.as_slice(), &[late, me]].concat(),
-        };
-
-        assert_eq!(
-            group.clone().into_summary(Some(me)),
-            ReactionSummary {
-                name: CAT.to_owned(),
-                count: 7,
-                me: true,
-                url: Some(CAT_URL.to_owned()),
-                account_ids: listed,
-            },
-            "the seventh reactor is `me` without being listed"
-        );
-        assert!(
-            !group.into_summary(None).me,
-            "an anonymous viewer is never `me`"
-        );
-    }
 }

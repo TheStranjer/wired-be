@@ -1,7 +1,7 @@
 //! The unauthenticated read endpoints: the util emoji map, the pack
 //! listing, one pack and the pack archive download.
 
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, path::Path};
 
 use axum::{
     Json,
@@ -23,15 +23,44 @@ use crate::{
     models::custom_emoji,
     services::emoji_packs,
     state::AppState,
+    util::token::sha256_hex_bytes,
 };
+
+/// The metadata block a listing serializes: the stored
+/// [`PackMeta`](emoji_packs::PackMeta) plus the two keys Pleroma computes
+/// when it loads a pack (`validate_pack`), which a remote instance needs to
+/// install a shared pack.
+#[derive(Debug, Serialize)]
+pub(super) struct PackMetaView {
+    /// The stored metadata, its `download-sha256` replaced by the digest
+    /// of the archive this instance serves right now.
+    #[serde(flatten)]
+    meta: emoji_packs::PackMeta,
+    /// Whether the archive endpoint can serve this pack.
+    #[serde(rename = "can-download")]
+    can_download: bool,
+}
+
+impl PackMetaView {
+    /// The block for `meta` with `digest`, the uppercase hex SHA-256 of
+    /// the pack's archive, or `None` for a pack that cannot be downloaded
+    /// (whatever digest the manifest carried is dropped).
+    fn new(mut meta: emoji_packs::PackMeta, digest: Option<String>) -> Self {
+        meta.download_sha256 = digest;
+        Self {
+            can_download: meta.download_sha256.is_some(),
+            meta,
+        }
+    }
+}
 
 /// One pack as the endpoints serialize it: Pleroma's `@derive
 /// {Jason.Encoder, only: [:files, :pack, :files_count]}` — `files` may be
 /// the paginated window while `files_count` always counts the whole pack.
 #[derive(Debug, Serialize)]
 pub(super) struct PackView {
-    /// The manifest metadata block.
-    pack: emoji_packs::PackMeta,
+    /// The manifest metadata block with the download advertisement.
+    pack: PackMetaView,
     /// The pack's files (full list on `/packs`, one page on `/pack`).
     files: BTreeMap<String, String>,
     /// Total files in the pack, before pagination.
@@ -39,28 +68,48 @@ pub(super) struct PackView {
 }
 
 impl PackView {
-    /// The view carrying all of `pack`'s files.
-    fn full(pack: emoji_packs::Pack) -> Self {
+    /// The view carrying all of `pack`'s files, advertising `digest`.
+    fn full(pack: emoji_packs::Pack, digest: Option<String>) -> Self {
         let files_count = pack.files.len();
         Self {
-            pack: pack.pack,
+            pack: PackMetaView::new(pack.pack, digest),
             files: pack.files,
             files_count,
         }
     }
 
     /// The view carrying `pack`'s files paginated by shortcode (the map is
-    /// ordered, matching Pleroma's `Enum.sort` of the keys).
-    fn paginated(pack: emoji_packs::Pack, page: usize, page_size: usize) -> Self {
+    /// ordered, matching Pleroma's `Enum.sort` of the keys), advertising
+    /// `digest`.
+    fn paginated(
+        pack: emoji_packs::Pack,
+        digest: Option<String>,
+        page: usize,
+        page_size: usize,
+    ) -> Self {
         let files_count = pack.files.len();
         Self {
-            pack: pack.pack,
+            pack: PackMetaView::new(pack.pack, digest),
             files: take_page(pack.files.into_iter(), page, page_size)
                 .into_iter()
                 .collect(),
             files_count,
         }
     }
+}
+
+/// The uppercase hex SHA-256 of pack `name`'s archive (Pleroma's
+/// `Base.encode16`), the digest of the bytes `/packs/archive` serves.
+/// `None` when `pack` does not share its files or its archive cannot be
+/// built: the pack is then not downloadable.
+/// [`emoji_packs::pack_archive`] writes entries in a fixed order with a
+/// fixed timestamp, so the digest matches the download byte for byte.
+async fn download_digest(dir: &Path, name: &str, pack: &emoji_packs::Pack) -> Option<String> {
+    if !pack.pack.share_files {
+        return None;
+    }
+    let bytes = emoji_packs::pack_archive(dir, name).await.ok()?;
+    Some(sha256_hex_bytes(&bytes).to_ascii_uppercase())
 }
 
 /// The `/packs` response body: the total pack count and one page of packs
@@ -75,15 +124,21 @@ pub(super) struct PacksResponse {
 
 impl PacksResponse {
     /// The paginated listing over every loaded pack (`all` is name-ordered
-    /// by [`list_packs`](emoji_packs::list_packs)).
-    fn new(all: Vec<(String, emoji_packs::Pack)>, page: usize, page_size: usize) -> Self {
-        Self {
-            count: all.len(),
-            packs: take_page(all.into_iter(), page, page_size)
-                .into_iter()
-                .map(|(name, pack)| (name, PackView::full(pack)))
-                .collect(),
+    /// by [`list_packs`](emoji_packs::list_packs)); only the packs of the
+    /// requested page have their archives hashed.
+    async fn load(
+        dir: &Path,
+        all: Vec<(String, emoji_packs::Pack)>,
+        page: usize,
+        page_size: usize,
+    ) -> Self {
+        let count = all.len();
+        let mut packs = BTreeMap::new();
+        for (name, pack) in take_page(all.into_iter(), page, page_size) {
+            let digest = download_digest(dir, &name, &pack).await;
+            let _previous: Option<PackView> = packs.insert(name, PackView::full(pack, digest));
         }
+        Self { count, packs }
     }
 }
 
@@ -135,7 +190,9 @@ pub(super) async fn index(
     params: PackParams,
 ) -> AppResult<Json<PacksResponse>> {
     let all = emoji_packs::list_packs(&state.config.emoji_dir).await?;
-    Ok(Json(PacksResponse::new(all, params.page, params.page_size)))
+    Ok(Json(
+        PacksResponse::load(&state.config.emoji_dir, all, params.page, params.page_size).await,
+    ))
 }
 
 /// `GET /api/v1/pleroma/emoji/pack?name=…` — one pack with its files
@@ -151,9 +208,12 @@ pub(super) async fn show(
     State(state): State<AppState>,
     params: PackParams,
 ) -> AppResult<Json<PackView>> {
-    let pack = load_or_404(&state, params.required_name()?).await?;
+    let name = params.required_name()?;
+    let pack = load_or_404(&state, name).await?;
+    let digest = download_digest(&state.config.emoji_dir, name, &pack).await;
     Ok(Json(PackView::paginated(
         pack,
+        digest,
         params.page,
         params.page_size,
     )))
@@ -250,22 +310,34 @@ mod tests {
 
     #[test]
     fn the_pack_view_serializes_pleromas_three_keys() {
-        let value = serde_json::to_value(PackView::full(fixture_pack())).unwrap();
+        let digest = Some("ABCDEF".to_owned());
+        let value = serde_json::to_value(PackView::full(fixture_pack(), digest.clone())).unwrap();
         assert_eq!(
             value,
             json!({
-                "pack": {"license": "CC0-1.0", "share-files": true},
+                "pack": {
+                    "license": "CC0-1.0",
+                    "share-files": true,
+                    "can-download": true,
+                    "download-sha256": "ABCDEF",
+                },
                 "files": {"cat": "cat.png", "dog": "dog.png"},
                 "files_count": 2,
             }),
-            "metadata block, full shortcode map and count"
+            "metadata block with the advertisement, full shortcode map and count"
         );
 
-        let paged = serde_json::to_value(PackView::paginated(fixture_pack(), 2, 1)).unwrap();
+        let paged =
+            serde_json::to_value(PackView::paginated(fixture_pack(), digest, 2, 1)).unwrap();
         assert_eq!(
             paged,
             json!({
-                "pack": {"license": "CC0-1.0", "share-files": true},
+                "pack": {
+                    "license": "CC0-1.0",
+                    "share-files": true,
+                    "can-download": true,
+                    "download-sha256": "ABCDEF",
+                },
                 "files": {"dog": "dog.png"},
                 "files_count": 2,
             }),
@@ -274,14 +346,32 @@ mod tests {
     }
 
     #[test]
-    fn the_packs_response_pages_by_name_and_counts_everything() {
+    fn a_pack_without_a_digest_is_not_downloadable_and_drops_a_stored_hash() {
+        let mut pack = fixture_pack();
+        pack.pack.download_sha256 = Some("STALE".to_owned());
+        let value = serde_json::to_value(PackView::full(pack, None)).unwrap();
+        assert_eq!(
+            value["pack"],
+            json!({"license": "CC0-1.0", "share-files": true, "can-download": false}),
+            "can-download is false and the stored digest is not advertised"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_packs_response_pages_by_name_and_counts_everything() {
+        let dir = tempfile::TempDir::new().unwrap();
         let all = vec![
             ("a".to_owned(), fixture_pack()),
             ("b".to_owned(), fixture_pack()),
             ("c".to_owned(), fixture_pack()),
         ];
-        let value = serde_json::to_value(PacksResponse::new(all, 2, 2)).unwrap();
+        let value = serde_json::to_value(PacksResponse::load(dir.path(), all, 2, 2).await).unwrap();
         assert_eq!(value["count"], json!(3), "count is every pack on disk");
+        assert_eq!(
+            value["packs"]["c"]["pack"]["can-download"],
+            json!(false),
+            "a shared pack whose files are off disk cannot be downloaded"
+        );
         assert_eq!(
             value["packs"]
                 .as_object()

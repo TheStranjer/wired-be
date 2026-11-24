@@ -222,21 +222,12 @@ mod tests {
         config::TEST_BASE_URL,
         error::AppError,
         models::status::{NewStatus, insert, soft_delete},
-        models::user::{NewUser, User, insert as insert_user, local_ap_id},
+        models::user::User,
+        test_fixtures::local_user as user,
     };
 
     /// The instance origin the fixtures post under.
     const BASE: &str = TEST_BASE_URL;
-
-    /// A local user named `nickname`.
-    async fn user(pool: &PgPool, nickname: &str) -> User {
-        insert_user(
-            pool,
-            &NewUser::local(nickname, &local_ap_id(BASE, nickname)),
-        )
-        .await
-        .expect("the fixture user inserts")
-    }
 
     /// A public post by `author`, as its row.
     async fn post(pool: &PgPool, author: &User) -> Status {

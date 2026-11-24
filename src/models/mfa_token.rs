@@ -181,24 +181,13 @@ mod tests {
     use sqlx::PgPool;
 
     use super::*;
-    use crate::models::{
-        oauth_app::{NewOauthApp, create as create_app},
-        oauth_token,
-        user::{NewUser, insert, local_ap_id},
+    use crate::{
+        models::{
+            oauth_app::{NewOauthApp, create as create_app},
+            oauth_token,
+        },
+        test_fixtures::local_user as insert_user,
     };
-
-    /// The instance origin the fixtures pretend to serve.
-    const BASE: &str = "https://test.example";
-
-    /// Inserts a local user named `nickname` and returns the row.
-    async fn insert_user(pool: &PgPool, nickname: &str) -> crate::models::user::User {
-        insert(
-            pool,
-            &NewUser::local(nickname, &local_ap_id(BASE, nickname)),
-        )
-        .await
-        .unwrap()
-    }
 
     /// Registers an app named `name` and returns it.
     async fn insert_app(pool: &PgPool, name: &str) -> crate::models::oauth_app::OauthApp {

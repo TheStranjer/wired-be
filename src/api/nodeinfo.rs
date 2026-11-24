@@ -42,13 +42,13 @@ use axum::{
 
 use self::{
     document::{Discovery, NodeInfo},
-    metadata::{Federation, Metadata},
+    metadata::Metadata,
     usage::{Usage, read_local_post_count, read_staff_accounts, read_user_counts},
 };
 use crate::{
     error::{AppError, AppResult},
     federation::mrf,
-    services::runtime_config::RuntimeConfig,
+    services::{instance_meta::Federation, runtime_config::RuntimeConfig},
     state::AppState,
 };
 
@@ -60,12 +60,6 @@ const REL_21: &str = "http://nodeinfo.diaspora.software/ns/schema/2.1";
 /// speak Pleroma's dialect detect it through the `features` list (see
 /// [`crate::services::instance_meta`]), not by sniffing this name.
 const SOFTWARE_NAME: &str = "wired";
-/// The Pleroma release whose HTTP interface this server replicates
-/// (decision 1), kept in the software version's compatibility comment.
-const PLEROMA_COMPATIBILITY_VERSION: &str = "2.10.2";
-/// Source repository, reported as `software.repository` and
-/// `software.homepage` by the 2.1 document.
-const REPOSITORY_URL: &str = "https://github.com/TheStranjer/wired-be";
 /// 404 body of `/nodeinfo/{version}` for a schema this server does not
 /// serve, Pleroma's `render_error(:not_found, …)` message.
 const UNHANDLED_VERSION: &str = "Nodeinfo schema version not handled";
@@ -79,37 +73,6 @@ const CONTENT_TYPE_21: &str =
     "application/json; profile=\"http://nodeinfo.diaspora.software/ns/schema/2.1#\"";
 /// The only protocol this server federates with.
 const PROTOCOLS: [&str; 1] = ["activitypub"];
-/// `metadata.postFormats`: the source formats a status may be written in
-/// (the three [`crate::util::format`] renders); Pleroma's list names
-/// bbcode and Misskey markdown too, which this server has no renderer for.
-const POST_FORMATS: [&str; 3] = ["text/plain", "text/html", "text/markdown"];
-/// Characters one poll option may hold (Pleroma's
-/// `[:instance, :poll_limits]` `max_option_chars`).
-const MAX_POLL_OPTION_CHARS: usize = 200;
-/// Seconds a poll may run for at least; 0 means "no minimum"
-/// (Pleroma's `min_expiration`).
-const MIN_POLL_EXPIRATION_SECS: usize = 0;
-/// Seconds a poll may run for at most: a year (Pleroma's `max_expiration`
-/// of `365 * 24 * 60 * 60`).
-const MAX_POLL_EXPIRATION_SECS: usize = 365 * 24 * 60 * 60;
-/// Bytes an uploaded avatar may hold (Pleroma's `avatar_upload_limit`).
-const AVATAR_UPLOAD_LIMIT: usize = 2_000_000;
-/// Bytes an uploaded banner may hold (Pleroma's `banner_upload_limit`).
-const BANNER_UPLOAD_LIMIT: usize = 4_000_000;
-/// Bytes a profile background may hold (Pleroma's
-/// `background_upload_limit`).
-const BACKGROUND_UPLOAD_LIMIT: usize = 4_000_000;
-/// Profile fields one account may set (Pleroma's `max_account_fields`).
-const MAX_ACCOUNT_FIELDS: usize = 10;
-/// Fields a remote account may carry before they are dropped (Pleroma's
-/// `max_remote_account_fields`).
-const MAX_REMOTE_ACCOUNT_FIELDS: usize = 20;
-/// Characters a profile field name may hold (Pleroma's
-/// `account_field_name_length`).
-const ACCOUNT_FIELD_NAME_LENGTH: usize = 512;
-/// Characters a profile field value may hold (Pleroma's
-/// `account_field_value_length`).
-const ACCOUNT_FIELD_VALUE_LENGTH: usize = 2048;
 
 /// The top-level `NodeInfo` router, merged by [`crate::app`].
 ///

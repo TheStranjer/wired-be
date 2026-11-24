@@ -61,17 +61,18 @@ async fn a_created_public_status_reaches_public_and_home_then_deletes() {
 
     let anon_frame = next_json(&mut anon).await;
     assert_update_carries(&anon_frame, &entity.id);
-    assert!(
-        streams_of(&anon_frame).contains(&"public"),
+    assert_eq!(
+        streams_of(&anon_frame),
+        ["public"],
         "the anonymous socket's public stream carries it: {anon_frame}"
     );
 
-    let home_stream = format!("user:{}", follower.id);
     let home_frame = next_json(&mut home).await;
     assert_update_carries(&home_frame, &entity.id);
-    assert!(
-        streams_of(&home_frame).contains(&home_stream.as_str()),
-        "the follower's home stream carries it: {home_frame}"
+    assert_eq!(
+        streams_of(&home_frame),
+        ["user"],
+        "the follower's home stream carries it, under its public name: {home_frame}"
     );
 
     let id = Uuid::parse_str(&entity.id).expect("the entity id is a uuid");
@@ -200,9 +201,9 @@ async fn a_favourite_lands_a_notification_frame_on_the_recipient_socket() {
         frame["event"], "notification",
         "the recipient sees the event"
     );
-    let recipient_stream = format!("user:notification:{}", author.id);
-    assert!(
-        streams_of(&frame).contains(&recipient_stream.as_str()),
+    assert_eq!(
+        streams_of(&frame),
+        ["user:notification"],
         "it rides the recipient's notification stream: {frame}"
     );
     let payload: Value = serde_json::from_str(
@@ -297,9 +298,10 @@ async fn announcement_published_reaches_every_active_local_socket() {
     let alice_announcement = parse_event(&alice_frames, "announcement");
     assert_eq!(
         alice_announcement["stream"],
-        json!([alice_stream, bob_stream]),
-        "the event rides exactly the roster's own streams, alice's first"
+        json!(["user"]),
+        "the socket is told its own public stream name, not the roster's uuid-named ones"
     );
+    assert_absent(&alice_frames, &[alice_stream.as_str(), bob_stream.as_str()]);
     assert_eq!(
         alice_announcement["payload"],
         entity.to_string(),

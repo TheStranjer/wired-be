@@ -90,7 +90,12 @@ use axum::{
     routing::{get, post},
 };
 
-use crate::{config::Config, extract::multipart::upload_body_limit, state::AppState};
+use crate::{
+    config::Config,
+    error::{AppError, AppResult},
+    extract::multipart::upload_body_limit,
+    state::AppState,
+};
 
 use self::{
     update::{get_media, update_media},
@@ -137,6 +142,20 @@ const UPDATE_FOCUS_INVALID: &str = "Invalid focus";
 /// Edge bound of the generated preview image, in pixels (the ticket's 400):
 /// the longest edge of a thumbnail is scaled down to this, never up.
 const THUMBNAIL_MAX_EDGE: u32 = 400;
+
+/// Refuses alt text longer than `config.max_media_description` characters,
+/// the one rule the upload and the update path both enforce.
+///
+/// # Errors
+///
+/// [`AppError::Unprocessable`] with [`DESCRIPTION_TOO_LONG`] when `text` has
+/// more characters (not bytes) than the configured limit.
+fn check_description(config: &Config, text: &str) -> AppResult<()> {
+    if text.chars().count() > config.max_media_description {
+        return Err(AppError::Unprocessable(DESCRIPTION_TOO_LONG.to_owned()));
+    }
+    Ok(())
+}
 
 /// The `/media` router, merged into both [`crate::api::v1`] and
 /// [`crate::api::v2`]: the two upload paths and the `{id}` metadata routes

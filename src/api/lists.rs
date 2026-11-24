@@ -76,7 +76,7 @@ use tracing::debug;
 use uuid::Uuid;
 
 use crate::{
-    api::helpers::{account_or_404, distinct_ids},
+    api::helpers::{account_or_404, capped_distinct_ids},
     auth::AuthUser,
     entities::{
         account::{Account, AccountViewer},
@@ -89,7 +89,7 @@ use crate::{
         list, user,
     },
     oauth::scopes::{READ_LISTS, WRITE_LISTS},
-    pagination::{MAX_LIMIT, OrdinalPageParams, link_header, set_link_header},
+    pagination::{MAX_LIMIT, OrdinalPageParams, link_for_page, set_link_header},
     state::AppState,
     util::id::parse_id,
 };
@@ -107,10 +107,6 @@ const POLICY_INVALID: &str = "Validation failed: Replies policy is not included 
 /// 422 body for an account the caller does not follow (Mastodon's changeset
 /// wording for `List`'s `account_ids` validation; the ticket's exact text).
 const NOT_FOLLOWED: &str = "Validation failed: Account is not followed";
-/// The `Link` header's query parameters carry nothing but the cursor: the
-/// members page has no filter to repeat on either link (the relationship
-/// listings' constant, same rule).
-const NO_EXTRA_QUERY: [(String, String); 0] = [];
 
 /// The `/api/v1/lists` router, merged into [`crate::api::v1`].
 pub fn router() -> Router<AppState> {
@@ -308,7 +304,7 @@ async fn list_list_accounts(
     OriginalUri(uri): OriginalUri,
 ) -> AppResult<(HeaderMap, Json<Vec<Account>>)> {
     auth.require(READ_LISTS)?;
-    let list_id = owned_list(&state, &auth, &id).await?;
+    let list_id = owned_list(&state, auth.0.id, &id).await?;
     let page = OrdinalPageParams::from_query(uri.query(), MAX_LIMIT)?;
     let entries = list::members_page(&state.db, list_id, page).await?;
     debug!(
@@ -317,7 +313,9 @@ async fn list_list_accounts(
         user = %auth.0.id,
         "list members listed"
     );
-    let link = page_link(&state.config.base_url, uri.path(), &entries);
+    // The cursors key on the membership ordinal
+    // ([`list::MemberEntry::position`]), not on the members' ids.
+    let link = link_for_page(&state.config.base_url, uri.path(), &entries, |e| e.position);
     let mut headers = HeaderMap::new();
     set_link_header(&mut headers, link.as_deref())?;
     let viewer: AccountViewer<'_> = Some(&auth.0);
@@ -345,8 +343,10 @@ async fn list_list_accounts(
 ///
 /// [`AppError::Unauthorized`] / [`AppError::Forbidden`] from [`AuthUser`] and
 /// the `write:lists` check; [`AppError::Unprocessable`] when the body has no
-/// `account_ids` array (the extractor's 422) or names an account the caller
-/// does not follow; [`AppError::NotFound`] for a list that is malformed,
+/// `account_ids` array (the extractor's 422), names an account the caller
+/// does not follow, or names more than
+/// [`MAX_BATCH_IDS`](crate::api::helpers::MAX_BATCH_IDS) distinct ids
+/// (`Too many ids`, refused before any read); [`AppError::NotFound`] for a list that is malformed,
 /// unknown or foreign, and for an account id that is malformed or names no
 /// account. Any database failure arrives through `?` as [`AppError::Database`].
 async fn add_list_accounts(
@@ -356,8 +356,9 @@ async fn add_list_accounts(
     ApiBody(body): ApiBody<MemberParams>,
 ) -> AppResult<Json<Value>> {
     auth.require(WRITE_LISTS)?;
-    let list_id = owned_list(&state, &auth, &id).await?;
-    let members = requested_accounts(&state, &body.account_ids).await?;
+    let (ids, all_ids) = capped_distinct_ids(body.account_ids.iter().map(String::as_str))?;
+    let list_id = owned_list(&state, auth.0.id, &id).await?;
+    let members = requested_accounts(&state, ids, all_ids).await?;
     ensure_followed(&state, auth.0.id, &members).await?;
     let added = list::add_members(&state.db, list_id, &members).await?;
     debug!(
@@ -382,7 +383,9 @@ async fn add_list_accounts(
 ///
 /// [`AppError::Unauthorized`] / [`AppError::Forbidden`] from [`AuthUser`] and
 /// the `write:lists` check; [`AppError::Unprocessable`] when neither the body
-/// nor the query carries an `account_ids` array; [`AppError::NotFound`] for a
+/// nor the query carries an `account_ids` array, or it names more than
+/// [`MAX_BATCH_IDS`](crate::api::helpers::MAX_BATCH_IDS) distinct ids
+/// (`Too many ids`, refused before any read); [`AppError::NotFound`] for a
 /// list that is malformed, unknown or foreign. Any database failure arrives
 /// through `?` as [`AppError::Database`].
 async fn remove_list_accounts(
@@ -392,8 +395,9 @@ async fn remove_list_accounts(
     ApiParams(params): ApiParams<MemberParams>,
 ) -> AppResult<Json<Value>> {
     auth.require(WRITE_LISTS)?;
-    let list_id = owned_list(&state, &auth, &id).await?;
-    let (members, _unknown_ignored) = distinct_ids(params.account_ids.iter().map(String::as_str));
+    let (members, _unknown_ignored) =
+        capped_distinct_ids(params.account_ids.iter().map(String::as_str))?;
+    let list_id = owned_list(&state, auth.0.id, &id).await?;
     let removed = list::remove_members(&state.db, list_id, &members).await?;
     debug!(
         removed,
@@ -404,23 +408,21 @@ async fn remove_list_accounts(
     Ok(empty_object())
 }
 
-/// The `{id}` path segment of a list route, resolved to the caller's list:
-/// [`AppError::NotFound`] for an id that is malformed, names no list or names
-/// one of another account — Pleroma's `list_by_id_and_user` plug, which
-/// answers all three the same way before any action runs.
+/// The `{id}` path segment of a list route, resolved to the list `owner`
+/// owns: [`AppError::NotFound`] for an id that is malformed, names no list or
+/// names one of another account — Pleroma's `list_by_id_and_user` plug, which
+/// answers all three the same way before any action runs. The list timeline
+/// resolves its `{list_id}` the same way.
 ///
 /// # Errors
 ///
 /// [`AppError::NotFound`] as described; any database failure arrives through
 /// `?` as [`AppError::Database`].
-async fn owned_list(state: &AppState, auth: &AuthUser, id: &str) -> AppResult<Uuid> {
+pub(crate) async fn owned_list(state: &AppState, owner: Uuid, id: &str) -> AppResult<Uuid> {
     let Some(list_id) = parse_id(id) else {
         return Err(AppError::NotFound);
     };
-    if list::get_owned(&state.db, auth.0.id, list_id)
-        .await?
-        .is_none()
-    {
+    if list::get_owned(&state.db, owner, list_id).await?.is_none() {
         return Err(AppError::NotFound);
     }
     Ok(list_id)
@@ -435,8 +437,11 @@ async fn owned_list(state: &AppState, auth: &AuthUser, id: &str) -> AppResult<Uu
 ///
 /// [`AppError::NotFound`] as described; any database failure arrives through
 /// `?` as [`AppError::Database`].
-async fn requested_accounts(state: &AppState, texts: &[String]) -> AppResult<Vec<Uuid>> {
-    let (ids, all_ids) = distinct_ids(texts.iter().map(String::as_str));
+async fn requested_accounts(
+    state: &AppState,
+    ids: Vec<Uuid>,
+    all_ids: bool,
+) -> AppResult<Vec<Uuid>> {
     if !all_ids {
         return Err(AppError::NotFound);
     }
@@ -472,18 +477,6 @@ async fn ensure_followed(state: &AppState, follower: Uuid, targets: &[Uuid]) -> 
         }
     }
     Ok(())
-}
-
-/// The `Link` header value for a fetched members page: Pleroma's
-/// `add_link_headers` over the first (newest) and last (oldest) entry's
-/// [`list::MemberEntry::position`] — the cursors key on the membership
-/// ordinal, not on the members' ids — and `None` for an empty page.
-///
-/// [`list::MemberEntry::position`]: crate::models::list::MemberEntry::position
-fn page_link(base_url: &str, path: &str, entries: &[list::MemberEntry]) -> Option<String> {
-    let newest = entries.first()?.position.to_string();
-    let oldest = entries.last()?.position.to_string();
-    link_header(base_url, path, &NO_EXTRA_QUERY, &newest, &oldest)
 }
 
 /// The body both membership writes answer: `{}`, Pleroma's
@@ -603,6 +596,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    use crate::api::helpers::distinct_ids;
 
     /// Parses `value` as the endpoint's parameters and validates them as a
     /// create would.

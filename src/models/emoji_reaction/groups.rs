@@ -1,11 +1,10 @@
-//! Folding the flat reaction rows of a query into one group per status
+//! Folding the flat reaction rows of [`reactors`] into one group per status
 //! and emoji, each carrying its reactors in order.
 
 use uuid::Uuid;
 
 #[cfg(doc)]
-use super::read::{FOR_STATUSES_SQL, REACTORS_SQL, for_statuses, reactors};
-use super::{MAX_SUMMARY_REACTORS, ReactionSummary};
+use super::read::{REACTORS_SQL, reactors};
 
 /// One emoji on one status with *every* account that reacted: what
 /// [`reactors`] answers for the reactions endpoint, which renders all of them
@@ -21,30 +20,8 @@ pub struct ReactorGroup {
     pub reactor_ids: Vec<Uuid>,
 }
 
-impl ReactorGroup {
-    /// This group as the Status entity's summary for `viewer_id` (`None`:
-    /// nobody, so `me` is false): the whole count, whether the viewer is among
-    /// the reactors, and only the first [`MAX_SUMMARY_REACTORS`] ids.
-    pub(super) fn into_summary(self, viewer_id: Option<Uuid>) -> ReactionSummary {
-        let me = viewer_id.is_some_and(|viewer| self.reactor_ids.contains(&viewer));
-        let count = i64::try_from(self.reactor_ids.len()).unwrap_or(i64::MAX);
-        ReactionSummary {
-            name: self.name,
-            count,
-            me,
-            url: self.url,
-            account_ids: self
-                .reactor_ids
-                .into_iter()
-                .take(MAX_SUMMARY_REACTORS)
-                .collect(),
-        }
-    }
-}
-
-/// One fetched row of [`FOR_STATUSES_SQL`] / [`REACTORS_SQL`]: a single
-/// reaction, in the order those statements return them (the window column they
-/// order by is not part of it).
+/// One fetched row of [`REACTORS_SQL`]: a single reaction, in the order that
+/// statement returns them (the window column it orders by is not part of it).
 #[derive(Debug, sqlx::FromRow)]
 pub(super) struct ReactionRow {
     /// The reacted-to status: the outer key of the grouping.
@@ -57,10 +34,10 @@ pub(super) struct ReactionRow {
     user_id: Uuid,
 }
 
-/// Folds [`for_statuses`]'s and [`reactors`]' flat rows into one
-/// [`ReactorGroup`] per `(status_id, emoji)`, in the order the statements
-/// returned them: a group starts at its first row and a later row joins the
-/// group the walk stands in, which both loaders' `ORDER BY` keeps contiguous.
+/// Folds [`reactors`]' flat rows into one [`ReactorGroup`] per
+/// `(status_id, emoji)`, in the order the statement returned them: a group
+/// starts at its first row and a later row joins the group the walk stands in,
+/// which the loader's `ORDER BY` keeps contiguous.
 pub(super) fn group(rows: Vec<ReactionRow>) -> Vec<(Uuid, ReactorGroup)> {
     let mut grouped: Vec<(Uuid, ReactorGroup)> = Vec::with_capacity(rows.len());
     for row in rows {
@@ -81,7 +58,7 @@ pub(super) fn group(rows: Vec<ReactionRow>) -> Vec<(Uuid, ReactorGroup)> {
 /// Appends `row`'s reactor to the group `grouped` last holds, answering whether
 /// it fitted.
 ///
-/// Only that last group can take a row: the statements order a status's rows by
+/// Only that last group can take a row: the statement orders a status's rows by
 /// their emoji's first reaction time and then by the emoji text, so the rows of
 /// one `(status_id, emoji)` arrive together and a row that does not match the
 /// open group starts a new one — which is what [`group`] does on `false`.

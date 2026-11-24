@@ -1,7 +1,10 @@
 //! The follow-up every report state change owes, shared by the three admin
 //! endpoints that move a report: Pleroma's `PATCH /reports`, Mastodon's
 //! `resolve` / `reopen`, and the account action's `report_id`.
+//!
+//! The assignment write both admin APIs' assign routes share lives here too.
 
+use sqlx::PgPool;
 use tracing::debug;
 use uuid::Uuid;
 
@@ -60,6 +63,43 @@ pub async fn set_report_state(
     Ok(Some(row))
 }
 
+/// Hands a report to `assignee`, or back to the unassigned queue on `None`.
+///
+/// Leaves the entry the move owes: `report_assigned` naming the assignee by
+/// nickname, or `report_unassigned`. Assignment is not a state change, so
+/// no event fires. Returns the rewritten row, or `None` — with nothing
+/// written — when no report carries `report_id`.
+///
+/// # Errors
+///
+/// [`AppError::Database`](crate::error::AppError) from the write, the
+/// target read and the log.
+pub async fn assign_report(
+    pool: &PgPool,
+    actor: &User,
+    report_id: Uuid,
+    assignee: Option<&User>,
+) -> AppResult<Option<ReportRow>> {
+    let Some(row) = report::assign(pool, report_id, assignee.map(|found| found.id)).await? else {
+        return Ok(None);
+    };
+    let target = user::get_by_id(pool, row.target_id).await?;
+    let logged = match assignee {
+        Some(found) => {
+            moderation_log::report_assigned(pool, actor, row.id, &found.nickname, target.as_ref())
+                .await?
+        }
+        None => moderation_log::report_unassigned(pool, actor, row.id, target.as_ref()).await?,
+    };
+    debug!(
+        log = %logged.id,
+        report = %row.id,
+        assigned = row.assigned_to.is_some(),
+        "report assignment changed"
+    );
+    Ok(Some(row))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -75,7 +115,7 @@ mod tests {
     };
 
     /// A local account named `nickname`.
-    async fn local(pool: &sqlx::PgPool, nickname: &str) -> User {
+    async fn local(pool: &PgPool, nickname: &str) -> User {
         insert(
             pool,
             &NewUser {
@@ -88,7 +128,7 @@ mod tests {
     }
 
     /// The single count `sql` reads, with `value` bound as `$1`.
-    async fn count(pool: &sqlx::PgPool, sql: &'static str, value: &str) -> i64 {
+    async fn count(pool: &PgPool, sql: &'static str, value: &str) -> i64 {
         sqlx::query_scalar::<_, i64>(sql)
             .bind(value)
             .fetch_one(pool)
@@ -186,5 +226,97 @@ mod tests {
         )
         .await;
         assert_eq!(jobs, 0, "no delivery job");
+    }
+
+    /// A filed report against a fresh target.
+    async fn filed(pool: &PgPool, tag: &str) -> ReportRow {
+        let reporter = local(pool, &format!("{tag}reporter")).await;
+        let target = local(pool, &format!("{tag}target")).await;
+        report::create(
+            pool,
+            TEST_BASE_URL,
+            &reporter,
+            &target,
+            &NewReport {
+                comment: "spam".to_owned(),
+                category: Category::Spam,
+                forwarded: false,
+                rule_ids: vec![],
+                status_ids: vec![],
+            },
+        )
+        .await
+        .expect("the report files")
+    }
+
+    /// Assigning writes the owner and one `report_assigned` entry naming
+    /// the assignee; unassigning clears it and writes `report_unassigned`.
+    #[tokio::test]
+    async fn assigning_and_unassigning_log_once_each() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let actor = local(&pool, "asactor").await;
+        let assignee = local(&pool, "asassignee").await;
+        let report = filed(&pool, "as").await;
+
+        let moved = assign_report(&pool, &actor, report.id, Some(&assignee))
+            .await
+            .expect("the assignment runs")
+            .expect("the report exists");
+
+        assert_eq!(moved.assigned_to, Some(assignee.id), "the assignee owns it");
+        let assign_entries = count(
+            &pool,
+            "SELECT count(*) FROM moderation_log WHERE action = $1",
+            "report_assigned",
+        )
+        .await;
+        assert_eq!(assign_entries, 1, "one report_assigned entry");
+        let named = count(
+            &pool,
+            "SELECT count(*) FROM moderation_log WHERE action = $1 AND message LIKE '%asassignee%'",
+            "report_assigned",
+        )
+        .await;
+        assert_eq!(named, 1, "the entry names the assignee");
+
+        let released = assign_report(&pool, &actor, report.id, None)
+            .await
+            .expect("the release runs")
+            .expect("the report exists");
+
+        assert_eq!(released.assigned_to, None, "nobody owns it");
+        let unassign_entries = count(
+            &pool,
+            "SELECT count(*) FROM moderation_log WHERE action = $1",
+            "report_unassigned",
+        )
+        .await;
+        assert_eq!(unassign_entries, 1, "one report_unassigned entry");
+    }
+
+    /// An id that names no report is `Ok(None)` and leaves no entry.
+    #[tokio::test]
+    async fn assigning_an_unknown_report_writes_nothing() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let actor = local(&pool, "asnoactor").await;
+
+        let moved = assign_report(&pool, &actor, new_id(), Some(&actor))
+            .await
+            .expect("the assignment runs");
+        let released = assign_report(&pool, &actor, new_id(), None)
+            .await
+            .expect("the release runs");
+
+        assert!(moved.is_none(), "no report, no row");
+        assert!(released.is_none(), "no report, no row on release either");
+        let logged = count(
+            &pool,
+            "SELECT count(*) FROM moderation_log WHERE action <> $1",
+            "report_update",
+        )
+        .await;
+        assert_eq!(logged, 0, "no log entry");
     }
 }

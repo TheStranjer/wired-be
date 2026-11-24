@@ -157,7 +157,7 @@ impl Config {
             statics: statics_settings(&lookup)?,
             rich_media_ignore_hosts: rich_media_ignore_hosts(&lookup),
             rich_media_remote: rich_media_remote(&lookup)?,
-            vapid: vapid_settings(&lookup),
+            vapid: vapid_settings(&lookup)?,
             translation: translation_settings(&lookup)?,
             fetch: rest.fetch,
             federation_enabled: federation_enabled(&lookup)?,

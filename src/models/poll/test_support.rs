@@ -7,23 +7,15 @@ use uuid::Uuid;
 
 use crate::models::{
     status::{self, NewStatus, Status},
-    user::{NewUser, User, insert as insert_user, local_ap_id},
+    user::User,
 };
 
 use super::{Poll, PollParams, create};
 
+pub(super) use crate::test_fixtures::local_user as create_user;
+
 /// The instance origin the fixtures pretend to serve.
 pub(super) const BASE: &str = "https://test.example";
-
-/// Inserts a local user named `nickname`, because a vote names one.
-pub(super) async fn create_user(pool: &PgPool, nickname: &str) -> User {
-    insert_user(
-        pool,
-        &NewUser::local(nickname, &local_ap_id(BASE, nickname)),
-    )
-    .await
-    .expect("fixture user inserts")
-}
 
 /// Inserts a local status of `author`, because `status_id` is a foreign
 /// key every poll names.

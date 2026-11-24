@@ -18,10 +18,10 @@
 
 use chrono::TimeDelta;
 use serde_json::Value;
-use tracing::debug;
 
+use super::maintenance::run_sweep;
 use crate::{
-    jobs::{AttemptInfo, HandlerFuture, JobError},
+    jobs::{AttemptInfo, HandlerFuture},
     models::idempotency_key,
     state::AppState,
 };
@@ -41,23 +41,17 @@ pub const MAX_AGE: TimeDelta = TimeDelta::hours(24);
 /// sweep of the mappings older than [`MAX_AGE`], i.e.
 /// [`idempotency_key::delete_older_than`].
 ///
-/// A failed sweep is a [`JobError::Retry`], and the scheduler enqueues the
+/// A failed sweep is a [`JobError::Retry`](crate::jobs::JobError::Retry), and the scheduler enqueues the
 /// next period regardless, so a missed pass costs a dead key its stay in the
 /// table, never a create: the create path treats an unclaimed key exactly as
 /// it always has.
 pub fn handle_cleanup(state: AppState, _attempt: AttemptInfo, _args: Value) -> HandlerFuture {
     Box::pin(async move {
-        match idempotency_key::delete_older_than(&state.db, MAX_AGE).await {
-            Ok(count) => {
-                if count > 0 {
-                    debug!(count, "expired idempotency keys deleted");
-                }
-                Ok(())
-            }
-            Err(err) => Err(JobError::Retry(format!(
-                "expired idempotency key sweep failed: {err}"
-            ))),
-        }
+        run_sweep(
+            "expired idempotency keys deleted",
+            idempotency_key::delete_older_than(&state.db, MAX_AGE),
+        )
+        .await
     })
 }
 
@@ -72,7 +66,7 @@ mod tests {
     use super::*;
     use crate::{
         config::{Config, TEST_BASE_URL},
-        jobs::{QUEUE_BACKGROUND, scheduler::periodic_jobs},
+        jobs::{JobError, QUEUE_BACKGROUND, scheduler::periodic_jobs},
         models::{
             idempotency_key::live_status,
             status::Status,
@@ -182,7 +176,7 @@ mod tests {
 
         match outcome {
             Err(JobError::Retry(detail)) => assert!(
-                detail.starts_with("expired idempotency key sweep failed"),
+                detail.starts_with("expired idempotency keys deleted failed"),
                 "the retry states what failed: {detail}"
             ),
             Ok(()) => panic!("a closed pool must not read as a successful sweep"),

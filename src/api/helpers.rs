@@ -18,6 +18,7 @@ use axum::{
     Json,
     http::{HeaderMap, Uri},
 };
+use serde::Deserialize;
 use tracing::debug;
 use url::form_urlencoded;
 use uuid::Uuid;
@@ -42,7 +43,7 @@ use crate::{
         timeline::TimelineQuery,
     },
     state::AppState,
-    util::id::parse_id,
+    util::{id::parse_id, params::truthy},
 };
 
 /// The `RESTRICT_UNAUTHENTICATED` area that closes anonymous reads of a
@@ -59,6 +60,13 @@ const ID_KEYS: [&str; 2] = ["id", "id[]"];
 /// answers to (`GET /api/v1/statuses`), per
 /// [`requested_status_ids`].
 const IDS_KEYS: [&str; 2] = ["ids", "ids[]"];
+
+/// The most distinct ids a client-supplied id array may name on the routes
+/// that do per-id work (list membership, conversation recipients, bulk
+/// notification dismissal); more is refused with [`TOO_MANY_IDS`].
+pub const MAX_BATCH_IDS: usize = 200;
+/// The 422 message of an id array past [`MAX_BATCH_IDS`].
+pub const TOO_MANY_IDS: &str = "Too many ids";
 
 /// Resolves the `{id}` segment of an account route to its [`User`] row.
 ///
@@ -381,7 +389,7 @@ const CURSOR_KEYS: [&str; 4] = ["max_id", "min_id", "since_id", "offset"];
 /// its viewer, post-process the page through
 /// [`apply_active`](crate::services::filter::apply_active) in the source's
 /// filter context ([`TimelineSource::filter_context`] — `None` for the
-/// direct and list timelines, whose answer skips the pass entirely), and
+/// direct timeline, whose answer skips the pass entirely), and
 /// answer the newest-first [`StatusEntity`] array with the `Link` header
 /// this module's own page cursor derives from the request's `uri` and the
 /// fetched rows' ids (Pleroma's `add_link_headers`). An empty page carries
@@ -495,13 +503,12 @@ pub fn push_visibility(list: &mut Vec<Visibility>, raw: &str) {
 
 /// Whether a query parameter's text spells a true boolean.
 ///
-/// `true` or `1`, trimmed and matched case-insensitively — the same reading
-/// [`crate::api::search`] gives its flags; anything else (absent, empty,
-/// `false`, junk) is `false`.
+/// [`truthy`] is `Some(true)` — `true`, `1`, `on`, `yes` or `t`, trimmed and
+/// matched case-insensitively, the reading every flag in the crate shares;
+/// anything else (absent, empty, `false`, junk) is `false`.
 #[must_use]
 pub fn is_true(text: &str) -> bool {
-    let text = text.trim();
-    text.eq_ignore_ascii_case("true") || text == "1"
+    truthy(text) == Some(true)
 }
 
 /// Starts `account`'s deletion: the write the admin `DELETE
@@ -609,9 +616,70 @@ where
     (ids, all_ids)
 }
 
+/// [`distinct_ids`], refused with [`TOO_MANY_IDS`] when the distinct ids
+/// number more than [`MAX_BATCH_IDS`].
+///
+/// The count is of ids, not of texts: repeats fold into one and junk text
+/// names nothing, so a request is refused only for naming more accounts
+/// than the batch routes will do per-id work for. Callers run it before
+/// any database read.
+///
+/// # Errors
+///
+/// [`AppError::Unprocessable`] with [`TOO_MANY_IDS`] past the cap.
+pub fn capped_distinct_ids<'a, I>(texts: I) -> AppResult<(Vec<Uuid>, bool)>
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    let (ids, all_ids) = distinct_ids(texts);
+    if ids.len() > MAX_BATCH_IDS {
+        return Err(AppError::Unprocessable(TOO_MANY_IDS.to_owned()));
+    }
+    Ok((ids, all_ids))
+}
+
+/// One name list of a repeated parameter: one value or a list (a JSON
+/// array, or `types[]=…` keys in a query string) — the two spellings
+/// Mastodon clients and forms both send.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub(crate) enum StringList {
+    /// A lone name.
+    Single(String),
+    /// A list of names.
+    Multiple(Vec<String>),
+}
+
+impl StringList {
+    /// The names, borrowed, in the order sent.
+    pub(crate) fn names(&self) -> Vec<&str> {
+        match self {
+            Self::Single(name) => vec![name.as_str()],
+            Self::Multiple(names) => names.iter().map(String::as_str).collect(),
+        }
+    }
+}
+
+/// The names behind an optional list parameter, none when it was absent.
+pub(crate) fn names_of(list: Option<&StringList>) -> Vec<&str> {
+    list.map_or_else(Vec::new, StringList::names)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_string_list_reads_a_lone_value_and_an_array() {
+        let lone: StringList =
+            serde_json::from_value(serde_json::json!("follow")).expect("a lone value");
+        assert_eq!(lone.names(), ["follow"], "one name");
+        let many: StringList =
+            serde_json::from_value(serde_json::json!(["a", "b"])).expect("an array");
+        assert_eq!(many.names(), ["a", "b"], "the names in the order sent");
+        assert!(names_of(None).is_empty(), "absent is no names");
+        assert_eq!(names_of(Some(&many)), ["a", "b"], "present is its names");
+    }
 
     /// One of the ids the fixtures pass around.
     const ID_A: &str = "01934567-89ab-7cde-f012-3456789abcde";
@@ -810,10 +878,10 @@ mod tests {
 
     #[test]
     fn the_shared_readers_spell_true_and_a_stored_visibility() {
-        for text in ["true", "1", "TRUE", " true "] {
+        for text in ["true", "1", "TRUE", " true ", "yes", "on", "t"] {
             assert!(is_true(text), "`{text}` spells true");
         }
-        for text in ["", " ", "false", "0", "yes"] {
+        for text in ["", " ", "false", "0", "no", "junk"] {
             assert!(!is_true(text), "`{text}` is not true here");
         }
         let mut kept = Vec::new();
@@ -856,6 +924,39 @@ mod tests {
         let (found, every_text_parsed) = distinct_ids([ID_A, "junk", ID_A, ""]);
         assert!(!every_text_parsed, "junk clears the flag");
         assert_eq!(found.len(), 1, "the ids around the junk are still kept");
+    }
+
+    /// `count` distinct id texts (the simple spelling of 1, 2, ...).
+    fn id_texts(count: usize) -> Vec<String> {
+        (1..=count).map(|n| format!("{n:032x}")).collect()
+    }
+
+    #[test]
+    fn capped_distinct_ids_allows_exactly_the_cap() {
+        let texts = id_texts(MAX_BATCH_IDS);
+        let (ids, all_ids) = capped_distinct_ids(texts.iter().map(String::as_str))
+            .expect("the cap itself is allowed");
+        assert_eq!(ids.len(), MAX_BATCH_IDS);
+        assert!(all_ids);
+    }
+
+    #[test]
+    fn capped_distinct_ids_refuses_one_past_the_cap() {
+        let texts = id_texts(MAX_BATCH_IDS + 1);
+        let err = capped_distinct_ids(texts.iter().map(String::as_str))
+            .expect_err("one past the cap is refused");
+        assert!(matches!(&err, AppError::Unprocessable(m) if m.as_str() == TOO_MANY_IDS));
+    }
+
+    #[test]
+    fn capped_distinct_ids_counts_distinct_ids_only() {
+        let mut texts = id_texts(MAX_BATCH_IDS);
+        texts.extend(id_texts(MAX_BATCH_IDS));
+        texts.push("junk".to_owned());
+        let (ids, all_ids) = capped_distinct_ids(texts.iter().map(String::as_str))
+            .expect("repeats and junk do not count");
+        assert_eq!(ids.len(), MAX_BATCH_IDS);
+        assert!(!all_ids, "the junk is still flagged");
     }
 
     #[test]

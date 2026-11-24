@@ -123,7 +123,7 @@ async fn resolution_telling(
 /// the endpoint's [`on_follow`] audience is the client API's follows, and a
 /// migrated relationship is the move itself, which this one row reports.
 /// Deduplicated on
-/// [`notification::already_notified`](crate::models::notification::already_notified)
+/// [`notification::already_told`](crate::models::notification::already_told)
 /// through this module's `tell_once`: a `Move` redelivered after the
 /// ledger's fortnight expires tells an already-told follower nothing new.
 pub async fn on_move(state: &AppState, follower: &User, moved: &User) {

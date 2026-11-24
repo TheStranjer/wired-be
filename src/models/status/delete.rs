@@ -11,28 +11,34 @@ use crate::{error::AppResult, util::id::new_id};
 
 use super::{Status, counters::uncount_deleted};
 
+/// The tombstone assignment, as a literal so [`concat!`] can splice it into
+/// every statement that turns a status row into a tombstone. A column a
+/// tombstone must clear is added here, once.
+macro_rules! tombstone_set {
+    () => {
+        "SET content = '', raw_text = '', spoiler_text = '', deleted_at = now(), \
+         updated_at = now()"
+    };
+}
+
+pub(super) use tombstone_set;
+
 /// [`soft_delete`]: a live row becomes a tombstone once, which is what makes
 /// the counter steps of the same transaction run exactly once per status.
-const SOFT_DELETE_SQL: &str = "UPDATE statuses
-      SET content = '',
-          raw_text = '',
-          spoiler_text = '',
-          deleted_at = now(),
-          updated_at = now()
-    WHERE id = $1 AND deleted_at IS NULL
-  RETURNING *";
+const SOFT_DELETE_SQL: &str = concat!(
+    "UPDATE statuses ",
+    tombstone_set!(),
+    " WHERE id = $1 AND deleted_at IS NULL RETURNING *"
+);
 
 /// [`soft_delete_with_reblogs`]: the same tombstone [`soft_delete`] writes,
 /// for every live reblog of `id` at once. `RETURNING *` brings those rows back
 /// so their own counters can be stepped down in the same transaction.
-const SOFT_DELETE_REBLOGS_SQL: &str = "UPDATE statuses
-      SET content = '',
-          raw_text = '',
-          spoiler_text = '',
-          deleted_at = now(),
-          updated_at = now()
-    WHERE reblog_of_id = $1 AND deleted_at IS NULL
-  RETURNING *";
+const SOFT_DELETE_REBLOGS_SQL: &str = concat!(
+    "UPDATE statuses ",
+    tombstone_set!(),
+    " WHERE reblog_of_id = $1 AND deleted_at IS NULL RETURNING *"
+);
 
 /// [`soft_delete`] and [`soft_delete_with_reblogs`]: every account's pin of a
 /// status that has just become a tombstone goes with it. A pin is a promise
@@ -118,18 +124,16 @@ const SOFT_DELETE_BATCH: i64 = 100;
 /// The `UPDATE` behind [`soft_delete_all_for_user`]: the tombstone
 /// [`soft_delete`] writes, applied to at most [`SOFT_DELETE_BATCH`] of the
 /// account's live rows per pass, oldest id first.
-const SOFT_DELETE_BATCH_FOR_USER_SQL: &str = "UPDATE statuses
-       SET content = '',
-           raw_text = '',
-           spoiler_text = '',
-           deleted_at = now(),
-           updated_at = now()
-     WHERE id IN (
+const SOFT_DELETE_BATCH_FOR_USER_SQL: &str = concat!(
+    "UPDATE statuses ",
+    tombstone_set!(),
+    " WHERE id IN (
          SELECT id FROM statuses
           WHERE user_id = $1 AND deleted_at IS NULL
           ORDER BY id
           LIMIT $2
-     )";
+     )"
+);
 
 /// Soft-deletes every status authored by user `user_id`: the status step of
 /// the [`users.delete`](crate::jobs::deletion::KIND_DELETE) job.
@@ -279,3 +283,37 @@ async fn tombstone_reblogs(conn: &mut PgConnection, id: Uuid) -> AppResult<Vec<S
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod tombstone_sql_tests {
+    //! The four tombstone statements share one `SET` clause.
+
+    use super::super::reblogs::TOMBSTONE_REBLOG_SQL;
+    use super::*;
+
+    /// Every statement that tombstones a status clears the text and stamps
+    /// `deleted_at`, because they all splice in [`tombstone_set!`].
+    #[test]
+    fn every_tombstone_statement_carries_the_shared_set_clause() {
+        let statements = [
+            ("SOFT_DELETE_SQL", SOFT_DELETE_SQL),
+            ("SOFT_DELETE_REBLOGS_SQL", SOFT_DELETE_REBLOGS_SQL),
+            (
+                "SOFT_DELETE_BATCH_FOR_USER_SQL",
+                SOFT_DELETE_BATCH_FOR_USER_SQL,
+            ),
+            ("TOMBSTONE_REBLOG_SQL", TOMBSTONE_REBLOG_SQL),
+        ];
+        for (name, sql) in statements {
+            assert!(sql.contains(tombstone_set!()), "{name} splices the clause");
+            assert!(
+                sql.contains("deleted_at = now()"),
+                "{name} stamps deleted_at"
+            );
+            assert!(
+                sql.contains("spoiler_text = ''"),
+                "{name} clears spoiler_text"
+            );
+        }
+    }
+}

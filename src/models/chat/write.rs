@@ -6,7 +6,7 @@ use uuid::Uuid;
 
 use crate::{
     error::{AppError, AppResult},
-    util::id::new_id,
+    util::id::{new_id, object_ap_id},
 };
 
 use super::{ChatMessage, MAX_CHAT_MESSAGE_CHARS, NewChatMessage};
@@ -49,7 +49,7 @@ pub(super) async fn write_message(
     let ap_id = new_message
         .ap_id
         .clone()
-        .unwrap_or_else(|| format!("{base_url}/objects/{id}"));
+        .unwrap_or_else(|| object_ap_id(base_url, id));
     let message = sqlx::query_as::<_, ChatMessage>(INSERT_MESSAGE_SQL)
         .bind(id)
         .bind(sender_id)

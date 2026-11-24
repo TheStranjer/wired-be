@@ -17,7 +17,7 @@ use crate::{
     http_client::{HttpError, HttpResponse},
     models::media_proxy_cache,
     state::AppState,
-    util::headers::NOSNIFF,
+    util::{headers::NOSNIFF, media_type::top_level},
 };
 
 /// `cache-control` for proxied media: a day, per the ticket (Pleroma's
@@ -221,15 +221,7 @@ fn copy_validator_headers(
 /// top-level type is `image/…`, `video/…` or `audio/…` (case-insensitive,
 /// parameters stripped).
 fn is_media_type(content_type: &str) -> bool {
-    let top_level = content_type
-        .split(';')
-        .next()
-        .unwrap_or(content_type)
-        .trim()
-        .to_ascii_lowercase();
-    top_level.starts_with("image/")
-        || top_level.starts_with("video/")
-        || top_level.starts_with("audio/")
+    top_level(content_type).is_some()
 }
 
 /// The visible text of header `name`, empty when absent or not text.

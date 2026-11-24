@@ -5,13 +5,9 @@
 use chrono::{DateTime, TimeZone as _, Utc};
 use serde_json::Value;
 
-use crate::config::Config;
+use crate::{config::Config, services::instance_meta::Federation};
 
-use super::{
-    InstanceStats,
-    pleroma::{Federation, PleromaBlock},
-    v1::Instance,
-};
+use super::{InstanceStats, pleroma::PleromaBlock, v1::Instance};
 
 /// The VAPID public key the document builders are tested with: a
 /// stand-in for the pair [`crate::services::vapid`] keeps in

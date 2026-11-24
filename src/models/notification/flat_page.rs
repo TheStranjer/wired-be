@@ -7,7 +7,10 @@
 use sqlx::{PgPool, Postgres, QueryBuilder};
 use uuid::Uuid;
 
-use crate::{error::AppResult, pagination::PageParams};
+use crate::{
+    error::AppResult,
+    pagination::{PageParams, keyset_page},
+};
 
 use super::{BLOCKED_CAUSES, MUTED_CAUSES, Notification};
 
@@ -112,9 +115,7 @@ pub async fn page_for_user(
     let mut qb = QueryBuilder::<Postgres>::new("SELECT n.* FROM notifications n");
     push_visible_scope(&mut qb, params.user_id, params.with_muted);
     params.filters.push(&mut qb);
-    params.page.apply_keyset(&mut qb, "n.id");
-    let rows = qb.build_query_as::<Notification>().fetch_all(pool).await?;
-    Ok(params.page.finish(rows))
+    keyset_page(pool, qb, "n.id", &params.page).await
 }
 
 /// One notification of `user_id` as the listings show it.

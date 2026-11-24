@@ -21,10 +21,7 @@
 //! route's `content_type_for_key` reads back when it serves a file, which is
 //! why [`media_key`] picks the extension from the upload's content type.
 
-use std::{
-    io,
-    path::{Path, PathBuf},
-};
+use std::{io, path::PathBuf};
 
 use bytes::Bytes;
 use rand::RngCore as _;
@@ -33,7 +30,8 @@ use uuid::Uuid;
 
 use crate::{
     config::Config,
-    error::{AppError, AppResult},
+    error::{AppError, AppResult, io_error},
+    util::media_type::essence,
 };
 
 /// Bytes behind the random part of a media key: 8 bytes are 16 hex characters.
@@ -228,12 +226,6 @@ impl LocalUploader {
     }
 }
 
-/// Wraps a filesystem failure, keeping the operation and path for the log:
-/// [`AppError::Internal`] never sends its detail to a client.
-fn io_error(operation: &str, path: &Path, err: &io::Error) -> AppError {
-    AppError::Internal(format!("{operation} {} failed: {err}", path.display()))
-}
-
 /// The backend for an instance's configuration: the local filesystem under
 /// `UPLOADS_DIR`, served at `MEDIA_BASE_URL`.
 impl From<&Config> for UploaderBackend {
@@ -280,14 +272,10 @@ fn extension_for(content_type: &str, filename: Option<&str>) -> String {
 /// The canonical extension of `content_type`, ignoring any `; charset=…`
 /// parameters and letter case; `None` for a type [`MEDIA_TYPES`] does not list.
 fn extension_for_media_type(content_type: &str) -> Option<&'static str> {
-    let media_type = content_type
-        .split(';')
-        .next()
-        .unwrap_or(content_type)
-        .trim();
+    let media_type = essence(content_type);
     MEDIA_TYPES
         .iter()
-        .find(|(known, _)| known.eq_ignore_ascii_case(media_type))
+        .find(|(known, _)| known.eq_ignore_ascii_case(&media_type))
         .map(|(_, extension)| *extension)
 }
 

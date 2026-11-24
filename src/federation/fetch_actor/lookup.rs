@@ -10,12 +10,12 @@ mod by_acct;
 mod by_ap_id;
 
 use chrono::{DateTime, Utc};
-use url::Url;
 
 use crate::{
     config::Config,
     models::user::{User, get_by_id},
     state::AppState,
+    util::url::{is_local_url, parse_http_url},
 };
 
 use super::{FetchError, REFRESH_AFTER, error::server_error, fetch::fetch_and_store};
@@ -62,10 +62,7 @@ fn fresh_since(stamp: Option<DateTime<Utc>>) -> bool {
 /// which answers an unknown local object id without touching the network
 /// too.
 pub(crate) fn is_local_ap_id(config: &Config, ap_id: &str) -> bool {
-    let Ok(base) = Url::parse(&config.base_url) else {
-        return false;
-    };
-    Url::parse(ap_id).is_ok_and(|url| url.authority() == base.authority())
+    parse_http_url(ap_id).is_some_and(|url| is_local_url(config, &url))
 }
 
 #[cfg(test)]

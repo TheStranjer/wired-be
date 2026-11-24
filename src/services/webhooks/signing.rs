@@ -2,17 +2,15 @@
 //! envelope and how an endpoint's answer sorts into complete, discard or
 //! retry.
 
-use hmac::{Hmac, KeyInit as _, Mac as _};
 use serde_json::json;
-use sha2_011::Sha256;
 
-use crate::{http_client::HttpError, jobs::JobError, util::token::to_hex};
+use crate::{
+    http_client::HttpError,
+    jobs::JobError,
+    util::{hmac::hmac_sha256, token::to_hex},
+};
 
 use super::DeliverArgs;
-
-/// The HMAC flavour a delivery signature uses: HMAC-SHA256 over
-/// `"{timestamp}.{body}"`, as Mastodon's webhook signing spells it.
-pub(super) type HmacSha256 = Hmac<Sha256>;
 
 /// Prefix of the `X-Wired-Signature` value, which carries the algorithm
 /// beside the digest (Mastodon's `sha256=<hex>` spelling).
@@ -51,9 +49,7 @@ pub(super) fn event_body(args: &DeliverArgs, created_at: &str) -> String {
 /// `"{timestamp}.{body}"` keyed by `secret` (Pleroma signs the bare body with
 /// its `X-Hub-Signature`; the ticket pins the Mastodon timestamped form).
 pub(super) fn signature(secret: &str, timestamp: i64, body: &str) -> Option<String> {
-    let mut mac = HmacSha256::new_from_slice(secret.as_bytes()).ok()?;
-    mac.update(format!("{timestamp}.{body}").as_bytes());
-    let digest = mac.finalize().into_bytes();
+    let digest = hmac_sha256(secret.as_bytes(), format!("{timestamp}.{body}").as_bytes())?;
     Some(format!("{SIGNATURE_PREFIX}{}", to_hex(&digest)))
 }
 
@@ -108,9 +104,8 @@ mod tests {
         // RFC 4231 case 2: HMAC-SHA256(key "Jefe", data "what do ya want for
         // nothing?"), pinned here so `hex_lower` and the digest are checked
         // against a published value rather than against themselves.
-        let mut mac = HmacSha256::new_from_slice(b"Jefe").expect("a key length");
-        mac.update(b"what do ya want for nothing?");
-        let hex = to_hex(&mac.finalize().into_bytes());
+        let digest = hmac_sha256(b"Jefe", b"what do ya want for nothing?").expect("a key length");
+        let hex = to_hex(&digest);
         assert_eq!(
             hex, "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843",
             "the published digest, lowercase hex"

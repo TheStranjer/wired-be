@@ -9,6 +9,7 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use super::{AccountStatus, Flag};
+use crate::util::password::verify_password;
 
 /// One row of `users`: a local account or a mirror of a remote actor
 /// (decision 7).
@@ -287,6 +288,14 @@ impl fmt::Debug for User {
 }
 
 impl User {
+    /// Whether this is one of this instance's own accounts and is not
+    /// deactivated: the test every public, federated or account-bound
+    /// surface applies before it serves or acts for a user.
+    #[must_use]
+    pub const fn is_local_active(&self) -> bool {
+        self.local.get() && self.is_active.get()
+    }
+
     /// Where this account stands between registration and use, weighed in
     /// the order Pleroma's `User.account_status` uses: deactivation, then
     /// the staff approval `REGISTRATIONS_APPROVAL_REQUIRED` asks for, then
@@ -310,6 +319,28 @@ impl User {
         }
         AccountStatus::Active
     }
+
+    /// Whether `password` matches the stored hash. A row without a hash (a
+    /// remote mirror, a bot-created account) fails exactly like a wrong
+    /// password, as Pleroma's `confirm_current_password` does.
+    ///
+    /// The MFA and account-settings endpoints both confirm the current
+    /// password through this one check.
+    #[must_use]
+    pub fn password_matches(&self, password: &str) -> bool {
+        self.password_hash
+            .as_deref()
+            .is_some_and(|hash| verify_password(password, hash))
+    }
+
+    /// The URL a profile links to: the stored
+    /// [`profile_url`](User::profile_url) when set (what Pleroma's
+    /// `Formatter.mention_from_user` prefers as `user.uri`), else the actor
+    /// id every row is guaranteed to carry.
+    #[must_use]
+    pub fn profile_url_or_ap_id(&self) -> &str {
+        self.profile_url.as_deref().unwrap_or(&self.ap_id)
+    }
 }
 
 #[cfg(test)]
@@ -321,6 +352,59 @@ mod tests {
         NewUser, featured, followers, following, get_by_nickname, inbox, insert, outbox,
         test_support::*,
     };
+
+    #[tokio::test]
+    async fn password_matches_accepts_only_the_stored_password() {
+        const PASSWORD: &str = "correct horse battery staple";
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let hash = crate::util::password::hash_password(PASSWORD).expect("hashing works");
+        let mut user = insert(
+            &pool,
+            &NewUser {
+                password_hash: Some(hash),
+                ..local_new("frank")
+            },
+        )
+        .await
+        .unwrap();
+        assert!(user.password_matches(PASSWORD), "the right password");
+        assert!(!user.password_matches("wrong password"), "a wrong password");
+        assert!(!user.password_matches(""), "an empty password");
+
+        user.password_hash = None;
+        assert!(
+            !user.password_matches(PASSWORD),
+            "a hashless row fails like a wrong password"
+        );
+    }
+
+    #[tokio::test]
+    async fn profile_url_or_ap_id_prefers_the_stored_profile_url() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let bare = insert(&pool, &local_new("plain")).await.unwrap();
+        assert_eq!(
+            bare.profile_url_or_ap_id(),
+            bare.ap_id,
+            "without a profile_url the actor id stands in"
+        );
+        let profile = format!("{BASE}/@fancy");
+        let with_url = insert(
+            &pool,
+            &NewUser {
+                profile_url: Some(profile.clone()),
+                ..local_new("fancy")
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            with_url.profile_url_or_ap_id(),
+            profile,
+            "a stored profile_url wins over the actor id"
+        );
+    }
 
     #[tokio::test]
     async fn remote_user_nickname_carries_the_host() {
@@ -400,6 +484,27 @@ mod tests {
             .unwrap()
             .expect("the remote handle finds the row");
         assert_eq!(fetched.ap_id, ap_id, "same row by nickname");
+    }
+
+    #[tokio::test]
+    async fn is_local_active_needs_both_flags() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let mut row = insert(&pool, &local_new("flags")).await.unwrap();
+        for (local, active, expected) in [
+            (true, true, true),
+            (true, false, false),
+            (false, true, false),
+            (false, false, false),
+        ] {
+            row.local = Flag::new(local);
+            row.is_active = Flag::new(active);
+            assert_eq!(
+                row.is_local_active(),
+                expected,
+                "local={local}, active={active}"
+            );
+        }
     }
 
     #[tokio::test]

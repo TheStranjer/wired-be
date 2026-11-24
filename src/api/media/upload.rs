@@ -29,6 +29,7 @@ use crate::{
 use super::{
     BLANK_FILE, FILE_FIELD, FOCUS_INVALID, MISSING_FILE,
     analyze::{Detection, analyze_upload, detect_media_type, detect_stored},
+    check_description,
     update::parse_focus,
 };
 
@@ -81,6 +82,9 @@ pub(crate) async fn store_upload(
     form: MultipartForm<UploadParams>,
 ) -> AppResult<media_attachment::MediaAttachment> {
     let upload = Upload::from_form(form)?;
+    if let Some(text) = upload.description.as_deref() {
+        check_description(&state.config, text)?;
+    }
     let analyzed = analyze_upload(state, &upload).await?;
     let key = uploads::media_key(
         user_id,

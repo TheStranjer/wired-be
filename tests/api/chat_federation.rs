@@ -20,8 +20,8 @@
 //! - the same object delivered twice — through one activity id and through
 //!   a renamed envelope — is one message and one notification;
 //! - only the sender's `Delete` withdraws: the row becomes a tombstone and
-//!   the notification goes with it, a stranger's `Delete` and a bare-id
-//!   `Delete` leave the message standing.
+//!   the notification goes with it, a bare-id `Delete` withdraws it the
+//!   same way, and a stranger's `Delete` leaves the message standing.
 
 #![cfg(test)]
 
@@ -631,10 +631,12 @@ async fn a_stranger_cannot_withdraw_anothers_message() {
     );
 }
 
-/// A `Delete` whose object is only an id declares no type, routes past
-/// the chat entry to the actor fallback, and leaves the message alone.
+/// A `Delete` whose object is only an id (Pleroma's shape) declares no
+/// type and routes past the chat entry to the note fallback, which finds
+/// the stored chat message under that id and withdraws it — writing no
+/// status tombstone for the uri.
 #[tokio::test]
-async fn a_bare_id_delete_is_not_a_withdrawal() {
+async fn a_bare_id_delete_withdraws_the_message() {
     let db = common::test_db().await;
     let pool = db.pool().clone();
     let (alice, bob) = pair(&pool).await;
@@ -657,14 +659,19 @@ async fn a_bare_id_delete_is_not_a_withdrawal() {
 
     let message = stored_message(&pool, "https://remote.example/objects/chat-bare").await;
     assert!(
-        message.deleted_at.is_none(),
-        "the bare-id Delete is not a withdrawal"
+        message.deleted_at.is_some(),
+        "the bare-id Delete withdraws the message"
     );
-    assert_eq!(
-        note_rows(&pool, alice.id).await.len(),
-        1,
-        "and the telling stands"
+    assert!(
+        note_rows(&pool, alice.id).await.is_empty(),
+        "and the telling goes with it"
     );
+    let statuses = sqlx::query_scalar::<_, i64>("SELECT count(*) FROM statuses WHERE uri = $1")
+        .bind("https://remote.example/objects/chat-bare")
+        .fetch_one(&pool)
+        .await
+        .expect("the status count reads");
+    assert_eq!(statuses, 0, "and no status tombstone is reserved");
 }
 
 /// The delivered sender must be the object's attributed author and a live

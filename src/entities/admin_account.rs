@@ -37,9 +37,11 @@ use serde_json::Value;
 
 use crate::{
     config::Config,
-    entities::account::{DEFAULT_AVATAR_PATH, DEFAULT_BANNER_PATH, JsonBool, profile_image},
+    entities::account::{
+        DEFAULT_AVATAR_PATH, DEFAULT_BANNER_PATH, JsonBool, plain_display_name, profile_image,
+    },
     models::user::{User, admin},
-    util::{sanitize::sanitize_display_name, time::mastodon_time},
+    util::time::mastodon_time,
 };
 
 /// The `roles` object of [`AdminAccount`]: Pleroma's `roles/1`, the two
@@ -116,7 +118,7 @@ impl AdminAccount {
                 DEFAULT_AVATAR_PATH,
             ),
             nickname: user.nickname.clone(),
-            display_name: display_name(user),
+            display_name: plain_display_name(user),
             is_active: JsonBool(user.is_active.get()),
             local: JsonBool(user.local.get()),
             roles: AdminRoles {
@@ -127,10 +129,7 @@ impl AdminAccount {
             is_confirmed: JsonBool(user.email_confirmed.get()),
             is_approved: JsonBool(!user.approval_pending.get()),
             is_suggested: JsonBool(user.is_suggested.get()),
-            url: user
-                .profile_url
-                .clone()
-                .unwrap_or_else(|| user.ap_id.clone()),
+            url: user.profile_url_or_ap_id().to_owned(),
             registration_reason: user.registration_reason.clone(),
             actor_type: user.actor_type.clone(),
             created_at: mastodon_time(&user.inserted_at),
@@ -335,19 +334,6 @@ impl AdminAccounts {
                 .collect(),
         }
     }
-}
-
-/// Pleroma's `strip_tags(user.name || user.nickname)`: the display name
-/// when the account has one, the handle when it does not, and either way
-/// reduced to one line of plain text (the column holds sanitized markup, so
-/// a name fetched from a remote actor can still carry tags).
-fn display_name(user: &User) -> String {
-    let stored = if user.name.is_empty() {
-        user.nickname.as_str()
-    } else {
-        user.name.as_str()
-    };
-    sanitize_display_name(stored)
 }
 
 #[cfg(test)]
@@ -559,7 +545,7 @@ mod tests {
             ..base_user("ada")
         };
         assert_eq!(
-            display_name(&named),
+            plain_display_name(&named),
             "Ada the Countess",
             "the tags go, the text stays"
         );
@@ -567,9 +553,13 @@ mod tests {
             name: "Ada<br>Byron".to_owned(),
             ..base_user("ada")
         };
-        assert_eq!(display_name(&bracked), "Ada Byron", "a break is one space");
         assert_eq!(
-            display_name(&base_user("ada")),
+            plain_display_name(&bracked),
+            "Ada Byron",
+            "a break is one space"
+        );
+        assert_eq!(
+            plain_display_name(&base_user("ada")),
             "ada",
             "with no name at all, the nickname"
         );

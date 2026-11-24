@@ -41,6 +41,8 @@ use uuid::Uuid;
 use crate::{
     error::AppResult,
     models::{
+        block::push_not_blocked,
+        mute::push_not_muted,
         status::Status,
         status_visibility::{ACTIVE_AUTHOR, push_visibility_clause},
         user::User,
@@ -55,11 +57,6 @@ use crate::{
 const BASE_SQL: &str = "SELECT s.* FROM statuses s \
      WHERE s.reblog_of_id IS NULL AND s.deleted_at IS NULL \
      AND s.search_vector @@ plainto_tsquery('simple', ";
-
-/// The tail of the mute exclusion: the edge hides the author only while it
-/// has no expiry, or an expiry that has not lapsed — the same test the
-/// account search and every other mute read of this repo applies.
-const MUTE_LIVE_ARMS: &str = " AND (m.expires_at IS NULL OR m.expires_at > now()))";
 
 /// The [`crate::models::status::Status`] rows matching `query` for
 /// `viewer`, as the search's newest-first page.
@@ -114,15 +111,8 @@ fn push_viewer_exclusions(builder: &mut QueryBuilder<Postgres>, viewer: Option<&
     let Some(viewer) = viewer else {
         return;
     };
-    let _blocked: &mut _ = builder
-        .push(" AND NOT EXISTS (SELECT 1 FROM blocks b WHERE b.blocker_id = ")
-        .push_bind(viewer.id)
-        .push(" AND b.blocked_id = s.user_id)");
-    let _muted: &mut _ = builder
-        .push(" AND NOT EXISTS (SELECT 1 FROM mutes m WHERE m.muter_id = ")
-        .push_bind(viewer.id)
-        .push(" AND m.muted_id = s.user_id")
-        .push(MUTE_LIVE_ARMS);
+    push_not_blocked(builder, viewer.id, &["s.user_id"]);
+    push_not_muted(builder, viewer.id, &["s.user_id"]);
     let _domain: &mut _ = builder
         .push(
             " AND NOT EXISTS (SELECT 1 FROM user_domain_blocks udb \
@@ -146,8 +136,9 @@ mod tests {
             block, domain_block, follow,
             mute::{self, MuteOptions},
             status::{self, NewStatus, Visibility},
-            user::{NewUser, insert as insert_user, local_ap_id},
+            user::{NewUser, insert as insert_user},
         },
+        test_fixtures::local_user as user,
     };
 
     /// The instance origin the fixtures pretend to serve.
@@ -155,16 +146,6 @@ mod tests {
     /// A limit above every fixture page this module asks for, so a "full"
     /// page really is the whole answer.
     const EVERY: i64 = 80;
-
-    /// A local user named `nickname`.
-    async fn user(pool: &PgPool, nickname: &str) -> User {
-        insert_user(
-            pool,
-            &NewUser::local(nickname, &local_ap_id(BASE, nickname)),
-        )
-        .await
-        .expect("the local fixture inserts")
-    }
 
     /// Inserts `text` as `author`'s status of `visibility`.
     async fn post(pool: &PgPool, author: &User, visibility: Visibility, text: &str) -> Status {

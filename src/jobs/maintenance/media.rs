@@ -11,11 +11,12 @@
 
 use serde_json::Value;
 use sqlx::{PgPool, query, query_as};
-use tracing::{info, warn};
+use tracing::warn;
 use uuid::Uuid;
 
+use super::run_sweep;
 use crate::{
-    jobs::{AttemptInfo, HandlerFuture, JobError},
+    jobs::{AttemptInfo, HandlerFuture},
     state::AppState,
 };
 
@@ -164,20 +165,10 @@ async fn sweep_media(state: &AppState) -> Result<u64, sqlx::Error> {
 /// A file that cannot be removed is not a failed pass: its row is kept,
 /// warned about, and retried by the next run, so one unreadable file never
 /// strands the sweep on the rest. Only a database failure is a
-/// [`JobError::Retry`], and the scheduler enqueues the next six hours
+/// [`JobError::Retry`](crate::jobs::JobError::Retry), and the scheduler enqueues the next six hours
 /// regardless; a pass lost to an outage costs nothing but the storage.
 pub fn handle_sweep_media(state: AppState, _attempt: AttemptInfo, _args: Value) -> HandlerFuture {
-    Box::pin(async move {
-        match sweep_media(&state).await {
-            Ok(deleted) => {
-                info!(deleted, "orphaned local media deleted");
-                Ok(())
-            }
-            Err(err) => Err(JobError::Retry(format!(
-                "orphaned media sweep failed: {err}"
-            ))),
-        }
-    })
+    Box::pin(async move { run_sweep("orphaned local media deleted", sweep_media(&state)).await })
 }
 
 #[cfg(test)]

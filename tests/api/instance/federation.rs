@@ -32,13 +32,18 @@ async fn federation_reports_the_enabled_mrf_policies() {
         let federation = response.json_value()["pleroma"]["metadata"]["federation"].clone();
         assert_eq!(
             federation["mrf_policies"],
-            json!(["NoOpPolicy"]),
+            json!(["NoOpPolicy", "HashtagPolicy"]),
             "{path}: the chain's names, the unknown one dropped"
         );
         assert_eq!(
             federation["mrf_noop"],
             json!({}),
             "{path}: the shipped policy describes itself empty"
+        );
+        assert_eq!(
+            federation["mrf_hashtag"],
+            json!({"sensitive": ["nsfw"], "reject": [], "federated_timeline_removal": []}),
+            "{path}: the always-on hashtag policy describes its default lists"
         );
         assert_eq!(federation["enabled"], true, "{path}: still federating");
         assert_eq!(
@@ -63,7 +68,7 @@ async fn mrf_policies_env_enables_the_federation_block() {
     assert_eq!(response.status, StatusCode::OK, "the document answers");
     assert_eq!(
         response.json_value()["pleroma"]["metadata"]["federation"]["mrf_policies"],
-        json!(["NoOpPolicy"]),
+        json!(["NoOpPolicy", "HashtagPolicy"]),
         "the env list builds the advertised chain"
     );
 }
@@ -101,7 +106,7 @@ async fn federation_publishes_the_simple_policy_lists() {
         let federation = response.json_value()["pleroma"]["metadata"]["federation"].clone();
         assert_eq!(
             federation["mrf_policies"],
-            json!(["SimplePolicy"]),
+            json!(["SimplePolicy", "HashtagPolicy"]),
             "{path}: the running policy, Pleroma-named"
         );
         assert_eq!(
@@ -209,7 +214,7 @@ async fn federation_exclusions_hide_hosts_and_are_disclosed() {
         );
         assert_eq!(
             federation["mrf_policies"],
-            json!(["SimplePolicy"]),
+            json!(["SimplePolicy", "HashtagPolicy"]),
             "{path}: the policy is still named, and still running"
         );
         assert_eq!(

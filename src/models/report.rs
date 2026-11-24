@@ -65,8 +65,6 @@ pub use writes::{create, get, set_ap_id, statuses_for};
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
-use crate::{models::user::User, util::id::new_id};
-
 /// 422 message [`create`] answers when an account reports itself, the wording
 /// this ticket pins (Pleroma's `CommonAPI.report` has no such guard; Mastodon's
 /// `Report` changeset refuses the self relationship the way [`block`] does).
@@ -157,15 +155,4 @@ pub struct NewReport {
     /// The statuses it cites for context; validated to be the target's and
     /// visible to the reporter by the endpoint, and deduplicated here.
     pub status_ids: Vec<Uuid>,
-}
-
-/// The `ap_id` to store for a new report: a freshly minted
-/// `{base_url}/activities/{uuid}` (decision 6) for a reporter this instance
-/// owns, `None` for a remote one, whose own activity id the federation layer
-/// records from the `Flag` activity it processed.
-fn local_activity_id(base_url: &str, reporter: &User) -> Option<String> {
-    reporter
-        .local
-        .get()
-        .then(|| format!("{base_url}/activities/{}", new_id()))
 }

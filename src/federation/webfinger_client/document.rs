@@ -6,7 +6,7 @@ use serde::Deserialize;
 use serde_json::{Map, Value};
 
 use super::{ACTIVITY_JSON, LD_JSON, SELF_REL};
-use crate::util::url::is_http_url;
+use crate::util::{media_type::essence, url::is_http_url};
 
 /// One `Link` element or object of a `WebFinger` document: JRD objects
 /// deserialize straight into it, and the XRD reader fills the same shape
@@ -89,11 +89,7 @@ impl FingerLink {
 /// ignoring parameters and whitespace: `application/activity+json` or
 /// `application/ld+json` with any (or no) parameters after the `;`.
 fn is_activity_media_type(candidate: &str) -> bool {
-    let media_type = candidate
-        .split_once(';')
-        .map_or(candidate, |(media_type, _parameters)| media_type)
-        .trim()
-        .to_ascii_lowercase();
+    let media_type = essence(candidate);
     media_type == ACTIVITY_JSON || media_type == LD_JSON
 }
 

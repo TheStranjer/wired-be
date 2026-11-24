@@ -167,6 +167,46 @@ async fn a_question_lands_its_poll_with_the_reported_counts() {
 }
 
 #[tokio::test]
+async fn a_thirty_option_question_is_ingested_not_dropped() {
+    let db = crate::test_db::test_db().await.expect("test database slot");
+    let pool = db.pool().clone();
+    let state = app_state(&pool);
+    let bob = author(&pool).await;
+    let options: Vec<Value> = (0..30)
+        .map(|n| json!({ "type": "Note", "name": format!("opt{n}"), "replies": { "totalItems": n } }))
+        .collect();
+    let object = json!({
+        "id": "https://remote.example/objects/ingest-big-poll",
+        "type": "Question",
+        "attributedTo": "https://remote.example/users/bob",
+        "to": ["https://www.w3.org/ns/activitystreams#Public"],
+        "content": "<p>many choices</p>",
+        "oneOf": options
+    });
+
+    let outcome = ingest_note(&state, &bob, &object)
+        .await
+        .expect("a 30-option question ingests");
+    let IngestOutcome::Created(row) = outcome else {
+        panic!("the poll post writes, got {outcome:?}");
+    };
+
+    let stand = poll::get_for_status(&pool, row.id)
+        .await
+        .expect("the poll reads")
+        .expect("the status carries a poll");
+    let choices = poll::options(&pool, stand.id)
+        .await
+        .expect("the options read");
+    assert_eq!(
+        choices.len(),
+        30,
+        "every option lands, under the federated cap"
+    );
+    assert_eq!(choices[29].title, "opt29", "in document order");
+}
+
+#[tokio::test]
 async fn a_direct_note_is_its_own_conversation_root() {
     let db = crate::test_db::test_db().await.expect("test database slot");
     let pool = db.pool().clone();
