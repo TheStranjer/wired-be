@@ -22,10 +22,10 @@ use axum::{
 };
 use serde_json::{Value, json};
 use sqlx::PgPool;
-use tokio::{net::TcpListener, task::JoinHandle};
 use uuid::Uuid;
 
 use super::{fetch::MAX_OBJECT_BODY_BYTES, *};
+use crate::test_server::{bind, origin, spawn};
 use crate::{
     config::{Config, TEST_BASE_URL},
     federation::{dispatch::FederationError, fetch_actor::ACTOR_ACCEPT},
@@ -60,25 +60,6 @@ fn state_with_config(pool: PgPool, config: Config) -> AppState {
         http_client: HttpClient::new_for_tests(TEST_UA),
         ..AppState::for_tests(pool, config)
     }
-}
-
-/// Binds an unused loopback port.
-async fn bind() -> TcpListener {
-    TcpListener::bind("127.0.0.1:0").await.unwrap()
-}
-
-/// The `http://{addr}` origin a listener answers on.
-fn origin(listener: &TcpListener) -> String {
-    format!("http://{}", listener.local_addr().unwrap())
-}
-
-/// Serves `app` on `listener` until the test aborts the task.
-fn spawn(listener: TcpListener, app: Router) -> JoinHandle<()> {
-    tokio::spawn(async move {
-        if let Err(err) = axum::serve(listener, app).await {
-            tracing::debug!("test server stopped: {err}");
-        }
-    })
 }
 
 /// The state every mock-peer handler runs with: its own origin, the

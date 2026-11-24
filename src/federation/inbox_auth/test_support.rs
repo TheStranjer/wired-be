@@ -23,10 +23,10 @@ use axum::{
 use chrono::Utc;
 use serde_json::{Value, json};
 use sqlx::PgPool;
-use tokio::{net::TcpListener, task::JoinHandle};
 use tower::ServiceExt as _;
 
 use super::SignedActivity;
+pub(super) use crate::test_server::{bind, origin, spawn};
 use crate::{
     config::Config,
     federation::signature::{SigningKey, sign_request},
@@ -204,25 +204,6 @@ async fn serve_key_object(State(peer): State<Peer>) -> Response {
 /// Answers the configured status and nothing else (410, 404).
 async fn status_only(State(status): State<StatusCode>) -> StatusCode {
     status
-}
-
-/// Binds an unused loopback port.
-pub(super) async fn bind() -> TcpListener {
-    TcpListener::bind("127.0.0.1:0").await.unwrap()
-}
-
-/// The `http://{addr}` origin a listener answers on.
-pub(super) fn origin(listener: &TcpListener) -> String {
-    format!("http://{}", listener.local_addr().unwrap())
-}
-
-/// Serves `app` on `listener` until the test aborts the task.
-pub(super) fn spawn(listener: TcpListener, app: Router) -> JoinHandle<()> {
-    tokio::spawn(async move {
-        if let Err(err) = axum::serve(listener, app).await {
-            tracing::debug!("test server stopped: {err}");
-        }
-    })
 }
 
 /// A mock peer answering `/users/alice` (actor), `/keys/1` (key

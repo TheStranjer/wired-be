@@ -21,10 +21,11 @@ use chrono::{DateTime, TimeZone as _, Utc};
 use reqwest::header::RETRY_AFTER;
 use serde_json::{Value, json};
 use sqlx::PgPool;
-use tokio::{net::TcpListener, task::JoinHandle};
+use tokio::task::JoinHandle;
 use uuid::Uuid;
 
 use super::{FIRST_ATTEMPT, MAX_ATTEMPTS, handle};
+pub(super) use crate::test_server::{bind, origin, spawn};
 use crate::{
     config::{Config, TEST_BASE_URL},
     federation::signature::verify::{
@@ -116,25 +117,6 @@ fn delivery_args(inbox: &str, actor_id: Uuid) -> Value {
         "actor_id": actor_id,
         "body": activity(),
         "activity_id": activity()["id"],
-    })
-}
-
-/// Binds an unused loopback port.
-pub(super) async fn bind() -> TcpListener {
-    TcpListener::bind("127.0.0.1:0").await.unwrap()
-}
-
-/// The `http://` origin a listener answers on.
-pub(super) fn origin(listener: &TcpListener) -> String {
-    format!("http://{}", listener.local_addr().unwrap())
-}
-
-/// Serves `app` on `listener` until the test aborts the task.
-pub(super) fn spawn(listener: TcpListener, app: Router) -> JoinHandle<()> {
-    tokio::spawn(async move {
-        if let Err(err) = axum::serve(listener, app).await {
-            tracing::debug!("test server stopped: {err}");
-        }
     })
 }
 
