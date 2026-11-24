@@ -369,10 +369,8 @@ mod tests {
     use super::*;
     use crate::{
         config::TEST_BASE_URL,
-        models::{
-            media_attachment::NewMediaAttachment,
-            user::{NewUser, User, insert as insert_user, local_ap_id},
-        },
+        models::{media_attachment::NewMediaAttachment, user::User},
+        test_fixtures::local_user,
         util::time::mastodon_time,
     };
 
@@ -417,16 +415,6 @@ mod tests {
     /// Test state over `pool` with the fixed test config.
     fn app_state(pool: &PgPool) -> AppState {
         AppState::for_tests(pool.clone(), Config::for_tests())
-    }
-
-    /// A local user named `nickname`, to own fixture uploads.
-    async fn local_user(pool: &PgPool, nickname: &str) -> User {
-        insert_user(
-            pool,
-            &NewUser::local(nickname, &local_ap_id(TEST_BASE_URL, nickname)),
-        )
-        .await
-        .expect("the local fixture inserts")
     }
 
     /// An unposted `image/png` upload of `owner`, named for its url.

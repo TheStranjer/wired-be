@@ -292,7 +292,7 @@ mod tests {
             mute::{self, MuteOptions},
             user::{Flag, INSTANCE_ACTOR_NICKNAME, NewUser, insert},
         },
-        test_fixtures::{local_new, local_user as user},
+        test_fixtures::{local_new, local_user as user, remote_user as remote},
     };
 
     /// The instance origin the fixtures pretend to serve.
@@ -309,22 +309,6 @@ mod tests {
         )
         .await
         .expect("the named fixture inserts")
-    }
-
-    /// A mirror of the remote actor `nickname` on `remote.example`: its
-    /// stored nickname is `nickname@remote.example` (decision 7).
-    async fn remote(pool: &PgPool, nickname: &str) -> User {
-        insert(
-            pool,
-            &NewUser {
-                nickname: format!("{nickname}@remote.example"),
-                ap_id: format!("https://remote.example/users/{nickname}"),
-                domain: Some("remote.example".to_owned()),
-                ..NewUser::default()
-            },
-        )
-        .await
-        .expect("the remote fixture inserts")
     }
 
     /// The ids of `users`, in the order they came back.

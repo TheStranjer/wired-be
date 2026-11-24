@@ -108,32 +108,13 @@ mod tests {
     use super::*;
     use crate::{
         error::AppError,
-        models::user::{self, Flag, NewUser},
-        test_fixtures::local_user as create_user,
+        test_fixtures::{local_user as create_user, remote_user as create_remote_user},
     };
-    use sqlx::PgPool;
 
     /// The provider and id the tests link.
     const PROVIDER: &str = "github";
     /// See [`PROVIDER`].
     const UID: &str = "4242";
-
-    /// A mirror of a remote actor named `nickname` on `host`.
-    async fn create_remote_user(pool: &PgPool, nickname: &str) -> User {
-        let ap_id = format!("https://remote.example/users/{nickname}");
-        user::insert(
-            pool,
-            &NewUser {
-                nickname: format!("{nickname}@remote.example"),
-                ap_id: ap_id.clone(),
-                domain: Some("remote.example".to_owned()),
-                local: Flag::new(false),
-                ..NewUser::default()
-            },
-        )
-        .await
-        .expect("the remote fixture inserts")
-    }
 
     /// A fresh table answers `None`: nothing is linked to anything.
     #[tokio::test]

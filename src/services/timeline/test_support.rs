@@ -10,25 +10,18 @@ use crate::{
     models::{
         list::{self, List, NewList},
         status::{self, NewStatus, Status, Visibility},
-        user::{self, NewUser, User, insert as insert_user, local_ap_id},
+        user::{self, NewUser, User, insert as insert_user},
     },
     pagination::PageParams,
 };
+
+// Inserts a local user named `nickname`.
+pub(super) use crate::test_fixtures::local_user as local;
 
 use super::{TimelineFilters, TimelineQuery, TimelineSource};
 
 /// The instance origin the fixtures pretend to serve.
 pub(super) const BASE: &str = TEST_BASE_URL;
-
-/// Inserts a local user named `nickname`.
-pub(super) async fn local(pool: &PgPool, nickname: &str) -> User {
-    insert_user(
-        pool,
-        &NewUser::local(nickname, &local_ap_id(BASE, nickname)),
-    )
-    .await
-    .expect("the local fixture inserts")
-}
 
 /// Inserts a mirror of the remote actor `nickname` on `domain`.
 pub(super) async fn remote(pool: &PgPool, nickname: &str, domain: &str) -> User {

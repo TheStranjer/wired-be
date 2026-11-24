@@ -11,17 +11,13 @@ use crate::{
         user::{self, User},
     },
     state::AppState,
+    test_fixtures::{local_new, remote_new},
 };
 
-/// Inserts a local [`User`] named `nickname` that accepts chats.
-pub(super) async fn chatter(pool: &sqlx::PgPool, nickname: &str) -> User {
-    user::insert(
-        pool,
-        &user::NewUser::local(nickname, &user::local_ap_id(TEST_BASE_URL, nickname)),
-    )
-    .await
-    .expect("fixture user inserts")
-}
+// A local user named `nickname` that accepts chats, and its remote
+// counterpart on `remote.example`: the pair a delivered or addressed
+// message runs between.
+pub(super) use crate::test_fixtures::{local_user as chatter, remote_user as remote_chatter};
 
 /// Inserts a local [`User`] named `nickname` whose chat flag is down.
 pub(super) async fn quiet(pool: &sqlx::PgPool, nickname: &str) -> User {
@@ -29,7 +25,7 @@ pub(super) async fn quiet(pool: &sqlx::PgPool, nickname: &str) -> User {
         pool,
         &user::NewUser {
             accepts_chat_messages: user::Flag::new(false),
-            ..user::NewUser::local(nickname, &user::local_ap_id(TEST_BASE_URL, nickname))
+            ..local_new(nickname)
         },
     )
     .await
@@ -42,27 +38,8 @@ pub(super) async fn quiet_remote(pool: &sqlx::PgPool, nickname: &str) -> User {
     user::insert(
         pool,
         &user::NewUser {
-            nickname: format!("{nickname}@remote.example"),
-            ap_id: format!("https://remote.example/users/{nickname}"),
-            domain: Some("remote.example".to_owned()),
             accepts_chat_messages: user::Flag::new(false),
-            ..user::NewUser::default()
-        },
-    )
-    .await
-    .expect("fixture remote user inserts")
-}
-
-/// Inserts a mirror named `nickname` on `remote.example` that accepts
-/// chats: the remote counterpart of a delivered or addressed pair.
-pub(super) async fn remote_chatter(pool: &sqlx::PgPool, nickname: &str) -> User {
-    user::insert(
-        pool,
-        &user::NewUser {
-            nickname: format!("{nickname}@remote.example"),
-            ap_id: format!("https://remote.example/users/{nickname}"),
-            domain: Some("remote.example".to_owned()),
-            ..user::NewUser::default()
+            ..remote_new(nickname)
         },
     )
     .await

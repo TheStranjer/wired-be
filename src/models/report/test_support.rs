@@ -9,7 +9,7 @@ use crate::{
     config::TEST_BASE_URL,
     models::{
         status::{self, NewStatus},
-        user::{NewUser, User, insert},
+        user::User,
     },
     pagination::{MAX_LIMIT, PageParams},
     util::id::assert_local_activity_id,
@@ -17,23 +17,7 @@ use crate::{
 
 use super::{Category, NewReport, Report, create, get};
 
-pub(super) use crate::test_fixtures::local_user;
-
-/// Inserts a mirror of `nickname` on `remote.example`: the account this
-/// instance does not own, whose `Flag` activity id is not ours to mint.
-pub(super) async fn remote_user(pool: &PgPool, nickname: &str) -> User {
-    insert(
-        pool,
-        &NewUser {
-            nickname: format!("{nickname}@remote.example"),
-            ap_id: format!("https://remote.example/users/{nickname}"),
-            domain: Some("remote.example".to_owned()),
-            ..NewUser::default()
-        },
-    )
-    .await
-    .expect("the remote fixture inserts")
-}
+pub(super) use crate::test_fixtures::{local_user, remote_user};
 
 /// A public post by `author`, for the reports that cite something.
 pub(super) async fn post(pool: &PgPool, author: &User, text: &str) -> status::Status {

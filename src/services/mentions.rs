@@ -247,6 +247,7 @@ mod tests {
         config::{Config, TEST_BASE_URL},
         http_client::HttpClient,
         models::user::{NewUser, get_by_id, insert},
+        test_fixtures::remote_user,
     };
 
     /// The instance the fixtures resolve against.
@@ -276,21 +277,6 @@ mod tests {
         )
         .await
         .expect("fixture local user inserts")
-    }
-
-    /// Inserts a stored remote mirror, `nickname@remote.example`.
-    async fn remote_user(pool: &PgPool, nickname: &str) -> User {
-        insert(
-            pool,
-            &NewUser {
-                nickname: format!("{nickname}@remote.example"),
-                ap_id: format!("https://remote.example/users/{nickname}"),
-                domain: Some("remote.example".to_owned()),
-                ..NewUser::default()
-            },
-        )
-        .await
-        .expect("fixture remote user inserts")
     }
 
     /// The resolved pairs as `(written nickname, written domain, user id)`,

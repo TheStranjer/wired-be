@@ -66,7 +66,7 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
-    use crate::util::time::parse_time;
+    use crate::{test_fixtures::json_keys, util::time::parse_time};
 
     /// The instant the marker last moved, in the wire format.
     const UPDATED: &str = "2024-01-31T12:34:56.789Z";
@@ -89,18 +89,6 @@ mod tests {
     /// `row` rendered with `unread_count`; entities always serialize.
     fn render(unread_count: i64) -> Value {
         serde_json::to_value(Marker::from_row(&row(), unread_count)).expect("an entity serializes")
-    }
-
-    /// The rendered object's keys, sorted, for exact key-set assertions.
-    fn json_keys(value: &Value) -> Vec<&str> {
-        let mut keys: Vec<&str> = value
-            .as_object()
-            .expect("markers render objects")
-            .keys()
-            .map(String::as_str)
-            .collect();
-        keys.sort_unstable();
-        keys
     }
 
     #[test]
