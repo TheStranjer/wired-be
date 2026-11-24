@@ -16,6 +16,7 @@ use super::{InboxAuthError, JSON_MEDIA_TYPES, SIGNATURE_HEADER, SIGNATURE_SCHEME
 use crate::{
     error::AppError,
     federation::signature::verify::{ParsedSignature, parse_signature_header},
+    util::media_type::essence,
 };
 
 /// Whether the request labels its body one of the JSON `ActivityPub` media
@@ -23,10 +24,10 @@ use crate::{
 /// case-folded, names exactly one of [`JSON_MEDIA_TYPES`].
 pub(super) fn declares_json_type(headers: &HeaderMap) -> bool {
     header_text(headers, &header::CONTENT_TYPE).is_some_and(|value| {
-        let media_type = value.split_once(';').map_or(value, |(typed, _)| typed);
+        let media_type = essence(value);
         JSON_MEDIA_TYPES
             .iter()
-            .any(|wanted| media_type.trim().eq_ignore_ascii_case(wanted))
+            .any(|wanted| media_type.eq_ignore_ascii_case(wanted))
     })
 }
 
