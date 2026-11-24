@@ -42,7 +42,7 @@ async fn every_admin_chat_route_demands_a_user_token_of_the_right_role() {
         let unauthenticated = chat_request(*is_delete, path).send(&app).await;
         common::assert_answer(&unauthenticated, StatusCode::UNAUTHORIZED, "no token");
         assert_eq!(
-            error_message(&unauthenticated).as_deref(),
+            unauthenticated.error_field().as_deref(),
             Some(NO_TOKEN),
             "every route challenges alike"
         );
@@ -52,7 +52,7 @@ async fn every_admin_chat_route_demands_a_user_token_of_the_right_role() {
             .send(&app)
             .await;
         common::assert_answer(&bogus, StatusCode::UNAUTHORIZED, "a bogus token");
-        assert_eq!(error_message(&bogus).as_deref(), Some(INVALID_TOKEN));
+        assert_eq!(bogus.error_field().as_deref(), Some(INVALID_TOKEN));
 
         let mut refusals = vec![
             (app_only.as_str(), USER_REQUIRED),
@@ -70,7 +70,7 @@ async fn every_admin_chat_route_demands_a_user_token_of_the_right_role() {
                 .send(&app)
                 .await;
             common::assert_answer(&refused, StatusCode::FORBIDDEN, reason);
-            assert_eq!(error_message(&refused).as_deref(), Some(reason));
+            assert_eq!(refused.error_field().as_deref(), Some(reason));
         }
     }
 
@@ -132,17 +132,14 @@ async fn the_chats_scopes_gate_reads_and_write_apart() {
             StatusCode::FORBIDDEN,
             &format!("admin:write:chats on {path}"),
         );
-        assert_eq!(
-            error_message(&write_on_read).as_deref(),
-            Some(NO_ADMIN_READ)
-        );
+        assert_eq!(write_on_read.error_field().as_deref(), Some(NO_ADMIN_READ));
         let foreign = get(&app, &wrong_area, &path).await;
         common::assert_answer(
             &foreign,
             StatusCode::FORBIDDEN,
             "the accounts scope reads no chats",
         );
-        assert_eq!(error_message(&foreign).as_deref(), Some(NO_ADMIN_READ));
+        assert_eq!(foreign.error_field().as_deref(), Some(NO_ADMIN_READ));
     }
 
     let read_on_write = delete(&app, &read_only, &message_path(&chat_id, &message_id)).await;
@@ -152,7 +149,7 @@ async fn the_chats_scopes_gate_reads_and_write_apart() {
         "a read scope cannot delete",
     );
     assert_eq!(
-        error_message(&read_on_write).as_deref(),
+        read_on_write.error_field().as_deref(),
         Some(NO_ADMIN_WRITE),
         "naming the write root Pleroma's plug asks for"
     );
@@ -191,7 +188,7 @@ async fn a_moderator_deletes_a_chat_message_but_cannot_read_chats() {
     let (_mod, token) = moderator(&pool, "mod", "admin:write:chats admin:read:chats").await;
     let refused = get(&app, &token, &messages_path(&chat_id)).await;
     common::assert_answer(&refused, StatusCode::FORBIDDEN, "a moderator read");
-    assert_eq!(error_message(&refused).as_deref(), Some(NOT_ADMIN));
+    assert_eq!(refused.error_field().as_deref(), Some(NOT_ADMIN));
 
     let deleted = delete(&app, &token, &message_path(&chat_id, &message_id)).await;
     common::assert_answer(&deleted, StatusCode::OK, "a moderator deletes");
@@ -229,5 +226,5 @@ async fn a_moderator_without_the_write_scope_deletes_nothing() {
     )
     .await;
     common::assert_answer(&refused, StatusCode::FORBIDDEN, "no write scope");
-    assert_eq!(error_message(&refused).as_deref(), Some(NO_ADMIN_WRITE));
+    assert_eq!(refused.error_field().as_deref(), Some(NO_ADMIN_WRITE));
 }

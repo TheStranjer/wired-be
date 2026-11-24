@@ -1,7 +1,6 @@
 //! Fixtures and request helpers the collection tests share.
 
 use axum::Router;
-use serde_json::Value;
 use sqlx::PgPool;
 use uuid::Uuid;
 use wired_be::{
@@ -32,18 +31,6 @@ pub(super) async fn fetch_ap(app: &Router, path: &str) -> common::TestResponse {
         .header("accept", "application/activity+json")
         .send(app)
         .await
-}
-
-/// The sorted key set of a document object.
-pub(super) fn key_set(document: &Value) -> Vec<&str> {
-    let mut keys: Vec<&str> = document
-        .as_object()
-        .expect("a document is a JSON object")
-        .keys()
-        .map(String::as_str)
-        .collect();
-    keys.sort_unstable();
-    keys
 }
 
 /// The account named `nickname` as stored now — the row whose denormalised

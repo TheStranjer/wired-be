@@ -14,8 +14,7 @@ use wired_be::{
 };
 
 use super::support::{
-    ACTIVITY_JSON, ACTOR_KEYS, BASE, PUBLIC_PEM, fetch_activity_json, fetch_actor, key_set,
-    keys_with,
+    ACTIVITY_JSON, ACTOR_KEYS, BASE, PUBLIC_PEM, fetch_activity_json, fetch_actor, keys_with,
 };
 use crate::common;
 
@@ -181,7 +180,7 @@ async fn a_bare_user_has_the_documented_key_set() {
     let pool = db.pool().clone();
     let alice = common::create_local_user(&pool, "alice").await;
     let document = fetch_actor(&pool, &alice).await;
-    assert_eq!(key_set(&document), ACTOR_KEYS, "exact key set");
+    assert_eq!(common::sorted_keys(&document), ACTOR_KEYS, "exact key set");
     assert_eq!(
         document["endpoints"],
         json!({
@@ -228,7 +227,11 @@ async fn a_locked_user_approves_followers_manually() {
         document["manuallyApprovesFollowers"], true,
         "the stored flag is the ActivityPub field"
     );
-    assert_eq!(key_set(&document), ACTOR_KEYS, "the key set is stable");
+    assert_eq!(
+        common::sorted_keys(&document),
+        ACTOR_KEYS,
+        "the key set is stable"
+    );
 }
 
 /// A bot federates as its `actor_type`: Pleroma emits no `bot` key, so the
@@ -250,7 +253,11 @@ async fn a_bot_is_federated_by_its_actor_type() {
         document.get("bot").is_none(),
         "the bot flag itself is not federated"
     );
-    assert_eq!(key_set(&document), ACTOR_KEYS, "the key set is stable");
+    assert_eq!(
+        common::sorted_keys(&document),
+        ACTOR_KEYS,
+        "the key set is stable"
+    );
 }
 
 /// An avatar becomes `icon` and a banner `image`, each an `Image` object;
@@ -277,7 +284,7 @@ async fn an_avatar_user_carries_icon_and_image() {
         "the banner is an Image"
     );
     assert_eq!(
-        key_set(&document),
+        common::sorted_keys(&document),
         keys_with(&["icon", "image"]),
         "media adds its keys"
     );
@@ -289,7 +296,7 @@ async fn an_avatar_user_carries_icon_and_image() {
     .await;
     let carol_document = fetch_actor(&pool, &carol).await;
     assert_eq!(
-        key_set(&carol_document),
+        common::sorted_keys(&carol_document),
         keys_with(&["icon"]),
         "an avatar alone adds only icon"
     );

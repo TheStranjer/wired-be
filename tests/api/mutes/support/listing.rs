@@ -46,7 +46,7 @@ async fn the_listing_answers_accounts_with_their_expiry() {
     );
     assert_eq!(
         listed.header("link"),
-        Some(expected_link(&stored[1].0, &stored[0].0).as_str()),
+        Some(common::expected_link(MUTES, &stored[0].0, &stored[1].0).as_str()),
         "the Link cursors are the mute row ids, not the accounts"
     );
 
@@ -97,7 +97,7 @@ async fn the_listing_pages_by_mute_row_id() {
     );
     assert_eq!(
         first.header("link"),
-        Some(expected_link(&stored[1].0, &stored[0].0).as_str()),
+        Some(common::expected_link(MUTES, &stored[0].0, &stored[1].0).as_str()),
         "the cursors are the page's own ends"
     );
 
@@ -193,7 +193,7 @@ async fn the_listing_pages_up_to_eighty_rows() {
     );
     assert_eq!(
         big.header("link"),
-        Some(expected_link(&stored[40].0, &stored[0].0).as_str()),
+        Some(common::expected_link(MUTES, &stored[0].0, &stored[40].0).as_str()),
         "and the whole page is one page, linked at both ends"
     );
 }

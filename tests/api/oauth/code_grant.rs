@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 use wired_be::models::oauth_app::OauthApp;
 
 use super::authorize_get::{issue_code, register_app};
-use super::support::{PASSWORD, REDIRECT, error_text, post_json};
+use super::support::{PASSWORD, REDIRECT, post_json};
 use crate::common;
 
 /// A second URI the same client registers, never the one a code is issued for.
@@ -51,7 +51,7 @@ async fn a_code_redeems_only_with_the_redirect_uri_it_was_issued_for() {
         StatusCode::BAD_REQUEST,
         "another registered URI is refused"
     );
-    assert_eq!(error_text(&other), "Invalid credentials", "the shared 400");
+    assert_eq!(other.error_text(), "Invalid credentials", "the shared 400");
 
     let missing = post_json(&http, &exchange_body(&app, &code, None)).await;
     assert_eq!(
@@ -60,7 +60,7 @@ async fn a_code_redeems_only_with_the_redirect_uri_it_was_issued_for() {
         "no redirect_uri at all is refused"
     );
     assert_eq!(
-        error_text(&missing),
+        missing.error_text(),
         "Invalid credentials",
         "the shared 400"
     );

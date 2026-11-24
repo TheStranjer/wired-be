@@ -10,8 +10,8 @@ use uuid::Uuid;
 use wired_be::util::time::mastodon_time;
 
 use super::routes_support::{
-    NOT_AN_ID, READ, cancel, day, entity_texts, expected_link, list, manager, move_to, reader,
-    row_ids, seeded, seeded_text, show,
+    NOT_AN_ID, READ, SCHEDULES, cancel, day, entity_texts, list, manager, move_to, reader, row_ids,
+    seeded, seeded_text, show,
 };
 use super::support::{NOT_FOUND, keys, object_keys, stored_schedule, upload};
 use crate::common;
@@ -54,7 +54,7 @@ async fn the_listing_answers_the_callers_own_schedules_newest_id_first() {
     );
     assert_eq!(
         first.header("link"),
-        Some(expected_link(&newest.id.to_string(), &oldest.id.to_string()).as_str(),),
+        Some(common::expected_link(SCHEDULES, &newest.id, &oldest.id).as_str()),
         "next walks to the oldest row shown, prev back to the newest"
     );
 
@@ -111,7 +111,7 @@ async fn the_listing_walks_its_id_cursors_in_both_directions() {
     );
     assert_eq!(
         page.header("link"),
-        Some(expected_link(&newest.id.to_string(), &middle.id.to_string()).as_str()),
+        Some(common::expected_link(SCHEDULES, &newest.id, &middle.id).as_str()),
         "and the cursors move with the page"
     );
 

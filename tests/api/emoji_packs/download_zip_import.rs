@@ -11,9 +11,7 @@ use super::{
         ARCHIVE_MANIFEST, UNREADABLE, UNSAFE_PATH, WEBP_BYTES, build_zip, good_archive,
         installed_manifest, manifest_files,
     },
-    support::{
-        BOUNDARY, GIF_BYTES, PNG_BYTES, admin_token, error_message, pack, seed_pack, served_emojis,
-    },
+    support::{BOUNDARY, GIF_BYTES, PNG_BYTES, admin_token, pack, seed_pack, served_emojis},
 };
 use crate::common;
 
@@ -241,7 +239,8 @@ async fn download_zip_refuses_bad_archives_and_sizes() {
         "a part past the upload limit",
     );
     assert!(
-        error_message(&big).is_some_and(|message| message.contains("4096")),
+        big.error_field()
+            .is_some_and(|message| message.contains("4096")),
         "the 413 names the limit: {}",
         big.text()
     );

@@ -6,7 +6,7 @@ use serde_json::json;
 use wired_be::models::follow::Follow;
 
 use super::support::{
-    ask, asking, expected_link, following, listed_entry, locked_user, outgoing, wanted_follows,
+    OUTGOING, ask, asking, following, listed_entry, locked_user, outgoing, wanted_follows,
     wanted_targets,
 };
 use crate::common;
@@ -121,7 +121,7 @@ async fn the_outgoing_list_pages_key_on_follow_row_ids_and_link() {
     );
     assert_eq!(
         first.header("link"),
-        Some(expected_link(&wanted_rows[1], &wanted_rows[0]).as_str()),
+        Some(common::expected_link(OUTGOING, &wanted_rows[0], &wanted_rows[1]).as_str()),
         "the Link cursors are the page's follow row ids, not account ids"
     );
 

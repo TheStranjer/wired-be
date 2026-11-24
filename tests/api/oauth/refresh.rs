@@ -18,7 +18,7 @@ use wired_be::{
 };
 
 use super::revoke::{probe_user_endpoint, token_rows};
-use super::support::{PASSWORD, assert_no_store, error_text, fixtures, post_json};
+use super::support::{PASSWORD, assert_no_store, fixtures, post_json};
 use crate::common;
 
 /// A refresh-grant body carrying app `app`'s credentials in the plain
@@ -151,7 +151,7 @@ async fn rotation_ends_the_old_pair_and_the_new_one_works() {
         "the old access token stopped working"
     );
     assert_eq!(
-        error_text(&dead),
+        dead.error_text(),
         "The access token is invalid",
         "its row is gone"
     );
@@ -163,7 +163,7 @@ async fn rotation_ends_the_old_pair_and_the_new_one_works() {
         "the old refresh token cannot rotate again"
     );
     assert_eq!(
-        error_text(&reuse),
+        reuse.error_text(),
         "Invalid credentials",
         "like any unknown one"
     );
@@ -240,7 +240,7 @@ async fn the_refresh_token_works_only_within_the_grace_window() {
         "past the grace: a 400"
     );
     assert_eq!(
-        error_text(&late),
+        late.error_text(),
         "Invalid credentials",
         "the shared refusal"
     );
@@ -276,7 +276,7 @@ async fn a_refresh_token_redeems_once() {
         StatusCode::BAD_REQUEST,
         "the second finds the token spent"
     );
-    assert_eq!(error_text(&second), "Invalid credentials", "shared 400");
+    assert_eq!(second.error_text(), "Invalid credentials", "shared 400");
     assert_eq!(token_count(&pool).await, 1, "one pair minted, no more");
 }
 
@@ -326,7 +326,7 @@ async fn the_wrong_app_cannot_rotate_another_apps_token() {
         "another app's token is a 400"
     );
     assert_eq!(
-        error_text(&foreign),
+        foreign.error_text(),
         "Invalid credentials",
         "Pleroma's shared refusal"
     );
@@ -341,7 +341,7 @@ async fn the_wrong_app_cannot_rotate_another_apps_token() {
         "a wrong secret is a 400"
     );
     assert_eq!(
-        error_text(&secret_answer),
+        secret_answer.error_text(),
         "Invalid credentials",
         "the same message"
     );
@@ -367,7 +367,7 @@ async fn an_unknown_refresh_token_is_invalid_credentials() {
     let response = post_json(&http, &refresh_body(&app, "no-such-refresh-token")).await;
     assert_eq!(response.status, StatusCode::BAD_REQUEST, "a 400");
     assert_eq!(
-        error_text(&response),
+        response.error_text(),
         "Invalid credentials",
         "not told apart from the rest"
     );
@@ -390,7 +390,7 @@ async fn a_deactivated_owner_cannot_rotate() {
     let response = post_json(&http, &refresh_body(&app, &token.refresh_token)).await;
     assert_eq!(response.status, StatusCode::BAD_REQUEST, "a 400");
     assert_eq!(
-        error_text(&response),
+        response.error_text(),
         "Invalid credentials",
         "Pleroma's shared refusal"
     );
@@ -417,7 +417,7 @@ async fn a_missing_refresh_token_parameter_is_named() {
     let response = post_json(&http, &body).await;
     assert_eq!(response.status, StatusCode::BAD_REQUEST, "a 400");
     assert_eq!(
-        error_text(&response),
+        response.error_text(),
         "Missing parameter: refresh_token",
         "naming the missing parameter"
     );
@@ -432,7 +432,7 @@ async fn a_missing_refresh_token_parameter_is_named() {
     .await;
     assert_eq!(both_bad.status, StatusCode::BAD_REQUEST, "still a 400");
     assert_eq!(
-        error_text(&both_bad),
+        both_bad.error_text(),
         "Missing parameter: refresh_token",
         "with the same message"
     );
@@ -444,7 +444,7 @@ async fn a_missing_refresh_token_parameter_is_named() {
         .await;
     assert_eq!(form_answer.status, StatusCode::BAD_REQUEST, "alike");
     assert_eq!(
-        error_text(&form_answer),
+        form_answer.error_text(),
         "Missing parameter: refresh_token",
         "the same refusal"
     );

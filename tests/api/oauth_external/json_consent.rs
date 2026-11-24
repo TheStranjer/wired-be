@@ -9,8 +9,8 @@ use wired_be::models::{oauth_app::OauthApp, oauth_token, user::User};
 
 use super::provider::{LINKED_UID, MockProvider, PROVIDER, REDIRECT};
 use super::support::{
-    assert_no_store, count_codes, count_states, error_text, fixture, link, location, prepare,
-    query_param, set_trusted,
+    assert_no_store, count_codes, count_states, fixture, link, location, prepare, query_param,
+    set_trusted,
 };
 use crate::common;
 
@@ -124,7 +124,7 @@ async fn consent_get_refuses_a_wrong_token() {
     ] {
         let response = consent_get(&parked.http, &query).await;
         assert_eq!(response.status, StatusCode::BAD_REQUEST, "{why}");
-        assert_eq!(error_text(&response), "Invalid state", "for {why}");
+        assert_eq!(response.error_text(), "Invalid state", "for {why}");
     }
     let still = consent_get(
         &parked.http,
@@ -210,7 +210,7 @@ async fn consent_post_cannot_be_reused() {
         StatusCode::BAD_REQUEST,
         "the replay is refused"
     );
-    assert_eq!(error_text(&second), "Invalid state", "the usual refusal");
+    assert_eq!(second.error_text(), "Invalid state", "the usual refusal");
     assert_eq!(count_codes(&pool).await, 1, "one code, from the first");
     parked.provider.stop();
 }
@@ -229,7 +229,7 @@ async fn consent_post_refusals_leave_the_state_alone() {
     )
     .await;
     assert_eq!(wrong.status, StatusCode::BAD_REQUEST, "wrong token");
-    assert_eq!(error_text(&wrong), "Invalid state", "the usual refusal");
+    assert_eq!(wrong.error_text(), "Invalid state", "the usual refusal");
 
     let undecided = consent_post(
         &parked.http,
@@ -238,7 +238,7 @@ async fn consent_post_refusals_leave_the_state_alone() {
     .await;
     assert_eq!(undecided.status, StatusCode::BAD_REQUEST, "no verdict");
     assert_eq!(
-        error_text(&undecided),
+        undecided.error_text(),
         "Missing parameter: approve",
         "the missing field is named"
     );

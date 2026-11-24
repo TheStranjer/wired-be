@@ -90,18 +90,6 @@ pub(super) fn keys_with(extra: &[&'static str]) -> Vec<&'static str> {
     keys
 }
 
-/// The sorted key set of `document`.
-pub(super) fn key_set(document: &Value) -> Vec<&str> {
-    let mut keys: Vec<&str> = document
-        .as_object()
-        .expect("an actor document is a JSON object")
-        .keys()
-        .map(String::as_str)
-        .collect();
-    keys.sort_unstable();
-    keys
-}
-
 /// Boundary the C2S upload bodies are framed with.
 pub(super) const C2S_BOUNDARY: &str = "wired-c2s-test-boundary";
 /// The `ActivityStreams` public collection.

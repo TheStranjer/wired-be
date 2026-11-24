@@ -13,7 +13,7 @@ use serde_json::{Value, json};
 use sqlx::PgPool;
 use wired_be::{models::oauth_app::OauthApp, util::token::sha256_hex};
 
-use super::support::{assert_no_store, error_text, fixtures};
+use super::support::{assert_no_store, fixtures};
 use crate::common;
 
 /// A revoke body carrying app `app`'s credentials in the plain body
@@ -91,7 +91,7 @@ async fn revoke_deletes_the_apps_own_token() {
         "the revoked bearer stops working"
     );
     assert_eq!(
-        error_text(&after),
+        after.error_text(),
         "The access token is invalid",
         "the 401 wording"
     );
@@ -161,7 +161,7 @@ async fn revoke_refuses_foreign_tokens_and_bad_credentials() {
         "another app's token is a 400"
     );
     assert_eq!(
-        error_text(&foreign),
+        foreign.error_text(),
         "Invalid credentials",
         "Pleroma's shared refusal"
     );
@@ -176,7 +176,7 @@ async fn revoke_refuses_foreign_tokens_and_bad_credentials() {
         "a wrong secret is a 400"
     );
     assert_eq!(
-        error_text(&secret_answer),
+        secret_answer.error_text(),
         "Invalid credentials",
         "the same message"
     );
@@ -190,7 +190,7 @@ async fn revoke_refuses_foreign_tokens_and_bad_credentials() {
         "an unknown client id is a 400"
     );
     assert_eq!(
-        error_text(&client_answer),
+        client_answer.error_text(),
         "Invalid credentials",
         "the same message"
     );
@@ -201,7 +201,7 @@ async fn revoke_refuses_foreign_tokens_and_bad_credentials() {
         StatusCode::BAD_REQUEST,
         "absent credentials are a 400"
     );
-    assert_eq!(error_text(&bare), "Invalid credentials", "the same message");
+    assert_eq!(bare.error_text(), "Invalid credentials", "the same message");
 
     assert_eq!(
         token_rows(&pool, &token.token).await,
@@ -247,7 +247,7 @@ async fn a_missing_token_parameter_is_named() {
     .await;
     assert_eq!(response.status, StatusCode::BAD_REQUEST, "a 400");
     assert_eq!(
-        error_text(&response),
+        response.error_text(),
         "Missing parameter: token",
         "naming the missing parameter"
     );
@@ -262,7 +262,7 @@ async fn a_missing_token_parameter_is_named() {
     .await;
     assert_eq!(both_bad.status, StatusCode::BAD_REQUEST, "still a 400");
     assert_eq!(
-        error_text(&both_bad),
+        both_bad.error_text(),
         "Missing parameter: token",
         "with the same message"
     );
@@ -278,7 +278,7 @@ async fn a_missing_token_parameter_is_named() {
         "an unrelated form body"
     );
     assert_eq!(
-        error_text(&empty),
+        empty.error_text(),
         "Missing parameter: token",
         "gets the same answer"
     );
@@ -409,7 +409,7 @@ async fn revoke_refuses_a_foreign_refresh_token() {
     let response = post_revoke_json(&http, &revoke_body(&stranger, &token.refresh_token)).await;
     assert_eq!(response.status, StatusCode::BAD_REQUEST, "a 400");
     assert_eq!(
-        error_text(&response),
+        response.error_text(),
         "Invalid credentials",
         "the shared refusal"
     );

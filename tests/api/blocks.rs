@@ -32,8 +32,6 @@ use wired_be::{
 
 use crate::common;
 
-/// The instance origin the fixtures live on (`Config::for_tests`).
-const BASE: &str = "https://test.example";
 /// The blocked-listing path, as the `Link` header links back to it.
 const BLOCKS: &str = "/api/v1/blocks";
 /// The 422 body `POST …/block` answers for the caller's own id: the wording
@@ -173,16 +171,6 @@ async fn stored_blocks(pool: &PgPool, blocker: &User) -> Vec<Listed> {
     rows.into_iter()
         .map(|(id, blocked)| (id, blocked.to_string()))
         .collect()
-}
-
-/// The `Link` header Pleroma's `add_link_headers` writes for a page of the
-/// blocked listing: `next` walks to the oldest block row, `prev` back to the
-/// newest.
-fn expected_link(oldest: &Uuid, newest: &Uuid) -> String {
-    format!(
-        "<{BASE}{BLOCKS}?max_id={oldest}>; rel=\"next\", \
-         <{BASE}{BLOCKS}?min_id={newest}>; rel=\"prev\""
-    )
 }
 
 /// The relationship `token`'s account holds to `target`, as the batch endpoint
@@ -461,7 +449,7 @@ async fn the_listing_answers_accounts_newest_first() {
     );
     assert_eq!(
         listed.header("link"),
-        Some(expected_link(&stored[2].0, &stored[0].0).as_str()),
+        Some(common::expected_link(BLOCKS, &stored[0].0, &stored[2].0).as_str()),
         "the Link cursors are the block row ids, not the accounts"
     );
     let first = &listed.json_value()[0];
@@ -517,7 +505,7 @@ async fn the_listing_pages_by_block_row_id() {
     );
     assert_eq!(
         first.header("link"),
-        Some(expected_link(&stored[1].0, &stored[0].0).as_str()),
+        Some(common::expected_link(BLOCKS, &stored[0].0, &stored[1].0).as_str()),
         "the cursors are the page's own ends"
     );
 
@@ -619,7 +607,7 @@ async fn the_listing_pages_up_to_eighty_rows() {
     );
     assert_eq!(
         big.header("link"),
-        Some(expected_link(&stored[40].0, &stored[0].0).as_str()),
+        Some(common::expected_link(BLOCKS, &stored[0].0, &stored[40].0).as_str()),
         "and the whole page is one page, linked at both ends"
     );
 }

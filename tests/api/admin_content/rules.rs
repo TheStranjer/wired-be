@@ -7,7 +7,7 @@ use uuid::Uuid;
 
 use super::support::{
     ALL_ADMIN, BLANK, INSTANCE, PUBLIC_RULES, RULE_KEYS, RULES, TOO_LONG, a_rule, admin, app,
-    create_rule, destroy, get, json_keys, log_entry, patch, post_rule, rule_count, texts_of,
+    create_rule, destroy, get, log_entry, patch, post_rule, rule_count, texts_of,
 };
 use crate::common;
 
@@ -29,9 +29,13 @@ async fn a_created_rule_answers_the_four_key_entity() {
         &json!({"text": "Be nice", "hint": "say hi first", "priority": 2}),
     )
     .await;
-    assert_eq!(json_keys(&full), RULE_KEYS, "exactly the view's keys");
     assert_eq!(
-        json_keys(&bare),
+        common::sorted_keys(&full),
+        RULE_KEYS,
+        "exactly the view's keys"
+    );
+    assert_eq!(
+        common::sorted_keys(&bare),
         RULE_KEYS,
         "and the same four on a bare write"
     );

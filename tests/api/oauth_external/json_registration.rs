@@ -12,7 +12,7 @@ use wired_be::models::{
 
 use super::provider::{PROVIDER, REDIRECT, UNLINKED_UID};
 use super::support::{
-    assert_no_store, count_codes, count_identities, count_states, count_users, error_text, fixture,
+    assert_no_store, count_codes, count_identities, count_states, count_users, fixture,
     pending_nickname, pending_state, prepare, query_param,
 };
 use crate::common;
@@ -80,7 +80,7 @@ async fn registration_details_json_refuses_a_bad_state() {
     ] {
         let response = details(&site.http, &query).await;
         assert_eq!(response.status, StatusCode::BAD_REQUEST, "{why}");
-        assert_eq!(error_text(&response), "Invalid state", "for {why}");
+        assert_eq!(response.error_text(), "Invalid state", "for {why}");
         assert_no_store(&response);
     }
     site.provider.stop();
@@ -150,9 +150,9 @@ async fn json_register_takes_a_chosen_password() {
     .await;
     assert_eq!(short.status, StatusCode::UNPROCESSABLE_ENTITY, "too short");
     assert!(
-        error_text(&short).contains("password"),
+        short.error_text().contains("password"),
         "the password is named: {}",
-        error_text(&short)
+        short.error_text()
     );
 
     let response = register_json(
@@ -191,7 +191,7 @@ async fn json_register_refuses_a_taken_nickname_with_a_422() {
     .await;
     assert_eq!(response.status, StatusCode::UNPROCESSABLE_ENTITY, "refused");
     assert_eq!(
-        error_text(&response),
+        response.error_text(),
         r#"{"nickname":["has already been taken"]}"#,
         "the accounts endpoint's wording"
     );
@@ -222,7 +222,7 @@ async fn json_register_refuses_bad_states() {
     for state in ["never-issued", ""] {
         let response = register_json(&site.http, &json!({"state": state, "nickname": "x"})).await;
         assert_eq!(response.status, StatusCode::BAD_REQUEST, "state `{state}`");
-        assert_eq!(error_text(&response), "Invalid state", "for `{state}`");
+        assert_eq!(response.error_text(), "Invalid state", "for `{state}`");
     }
     assert_eq!(count_users(&pool).await, 1, "no user was created");
     site.provider.stop();

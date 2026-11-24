@@ -170,14 +170,6 @@ pub(super) fn assert_no_store(response: &common::TestResponse) {
     );
 }
 
-/// The `error` message of a JSON error response.
-pub(super) fn error_text(response: &common::TestResponse) -> String {
-    response.json_value()["error"]
-        .as_str()
-        .expect("errors carry a string error field")
-        .to_owned()
-}
-
 /// The parameters stored against `state`, and its provider.
 pub(super) async fn stored_params(pool: &PgPool, state: &str) -> (String, Value) {
     sqlx::query_as("SELECT provider, params FROM oauth_login_states WHERE state = $1")

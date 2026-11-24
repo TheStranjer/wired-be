@@ -38,7 +38,8 @@ async fn the_admin_lists_a_users_chats_newest_first_under_link_headers() {
         "newest activity first, the backdated rows last"
     );
     for entry in value.as_array().expect("the list is an array") {
-        assert_eq!(json_keys(entry), CHAT_KEYS, "every entry is a Chat entity");
+        let keys = common::sorted_keys(entry);
+        assert_eq!(keys, CHAT_KEYS, "every entry is a Chat entity");
     }
     assert_eq!(
         value[0]["account"]["id"],
@@ -52,16 +53,10 @@ async fn the_admin_lists_a_users_chats_newest_first_under_link_headers() {
     );
 
     let first = get(&app, &token, &format!("{path}?limit=2")).await;
+    let link = common::expected_link(&path, &alice_dave.chat_id, &alice_carol.chat_id);
     assert_eq!(
         first.header("link"),
-        Some(
-            expected_link(
-                &path,
-                &alice_dave.chat_id.to_string(),
-                &alice_carol.chat_id.to_string()
-            )
-            .as_str()
-        ),
+        Some(link.as_str()),
         "the cursors key on the page's own chat ids"
     );
     let walked = get(
@@ -117,7 +112,7 @@ async fn the_user_lookup_takes_handles_and_refuses_strangers() {
     let stranger = get(&app, &token, &user_chats_path("nobody")).await;
     common::assert_answer(&stranger, StatusCode::NOT_FOUND, "an unknown nickname");
     assert_eq!(
-        error_message(&stranger).as_deref(),
+        stranger.error_field().as_deref(),
         Some(NOT_FOUND),
         "the ticket's wording"
     );
@@ -133,7 +128,7 @@ async fn the_user_lookup_takes_handles_and_refuses_strangers() {
     .await;
     common::assert_answer(&junk, StatusCode::BAD_REQUEST, "a broken cursor");
     assert_eq!(
-        error_message(&junk).as_deref(),
+        junk.error_field().as_deref(),
         Some("Invalid id"),
         "in the pagination module's wording"
     );
@@ -159,7 +154,11 @@ async fn the_admin_shows_any_chat_whatever_its_owner() {
     let alices_row = get(&app, &token, &chat_path(&alice_ref.chat_id.to_string())).await;
     common::assert_answer(&alices_row, StatusCode::OK, "alice's side of the pair");
     let shown = alices_row.json_value();
-    assert_eq!(json_keys(&shown), CHAT_KEYS, "the ordinary Chat entity");
+    assert_eq!(
+        common::sorted_keys(&shown),
+        CHAT_KEYS,
+        "the ordinary Chat entity"
+    );
     assert_eq!(
         shown["id"],
         alice_ref.chat_id.to_string(),
@@ -191,7 +190,7 @@ async fn the_admin_shows_any_chat_whatever_its_owner() {
             &format!("no chat answers to {raw:?}"),
         );
         assert_eq!(
-            error_message(&missing).as_deref(),
+            missing.error_field().as_deref(),
             Some(RECORD_NOT_FOUND),
             "the record-miss wording, malformed or unknown alike"
         );
@@ -233,7 +232,7 @@ async fn the_admin_lists_a_chats_messages_newest_first_without_the_withdrawn() {
     assert_message_entities(&listed.json_value(), &refs, &alice.id.to_string(), &chat_id);
     assert_eq!(
         listed.header("link"),
-        Some(expected_link(&path, &refs[2].id.to_string(), &refs[0].id.to_string()).as_str()),
+        Some(common::expected_link(&path, &refs[2].id, &refs[0].id).as_str()),
         "the cursors key on the page's first and last reference ids"
     );
 
@@ -250,7 +249,7 @@ async fn the_admin_lists_a_chats_messages_newest_first_without_the_withdrawn() {
     );
     let junk = get(&app, &token, &format!("{path}?since_id=nope")).await;
     common::assert_answer(&junk, StatusCode::BAD_REQUEST, "a broken cursor");
-    assert_eq!(error_message(&junk).as_deref(), Some("Invalid id"));
+    assert_eq!(junk.error_field().as_deref(), Some("Invalid id"));
 
     // Withdraw the middle message through the admin delete and every read
     // of this chat — this one included — loses it.
@@ -275,7 +274,7 @@ async fn the_admin_lists_a_chats_messages_newest_first_without_the_withdrawn() {
         "an unknown chat has no messages",
     );
     assert_eq!(
-        error_message(&nowhere).as_deref(),
+        nowhere.error_field().as_deref(),
         Some(RECORD_NOT_FOUND),
         "one 404, malformed or unknown alike"
     );
@@ -289,7 +288,7 @@ async fn the_admin_lists_a_chats_messages_newest_first_without_the_withdrawn() {
 fn assert_message_entities(list: &Value, refs: &[ChatMessageReference], sender: &str, chat: &str) {
     for entry in list.as_array().expect("the list is an array") {
         assert_eq!(
-            json_keys(entry),
+            common::sorted_keys(entry),
             MESSAGE_KEYS,
             "every entry is a ChatMessage entity"
         );
