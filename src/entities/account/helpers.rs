@@ -12,7 +12,10 @@ use serde_json::Value;
 use super::AccountSource;
 
 use super::{AccountViewer, Field};
-use crate::{config::Config, models::user::User, services::media_proxy};
+use crate::{
+    config::Config, models::user::User, services::media_proxy,
+    util::sanitize::sanitize_display_name,
+};
 
 /// Whether `viewer` is looking at their own account — Pleroma's
 /// `self = opts[:for] == user`, compared by primary key.
@@ -74,6 +77,21 @@ pub(crate) fn profile_image(
     } else {
         media_proxy::proxy_url(config, url)
     }
+}
+
+/// Pleroma's `strip_tags(user.name || user.nickname)`: the display name
+/// when the account has one, the handle when it does not, and either way
+/// reduced to one line of plain text (the column holds sanitized markup, so
+/// a name fetched from a remote actor can still carry tags). Crate-visible
+/// because the admin API's account entity and the push job's notification
+/// title both render this one rule.
+pub(crate) fn plain_display_name(user: &User) -> String {
+    let stored = if user.name.is_empty() {
+        user.nickname.as_str()
+    } else {
+        user.name.as_str()
+    };
+    sanitize_display_name(stored)
 }
 
 /// The part of `nickname` before the first `@` — Pleroma's
