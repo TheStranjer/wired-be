@@ -83,7 +83,7 @@ mod admin_content;
 mod admin_federation;
 
 /// The admin ops endpoints over HTTP: the media-proxy cache ledger, the
-/// frontend catalogue and installer, and the admin backup trigger.
+/// admin backup trigger, and the unported frontend installer routes.
 mod admin_ops;
 
 /// The admin reports surface over HTTP (`/api/v1/pleroma/admin/reports`,

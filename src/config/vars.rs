@@ -4,9 +4,7 @@
 //! variable holds.
 
 #[cfg(doc)]
-use super::{
-    defaults::MIN_MEDIA_PROXY_SECRET_CHARS, frontend::FrontendConfig, integrations::OauthProvider,
-};
+use super::{defaults::MIN_MEDIA_PROXY_SECRET_CHARS, integrations::OauthProvider};
 /// Environment variable holding the PostgreSQL connection URL.
 pub const DATABASE_URL_VAR: &str = "DATABASE_URL";
 /// Environment variable holding the address to listen on.
@@ -181,12 +179,6 @@ pub const OAUTH_PROVIDERS_VAR: &str = "OAUTH_PROVIDERS";
 /// Environment variable holding the comma-separated list of frontends
 /// clients may pick at `PUT /api/v1/pleroma/preferred_frontend`.
 pub const AVAILABLE_FRONTENDS_VAR: &str = "AVAILABLE_FRONTENDS";
-/// Environment variable holding the directory admin-installed frontends
-/// live in (`src/api/admin/ops.rs`, WBE-208).
-pub const FRONTENDS_DIR_VAR: &str = "FRONTENDS_DIR";
-/// Environment variable holding the installable frontends, as the JSON
-/// text of a [`FrontendConfig`] array.
-pub const FRONTENDS_AVAILABLE_VAR: &str = "FRONTENDS_AVAILABLE";
 /// Environment variable holding the job worker's concurrent handler count.
 pub const JOB_CONCURRENCY_VAR: &str = "JOB_CONCURRENCY";
 /// Environment variable holding the comma-separated job queue names.

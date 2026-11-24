@@ -172,9 +172,8 @@ fn document_path(config: &Config, name: &str) -> Option<PathBuf> {
         })
 }
 
-/// Whether `name` may stand as one document segment: the same filename
-/// charset the frontend installer keeps, non-empty, and neither `.` nor
-/// `..`.
+/// Whether `name` may stand as one document segment: a safe filename
+/// charset, non-empty, and neither `.` nor `..`.
 fn is_document_name(name: &str) -> bool {
     !name.is_empty()
         && name != "."
@@ -207,8 +206,7 @@ async fn read_document(config: &Config, name: &str) -> AppResult<Bytes> {
 /// Writes the document atomically: the bytes land in a hidden staging
 /// file beside the target (same directory, so the rename is a plain
 /// move) and the rename swaps them in, replacing whatever stood there.
-/// The filesystem work runs on the blocking pool, the way the frontend
-/// installer's does.
+/// The filesystem work runs on the blocking pool.
 ///
 /// # Errors
 ///

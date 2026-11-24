@@ -123,7 +123,7 @@ mod tests {
         let rows: Vec<&RouteSpec> = routes().collect();
         assert_eq!(
             rows.len(),
-            372,
+            370,
             "the assembled table holds every row exactly once"
         );
         assert_eq!(

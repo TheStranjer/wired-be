@@ -301,11 +301,9 @@ pub struct Config {
     /// The media proxy settings, from the `MEDIA_PROXY_*` variables
     /// (see [`crate::services::media_proxy`]).
     pub media_proxy: MediaProxyConfig,
-    /// The admin-managed static content: the installed/installable
-    /// frontends and the instance documents, from the `FRONTENDS_*` and
+    /// The admin-managed static content: the instance documents, from the
     /// `INSTANCE_DOCUMENT*` variables
-    /// (see [`crate::api::admin::ops`] and
-    /// [`crate::api::admin::apps_docs`]).
+    /// (see [`crate::api::admin::apps_docs`]).
     pub statics: StaticSettings,
     /// Hosts rich media card fetching never visits, from
     /// `RICH_MEDIA_IGNORE_HOSTS` (a comma-separated list, empty by

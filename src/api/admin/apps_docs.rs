@@ -64,7 +64,7 @@
 //!   document never uploaded.
 //! - `PATCH /instance_document/{name}` (`update`) — the multipart `file`
 //!   part, at most 1 MiB, written atomically (a hidden staging file
-//!   renamed into place, the same move the frontend installer makes);
+//!   renamed into place);
 //!   200 `{"url":"{BASE_URL}/instance/<name>.html"}`. A body without the
 //!   part is 400 `{"error":"Missing parameter: file"}`, an oversize one
 //!   413.

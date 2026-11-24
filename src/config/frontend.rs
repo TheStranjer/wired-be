@@ -1,106 +1,25 @@
-//! The admin-managed static content: the installable frontends and the
-//! instance documents, with the readers that fill one [`StaticSettings`]
-//! from the four `FRONTENDS_*` and `INSTANCE_DOCUMENT*` variables.
+//! The admin-managed static content: the instance documents, with the
+//! reader that fills one [`StaticSettings`] from the `INSTANCE_DOCUMENT*`
+//! variables.
 
 use std::path::PathBuf;
 
-#[cfg(doc)]
-use super::Config;
-
 use super::{
-    defaults::{
-        DEFAULT_FRONTENDS_AVAILABLE, DEFAULT_FRONTENDS_DIR, DEFAULT_INSTANCE_DOCS_DIR,
-        DEFAULT_INSTANCE_DOCUMENT_NAMES,
-    },
-    error::ConfigError,
+    defaults::{DEFAULT_INSTANCE_DOCS_DIR, DEFAULT_INSTANCE_DOCUMENT_NAMES},
     parse::comma_list,
     urls::directory,
-    vars::{
-        FRONTENDS_AVAILABLE_VAR, FRONTENDS_DIR_VAR, INSTANCE_DOCS_DIR_VAR,
-        INSTANCE_DOCUMENT_NAMES_VAR,
-    },
+    vars::{INSTANCE_DOCS_DIR_VAR, INSTANCE_DOCUMENT_NAMES_VAR},
 };
-
-/// One installable frontend, as one element of the
-/// `FRONTENDS_AVAILABLE` JSON array.
-///
-/// Pleroma's `[:frontends, :available]` keyword list, expressed as data
-/// (see `Pleroma.Frontend.install`, `lib/pleroma/frontend.ex`). `name` is
-/// the directory segment the frontend installs under and the answer's
-/// identity; the four optional fields carry Pleroma's own meaning: `git`
-/// is the source repository for the admin UI, `build_url` the pre-built-
-/// archive address (`${ref}` stands for the ref), `reference` the build
-/// ref (Pleroma's `ref` key), and `build_dir` the archive subdirectory to
-/// install (default `dist`).
-#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize)]
-pub struct FrontendConfig {
-    /// Frontend name: the answer's identity and the install directory's
-    /// first segment, e.g. `plume`.
-    pub name: String,
-    /// The source repository, answered verbatim; `None` when unset.
-    #[serde(default)]
-    pub git: Option<String>,
-    /// The build-archive download URL, `None` when unset — then only an
-    /// uploaded file can install this frontend.
-    #[serde(default)]
-    pub build_url: Option<String>,
-    /// The build ref, from the JSON `ref` key; `None` falls back to
-    /// the `master` default at install and to the name's top directory
-    /// for the installed flag.
-    #[serde(default, rename = "ref")]
-    pub reference: Option<String>,
-    /// The archive subdirectory to install; `None` means `dist`.
-    #[serde(default)]
-    pub build_dir: Option<String>,
-}
-
-/// The two settings that locate and describe installed frontends, from
-/// `FRONTENDS_DIR` and `FRONTENDS_AVAILABLE`
-/// (see [`crate::api::admin::ops`]).
-///
-/// It rides inside [`StaticSettings`], the one [`Config`] field for the
-/// admin-managed static trees, because the [`Config`] readers and the
-/// [`Debug`] impl each have an 80-line budget (AGENTS.md).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct FrontendSettings {
-    /// Directory installed frontends live in, from `FRONTENDS_DIR`; the
-    /// installed flag reads `dir/<name>/<ref>`.
-    pub dir: PathBuf,
-    /// The installable frontends, from `FRONTENDS_AVAILABLE`; empty when
-    /// none is configured.
-    pub available: Vec<FrontendConfig>,
-}
-
-/// Reads the two `FRONTENDS_*` settings into a [`FrontendSettings`].
-///
-/// # Errors
-///
-/// [`ConfigError::InvalidFrontends`] when `FRONTENDS_AVAILABLE` is neither
-/// unset, blank, nor a JSON array of frontend objects.
-pub(crate) fn frontend_settings<F>(lookup: &F) -> Result<FrontendSettings, ConfigError>
-where
-    F: Fn(&str) -> Option<String>,
-{
-    let configured = lookup(FRONTENDS_AVAILABLE_VAR).unwrap_or_default();
-    let text = if configured.trim().is_empty() {
-        DEFAULT_FRONTENDS_AVAILABLE
-    } else {
-        configured.as_str()
-    };
-    let available =
-        serde_json::from_str(text).map_err(|err| ConfigError::InvalidFrontends(err.to_string()))?;
-    Ok(FrontendSettings {
-        dir: directory(lookup, FRONTENDS_DIR_VAR, DEFAULT_FRONTENDS_DIR),
-        available,
-    })
-}
 
 /// The two settings that locate the instance documents and say which names
 /// exist, from `INSTANCE_DOCS_DIR` and `INSTANCE_DOCUMENT_NAMES`
 /// (see [`crate::api::admin::apps_docs`]).
 ///
-/// It rides inside [`StaticSettings`] for the same line-budget reason
-/// [`FrontendSettings`] does.
+/// It rides inside [`StaticSettings`], the one [`Config`] field for the
+/// admin-managed static trees, because the [`Config`] readers and the
+/// [`Debug`] impl each have an 80-line budget (AGENTS.md).
+///
+/// [`Config`]: super::Config
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InstanceDocumentSettings {
     /// Directory the `<name>.html` documents are stored in, from
@@ -130,120 +49,46 @@ where
     }
 }
 
-/// The two admin-managed static file trees: the frontends the installer
-/// lands and the documents the instance-document routes serve.
+/// The admin-managed static file trees: the documents the
+/// instance-document routes serve.
 ///
-/// Pleroma keeps both under one `[:instance, :static_dir]`; this server
-/// gives each its own directory variable, and they share one [`Config`]
-/// field because the [`Config`] readers and the [`Debug`] impl each have
-/// an 80-line budget (AGENTS.md) and both feed admin-served static
-/// content.
+/// They share one [`Config`] field because the [`Config`] readers and the
+/// [`Debug`] impl each have an 80-line budget (AGENTS.md).
+///
+/// [`Config`]: super::Config
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StaticSettings {
-    /// The installed and installable frontends
-    /// (see [`crate::api::admin::ops`]).
-    pub frontends: FrontendSettings,
     /// The instance documents
     /// (see [`crate::api::admin::apps_docs`]).
     pub documents: InstanceDocumentSettings,
 }
 
-/// Reads the four `FRONTENDS_*` and `INSTANCE_DOCUMENT*` settings into the
-/// one [`StaticSettings`].
-///
-/// # Errors
-///
-/// Those of [`frontend_settings`].
-pub(crate) fn statics_settings<F>(lookup: &F) -> Result<StaticSettings, ConfigError>
+/// Reads the `INSTANCE_DOCUMENT*` settings into the one
+/// [`StaticSettings`].
+pub(crate) fn statics_settings<F>(lookup: &F) -> StaticSettings
 where
     F: Fn(&str) -> Option<String>,
 {
-    Ok(StaticSettings {
-        frontends: frontend_settings(lookup)?,
+    StaticSettings {
         documents: instance_document_settings(lookup),
-    })
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    use crate::config::test_support::{config_with, try_config_with};
+    use crate::config::test_support::config_with;
 
     #[test]
-    fn frontends_default_to_the_stock_directory_and_no_catalogue() {
-        let config = config_with(&[]);
+    fn the_retired_frontend_catalogue_variable_is_ignored() {
+        let retired = concat!("FRONTENDS", "_AVAILABLE");
+        let config = config_with(&[(retired, "not json")]);
         assert_eq!(
-            config.statics.frontends.dir,
-            PathBuf::from("./frontends"),
-            "default FRONTENDS_DIR"
+            config.statics.documents.names.len(),
+            2,
+            "the rest of the configuration still loads"
         );
-        assert!(
-            config.statics.frontends.available.is_empty(),
-            "nothing is installable until the operator names it"
-        );
-        for blank in ["", "   "] {
-            let blank_catalogue = config_with(&[(FRONTENDS_AVAILABLE_VAR, blank)]);
-            assert!(
-                blank_catalogue.statics.frontends.available.is_empty(),
-                "FRONTENDS_AVAILABLE={blank:?} means no frontends"
-            );
-        }
-    }
-
-    #[test]
-    fn reads_the_frontends_catalogue() {
-        let config = config_with(&[
-            (FRONTENDS_DIR_VAR, "/srv/frontends"),
-            (
-                FRONTENDS_AVAILABLE_VAR,
-                r#"[{"name":"pleroma-fe","git":"https://example.com/fe","build_url":"https://build.example/${ref}.zip","ref":"stable","build_dir":"www"},
-                    {"name":"volar"}]"#,
-            ),
-        ]);
-        assert_eq!(
-            config.statics.frontends.dir,
-            PathBuf::from("/srv/frontends"),
-            "custom FRONTENDS_DIR"
-        );
-        assert_eq!(config.statics.frontends.available.len(), 2, "two entries");
-        assert_eq!(
-            config.statics.frontends.available[0],
-            FrontendConfig {
-                name: "pleroma-fe".to_owned(),
-                git: Some("https://example.com/fe".to_owned()),
-                build_url: Some("https://build.example/${ref}.zip".to_owned()),
-                reference: Some("stable".to_owned()),
-                build_dir: Some("www".to_owned()),
-            },
-            "the full entry"
-        );
-        assert_eq!(
-            config.statics.frontends.available[1],
-            FrontendConfig {
-                name: "volar".to_owned(),
-                git: None,
-                build_url: None,
-                reference: None,
-                build_dir: None,
-            },
-            "every field but the name is optional"
-        );
-    }
-
-    #[test]
-    fn invalid_frontends_available_is_an_error() {
-        for broken in ["{not json}", r#"[{"git":"https://example.com"}]"#] {
-            let err = try_config_with(&[(FRONTENDS_AVAILABLE_VAR, broken)]).unwrap_err();
-            assert!(
-                matches!(err, ConfigError::InvalidFrontends(_)),
-                "FRONTENDS_AVAILABLE={broken:?} is refused, got {err:?}"
-            );
-            assert!(
-                err.to_string().contains(FRONTENDS_AVAILABLE_VAR),
-                "the message names the variable: {err}"
-            );
-        }
     }
 
     #[test]

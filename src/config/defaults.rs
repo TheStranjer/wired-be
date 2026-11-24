@@ -17,7 +17,7 @@ use crate::{extract::multipart::UploadLimits, rate_limit};
 #[cfg(any(test, feature = "integration-tests"))]
 use super::{
     federation_types::{FetchSettings, RateLimitConfig, Toggle},
-    frontend::{FrontendSettings, InstanceDocumentSettings, StaticSettings},
+    frontend::{InstanceDocumentSettings, StaticSettings},
     integrations::MediaProxyConfig,
     parse::comma_list,
 };
@@ -317,17 +317,6 @@ pub const DEFAULT_MEDIA_PROXY_MAX_BYTES: usize = 50_000_000;
 /// Media-proxy cache ledger size used when `MEDIA_PROXY_CACHE_LIMIT` is
 /// unset: 100 000 served URLs kept, the oldest pruned past that.
 pub const DEFAULT_MEDIA_PROXY_CACHE_LIMIT: usize = 100_000;
-/// Directory admin-installed frontends live in when `FRONTENDS_DIR` is
-/// unset: `./frontends`, relative to the working directory.
-///
-/// The same shape as [`DEFAULT_UPLOADS_DIR`]'s and
-/// [`DEFAULT_EMOJI_DIR`]'s defaults, and Pleroma's
-/// `Pleroma.Frontend.dir()` (`lib/pleroma/frontend.ex`) with its
-/// `static_dir` parent step folded into the one setting.
-pub const DEFAULT_FRONTENDS_DIR: &str = "./frontends";
-/// Frontend list used when `FRONTENDS_AVAILABLE` is unset: nothing is
-/// installable, so `GET /api/v1/pleroma/admin/frontends` answers `[]`.
-pub const DEFAULT_FRONTENDS_AVAILABLE: &str = "[]";
 /// The media-proxy defaults together as a [`MediaProxyConfig`], spelled
 /// once for [`Config::test_defaults`]'s literal; the real read of the same
 /// group is the `media_proxy_settings` function.
@@ -355,18 +344,14 @@ pub(crate) fn test_rate_limit() -> RateLimitConfig {
         trusted_proxy_hops: DEFAULT_TRUSTED_PROXY_HOPS,
     }
 }
-/// The admin-managed static content defaults — no installable frontend,
-/// the stock document pair — as a [`StaticSettings`], spelled once for
-/// [`Config::test_defaults`]'s literal like [`TEST_MEDIA_PROXY`]; a
+/// The admin-managed static content defaults — the stock document pair —
+/// as a [`StaticSettings`], spelled once for [`Config::test_defaults`]'s
+/// literal like [`TEST_MEDIA_PROXY`]; a
 /// function rather than a `const` because [`PathBuf::from`] is not a
 /// `const fn`.
 #[cfg(any(test, feature = "integration-tests"))]
 pub(crate) fn test_statics() -> StaticSettings {
     StaticSettings {
-        frontends: FrontendSettings {
-            dir: PathBuf::from(DEFAULT_FRONTENDS_DIR),
-            available: Vec::new(),
-        },
         documents: InstanceDocumentSettings {
             dir: PathBuf::from(DEFAULT_INSTANCE_DOCS_DIR),
             names: comma_list(DEFAULT_INSTANCE_DOCUMENT_NAMES),

@@ -35,8 +35,8 @@
 //! resets, `users/confirm_email`, `users/resend_confirmation_email`,
 //! `users/disable_mfa` and the `users/follow` pair), the invite actions of
 //! [`invites`] and the webhook routes of [`webhooks`]. The
-//! media-proxy cache ledger, the frontend installer and the admin's backup
-//! trigger (WBE-208) are the [`ops`] submodule.
+//! media-proxy cache ledger and the admin's backup trigger (WBE-208) are
+//! the [`ops`] submodule.
 //!
 //! Later admin tickets join this same file with more `.merge(...)` /
 //! `.route(...)` lines; the [module docs of `crate::api::v1`](crate::api::v1)
@@ -136,9 +136,8 @@ const CLASS_READ: &str = "read";
 /// The `/api/v1/pleroma/admin` router, nested into [`crate::api::v1`].
 /// Later admin tickets extend it with more `.merge(...)` lines.
 ///
-/// `config` reaches [`ops::router`] and [`apps_docs::router`], the merged
-/// routers whose routes carry a body limit of their own (the frontend
-/// install's uploaded zip and the instance-document upload; see
+/// `config` reaches [`apps_docs::router`], the merged router whose routes
+/// carry a body limit of their own (the instance-document upload; see
 /// [`crate::extract::multipart::upload_body_limit`]).
 pub fn router(config: &Config) -> Router<AppState> {
     Router::new()
@@ -150,7 +149,7 @@ pub fn router(config: &Config) -> Router<AppState> {
         .merge(content::router())
         .merge(federation::router())
         .merge(invites::router())
-        .merge(ops::router(config))
+        .merge(ops::router())
         .merge(reports::router())
         .merge(statuses::router())
         .merge(users::router())
