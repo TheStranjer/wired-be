@@ -102,8 +102,8 @@ pub const EMOJI_DIR_VAR: &str = "EMOJI_DIR";
 /// written as `<name>.html` (see [`crate::api::admin::apps_docs`]).
 pub const INSTANCE_DOCS_DIR_VAR: &str = "INSTANCE_DOCS_DIR";
 /// Environment variable holding the comma-separated list of instance
-/// document names the admin and public document routes serve
-/// (see [`crate::api::admin::apps_docs`]).
+/// document names the admin document routes accept and the JSON terms of
+/// service reads (see [`crate::api::admin::apps_docs`]).
 pub const INSTANCE_DOCUMENT_NAMES_VAR: &str = "INSTANCE_DOCUMENT_NAMES";
 /// Environment variable holding the public prefix of uploaded files' URLs.
 pub const MEDIA_BASE_URL_VAR: &str = "MEDIA_BASE_URL";
