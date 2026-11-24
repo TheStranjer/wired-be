@@ -43,7 +43,9 @@
 //!    [`get_or_fetch_by_ap_id`] under `MENTION_LOOKUP_TIMEOUT`, at most
 //!    `MAX_MENTION_LOOKUPS` of them per status, and whatever stays
 //!    unresolved — a dead peer, an elapsed timeout, a mention past the
-//!    cap — is dropped rather than refused;
+//!    cap — is dropped rather than refused. The local accounts named in
+//!    `to`/`cc` join them as silent mentions (stored rows only, never
+//!    fetched), so an untagged direct post still reaches its recipient;
 //! 6. remote emojis upsert `custom_emojis` under the author's domain —
 //!    only once the unsolicited gate has let the post through, and only
 //!    the image URL of an emoji already stored, so a moderator's flags
@@ -125,7 +127,7 @@ pub mod write;
 mod test_support;
 
 pub(crate) use self::{
-    resolve::resolve_mentions,
+    resolve::{merge_accounts, resolve_local_audience, resolve_mentions},
     write::{insert_media, insert_poll},
 };
 use self::{
@@ -236,6 +238,10 @@ pub async fn ingest_note_delivered(
     let reply = resolve_reply(state, &parsed).await?;
     let quote_of_id = resolve_quote(state, parsed.quote_uri.as_deref()).await?;
     let mut mentioned = resolve_mentions(state, &parsed.mention_hrefs).await?;
+    merge_accounts(
+        &mut mentioned,
+        resolve_local_audience(state, &parsed.audience).await?,
+    );
     if let Some(owner) = owner
         && parsed.status.visibility == Visibility::Direct
         && owner.local.get()

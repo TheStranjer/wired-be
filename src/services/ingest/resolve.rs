@@ -129,6 +129,45 @@ pub(crate) async fn resolve_mentions(
     Ok(found)
 }
 
+/// The local accounts a note addresses in `to`/`cc` (its
+/// [`ParsedNote::audience`]), in document order, each once.
+///
+/// A silent mention in Mastodon's sense: only stored rows count, and only
+/// `local` ones — an unknown or remote id is skipped and never fetched, as
+/// a remote recipient needs no access grant here.
+///
+/// # Errors
+///
+/// [`FederationError::Transient`] when a lookup fails.
+pub(crate) async fn resolve_local_audience(
+    state: &AppState,
+    audience: &[String],
+) -> Result<Vec<User>, FederationError> {
+    let mut found: Vec<User> = Vec::new();
+    for ap_id in audience {
+        let stored = user::get_by_ap_id(&state.db, ap_id)
+            .await
+            .map_err(|err| FederationError::transient("the audience read failed", &err))?;
+        if let Some(account) = stored
+            && account.local.get()
+            && found.iter().all(|seen| seen.id != account.id)
+        {
+            found.push(account);
+        }
+    }
+    Ok(found)
+}
+
+/// Appends each of `extra` to `mentioned` unless an account with its id is
+/// already there.
+pub(crate) fn merge_accounts(mentioned: &mut Vec<User>, extra: Vec<User>) {
+    for account in extra {
+        if mentioned.iter().all(|seen| seen.id != account.id) {
+            mentioned.push(account);
+        }
+    }
+}
+
 /// One unknown mention's capped fetch: the [`User`] when the actor answers
 /// inside [`MENTION_LOOKUP_TIMEOUT`] and parses into a mirror, [`None`] —
 /// logged at debug — when it fails, refuses, or takes too long. A mention

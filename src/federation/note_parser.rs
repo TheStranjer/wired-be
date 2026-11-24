@@ -59,6 +59,7 @@ pub use types::{
 pub(crate) use addressing::parse_visibility;
 pub(crate) use attachments::pixel_dimension;
 
+use addressing::addressed_actor_ids;
 use attachments::parse_attachments;
 use envelope::{check_containment, check_size, object_id, object_kind, resolve_url};
 use polls::parse_poll;
@@ -207,6 +208,7 @@ pub fn parse_note(
         status,
         hashtags: tags.hashtags,
         mention_hrefs: tags.mention_hrefs,
+        audience: addressed_actor_ids(json, author),
         emojis: tags.emojis,
         attachments: parse_attachments(json),
         reply_to_uri: json.get("inReplyTo").and_then(value_or_id),
