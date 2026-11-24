@@ -28,14 +28,17 @@
 
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tracing::{debug, warn};
+use tracing::debug;
 use uuid::Uuid;
 
 use crate::{
     error::AppError,
-    jobs::{AttemptInfo, HandlerFuture, JobError, QUEUE_SCHEDULED, scheduler::PeriodicJob},
+    jobs::{
+        AttemptInfo, HandlerFuture, JobError, QUEUE_SCHEDULED, enqueue_keyed,
+        scheduler::PeriodicJob,
+    },
     models::{
-        job::{NewJob, enqueue},
+        job::NewJob,
         status::{self, Status},
     },
     services::delete_status,
@@ -74,7 +77,7 @@ pub fn job_args(status_id: Uuid) -> Value {
 ///
 /// At most one live scheduled delete per status, however many times its
 /// create is replayed (the `Idempotency-Key` arm restates the same row,
-/// [`enqueue`]'s `None` swallows the second claim).
+/// [`enqueue`](crate::models::job::enqueue)'s `None` swallows the second claim).
 #[must_use]
 pub fn unique_key(status_id: Uuid) -> String {
     format!("expire:{status_id}")
@@ -118,20 +121,7 @@ pub async fn schedule_expiration(state: &AppState, row: &Status) {
         max_attempts: None,
         unique_key: Some(&key),
     };
-    match enqueue(&state.db, request).await {
-        Ok(Some(job)) => debug!(
-            job = %job.id,
-            status = %row.id,
-            due = %expires_at,
-            "status expiration scheduled"
-        ),
-        Ok(None) => debug!(status = %row.id, "status expiration already scheduled"),
-        Err(err) => warn!(
-            %err,
-            status = %row.id,
-            "could not schedule status expiration; the sweep will expire it"
-        ),
-    }
+    drop(enqueue_keyed(&state.db, request, "status expiration").await);
 }
 
 /// Reads [`ExpireArgs`] out of a claimed job's payload; arguments this

@@ -40,12 +40,17 @@ mod worker;
 use std::{error::Error, fmt, future::Future, pin::Pin, time::Duration};
 
 use serde_json::Value;
+use sqlx::PgPool;
+use tracing::{debug, warn};
 
 pub use self::{
     registry::{JobRegistry, backoff},
     worker::Worker,
 };
-use crate::state::AppState;
+use crate::{
+    models::job::{Job, NewJob, enqueue},
+    state::AppState,
+};
 
 /// Queue for general-purpose jobs ([`crate::models::job`] callers that have
 /// no queue of their own).
@@ -136,9 +141,110 @@ pub type HandlerFuture = Pin<Box<dyn Future<Output = Result<(), JobError>> + Sen
 /// ```
 pub type HandlerFn = fn(AppState, AttemptInfo, Value) -> HandlerFuture;
 
+/// Enqueues `job` (normally carrying a `unique_key`) and logs the outcome,
+/// the one shape every deduplicating job producer shares.
+///
+/// `what` names the thing queued in the log line: `"{what} queued"` at
+/// `debug` for an inserted row, `"{what} already queued"` at `debug` when a
+/// live job already holds the key, and `"could not queue {what}"` at `warn`
+/// for a database failure. A failure is logged, not returned: every caller
+/// has stored the state the job acts on and has a sweep or a retry behind it,
+/// so refusing the client's request would be the worse answer. Returns the
+/// inserted job, `None` when it was deduplicated or the enqueue failed.
+pub(crate) async fn enqueue_keyed(pool: &PgPool, job: NewJob<'_>, what: &str) -> Option<Job> {
+    let kind = job.kind;
+    let key = job.unique_key;
+    match enqueue(pool, job).await {
+        Ok(Some(row)) => {
+            debug!(kind, key, id = %row.id, "{what} queued");
+            Some(row)
+        }
+        Ok(None) => {
+            debug!(kind, key, "{what} already queued");
+            None
+        }
+        Err(err) => {
+            warn!(%err, kind, key, "could not queue {what}");
+            None
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+
     use super::*;
+
+    /// A keyed job of kind `test.keyed` on the default queue.
+    fn keyed(key: &str) -> NewJob<'_> {
+        NewJob {
+            queue: QUEUE_DEFAULT,
+            kind: "test.keyed",
+            args: json!({}),
+            run_at: None,
+            max_attempts: None,
+            unique_key: Some(key),
+        }
+    }
+
+    /// How many rows the `jobs` table holds.
+    async fn job_count(pool: &PgPool) -> i64 {
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM jobs")
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn enqueue_keyed_returns_the_inserted_job() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+
+        let job = enqueue_keyed(&pool, keyed("k:1"), "test job").await;
+
+        let job = job.expect("the first claim of a key inserts");
+        assert_eq!(job.kind, "test.keyed", "the row carries the kind");
+        assert_eq!(job.state, "available", "a new row waits for a worker");
+        assert_eq!(job.unique_key.as_deref(), Some("k:1"), "the key is stored");
+        assert_eq!(job_count(&pool).await, 1, "one row was inserted");
+    }
+
+    #[tokio::test]
+    async fn enqueue_keyed_swallows_a_second_claim_of_a_live_key() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let first = enqueue_keyed(&pool, keyed("k:2"), "test job").await;
+        assert!(first.is_some(), "the first claim inserts");
+
+        let second = enqueue_keyed(&pool, keyed("k:2"), "test job").await;
+
+        assert!(second.is_none(), "the key is held by an available job");
+        assert_eq!(job_count(&pool).await, 1, "the duplicate inserted nothing");
+    }
+
+    #[tokio::test]
+    async fn enqueue_keyed_lets_distinct_keys_both_in() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+
+        let a = enqueue_keyed(&pool, keyed("k:a"), "test job").await;
+        let b = enqueue_keyed(&pool, keyed("k:b"), "test job").await;
+
+        assert!(a.is_some() && b.is_some(), "different keys do not collide");
+        assert_eq!(job_count(&pool).await, 2, "both rows were inserted");
+    }
+
+    #[tokio::test]
+    async fn enqueue_keyed_reports_a_database_failure_as_none() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        pool.close().await;
+
+        let job = enqueue_keyed(&pool, keyed("k:3"), "test job").await;
+
+        assert!(job.is_none(), "a failed enqueue is logged and yields None");
+    }
 
     #[test]
     fn default_queues_list_names_every_constant() {
