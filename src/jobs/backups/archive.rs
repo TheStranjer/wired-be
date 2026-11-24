@@ -19,12 +19,14 @@ use crate::{
     config::Config,
     error::{AppError, AppResult},
     federation::{
-        actor::actor_json,
+        actor::{actor_json, profile_emojis},
         note::{create_activity_json, load_note_context, note_json},
         vocab::AS_VOCABULARY,
     },
     models::{
-        bookmark, favourite,
+        bookmark,
+        custom_emoji::CustomEmoji,
+        favourite,
         status::{self, Status},
         user::User,
     },
@@ -110,7 +112,8 @@ pub async fn build(state: &AppState, user: &User, file_name: &str) -> AppResult<
             .try_clone()
             .map_err(|err| archive_error("open temp file", &err))?,
     );
-    write_actor(&mut zip, user, &state.config)?;
+    let emojis = profile_emojis(&state.db, user).await?;
+    write_actor(&mut zip, user, &state.config, &emojis)?;
     let outbox_items = write_outbox(&mut zip, state, user).await?;
     let like_items = write_uris(&mut zip, state, user.id, LIKES_ENTRY, UriTable::Likes).await?;
     let bookmark_items = write_uris(
@@ -177,8 +180,13 @@ fn start_entry(zip: &mut ZipWriter<File>, name: &str) -> AppResult<()> {
 /// Writes `actor.json`: this instance's actor document for `user`,
 /// verbatim — no relative-path key merge, the archive carries the same
 /// absolute document the fediverse already sees.
-fn write_actor(zip: &mut ZipWriter<File>, user: &User, config: &Config) -> AppResult<()> {
-    let bytes = encode(&actor_json(user, config))?;
+fn write_actor(
+    zip: &mut ZipWriter<File>,
+    user: &User,
+    config: &Config,
+    emojis: &[CustomEmoji],
+) -> AppResult<()> {
+    let bytes = encode(&actor_json(user, config, emojis))?;
     start_entry(zip, ACTOR_ENTRY)?;
     zip.write_all(&bytes)
         .map_err(|err| archive_error("write actor", &err))?;

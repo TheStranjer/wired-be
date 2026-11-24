@@ -9,7 +9,10 @@
 use axum::http::StatusCode;
 use serde_json::{Value, json};
 use wired_be::{
-    models::user::{Flag, NewUser},
+    models::{
+        custom_emoji::{self, NewCustomEmoji},
+        user::{Flag, NewUser},
+    },
     util::time::mastodon_time,
 };
 
@@ -599,5 +602,37 @@ async fn the_actor_redirect_follows_the_frontend_origin() {
         federating.json_value()["id"],
         format!("{BASE}/users/alice"),
         "whose id stays on the base URL"
+    );
+}
+
+/// The profile's custom emoji ride the served actor's `tag` as `Emoji`
+/// tags: one per local emoji used in the name, bio or a field; a shortcode
+/// with no emoji row adds none.
+#[tokio::test]
+async fn profile_custom_emoji_are_tagged_on_the_served_actor() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let url = format!("{BASE}/emoji/wiredcat.png");
+    let _stored = custom_emoji::upsert(&pool, &NewCustomEmoji::local("wiredcat", &url))
+        .await
+        .expect("the emoji stores");
+    let alice = common::create_local_user_with(&pool, "alice", |new| NewUser {
+        name: "Alice :wiredcat: A".to_owned(),
+        raw_bio: "bio :wiredcat: :nosuch:".to_owned(),
+        fields: json!([{"name": "emoji :wiredcat:", "value": ":wiredcat:"}]),
+        ..new
+    })
+    .await;
+
+    let document = fetch_actor(&pool, &alice).await;
+    assert_eq!(
+        document["tag"],
+        json!([{
+            "type": "Emoji",
+            "id": url,
+            "name": ":wiredcat:",
+            "icon": {"type": "Image", "url": url},
+        }]),
+        "one tag for the known emoji, however often it is used"
     );
 }
