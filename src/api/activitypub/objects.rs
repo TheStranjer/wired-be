@@ -33,6 +33,7 @@ use super::negotiation::{
     activity_content_type, document, document_response, frontend_redirect, wants_activity_json,
     wants_html, with_vary,
 };
+use super::scrobbles::audio_response;
 
 /// `GET /objects/{uuid}/replies` — the replies collection of one local
 /// status: the `Collection` root with the count of publicly visible
@@ -174,7 +175,11 @@ async fn object_core(
     }
     fetch_allowed(state, &Method::GET, uri, headers).await?;
     let Some(status) = status::get_by_id_including_deleted(&state.db, id).await? else {
-        return Err(AppError::RouteNotFound);
+        // Not a status: a scrobble's `Audio` object lives at the same path.
+        if nickname.is_some() {
+            return Err(AppError::RouteNotFound);
+        }
+        return audio_response(state, id).await;
     };
     if !status.local || status.reblog_of_id.is_some() {
         return Err(AppError::RouteNotFound);

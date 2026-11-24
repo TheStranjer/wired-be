@@ -207,6 +207,9 @@ mod outbox_create;
 /// The C2S outbox's relationship arms: the `Follow`, `Like`, `Announce`,
 /// `Block` and `Undo` activities it folds.
 mod outbox_relations;
+/// The scrobble documents: the `Audio` object and the `Listen` activity
+/// the object and activity routes fall back to for a scrobble id.
+mod scrobbles;
 /// The fixtures shared by this module tree's unit tests.
 #[cfg(test)]
 mod test_support;

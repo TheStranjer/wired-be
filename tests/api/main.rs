@@ -558,6 +558,10 @@ mod route_inventory;
 /// routes that list, read, move and cancel what was parked.
 mod scheduled_statuses;
 
+/// Scrobbles federating out as `Listen`/`Audio` documents (WBE-763): the
+/// queued delivery and the served object and activity.
+mod scrobble_federation;
+
 /// Scrobbles over HTTP (`/api/v1/pleroma/scrobble`).
 mod scrobbles;
 

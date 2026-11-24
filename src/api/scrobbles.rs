@@ -6,8 +6,10 @@
 //! `ScrobbleView` (`lib/pleroma/web/pleroma_api/views/scrobble_view.ex`).
 //! Pleroma stores a listen as a `Listen` activity wrapping an `Audio` object;
 //! here it is one row of `scrobbles` (see [`crate::models::scrobble`]), which
-//! is what the two routes below read and write — no federation, no
-//! notifications, no streaming.
+//! is what the two routes below read and write. A created scrobble
+//! federates as that `Listen` to the author's followers (see
+//! [`federation_out::after_scrobble_created`]); there are no notifications
+//! and no streaming.
 //!
 //! - `POST /api/v1/pleroma/scrobble` requires a user token with the
 //!   `write:scrobbles` scope (of which a `write` token is the parent) and
@@ -63,6 +65,7 @@ use crate::{
     },
     oauth::scopes::{READ_SCROBBLES, WRITE_SCROBBLES},
     pagination::{NO_EXTRA_QUERY, PageParams, keyset_link, set_link_header},
+    services::federation_out,
     state::AppState,
     util::url::is_http_url,
 };
@@ -110,7 +113,8 @@ async fn create_scrobble(
 ) -> AppResult<Json<Scrobble>> {
     auth.require(WRITE_SCROBBLES)?;
     let new = params.into_new_scrobble()?;
-    let row = scrobble::insert(&state.db, auth.0.id, &new).await?;
+    let row = scrobble::insert(&state.db, &state.config.base_url, auth.0.id, &new).await?;
+    federation_out::after_scrobble_created(&state, &row).await;
     debug!(
         scrobble = %row.id,
         user = %auth.0.id,
@@ -362,6 +366,7 @@ mod tests {
             .into_iter()
             .map(|id| scrobble::Scrobble {
                 id: Uuid::parse_str(id).expect("the fixture ids are ids"),
+                ap_id: None,
                 user_id: Uuid::now_v7(),
                 title: "x".to_owned(),
                 artist: None,

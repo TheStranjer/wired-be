@@ -36,6 +36,7 @@ use crate::{
 
 use super::negotiation::{document_response, wants_activity_json, with_vary};
 use super::objects::{nickname_owns, read_admitted};
+use super::scrobbles::listen_response;
 
 /// `GET /activities/{uuid}` — the local activity whose row `UUIDv7` names
 /// it (Pleroma's `ActivityPubController.activity/2`): the `Create` or
@@ -89,7 +90,8 @@ async fn activity_core(
         return Err(AppError::RouteNotFound);
     };
     let Some(resolved) = activity::find_local_by_id(&state.db, id).await? else {
-        return Err(AppError::RouteNotFound);
+        // Not a status or relation row: a scrobble's `Listen` has this id too.
+        return listen_response(state, id).await;
     };
     let document = match resolved.kind {
         LocalActivityKind::Create | LocalActivityKind::Announce => {

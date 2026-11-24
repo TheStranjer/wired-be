@@ -2,7 +2,7 @@
 //! /api/v1/pleroma/scrobble` and `GET /api/v1/pleroma/accounts/{id}/scrobbles`.
 //!
 //! The tests pin what the ticket promises: a created scrobble answers the
-//! eight-key `Scrobble` entity with its account embedded and is then listed
+//! nine-key `Scrobble` entity with its account embedded and is then listed
 //! newest first; the JSON and form spellings of the parameters both work and
 //! `externalLink` shares `external_link`'s slot; a blank, absent or
 //! 256-character title, an unknown `visibility` and a non-integer `length`
@@ -33,11 +33,12 @@ const SCROBBLE: &str = "/api/v1/pleroma/scrobble";
 /// The instance origin [`common::test_config`] runs the app on.
 const BASE: &str = "https://test.example";
 /// Every JSON key a scrobble entity must carry, sorted.
-const EXPECTED_KEYS: [&str; 8] = [
+const EXPECTED_KEYS: [&str; 9] = [
     "account",
     "album",
     "artist",
     "created_at",
+    "externalLink",
     "external_link",
     "id",
     "length",
@@ -66,6 +67,7 @@ async fn fixture(pool: &PgPool, nickname: &str, scopes: &str) -> (User, String) 
 async fn seed(pool: &PgPool, owner: &User, title: &str, visibility: Visibility) -> Stored {
     scrobble::insert(
         pool,
+        BASE,
         owner.id,
         &NewScrobble {
             title: title.to_owned(),
@@ -165,9 +167,9 @@ async fn a_full_scrobble_is_created_and_lists_back() {
         entity["external_link"], "https://example.test/midnight-city",
         "the camelCase parameter lands in `external_link`"
     );
-    assert!(
-        entity.get("externalLink").is_none(),
-        "and the deprecated duplicate key is not emitted"
+    assert_eq!(
+        entity["externalLink"], "https://example.test/midnight-city",
+        "and the camelCase twin Pleroma-FE reads carries it too"
     );
     assert_eq!(
         entity["account"]["id"],
