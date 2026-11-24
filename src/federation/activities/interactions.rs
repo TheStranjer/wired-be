@@ -1,10 +1,11 @@
-//! The interaction activities: `Like`, `Announce`, `EmojiReact` and the
-//! `Undo` that withdraws one.
+//! The interaction activities: `Like`, `EmojiReact` and the `Undo` that
+//! withdraws one. A boost's `Announce` is rendered by
+//! [`announce_activity_json`](crate::federation::note::announce_activity_json).
 
 use serde_json::{Value, json};
 
 use super::{
-    TYPE_ANNOUNCE, TYPE_EMOJI, TYPE_EMOJI_REACT, TYPE_IMAGE, TYPE_LIKE, TYPE_UNDO,
+    TYPE_EMOJI, TYPE_EMOJI_REACT, TYPE_IMAGE, TYPE_LIKE, TYPE_UNDO,
     contexts::{
         ActivityDocument, AnsweredActivity, EmojiReactContext, ObjectActivityContext,
         address_values, document_json, object_json,
@@ -36,19 +37,6 @@ fn react_emoji_tag(emoji: &str, url: &str) -> Value {
 #[must_use]
 pub fn like_json(ctx: &ObjectActivityContext<'_>) -> Value {
     object_json(TYPE_LIKE, ctx)
-}
-
-/// The `Announce` in `ctx`: `actor_ap_id` boosted the status whose object
-/// id is `object_uri`, under the addressing the caller computed from the
-/// boost's own visibility.
-///
-/// Decision 6: a reblog row *is* the activity, so `ctx.id` is the row's
-/// `uri` — the id peers know the boost by, which their `Undo` of a
-/// delivered one and a later fetch of it both name back. `published` is
-/// the row's `inserted_at`.
-#[must_use]
-pub fn announce_json(ctx: &ObjectActivityContext<'_>) -> Value {
-    object_json(TYPE_ANNOUNCE, ctx)
 }
 
 /// The `EmojiReact` behind the reaction row in `ctx`: `actor_ap_id`
@@ -97,7 +85,7 @@ mod tests {
         AS_PUBLIC,
         test_support::{
             ACTIVITY_ID, ACTIVITY_KEYS, ALICE_AP, AUTHOR_TO, BASE, BOB_AP, EMOJI_URL, FOLLOWERS,
-            FOLLOWERS_CC, PUBLIC_CC, PUBLIC_TO, PUBLISHED, STATUS_URI, activity_uuid, config,
+            FOLLOWERS_CC, PUBLIC_CC, PUBLISHED, STATUS_URI, activity_uuid, config,
             expected_context, follow_of_bob, json_keys, published, stored_id,
         },
     };
@@ -130,37 +118,6 @@ mod tests {
                 "cc": [FOLLOWERS, AS_PUBLIC],
             }),
             "the whole Like, field for field, under the caller's addressing"
-        );
-        assert_eq!(json_keys(&document), ACTIVITY_KEYS, "and nothing else");
-    }
-
-    #[test]
-    fn a_boost_renders_the_announce_under_its_stored_uri() {
-        let config = config();
-        let published = published();
-        let id = stored_id();
-        let document = announce_json(&ObjectActivityContext {
-            config: &config,
-            id: &id,
-            actor_ap_id: ALICE_AP,
-            object_uri: STATUS_URI,
-            to: &PUBLIC_TO,
-            cc: &PUBLIC_CC,
-            published: &published,
-        });
-        assert_eq!(
-            document,
-            json!({
-                "@context": expected_context(),
-                "id": id,
-                "type": "Announce",
-                "actor": ALICE_AP,
-                "object": STATUS_URI,
-                "published": PUBLISHED,
-                "to": [AS_PUBLIC],
-                "cc": [FOLLOWERS, AS_PUBLIC],
-            }),
-            "the whole Announce: the id is the reblog row's own uri string"
         );
         assert_eq!(json_keys(&document), ACTIVITY_KEYS, "and nothing else");
     }

@@ -53,7 +53,9 @@ async fn boost_withdrawal(state: &AppState, deleted: &Status, original_id: Uuid)
     let Some(action) = status_action(state, deleted.user_id, original_id).await else {
         return;
     };
-    let document = reblog_activity(state, deleted, &action, true);
+    let Some(document) = reblog_activity(state, deleted, &action, true) else {
+        return;
+    };
     queue_activity(state, &action.actor, &document, "boost withdrawal").await;
 }
 
