@@ -9,7 +9,7 @@ use axum::{Json, extract::State};
 use serde::Deserialize;
 use serde_json::Value;
 use tracing::debug;
-use url::{Url, form_urlencoded};
+use url::form_urlencoded;
 
 use super::{
     AREA_EMOJI, CLASS_WRITE, COULD_NOT_FETCH, INVALID_URL, MAX_FETCH_STATUS, MAX_REMOTE_LIST_BYTES,
@@ -21,6 +21,7 @@ use crate::{
     http_client::HttpResponse,
     services::emoji_packs,
     state::AppState,
+    util::url::parse_http_url,
 };
 
 /// The `url`, `name` and optional `as` body of `POST /packs/download`:
@@ -121,10 +122,7 @@ pub(super) fn instance_api_url(
     path: &str,
     query: &[(&str, &str)],
 ) -> AppResult<String> {
-    let parsed = Url::parse(base.trim()).map_err(|_err| bad_url())?;
-    if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
-        return Err(bad_url());
-    }
+    let parsed = parse_http_url(base.trim()).ok_or_else(bad_url)?;
     let mut target = parsed.join(path).map_err(|_err| bad_url())?;
     let query_text = form_urlencoded::Serializer::new(String::new())
         .extend_pairs(query.iter().copied())

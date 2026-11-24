@@ -14,10 +14,9 @@
 
 use serde_json::{Map, Value};
 use tracing::debug;
-use url::Url;
 use uuid::Uuid;
 
-use crate::models::domain_block;
+use crate::{models::domain_block, util::url::http_host};
 
 /// What one event's payload says about the entity it carries, as far as a
 /// reader's [`Filters`] can read it: the accounts that wrote it, the hosts
@@ -101,8 +100,7 @@ fn account_host(account: &Map<String, Value>) -> Option<String> {
     let url = account
         .get("url")
         .and_then(Value::as_str)
-        .and_then(|url| Url::parse(url).ok())
-        .and_then(|parsed| parsed.host_str().map(str::to_owned));
+        .and_then(http_host);
     domain_block::normalize_domain(handle.or(url.as_deref())?)
 }
 
