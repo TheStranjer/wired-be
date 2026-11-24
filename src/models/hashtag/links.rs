@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use sqlx::{PgConnection, PgPool};
 use uuid::Uuid;
 
-use crate::error::AppResult;
+use crate::{error::AppResult, util::collections::group_pairs};
 
 use super::{Hashtag, StatusHashtagRow, tags::upsert_many_conn};
 
@@ -131,11 +131,9 @@ pub async fn for_statuses(pool: &PgPool, ids: &[Uuid]) -> AppResult<HashMap<Uuid
         .bind(&ids)
         .fetch_all(pool)
         .await?;
-    let mut grouped: HashMap<Uuid, Vec<Hashtag>> = HashMap::new();
-    for row in rows {
-        grouped.entry(row.status_id).or_default().push(row.hashtag);
-    }
-    Ok(grouped)
+    Ok(group_pairs(
+        rows.into_iter().map(|row| (row.status_id, row.hashtag)),
+    ))
 }
 
 #[cfg(test)]

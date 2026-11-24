@@ -4,9 +4,7 @@
 //! variable holds.
 
 #[cfg(doc)]
-use super::{
-    defaults::MIN_MEDIA_PROXY_SECRET_CHARS, frontend::FrontendConfig, integrations::OauthProvider,
-};
+use super::{defaults::MIN_MEDIA_PROXY_SECRET_CHARS, integrations::OauthProvider};
 /// Environment variable holding the PostgreSQL connection URL.
 pub const DATABASE_URL_VAR: &str = "DATABASE_URL";
 /// Environment variable holding the address to listen on.
@@ -102,8 +100,8 @@ pub const EMOJI_DIR_VAR: &str = "EMOJI_DIR";
 /// written as `<name>.html` (see [`crate::api::admin::apps_docs`]).
 pub const INSTANCE_DOCS_DIR_VAR: &str = "INSTANCE_DOCS_DIR";
 /// Environment variable holding the comma-separated list of instance
-/// document names the admin and public document routes serve
-/// (see [`crate::api::admin::apps_docs`]).
+/// document names the admin document routes accept and the JSON terms of
+/// service reads (see [`crate::api::admin::apps_docs`]).
 pub const INSTANCE_DOCUMENT_NAMES_VAR: &str = "INSTANCE_DOCUMENT_NAMES";
 /// Environment variable holding the public prefix of uploaded files' URLs.
 pub const MEDIA_BASE_URL_VAR: &str = "MEDIA_BASE_URL";
@@ -166,24 +164,12 @@ pub const RESTRICT_UNAUTHENTICATED_AREAS: [&str; 6] = [
     "activities_local",
     "activities_remote",
 ];
-/// Environment variable holding the application-wide HMAC signing secret
-/// (`SECRET_KEY_BASE` in Pleroma's config).
-///
-/// When unset or blank, [`serve`](crate::serve) generates a random one per
-/// boot and warns, so links minted earlier stop validating after a restart.
-pub const SECRET_KEY_BASE_VAR: &str = "SECRET_KEY_BASE";
 /// Environment variable holding the external OAuth login providers, as the
 /// JSON text of an [`OauthProvider`] array.
 pub const OAUTH_PROVIDERS_VAR: &str = "OAUTH_PROVIDERS";
 /// Environment variable holding the comma-separated list of frontends
 /// clients may pick at `PUT /api/v1/pleroma/preferred_frontend`.
 pub const AVAILABLE_FRONTENDS_VAR: &str = "AVAILABLE_FRONTENDS";
-/// Environment variable holding the directory admin-installed frontends
-/// live in (`src/api/admin/ops.rs`, WBE-208).
-pub const FRONTENDS_DIR_VAR: &str = "FRONTENDS_DIR";
-/// Environment variable holding the installable frontends, as the JSON
-/// text of a [`FrontendConfig`] array.
-pub const FRONTENDS_AVAILABLE_VAR: &str = "FRONTENDS_AVAILABLE";
 /// Environment variable holding the job worker's concurrent handler count.
 pub const JOB_CONCURRENCY_VAR: &str = "JOB_CONCURRENCY";
 /// Environment variable holding the comma-separated job queue names.

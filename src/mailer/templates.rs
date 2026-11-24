@@ -194,6 +194,21 @@ mod tests {
     }
 
     #[test]
+    fn password_reset_carries_the_frontend_link() {
+        let mut config = config();
+        config.frontend_base_url = "https://fe.example".to_owned();
+        let link = crate::api::password_reset::frontend_link(&config, "token3");
+        let email = password_reset(&config, "who@example.org", &link);
+        assert!(
+            email
+                .text_body()
+                .contains("https://fe.example/password_reset/token3"),
+            "body carries the frontend reset link: {}",
+            email.text_body()
+        );
+    }
+
+    #[test]
     fn account_approved_names_the_instance() {
         let email = account_approved(&config(), "waiting@example.org");
         assert_eq!(email.to(), "waiting@example.org", "recipient");

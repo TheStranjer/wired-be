@@ -42,6 +42,13 @@ RETURNING *";
 /// answers `0`, and the caller reports the 404.
 const DELETE_OWNED_SQL: &str = "DELETE FROM scheduled_statuses WHERE id = $1 AND user_id = $2";
 
+/// [`lock_due`]: the publisher's claim — the row only while its moment has
+/// passed, locked for the caller's transaction; a row another transaction
+/// holds is skipped rather than waited for.
+const LOCK_DUE_SQL: &str = "SELECT * FROM scheduled_statuses
+    WHERE id = $1 AND scheduled_at <= now()
+      FOR UPDATE SKIP LOCKED";
+
 /// Inserts one schedule and returns the stored row.
 ///
 /// The id is a fresh `UUIDv7` (decision 4); the timestamps come from the
@@ -118,6 +125,29 @@ pub async fn get_owned(
     Ok(fetched)
 }
 
+/// Claims schedule `id` for the publisher: locks the row `FOR UPDATE SKIP
+/// LOCKED` on `conn`, only if its `scheduled_at` has passed.
+///
+/// `None` means there is nothing for this caller to publish: the row is gone,
+/// is not due yet (a reschedule moved it past the moment a stale fire was
+/// queued for), or another transaction holds its lock — which is how the
+/// per-row fire and the sweep keep from both posting one schedule. The lock
+/// lasts until the transaction `conn` belongs to ends; call this on the
+/// connection of an open transaction, since outside one the lock is released
+/// as soon as the statement finishes and protects nothing.
+///
+/// # Errors
+///
+/// Any database failure (connection, decoding) arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn lock_due(conn: &mut PgConnection, id: Uuid) -> AppResult<Option<ScheduledStatus>> {
+    let claimed = sqlx::query_as::<_, ScheduledStatus>(LOCK_DUE_SQL)
+        .bind(id)
+        .fetch_optional(conn)
+        .await?;
+    Ok(claimed)
+}
+
 /// Deletes schedule `id`, reporting whether a row went.
 ///
 /// Cancelling the schedule of a status that never fired is the ordinary
@@ -129,9 +159,20 @@ pub async fn get_owned(
 /// Any database failure (connection, encoding) arrives as
 /// [`AppError::Database`](crate::error::AppError).
 pub async fn delete(pool: &PgPool, id: Uuid) -> AppResult<bool> {
+    let mut conn = pool.acquire().await?;
+    delete_on(&mut conn, id).await
+}
+
+/// [`delete`] on a connection the caller holds, so the removal can share the
+/// transaction that holds the row's [`lock_due`] lock.
+///
+/// # Errors
+///
+/// The same as [`delete`].
+pub async fn delete_on(conn: &mut PgConnection, id: Uuid) -> AppResult<bool> {
     let deleted = sqlx::query("DELETE FROM scheduled_statuses WHERE id = $1")
         .bind(id)
-        .execute(pool)
+        .execute(conn)
         .await?;
     Ok(deleted.rows_affected() > 0)
 }
@@ -432,6 +473,106 @@ mod tests {
                 .is_none(),
             "and is gone afterwards"
         );
+    }
+
+    #[tokio::test]
+    async fn lock_due_claims_only_a_due_row_and_only_once() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = user(&pool, "alice").await;
+        let due = schedule(
+            &pool,
+            &alice,
+            Utc::now() - ChronoDuration::minutes(1),
+            json!({ "status": "due" }),
+        )
+        .await;
+        let future = schedule(
+            &pool,
+            &alice,
+            Utc::now() + ChronoDuration::hours(1),
+            json!({ "status": "later" }),
+        )
+        .await;
+
+        let mut first = pool.begin().await.expect("the first transaction opens");
+        let mut second = pool.begin().await.expect("the second transaction opens");
+        assert!(
+            lock_due(&mut first, future.id)
+                .await
+                .expect("the future claim runs")
+                .is_none(),
+            "a row whose moment has not come is not claimable"
+        );
+        assert!(
+            lock_due(&mut first, Uuid::now_v7())
+                .await
+                .expect("the unknown claim runs")
+                .is_none(),
+            "an id the table never held is not claimable"
+        );
+        let held = lock_due(&mut first, due.id)
+            .await
+            .expect("the first claim runs")
+            .expect("the first transaction gets the due row");
+        assert_eq!(held.id, due.id, "the claim returns the row itself");
+        assert!(
+            lock_due(&mut second, due.id)
+                .await
+                .expect("the second claim runs")
+                .is_none(),
+            "a row another transaction holds is skipped, not waited for"
+        );
+
+        assert!(
+            delete_on(&mut first, due.id)
+                .await
+                .expect("the delete runs"),
+            "the holder removes its row"
+        );
+        first.commit().await.expect("the holder commits");
+        assert!(
+            lock_due(&mut second, due.id)
+                .await
+                .expect("the claim after commit runs")
+                .is_none(),
+            "and once the holder committed the row is gone for good"
+        );
+        second.rollback().await.expect("the second rolls back");
+    }
+
+    #[tokio::test]
+    async fn lock_due_is_free_again_after_a_rollback() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = user(&pool, "alice").await;
+        let due = schedule(
+            &pool,
+            &alice,
+            Utc::now() - ChronoDuration::minutes(1),
+            json!({ "status": "due" }),
+        )
+        .await;
+
+        let mut first = pool.begin().await.expect("the first transaction opens");
+        assert!(
+            lock_due(&mut first, due.id)
+                .await
+                .expect("the first claim runs")
+                .is_some(),
+            "the first claim holds the row"
+        );
+        first.rollback().await.expect("the holder rolls back");
+
+        let mut second = pool.begin().await.expect("the second transaction opens");
+        assert!(
+            lock_due(&mut second, due.id)
+                .await
+                .expect("the second claim runs")
+                .is_some(),
+            "a rolled-back claim leaves the row claimable"
+        );
+        second.rollback().await.expect("the second rolls back");
     }
 
     #[tokio::test]

@@ -54,6 +54,57 @@ async fn unknown_route_returns_json_not_found() {
     );
 }
 
+/// `GET /mailer/unsubscribe/{token}` is not routed (the page was removed
+/// with `SECRET_KEY_BASE`): the fallback alone answers 404, and no page
+/// is served.
+#[tokio::test]
+async fn the_mailer_unsubscribe_page_is_answered_by_the_fallback() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let app = common::test_app(pool);
+    let response = common::TestRequest::get("/mailer/unsubscribe/abc.def")
+        .send(&app)
+        .await;
+    assert_eq!(
+        response.status,
+        StatusCode::NOT_FOUND,
+        "the unsubscribe page is gone"
+    );
+    assert_eq!(
+        response.header("x-wired-fallback"),
+        Some("1"),
+        "only the fallback answers the path"
+    );
+    assert_eq!(
+        response.header("content-type"),
+        Some("application/json"),
+        "the answer is the JSON error, not an HTML page"
+    );
+}
+
+/// The retired status embed card and player are not routed either: the
+/// fallback answers 404 for both.
+#[tokio::test]
+async fn the_retired_embed_pages_are_answered_by_the_fallback() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let app = common::test_app(pool);
+    for path in ["/embed/1", "/notice/1/embed_player?url=x"] {
+        let response = common::TestRequest::get(path).send(&app).await;
+        assert_eq!(response.status, StatusCode::NOT_FOUND, "{path} is gone");
+        assert_eq!(
+            response.header("x-wired-fallback"),
+            Some("1"),
+            "only the fallback answers {path}"
+        );
+        assert_eq!(
+            response.header("x-frame-options"),
+            None,
+            "no framable page is served at {path}"
+        );
+    }
+}
+
 /// A router-level verb mismatch is a 405 from axum, even with the JSON
 /// fallback installed for unknown paths.
 #[tokio::test]

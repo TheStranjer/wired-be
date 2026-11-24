@@ -106,7 +106,7 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
-    use crate::models::emoji_reaction::ReactionSummary as Row;
+    use crate::{models::emoji_reaction::ReactionSummary as Row, test_fixtures::json_keys};
 
     /// A model roll-up of `name`, reacted to by `ids`.
     fn row(name: &str, count: i64, me: bool, url: Option<&str>, ids: &[Uuid]) -> Row {
@@ -117,18 +117,6 @@ mod tests {
             url: url.map(str::to_owned),
             account_ids: ids.to_vec(),
         }
-    }
-
-    /// The keys of a JSON object, sorted.
-    fn json_keys(value: &Value) -> Vec<&str> {
-        let mut keys: Vec<&str> = value
-            .as_object()
-            .expect("a reaction renders an object")
-            .keys()
-            .map(String::as_str)
-            .collect();
-        keys.sort_unstable();
-        keys
     }
 
     #[test]

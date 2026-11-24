@@ -207,6 +207,10 @@ const PERMISSIONS_STAFF: &str = "staff";
 /// `{:error, "User is approved"}` and a 400 — the ticket pins this one
 /// wording for both.
 const NOT_ALLOWED: &str = "This action is not allowed";
+/// The 400 body of a `disable` or `suspend` aimed at a remote mirror: this
+/// instance owns no flag of a remote account's, and Pleroma's
+/// `validate_account_action` refuses the same way.
+const ONLY_LOCAL: &str = "Only local accounts can be disabled";
 /// The 422 body of a `type` word outside the five Mastodon spells: what
 /// Pleroma's `ApiSpec.CastAndValidate` plug answers a value outside the
 /// operation's enum with.

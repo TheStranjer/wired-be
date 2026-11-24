@@ -51,28 +51,6 @@ pub(super) const MESSAGE_KEYS: [&str; 9] = [
     "unread",
 ];
 
-/// The `error` string of a JSON error response, or `None` when the body is
-/// not an error object with a string `error` field.
-pub(super) fn error_message(response: &common::TestResponse) -> Option<String> {
-    response
-        .json_value()
-        .get("error")
-        .and_then(Value::as_str)
-        .map(str::to_owned)
-}
-
-/// The rendered object's keys, sorted, for exact key-set assertions.
-pub(super) fn json_keys(value: &Value) -> Vec<&str> {
-    let mut keys: Vec<&str> = value
-        .as_object()
-        .expect("entities render objects")
-        .keys()
-        .map(String::as_str)
-        .collect();
-    keys.sort_unstable();
-    keys
-}
-
 /// Id text back to an id, panicking only on fixture bugs.
 pub(super) fn parse(text: &str) -> Uuid {
     text.parse().expect("the fixture ids are id text")
@@ -242,7 +220,7 @@ pub(super) fn assert_refused(
         response.text()
     );
     assert_eq!(
-        error_message(response).as_deref(),
+        response.error_field().as_deref(),
         Some(message),
         "the refusal wording for {who} on {path}"
     );
@@ -302,20 +280,6 @@ pub(super) fn message_delete_path(chat: &str, message: &str) -> String {
     format!("{ROOT}/{chat}/messages/{message}")
 }
 
-/// The `id` strings of a rendered entity array, in order.
-pub(super) fn entity_ids(list: &Value) -> Vec<String> {
-    list.as_array()
-        .expect("the list is an array")
-        .iter()
-        .map(|entity| {
-            entity["id"]
-                .as_str()
-                .expect("entities carry their id")
-                .to_owned()
-        })
-        .collect()
-}
-
 /// `GET`s `path` with no credential at all.
 pub(super) async fn get_anonymous(app: &Router, path: &str) -> common::TestResponse {
     common::TestRequest::get(path).send(app).await
@@ -329,29 +293,6 @@ pub(super) fn open_path(account: &str) -> String {
 /// `GET` `path` as `token`.
 pub(super) async fn get_as(app: &Router, token: &str, path: &str) -> common::TestResponse {
     common::TestRequest::get(path).bearer(token).send(app).await
-}
-
-/// The ids of the chats in a rendered list, in the order they came back.
-pub(super) fn listed_ids(list: &Value) -> Vec<String> {
-    list.as_array()
-        .expect("the list is an array")
-        .iter()
-        .map(|chat| {
-            chat["id"]
-                .as_str()
-                .expect("chat entities carry their id")
-                .to_owned()
-        })
-        .collect()
-}
-
-/// The `Link` header Pleroma's `add_link_headers` puts on a page whose first
-/// and last rows carry `newest` and `oldest` as chat ids.
-pub(super) fn expected_link(path: &str, newest: &str, oldest: &str) -> String {
-    format!(
-        "<https://test.example{path}?max_id={oldest}>; rel=\"next\", \
-         <https://test.example{path}?min_id={newest}>; rel=\"prev\""
-    )
 }
 
 /// The chat of `owner` talking to `partner`, through the model — the row the

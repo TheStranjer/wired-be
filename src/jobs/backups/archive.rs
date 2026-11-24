@@ -21,6 +21,7 @@ use crate::{
     federation::{
         actor::actor_json,
         note::{create_activity_json, load_note_context, note_json},
+        vocab::AS_VOCABULARY,
     },
     models::{
         bookmark, favourite,
@@ -34,9 +35,6 @@ use crate::{
 /// that a page of rendered activities is a bounded working set, large
 /// enough that a normal account's archive costs one query per collection.
 const PAGE_SIZE: usize = 200;
-
-/// The `ActivityStreams` context every collection entry declares.
-const AS_CONTEXT: &str = "https://www.w3.org/ns/activitystreams";
 
 /// The archive's first entry: the account's own actor document.
 pub(super) const ACTOR_ENTRY: &str = "actor.json";
@@ -300,7 +298,7 @@ impl<'w> CollectionEntry<'w> {
         start_entry(zip, name)?;
         write!(
             zip,
-            r#"{{"@context": "{AS_CONTEXT}", "id": "{name}", "type": "OrderedCollection", "orderedItems": ["#
+            r#"{{"@context": "{AS_VOCABULARY}", "id": "{name}", "type": "OrderedCollection", "orderedItems": ["#
         )
         .map_err(|err| archive_error("write entry header", &err))?;
         Ok(Self { zip, items: 0 })

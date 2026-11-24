@@ -140,18 +140,6 @@ pub(super) fn phrases(rows: &[Value]) -> Vec<&str> {
         .collect()
 }
 
-/// The keys of a JSON object, sorted, for exact key-set assertions.
-pub(super) fn json_keys(value: &Value) -> Vec<&str> {
-    let mut keys: Vec<&str> = value
-        .as_object()
-        .expect("filters render objects")
-        .keys()
-        .map(String::as_str)
-        .collect();
-    keys.sort_unstable();
-    keys
-}
-
 // ---------------------------------------------------------------------------
 // Filter application: the v1 semantics of `services::filter` over HTTP —
 // the home, public and account timelines, the notification listing and the

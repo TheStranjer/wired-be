@@ -58,7 +58,11 @@ use serde_json::{Map, Value};
 use sqlx::{PgPool, Postgres, QueryBuilder};
 use uuid::Uuid;
 
-use crate::{error::AppResult, models::user::User, util::id::new_id};
+use crate::{
+    error::AppResult,
+    models::user::User,
+    util::{id::new_id, like},
+};
 use data::user_map;
 
 /// [`record`]: the minted id, the actor and its (denormalised) nickname,
@@ -161,7 +165,7 @@ pub struct LogListParams {
     /// Only actions this account performed (`user_id`).
     pub user_id: Option<Uuid>,
     /// Only entries whose message contains this text, case-insensitively
-    /// (Pleroma's `ILIKE '%…%'` on the message).
+    /// and literally: `%` and `_` in it match themselves, not any text.
     pub search: Option<String>,
     /// The earliest `inserted_at` still on the page (`start_date`).
     pub start_date: Option<DateTime<Utc>>,
@@ -248,8 +252,8 @@ async fn count_matching(pool: &PgPool, params: &LogListParams) -> AppResult<i64>
 }
 
 /// Appends the shared `WHERE` clause of [`list`] and [`count_matching`]:
-/// the actor filter on its column, the search as `ILIKE '%…%'` over the
-/// message (Pleroma's `maybe_filter_by_search`), and the inclusive time
+/// the actor filter on its column, the search as an escaped `ILIKE '%…%'`
+/// over the message (Pleroma's `maybe_filter_by_search`), and the inclusive time
 /// window on `inserted_at` (`maybe_filter_by_date`). The always-true
 /// predicate leads so every filter is one more `AND`.
 fn push_filters(builder: &mut QueryBuilder<Postgres>, params: &LogListParams) {
@@ -260,7 +264,7 @@ fn push_filters(builder: &mut QueryBuilder<Postgres>, params: &LogListParams) {
     if let Some(search) = &params.search {
         let _text: &mut _ = builder
             .push(" AND message ILIKE ")
-            .push_bind(format!("%{search}%"));
+            .push_bind(like::contains(search));
     }
     if let Some(start) = params.start_date {
         let _from: &mut _ = builder.push(" AND inserted_at >= ").push_bind(start);
@@ -344,6 +348,47 @@ mod tests {
             search: None,
             start_date: None,
             end_date: None,
+        }
+    }
+
+    /// Records an entry whose message is exactly `message`.
+    async fn with_message(pool: &PgPool, actor: &User, message: &str) -> ModerationLog {
+        record(
+            pool,
+            actor,
+            ModAction {
+                action: "test_action".to_owned(),
+                subjects: Vec::new(),
+                message: message.to_owned(),
+                data: Map::new(),
+            },
+        )
+        .await
+        .expect("records")
+    }
+
+    /// `%` and `_` in the search are literal text, not wildcards.
+    #[tokio::test]
+    async fn a_search_for_a_literal_percent_matches_only_messages_containing_it() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let actor = stored(&pool, "modone").await;
+        let percent = with_message(&pool, &actor, "grew 50% faster").await;
+        let _plain = with_message(&pool, &actor, "grew 50 times faster").await;
+        let underscore = with_message(&pool, &actor, "renamed a_b").await;
+        let _look_alike = with_message(&pool, &actor, "renamed axb").await;
+
+        for (needle, expected) in [("%", percent.id), ("a_b", underscore.id)] {
+            let params = LogListParams {
+                search: Some(needle.to_owned()),
+                ..open_page()
+            };
+            let found = list(&pool, &params).await.expect("searches");
+            assert_eq!(found.total, 1, "`{needle}` is no wildcard");
+            assert_eq!(
+                found.items[0].id, expected,
+                "only the literal match answers"
+            );
         }
     }
 

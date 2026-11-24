@@ -5,7 +5,11 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 use super::*;
-use crate::util::time::parse_time;
+use crate::{federation::vocab::AS_PUBLIC, util::time::parse_time};
+
+// Every field of a rendered document, sorted — the exact key-set assertion
+// the note tests pair with goldens.
+pub(super) use crate::test_fixtures::json_keys;
 
 /// The instance origin of [`Config::for_tests`].
 pub(super) const BASE: &str = "https://test.example";
@@ -62,19 +66,6 @@ pub(super) const ACTIVITY_KEYS: [&str; 8] = [
     "to",
     "type",
 ];
-
-/// Every field of a rendered document, sorted — the exact key-set
-/// assertion the note tests pair with goldens.
-pub(super) fn json_keys(value: &Value) -> Vec<&str> {
-    let mut keys: Vec<&str> = value
-        .as_object()
-        .expect("a document is a JSON object")
-        .keys()
-        .map(String::as_str)
-        .collect();
-    keys.sort_unstable();
-    keys
-}
 
 /// The test instance's config.
 pub(super) fn config() -> Config {

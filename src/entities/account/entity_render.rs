@@ -25,7 +25,7 @@ use super::{
         fields_from_json, full_nickname, is_owner_of, nickname_part, profile_image,
         visible_followers_count, visible_following_count,
     },
-    pleroma::{embedded_relationship, pleroma_metadata},
+    pleroma::pleroma_metadata,
 };
 use crate::{config::Config, entities::relationship::RelationshipMap, models::user::User};
 
@@ -116,11 +116,7 @@ impl Account {
             suspended: JsonBool(!user.is_active.get()),
             limited: JsonBool(false),
             source: None,
-            pleroma: pleroma_metadata(
-                user,
-                is_self,
-                embedded_relationship(viewer, user, is_self, relationships),
-            ),
+            pleroma: pleroma_metadata(user, viewer, relationships),
         }
     }
 

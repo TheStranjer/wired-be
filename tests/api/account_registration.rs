@@ -78,14 +78,6 @@ async fn register_json(app: &Router, token: &str, body: &Value) -> common::TestR
         .await
 }
 
-/// The `error` message of a JSON error response.
-fn error_text(response: &common::TestResponse) -> String {
-    response.json_value()["error"]
-        .as_str()
-        .expect("errors carry a string error field")
-        .to_owned()
-}
-
 /// Registers `username` over a fresh app-only token and returns the
 /// parsed 200 token body, asserting its shape.
 async fn register_one(app: &Router, pool: &PgPool, username: &str) -> Value {
@@ -272,7 +264,7 @@ async fn agreement_is_required_and_must_be_true() {
         "false 422"
     );
     assert_eq!(
-        error_text(&declined),
+        declined.error_text(),
         "You have to accept the terms to sign up",
         "the refusal wording"
     );
@@ -297,7 +289,7 @@ async fn a_duplicate_nickname_is_a_json_string_field_map() {
     let token = common::create_app_only_token(&pool, FULL_SCOPES).await;
     let response = register_json(&app, &token, &body_for("LAIN")).await;
     assert_eq!(response.status, StatusCode::UNPROCESSABLE_ENTITY, "422");
-    let message = error_text(&response);
+    let message = response.error_text();
     let field_map: Value =
         serde_json::from_str(&message).expect("the error value is the JSON text of the field map");
     assert_eq!(
@@ -324,7 +316,7 @@ async fn invalid_email_and_short_password_are_field_errors() {
     .await;
     assert_eq!(bad_email.status, StatusCode::UNPROCESSABLE_ENTITY, "422");
     let email_map: Value =
-        serde_json::from_str(&error_text(&bad_email)).expect("a JSON string field map");
+        serde_json::from_str(&bad_email.error_text()).expect("a JSON string field map");
     assert_eq!(
         email_map["email"],
         json!(["has invalid format"]),
@@ -339,7 +331,7 @@ async fn invalid_email_and_short_password_are_field_errors() {
     .await;
     assert_eq!(short.status, StatusCode::UNPROCESSABLE_ENTITY, "422");
     let password_map: Value =
-        serde_json::from_str(&error_text(&short)).expect("a JSON string field map");
+        serde_json::from_str(&short.error_text()).expect("a JSON string field map");
     assert_eq!(
         password_map["password"],
         json!(["should be at least 8 character(s)"]),
@@ -360,7 +352,7 @@ async fn closed_registrations_are_a_403() {
     let response = register_json(&app, &token, &body_for("lain")).await;
     assert_eq!(response.status, StatusCode::FORBIDDEN, "403 when closed");
     assert_eq!(
-        error_text(&response),
+        response.error_text(),
         "Registration is disabled",
         "the pinned wording"
     );
@@ -385,7 +377,7 @@ async fn scope_and_token_gates() {
     let denied = register_json(&app, &read_only, &body_for("lain")).await;
     assert_eq!(denied.status, StatusCode::FORBIDDEN, "a scope miss is 403");
     assert_eq!(
-        error_text(&denied),
+        denied.error_text(),
         "Insufficient permissions: write:accounts.",
         "Pleroma names the missing scope, period included"
     );
@@ -396,7 +388,7 @@ async fn scope_and_token_gates() {
         .await;
     assert_eq!(anonymous.status, StatusCode::UNAUTHORIZED, "no token 401");
     assert_eq!(
-        error_text(&anonymous),
+        anonymous.error_text(),
         "Invalid credentials",
         "the 401 body"
     );
@@ -404,7 +396,7 @@ async fn scope_and_token_gates() {
     let bogus = register_json(&app, "not-a-real-token", &body_for("lain")).await;
     assert_eq!(bogus.status, StatusCode::UNAUTHORIZED, "a bad token 401");
     assert_eq!(
-        error_text(&bogus),
+        bogus.error_text(),
         "The access token is invalid",
         "the 401 names the invalid credential"
     );
@@ -732,7 +724,7 @@ async fn closed_without_invites_refuses_even_a_valid_token() {
     let response = register_with_invite(&app, &pool, "wishful", &invite.token).await;
     assert_eq!(response.status, StatusCode::FORBIDDEN, "403 when closed");
     assert_eq!(
-        error_text(&response),
+        response.error_text(),
         "Registration is disabled",
         "the pinned wording"
     );

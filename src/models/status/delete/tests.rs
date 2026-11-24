@@ -449,3 +449,159 @@ async fn deleting_an_author_takes_their_statuses_with_it() {
         "cascade on user_id removed the author's statuses"
     );
 }
+
+/// The number of pins stored for status `id`, tombstoned or not.
+async fn pin_rows(pool: &PgPool, id: Uuid) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM pinned_statuses WHERE status_id = $1")
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .expect("the pin count reads")
+}
+
+#[tokio::test]
+async fn sweeping_an_account_steps_the_counters_of_other_users_posts() {
+    let db = crate::test_db::test_db().await.expect("test database slot");
+    let pool = db.pool().clone();
+    let alice = user(&pool, "alice").await;
+    let bob = user(&pool, "bob").await;
+    let target = post(&pool, &bob, "bob's post").await;
+    let answer = reply(&pool, &alice, &target, "an answer").await;
+    let boosted = boost(&pool, &alice, target.id).await;
+    let quoted = quote(&pool, &alice, target.id, "a quote").await;
+    assert_eq!(counter(&pool, target.id, Counter::Replies).await, 1);
+    assert_eq!(counter(&pool, target.id, Counter::Reblogs).await, 1);
+    assert_eq!(counter(&pool, target.id, Counter::Quotes).await, 1);
+
+    let swept = soft_delete_all_for_user(&pool, alice.id).await.unwrap();
+
+    assert_eq!(swept, 3, "the answer, the boost and the quote");
+    for id in [answer.id, boosted.id, quoted.id] {
+        assert!(
+            stored(&pool, id).await.deleted_at.is_some(),
+            "alice's row is a tombstone"
+        );
+    }
+    assert_eq!(
+        counter(&pool, target.id, Counter::Replies).await,
+        0,
+        "bob's post stops counting the answer"
+    );
+    assert_eq!(
+        counter(&pool, target.id, Counter::Reblogs).await,
+        0,
+        "and the boost"
+    );
+    assert_eq!(
+        counter(&pool, target.id, Counter::Quotes).await,
+        0,
+        "and the quote"
+    );
+    assert!(
+        get_by_id(&pool, target.id).await.unwrap().is_some(),
+        "bob's post is still live"
+    );
+    assert_eq!(
+        fresh_user(&pool, bob.id).await.statuses_count,
+        1,
+        "bob's own count is not touched"
+    );
+}
+
+#[tokio::test]
+async fn sweeping_an_account_clears_the_pins_of_its_posts() {
+    let db = crate::test_db::test_db().await.expect("test database slot");
+    let pool = db.pool().clone();
+    let alice = user(&pool, "alice").await;
+    let bob = user(&pool, "bob").await;
+    let pinned = post(&pool, &alice, "pinned").await;
+    let other = post(&pool, &bob, "bob's pinned").await;
+    let alice_pin = crate::models::pinned_status::pin(&pool, alice.id, pinned.id)
+        .await
+        .unwrap();
+    assert!(alice_pin.is_some(), "alice's pin is stored");
+    let bob_pin = crate::models::pinned_status::pin(&pool, bob.id, other.id)
+        .await
+        .unwrap();
+    assert!(bob_pin.is_some(), "bob's pin is stored");
+
+    let swept = soft_delete_all_for_user(&pool, alice.id).await.unwrap();
+
+    assert_eq!(swept, 1, "alice's one post is tombstoned");
+    assert_eq!(pin_rows(&pool, pinned.id).await, 0, "alice's pin is gone");
+    assert_eq!(pin_rows(&pool, other.id).await, 1, "bob's pin stays");
+}
+
+#[tokio::test]
+async fn a_sweep_of_more_than_one_batch_brings_the_counter_to_exactly_zero() {
+    let db = crate::test_db::test_db().await.expect("test database slot");
+    let pool = db.pool().clone();
+    let alice = user(&pool, "alice").await;
+    let bob = user(&pool, "bob").await;
+    let target = post(&pool, &bob, "bob's post").await;
+    let survivor = reply(&pool, &bob, &target, "bob answers himself").await;
+    let rows = SOFT_DELETE_BATCH + 1;
+    for _ in 0..rows {
+        let answer = reply(&pool, &alice, &target, "an answer").await;
+        assert_eq!(answer.in_reply_to_id, Some(target.id), "it answers P");
+    }
+    assert_eq!(
+        i64::from(counter(&pool, target.id, Counter::Replies).await),
+        rows + 1,
+        "every answer counts"
+    );
+
+    let swept = soft_delete_all_for_user(&pool, alice.id).await.unwrap();
+
+    assert_eq!(i64::try_from(swept).unwrap(), rows, "every row is swept");
+    assert_eq!(
+        counter(&pool, target.id, Counter::Replies).await,
+        1,
+        "only bob's own answer is left on the books"
+    );
+    assert!(
+        get_by_id(&pool, survivor.id).await.unwrap().is_some(),
+        "and it is live"
+    );
+}
+
+#[tokio::test]
+async fn sweeping_an_account_twice_moves_nothing_the_second_time() {
+    let db = crate::test_db::test_db().await.expect("test database slot");
+    let pool = db.pool().clone();
+    let alice = user(&pool, "alice").await;
+    let bob = user(&pool, "bob").await;
+    let target = post(&pool, &bob, "bob's post").await;
+    let alices = reply(&pool, &alice, &target, "an answer").await;
+    let bobs = reply(&pool, &bob, &target, "bob's answer").await;
+    assert_ne!(alices.id, bobs.id, "two separate answers");
+
+    assert_eq!(soft_delete_all_for_user(&pool, alice.id).await.unwrap(), 1);
+    assert_eq!(counter(&pool, target.id, Counter::Replies).await, 1);
+
+    assert_eq!(
+        soft_delete_all_for_user(&pool, alice.id).await.unwrap(),
+        0,
+        "nothing is left to tombstone"
+    );
+    assert_eq!(
+        counter(&pool, target.id, Counter::Replies).await,
+        1,
+        "so nothing is stepped twice"
+    );
+}
+
+#[tokio::test]
+async fn sweeping_an_account_with_an_internal_thread_tombstones_it_whole() {
+    let db = crate::test_db::test_db().await.expect("test database slot");
+    let pool = db.pool().clone();
+    let alice = user(&pool, "alice").await;
+    let root = post(&pool, &alice, "root").await;
+    let answer = reply(&pool, &alice, &root, "answer").await;
+
+    let swept = soft_delete_all_for_user(&pool, alice.id).await.unwrap();
+
+    assert_eq!(swept, 2, "both rows are tombstoned");
+    assert!(stored(&pool, root.id).await.deleted_at.is_some());
+    assert!(stored(&pool, answer.id).await.deleted_at.is_some());
+}

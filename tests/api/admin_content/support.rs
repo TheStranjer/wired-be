@@ -181,24 +181,6 @@ pub(super) async fn a_notice(app: &Router, token: &str, content: &str) -> Value 
     create_notice(app, token, &json!({"content": content})).await
 }
 
-/// The `id` an entity answers with.
-pub(super) fn entity_id(entity: &Value) -> String {
-    entity["id"]
-        .as_str()
-        .expect("the entity carries an id")
-        .to_owned()
-}
-
-/// The `id`s of a returned array, in answer order.
-pub(super) fn ids_of(listed: &Value) -> Vec<String> {
-    listed
-        .as_array()
-        .expect("the listings are arrays")
-        .iter()
-        .map(entity_id)
-        .collect()
-}
-
 /// The `text`s of a returned rule array, in answer order.
 pub(super) fn texts_of(listed: &Value) -> Vec<String> {
     listed
@@ -212,16 +194,4 @@ pub(super) fn texts_of(listed: &Value) -> Vec<String> {
                 .to_owned()
         })
         .collect()
-}
-
-/// The rendered object's keys, sorted, for exact key-set assertions.
-pub(super) fn json_keys(value: &Value) -> Vec<&str> {
-    let mut keys: Vec<&str> = value
-        .as_object()
-        .expect("entities render objects")
-        .keys()
-        .map(String::as_str)
-        .collect();
-    keys.sort_unstable();
-    keys
 }

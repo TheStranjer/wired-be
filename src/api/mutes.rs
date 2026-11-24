@@ -61,7 +61,7 @@ use tracing::debug;
 use uuid::Uuid;
 
 use crate::{
-    api::helpers::account_or_404,
+    api::helpers::{AccountPageEntry, account_or_404, account_page},
     auth::AuthUser,
     entities::{
         account::{Account, AccountViewer},
@@ -71,14 +71,9 @@ use crate::{
     extract::{ApiParams, flex},
     models::{mute, mute::Mute, user::User},
     oauth::scopes::{FOLLOW, READ_MUTES, WRITE_MUTES},
-    pagination::{NO_EXTRA_QUERY, PageParams, keyset_link, set_link_header},
+    pagination::{ACCOUNT_LIST_MAX_LIMIT, PageParams},
     state::AppState,
 };
-
-/// Page size cap of the muted list: Mastodon's account-list limit (80), above
-/// [`crate::pagination::MAX_LIMIT`] — the blocked list's counterpart constant,
-/// with Pleroma's global 20 as the default.
-const MAX_LIMIT: i64 = 80;
 
 /// The `/api/v1` mutes router, merged into [`crate::api::v1`].
 pub fn router() -> Router<AppState> {
@@ -202,7 +197,7 @@ async fn unmute_account(
 }
 
 /// `GET /api/v1/mutes` — the accounts the caller mutes, newest mute first, one
-/// [`PageParams`] page at a time (default limit 20, at most [`MAX_LIMIT`])
+/// [`PageParams`] page at a time (default limit 20, at most [`ACCOUNT_LIST_MAX_LIMIT`])
 /// under a `Link` header keyed on the mute row ids, every entry carrying its
 /// mute's expiry as `mute_expires_at`. Lapsed mutes are not on the page. The
 /// list is the caller's own, so no privacy check applies.
@@ -217,7 +212,7 @@ async fn unmute_account(
 /// [`AppError::Forbidden`](crate::error::AppError::Forbidden) when the token does not grant `read:mutes`;
 /// [`AppError::BadRequest`](crate::error::AppError::BadRequest) from [`PageParams`] for a malformed cursor. Any
 /// database failure arrives through `?` as [`AppError::Database`](crate::error::AppError::Database), and
-/// [`set_link_header`] reports a `Link` value that is not header-safe as
+/// [`set_link_header`](crate::pagination::set_link_header) reports a `Link` value that is not header-safe as
 /// [`AppError::Internal`](crate::error::AppError::Internal).
 async fn list_mutes(
     State(state): State<AppState>,
@@ -225,7 +220,7 @@ async fn list_mutes(
     OriginalUri(uri): OriginalUri,
 ) -> AppResult<(HeaderMap, Json<Vec<Account>>)> {
     auth.require(READ_MUTES)?;
-    let page = PageParams::from_query(uri.query(), MAX_LIMIT)?;
+    let page = PageParams::from_query(uri.query(), ACCOUNT_LIST_MAX_LIMIT)?;
     let entries = mute::muting_page(&state.db, auth.0.id, page).await?;
     debug!(
         count = entries.len(),
@@ -233,39 +228,22 @@ async fn list_mutes(
         "muted accounts listed"
     );
     let viewer: AccountViewer<'_> = Some(&auth.0);
-    page_response(&state, viewer, &entries, uri.path()).await
+    account_page(&state, viewer, uri.path(), &entries).await
 }
 
-/// Renders one fetched muted page for `viewer`: every entry's [`User`] as an
-/// [`Account`] with the viewer's relationship embedded where one is preloaded
-/// (see [`Relationship::load_map`]) and its mute's expiry attached as
-/// `mute_expires_at` (see [`Account::with_mute_expires_at`]), under the `Link`
-/// header [`keyset_link`] derives from the mute row ids.
-async fn page_response(
-    state: &AppState,
-    viewer: AccountViewer<'_>,
-    entries: &[(Mute, User)],
-    path: &str,
-) -> AppResult<(HeaderMap, Json<Vec<Account>>)> {
-    let targets: Vec<Uuid> = entries.iter().map(|(_, muted)| muted.id).collect();
-    let relationships = Relationship::load_map(&state.db, viewer, &targets).await?;
-    // The cursors key on the `mutes` row ([`Mute::id`]), not on the muted
-    // accounts.
-    let link = keyset_link(
-        &state.config.base_url,
-        path,
-        &NO_EXTRA_QUERY,
-        entries,
-        |e| e.0.id,
-    );
-    let mut headers = HeaderMap::new();
-    set_link_header(&mut headers, link.as_deref())?;
-    let accounts = entries
-        .iter()
-        .map(|(row, muted)| {
-            Account::from_user_for(viewer, muted, &state.config, relationships.as_ref())
-                .with_mute_expires_at(row.expires_at)
-        })
-        .collect();
-    Ok((headers, Json(accounts)))
+/// A muted-list row: the cursors key on the `mutes` row ([`Mute::id`]), not
+/// on the muted account, and every entry carries its mute's expiry as
+/// `mute_expires_at` ([`Account::with_mute_expires_at`]).
+impl AccountPageEntry for (Mute, User) {
+    fn cursor(&self) -> Uuid {
+        self.0.id
+    }
+
+    fn user(&self) -> &User {
+        &self.1
+    }
+
+    fn decorate(&self, account: Account) -> Account {
+        account.with_mute_expires_at(self.0.expires_at)
+    }
 }

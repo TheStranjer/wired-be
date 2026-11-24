@@ -21,27 +21,21 @@ use crate::{
         list::{self, NewList},
         media_attachment::{self, NewMediaAttachment},
         status::{self, NewStatus, Status, Visibility},
-        user::{Flag, NewUser, User, insert, local_ap_id},
+        user::{Flag, NewUser, User, insert},
     },
     services::streaming::targets,
     state::AppState,
     streaming::hub::{Audience, StreamEvent},
+    test_fixtures::local_new,
     util::id::new_id,
 };
+
+// The local and remote accounts the streaming tests seed.
+pub(super) use crate::test_fixtures::{local_user, remote_user};
 
 /// Test state over `pool` with the fixed test config.
 pub(super) fn app_state(pool: &PgPool) -> AppState {
     AppState::for_tests(pool.clone(), Config::for_tests())
-}
-
-/// Inserts a local user named `nickname`.
-pub(super) async fn local_user(pool: &PgPool, nickname: &str) -> User {
-    insert(
-        pool,
-        &NewUser::local(nickname, &local_ap_id(TEST_BASE_URL, nickname)),
-    )
-    .await
-    .expect("the local fixture inserts")
 }
 
 /// Inserts a local user named `nickname` whose account is deactivated.
@@ -50,26 +44,11 @@ pub(super) async fn inactive_user(pool: &PgPool, nickname: &str) -> User {
         pool,
         &NewUser {
             is_active: Flag::new(false),
-            ..NewUser::local(nickname, &local_ap_id(TEST_BASE_URL, nickname))
+            ..local_new(nickname)
         },
     )
     .await
     .expect("the deactivated fixture inserts")
-}
-
-/// Inserts a mirror of `nickname` on `remote.example`.
-pub(super) async fn remote_user(pool: &PgPool, nickname: &str) -> User {
-    insert(
-        pool,
-        &NewUser {
-            nickname: format!("{nickname}@remote.example"),
-            ap_id: format!("https://remote.example/users/{nickname}"),
-            domain: Some("remote.example".to_owned()),
-            ..NewUser::default()
-        },
-    )
-    .await
-    .expect("the remote fixture inserts")
 }
 
 /// A public local post by `author` of `text`.

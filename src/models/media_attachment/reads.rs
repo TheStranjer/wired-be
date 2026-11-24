@@ -7,7 +7,7 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use super::MediaAttachment;
-use crate::error::AppResult;
+use crate::{error::AppResult, util::collections::group_pairs};
 
 /// Fetches the attachment whose primary key is `id`, `None` when no row
 /// matches.
@@ -103,13 +103,9 @@ pub async fn for_statuses(
     .bind(&status_ids)
     .fetch_all(pool)
     .await?;
-    let mut grouped: HashMap<Uuid, Vec<MediaAttachment>> = HashMap::new();
-    for row in rows {
-        if let Some(status_id) = row.status_id {
-            grouped.entry(status_id).or_default().push(row);
-        }
-    }
-    Ok(grouped)
+    Ok(group_pairs(rows.into_iter().filter_map(|row| {
+        row.status_id.map(|status_id| (status_id, row))
+    })))
 }
 
 /// The media `GET` and `PUT /api/v1/media/{id}` serve: the row `id`,

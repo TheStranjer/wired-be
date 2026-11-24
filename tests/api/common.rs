@@ -25,8 +25,10 @@
 mod clients;
 mod config;
 mod credentials;
+mod federation;
 mod fixtures;
 mod jobs;
+mod json;
 mod request;
 mod response;
 
@@ -50,14 +52,17 @@ pub use self::{
         create_app_only_token, create_deactivated_user_with_password,
         create_mfa_user_with_password, create_moderator_with_password, create_token, expire_token,
     },
+    federation::{deliver, delivering_state, delivery_jobs, incoming_args},
     fixtures::{
         create_local_user, create_local_user_with, create_notification, create_reaction,
         create_remote_user, create_status, create_status_attachment, create_user_with_password,
+        reload_user,
     },
     jobs::run_all_jobs,
+    json::{id_of, ids_of, sorted_keys},
     request::{MultipartPart, TestRequest},
     response::{
         TestResponse, activity_json, assert_all_answered, assert_all_errors, assert_all_refused,
-        assert_answer, assert_error,
+        assert_answer, assert_error, expected_link,
     },
 };

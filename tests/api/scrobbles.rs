@@ -121,30 +121,9 @@ fn page_len(body: &Value) -> usize {
     body.as_array().expect("the listing is an array").len()
 }
 
-/// The object keys of `value`, sorted, for exact key-set assertions.
-fn key_set(value: &Value) -> Vec<&str> {
-    let mut keys: Vec<&str> = value
-        .as_object()
-        .expect("a JSON object")
-        .keys()
-        .map(String::as_str)
-        .collect();
-    keys.sort_unstable();
-    keys
-}
-
 /// The exact error body Pleroma's fallback renders for `message`.
 fn error_body(message: &str) -> Value {
     json!({"error": message})
-}
-
-/// The `Link` header Pleroma's `add_link_headers` writes for a page of the
-/// listing of `path`, cursors included.
-fn expected_link(path: &str, next_cursor: &str, prev_cursor: &str) -> String {
-    format!(
-        "<{BASE}{path}?max_id={next_cursor}>; rel=\"next\", \
-         <{BASE}{path}?min_id={prev_cursor}>; rel=\"prev\""
-    )
 }
 
 #[tokio::test]
@@ -168,7 +147,11 @@ async fn a_full_scrobble_is_created_and_lists_back() {
     .await;
     assert_eq!(created.status, StatusCode::OK, "Pleroma answers 200");
     let entity = created.json_value();
-    assert_eq!(key_set(&entity), EXPECTED_KEYS, "exactly the keys");
+    assert_eq!(
+        common::sorted_keys(&entity),
+        EXPECTED_KEYS,
+        "exactly the keys"
+    );
     let id: Uuid = entity["id"]
         .as_str()
         .and_then(|text| Uuid::parse_str(text).ok())
@@ -383,7 +366,7 @@ async fn the_other_parameter_rules_are_422s_too() {
             "`{body}` is no millisecond count"
         );
         assert_eq!(
-            key_set(&response.json_value()),
+            common::sorted_keys(&response.json_value()),
             ["error"],
             "and the body is the one-key error shape"
         );
@@ -444,7 +427,7 @@ async fn private_scrobbles_are_visible_to_their_owner_only() {
     .await;
     assert_eq!(private.status, StatusCode::OK, "direct is accepted");
     assert_eq!(
-        key_set(&private.json_value()),
+        common::sorted_keys(&private.json_value()),
         EXPECTED_KEYS,
         "and answers the plain entity, which names no visibility"
     );
@@ -526,7 +509,7 @@ async fn the_listing_pages_by_id_cursor_and_links() {
     assert_eq!(titles(&page), ["track 4", "track 3"], "two newest first");
     assert_eq!(
         first.header("link"),
-        Some(expected_link(&path, &rows[3].id.to_string(), &rows[4].id.to_string()).as_str()),
+        Some(common::expected_link(&path, &rows[4].id, &rows[3].id).as_str()),
         "Pleroma's add_link_headers, over the account's own path"
     );
 
@@ -564,7 +547,7 @@ async fn the_listing_pages_by_id_cursor_and_links() {
     );
     assert_eq!(
         polled.header("link"),
-        Some(expected_link(&path, &rows[4].id.to_string(), &rows[4].id.to_string()).as_str()),
+        Some(common::expected_link(&path, &rows[4].id, &rows[4].id).as_str()),
         "a one-row page carries its own id on both cursors"
     );
 

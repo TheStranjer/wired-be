@@ -13,8 +13,7 @@ use serde_json::{Value, json};
 use wired_be::streaming::hub::Audience;
 
 use super::support::{
-    BASE, BOUNDARY, CONFIG, FUTURE, P_ADMIN, PAST, World, assert_log, get_array, id_of,
-    post_configs, wire,
+    BASE, BOUNDARY, CONFIG, FUTURE, P_ADMIN, PAST, World, assert_log, get_array, post_configs, wire,
 };
 use crate::common;
 
@@ -132,9 +131,9 @@ async fn descriptions_answer_the_whitelist(app: &Router, token: &str) {
     );
 }
 
-/// The instance-document cycle: the multipart upload answers the public
-/// url, the public route serves the bytes with the document CSP, and the
-/// delete takes it back down.
+/// The instance-document cycle: the multipart upload answers the
+/// frontend url, the public JSON endpoint serves the text, the retired HTML
+/// route is the fallback 404, and the delete takes it back down.
 async fn instance_document_round_trip(world: &World) {
     let upload =
         common::TestRequest::patch(&format!("{P_ADMIN}/instance_document/terms-of-service"))
@@ -154,17 +153,18 @@ async fn instance_document_round_trip(world: &World) {
     assert_eq!(
         upload.json_value()["url"],
         json!(format!("{BASE}/instance/terms-of-service.html")),
-        "the answer names the public url"
+        "the answer names the frontend url"
     );
 
-    let served = common::api_get(&world.app, None, "/instance/terms-of-service.html").await;
+    let served = common::api_get(&world.app, None, "/api/v1/instance/terms_of_service").await;
     common::assert_answer(&served, StatusCode::OK, "the public document read");
-    assert_eq!(served.text(), "<h1>Terms</h1>", "the bytes round-trip");
     assert_eq!(
-        served.header("content-type"),
-        Some("text/html; charset=utf-8"),
-        "served as html"
+        served.json_value()["content"],
+        json!("<h1>Terms</h1>"),
+        "the text round-trips"
     );
+    let retired = common::api_get(&world.app, None, "/instance/terms-of-service.html").await;
+    common::assert_answer(&retired, StatusCode::NOT_FOUND, "no html page is served");
 
     let deleted = common::api_delete(
         &world.app,
@@ -174,7 +174,7 @@ async fn instance_document_round_trip(world: &World) {
     )
     .await;
     common::assert_answer(&deleted, StatusCode::OK, "the document delete");
-    let gone = common::api_get(&world.app, None, "/instance/terms-of-service.html").await;
+    let gone = common::api_get(&world.app, None, "/api/v1/instance/terms_of_service").await;
     common::assert_answer(
         &gone,
         StatusCode::NOT_FOUND,
@@ -194,7 +194,7 @@ async fn rules_walk(world: &World) {
     )
     .await;
     common::assert_answer(&keep, StatusCode::OK, "the rule create");
-    let keep_id = id_of(&keep.json_value());
+    let keep_id = common::id_of(&keep.json_value());
     let drop_me = common::api_post(
         &world.app,
         Some(&world.admin),
@@ -203,7 +203,7 @@ async fn rules_walk(world: &World) {
     )
     .await;
     common::assert_answer(&drop_me, StatusCode::OK, "the second rule create");
-    let drop_id = id_of(&drop_me.json_value());
+    let drop_id = common::id_of(&drop_me.json_value());
 
     let public = get_array(&world.app, None, "/api/v1/instance/rules").await;
     assert_eq!(
@@ -283,7 +283,7 @@ async fn announcements_walk(world: &World) {
     )
     .await;
     common::assert_answer(&created, StatusCode::OK, "the announcement create");
-    let announcement_id = id_of(&created.json_value());
+    let announcement_id = common::id_of(&created.json_value());
     assert_eq!(
         created.json_value()["pleroma"]["raw_content"],
         json!("Down at five"),

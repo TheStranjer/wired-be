@@ -12,16 +12,18 @@ use serde_json::{Value, json};
 use tracing::debug;
 
 use super::{
-    AREA_ACCOUNTS, CLASS_WRITE, INVALID_TYPE, MISSING_TYPE, WRONG_TARGET, reads::named_account,
+    AREA_ACCOUNTS, CLASS_WRITE, INVALID_TYPE, MISSING_TYPE, NOT_ALLOWED, ONLY_LOCAL, WRONG_TARGET,
+    reads::named_account,
 };
 use crate::{
+    api::helpers,
     auth::admin::AdminUser,
     error::{AppError, AppResult},
     extract::ApiBody,
     models::{
         moderation_log,
         report::{self, ReportState},
-        user::{User, admin},
+        user::User,
     },
     services::report_moderation::set_report_state,
     state::AppState,
@@ -32,9 +34,11 @@ use crate::{
 /// Mastodon's moderation umbrella: one submitted type, applied as this
 /// schema can apply it and recorded whatever the answer.
 ///
-/// The order is Pleroma's `with` chain: the type is validated before the
-/// report is looked up and before anything moves, so a request naming an
-/// unknown type changes nothing at all. The answer is the empty object
+/// The order is Pleroma's `with` chain: the type and its target are
+/// validated ([`validate_target`]) before the report is looked up and before
+/// anything moves, so a request naming an unknown type, the caller's own
+/// account or a remote mirror for a deactivation changes nothing at all
+/// and leaves its report open. The answer is the empty object
 /// where Pleroma answers `204` — the ticket's pinning — and the moderation
 /// log is what makes the request traceable.
 ///
@@ -44,6 +48,8 @@ use crate::{
 /// and its `admin:write` gate; [`AppError::Unprocessable`] with
 /// [`INVALID_TYPE`] / [`MISSING_TYPE`] from [`AccountAction::parse`];
 /// [`AppError::NotFound`] from [`named_account`] or [`resolve_report`];
+/// [`AppError::Forbidden`] with [`NOT_ALLOWED`] and [`AppError::BadRequest`]
+/// with [`ONLY_LOCAL`] from [`validate_target`];
 /// [`AppError::BadRequest`] with [`WRONG_TARGET`];
 /// [`AppError::Unprocessable`] from the body extractor for a `type` that is
 /// no text; and [`AppError::Database`] from the writes and the log.
@@ -56,9 +62,33 @@ pub(super) async fn account_action(
     admin.require(CLASS_WRITE, AREA_ACCOUNTS)?;
     let account = named_account(&state, &raw).await?;
     let action = AccountAction::parse(params.kind.as_deref())?;
+    validate_target(&admin.0, &account, action)?;
     resolve_report(&state, &admin.0, &account, params.report_id.as_deref()).await?;
     apply_action(&state, &admin.0, &account, action).await?;
     Ok(Json(json!({})))
+}
+
+/// Pleroma's `validate_account_action`, plus the self-protection its
+/// controller lacks: an action that deactivates is refused on the caller's
+/// own account (a sole admin could lock themselves out) and on a remote
+/// mirror (the flag means nothing for an account this instance does not
+/// own). The other three types touch no flag and pass anywhere.
+///
+/// # Errors
+///
+/// [`AppError::Forbidden`] with [`NOT_ALLOWED`] for the caller's own
+/// account; [`AppError::BadRequest`] with [`ONLY_LOCAL`] for a remote one.
+fn validate_target(actor: &User, account: &User, action: AccountAction) -> AppResult<()> {
+    if !action.deactivates() {
+        return Ok(());
+    }
+    if account.id == actor.id {
+        return Err(AppError::Forbidden(NOT_ALLOWED.to_owned()));
+    }
+    if !account.local.get() {
+        return Err(AppError::BadRequest(ONLY_LOCAL.to_owned()));
+    }
+    Ok(())
 }
 
 /// The effect of one action type: the flag its two real actions move, each
@@ -78,12 +108,11 @@ async fn apply_action(
     action: AccountAction,
 ) -> AppResult<()> {
     if action.deactivates() {
-        let moved = admin::set_active(&state.db, account.id, false)
+        let moved = helpers::set_activation(state, actor, slice::from_ref(account), false)
             .await?
+            .pop()
             .ok_or(AppError::NotFound)?;
-        let logged = moderation_log::deactivate(&state.db, actor, slice::from_ref(&moved)).await?;
         debug!(
-            log = %logged.id,
             account = %moved.id,
             "admin action deactivated an account"
         );
@@ -226,6 +255,33 @@ impl AccountAction {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_fixtures::{local_user, remote_user};
+
+    /// A deactivation of the caller's own account is the 403, and one of a
+    /// remote mirror the 400; the three types that move no flag pass on
+    /// the caller, and a local account other than the caller's passes
+    /// every type.
+    #[tokio::test]
+    async fn validate_target_guards_the_caller_and_remote_mirrors() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let admin = local_user(&pool, "root").await;
+        let other = local_user(&pool, "plain").await;
+        let mirror = remote_user(&pool, "faraway").await;
+
+        for action in [AccountAction::Disable, AccountAction::Suspend] {
+            let own = validate_target(&admin, &admin, action).expect_err("self is protected");
+            assert_eq!(own.to_string(), NOT_ALLOWED, "{action:?} on self");
+            assert!(matches!(own, AppError::Forbidden(_)), "as a 403");
+            validate_target(&admin, &other, action).expect("another local account passes");
+        }
+        let remote = validate_target(&admin, &mirror, AccountAction::Disable)
+            .expect_err("a mirror cannot be disabled");
+        assert_eq!(remote.to_string(), ONLY_LOCAL, "the pinned wording");
+        assert!(matches!(remote, AppError::BadRequest(_)), "as a 400");
+        validate_target(&admin, &admin, AccountAction::NoAction).expect("none on self passes");
+        validate_target(&admin, &mirror, AccountAction::Silence).expect("silence on a mirror");
+    }
 
     /// The umbrella's five words each read as their own action, spell back
     /// identically (that spelling is the moderation log's action name), and

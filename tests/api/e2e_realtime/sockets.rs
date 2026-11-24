@@ -238,29 +238,6 @@ pub(super) async fn post_status(srv: &Server, token: &str, text: &str, visibilit
     .await
 }
 
-/// The `id` of a JSON array of entities, in answer order.
-pub(super) fn ids_of(array: &Value) -> Vec<String> {
-    array
-        .as_array()
-        .expect("the listing answers a JSON array")
-        .iter()
-        .map(|entity| {
-            entity["id"]
-                .as_str()
-                .expect("every entity carries its id")
-                .to_owned()
-        })
-        .collect()
-}
-
-/// The id of the entity a write answered with.
-pub(super) fn id_of(entity: &Value) -> String {
-    entity["id"]
-        .as_str()
-        .expect("the entity carries its id")
-        .to_owned()
-}
-
 /// `token`'s user follows the account `target`, asserted granted.
 pub(super) async fn follow(srv: &Server, token: &str, target: Uuid) {
     let relationship = action_ok(srv, &format!("/api/v1/accounts/{target}/follow"), token).await;

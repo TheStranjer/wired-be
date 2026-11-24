@@ -43,13 +43,13 @@ use crate::{
     api::{accounts::after_follow_changed, blocks::after_block_changed},
     error::AppError,
     federation::fetch_actor::get_or_fetch_by_acct,
-    jobs::{AttemptInfo, HandlerFuture, JobError, QUEUE_BACKGROUND},
+    jobs::{AttemptInfo, HandlerFuture, JobError, QUEUE_BACKGROUND, load_user, parse_args},
     models::{
         block,
         follow::{self, FollowToggles},
         job::{NewJob, enqueue},
         mute::{self, MuteOptions},
-        user::{self, AccountStatus, User},
+        user::User,
     },
     state::AppState,
 };
@@ -69,6 +69,8 @@ const IMPORT_CHUNK: usize = 50;
 /// How long the re-enqueued remainder of an import waits before its next
 /// chunk may run (the 5 s throttle).
 const IMPORT_CHUNK_DELAY: TimeDelta = TimeDelta::seconds(5);
+/// The job name in the discard text of unusable [`ImportArgs`].
+const IMPORT_JOB: &str = "import";
 
 /// The `{user_id, accts, options}` arguments of an import job.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -97,13 +99,6 @@ pub struct ImportOption {
 }
 
 impl ImportArgs {
-    /// Reads the arguments of a claimed job; a payload this shape cannot
-    /// deserialize is permanent — the job is discarded, never retried.
-    fn from_value(args: &Value) -> Result<Self, JobError> {
-        serde_json::from_value(args.clone())
-            .map_err(|err| JobError::Discard(format!("import job arguments are unusable: {err}")))
-    }
-
     /// The same arguments with [`options`](Self::options) padded or
     /// truncated to exactly one entry per acct, so the two lists always
     /// zip, and always split at the same index.
@@ -183,8 +178,9 @@ async fn handle_chunked(
     action: Action,
     kind: &'static str,
 ) -> Result<(), JobError> {
-    let parsed = ImportArgs::from_value(args)?.with_options_aligned();
-    let importer = load_importer(state, parsed.user_id).await?;
+    let parsed = parse_args::<ImportArgs>(args, IMPORT_JOB)?.with_options_aligned();
+    // A vanished user, or one that can no longer act, is permanent.
+    let importer = load_user(state, parsed.user_id, "import", true).await?;
     let head_count = parsed.accts.len().min(IMPORT_CHUNK);
     let mut head = parsed;
     let tail_accts = head.accts.split_off(head_count);
@@ -194,35 +190,6 @@ async fn handle_chunked(
         enqueue_next_chunk(state, kind, head.user_id, tail_accts, tail_options).await?;
     }
     Ok(())
-}
-
-/// The importer the job acts as. A vanished user, or one that can no
-/// longer act (deactivated, deleted, or awaiting approval), is permanent
-/// (discard); a database that cannot answer is a retry.
-///
-/// # Errors
-///
-/// [`JobError::Discard`] when the user row is gone or the account can no
-/// longer act, [`JobError::Retry`] on a database failure.
-async fn load_importer(state: &AppState, user_id: Uuid) -> Result<User, JobError> {
-    match user::get_by_id(&state.db, user_id).await {
-        Ok(Some(importer)) => {
-            let blocked = matches!(
-                importer.account_status(),
-                AccountStatus::Deactivated | AccountStatus::ApprovalPending
-            ) || importer.deleted_at.is_some();
-            if blocked {
-                return Err(JobError::Discard(format!(
-                    "the import job's user {user_id} can no longer act"
-                )));
-            }
-            Ok(importer)
-        }
-        Ok(None) => Err(JobError::Discard(format!(
-            "the import job's user {user_id} no longer exists"
-        ))),
-        Err(err) => Err(JobError::Retry(format!("import user read failed: {err}"))),
-    }
 }
 
 /// Runs `action` for every (acct, option) pair of `args`, in list order.

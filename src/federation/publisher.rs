@@ -6,7 +6,7 @@
 //! `determine_inbox/2`, `lib/pleroma/user.ex`'s follower-inbox queries):
 //! turn one activity's `ActivityPub` addressing into the set of remote
 //! inboxes that should receive it, and queue one delivery per inbox.
-//! [`super::delivery`] already owns the per-inbox half — [`enqueue_delivery`]
+//! [`super::delivery`] already owns the per-inbox half — `enqueue_checked`
 //! queues the signed `federator.deliver` job — so this module is the
 //! producing side: [`publish`] computes the inboxes and calls it once per
 //! unique address, answering how many deliveries it queued.
@@ -17,8 +17,8 @@
 //! - the addressing properties `to`, `cc`, `bto`, `bcc` and `audience`
 //!   carry the recipients, each in any of the JSON-LD shapes
 //!   [`json::references`](crate::federation::json::references) normalizes;
-//! - the public address (`https://www.w3.org/ns/activitystreams#Public` and
-//!   its two shorthands) is never itself a recipient — it says "anyone",
+//! - the public address ([`AS_PUBLIC`](crate::federation::vocab::AS_PUBLIC)
+//!   and its two shorthands) is never itself a recipient — it says "anyone",
 //!   and "anyone" is spelled out as the followers collection and the
 //!   directly addressed actors;
 //! - the actor's own followers-collection URL expands to the actor's
@@ -83,7 +83,7 @@ use uuid::Uuid;
 use crate::{
     error::AppResult,
     federation::{
-        delivery::enqueue_delivery,
+        delivery::enqueue_checked,
         mrf::{self, MrfDecision},
     },
     jobs::QUEUE_FEDERATOR_OUTGOING,
@@ -161,7 +161,7 @@ struct PublishArgs {
 type OutgoingFilter = fn(AppState, Value) -> BoxFuture<'static, MrfDecision>;
 
 /// Computes the delivery targets of `activity` as addressed by `actor` and
-/// queues one [`enqueue_delivery`] per unique inbox, answering how many
+/// queues one delivery per unique inbox, answering how many
 /// deliveries were enqueued.
 ///
 /// The set is the addressing described in the module docs: the recipients
@@ -183,14 +183,19 @@ type OutgoingFilter = fn(AppState, Value) -> BoxFuture<'static, MrfDecision>;
 /// addressed and delivered.
 ///
 /// While `FEDERATION_ENABLED` is off nothing is computed or queued and the
-/// answer is `0`, the same no-op [`enqueue_delivery`] performs per inbox.
+/// answer is `0`, the same no-op
+/// [`enqueue_delivery`](crate::federation::delivery::enqueue_delivery)
+/// performs per inbox.
+///
+/// The instance policy is read once for the whole candidate set, by
+/// `deliverable_inboxes`; the per-inbox `enqueue_checked` repeats none of it.
 ///
 /// # Errors
 ///
 /// Any database failure reading followers or recipients arrives as
 /// [`AppError::Database`](crate::error::AppError), and a body with no
 /// string `id` as [`AppError::Unprocessable`](crate::error::AppError)
-/// through [`enqueue_delivery`].
+/// through `enqueue_checked`.
 pub async fn publish(
     state: &AppState,
     actor: &User,
@@ -233,7 +238,7 @@ async fn publish_filtered(
     let grace = unreachable_grace(state.config.unreachable_grace_secs);
     let targets = deliverable_inboxes(&state.db, policy.as_ref(), actor, candidates, grace).await?;
     for inbox in &targets {
-        enqueue_delivery(state, inbox, actor, &activity).await?;
+        enqueue_checked(state, inbox, actor, &activity).await?;
     }
     Ok(targets.len())
 }
@@ -247,7 +252,7 @@ async fn publish_filtered(
 /// [`PublishOpts::extra_inboxes`] — and runs as soon as a worker claims
 /// it. Large follower sets are the reason this exists. Each publish call
 /// enqueues its own job; the per-`(activity, inbox)` deduplication
-/// [`enqueue_delivery`] applies is what keeps a repeated publish from
+/// `enqueue_checked` applies is what keeps a repeated publish from
 /// sending twice.
 ///
 /// `unique_key` becomes the job row's deduplication key (see

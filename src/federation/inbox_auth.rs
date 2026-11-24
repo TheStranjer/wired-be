@@ -27,7 +27,9 @@
 //!    request;
 //! 4. the `Digest` header must describe the bytes actually received
 //!    (401 `Invalid digest`, [`verify_digest`] and its body rule);
-//! 5. the `keyId` minus its fragment is the signer's actor URL (Mastodon's
+//! 5. the mirror row that stored the full `keyId` as its `publicKey.id`
+//!    (`GoToSocial`'s path-style keys) is the signer; else the `keyId` minus
+//!    its fragment is the signer's actor URL (Mastodon's
 //!    `#main-key`): the stored mirror answers, else the actor is fetched
 //!    (401 `Unknown key` when neither works); a `keyId` naming a standalone
 //!    key object is resolved by fetching that document and following its
@@ -59,8 +61,9 @@ use bytes::Bytes;
 use serde_json::Value;
 
 use crate::{
-    federation::signature::verify::{
-        ParsedSignature, SignedRequestParts, path_and_query, verify_digest,
+    federation::{
+        signature::verify::{ParsedSignature, SignedRequestParts, path_and_query, verify_digest},
+        vocab::AP_MEDIA_TYPES,
     },
     models::user::User,
     state::AppState,
@@ -107,12 +110,10 @@ const REJECTED: &str = "Rejected";
 /// an actor's own deletion (see the [module docs](self) step 7).
 const DELETE_TYPE: &str = "Delete";
 /// The media types an inbox delivery may be labelled with, lowercase and
-/// without parameters: the `Content-Type` must name exactly one.
-const JSON_MEDIA_TYPES: [&str; 3] = [
-    "application/activity+json",
-    "application/ld+json",
-    "application/json",
-];
+/// without parameters: the `Content-Type` must name exactly one. The
+/// [`AP_MEDIA_TYPES`] pair plus plain `application/json`, which some peers
+/// send.
+const JSON_MEDIA_TYPES: [&str; 3] = [AP_MEDIA_TYPES[0], AP_MEDIA_TYPES[1], "application/json"];
 /// How often one actor's key may be refetched after a failed verification:
 /// Pleroma's `refetch_public_key` retry, rate limited to once per minute.
 const KEY_REFETCH_WINDOW: Duration = Duration::from_secs(60);
@@ -217,7 +218,7 @@ mod tests {
         config::Config,
         federation::inbox_auth::test_support::{
             BODY, activity, bind, block_domain, deliver, drop_header, header_value, inbox_app,
-            origin, peer, peer_app, replace_header, send, spawn, test_state,
+            origin, path_key_peer, peer, peer_app, replace_header, send, spawn, test_state,
             test_state_with_config,
         },
         util::keys::{FIXTURE_PRIVATE_PKCS1_PEM, FIXTURE_PUBLIC_PKCS1_PEM},
@@ -271,6 +272,51 @@ mod tests {
         .await;
         assert_eq!(mirror_reply.status, StatusCode::OK, "the second delivery");
         assert_eq!(hits.load(Ordering::SeqCst), 1, "answered from the mirror");
+        server.abort();
+    }
+
+    /// A path-style `keyId` is fetched once, then served from the mirror.
+    ///
+    /// `GoToSocial`'s `{actor}/main-key` has no fragment, so it strips to
+    /// itself, which is no stored `ap_id`. The first contact fetches; the
+    /// mirror then stores the document's `publicKey.id`, so the repeat is
+    /// served without any outbound fetch.
+    #[tokio::test]
+    async fn a_path_style_key_id_is_served_from_the_mirror_after_first_contact() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let listener = bind().await;
+        let base = origin(&listener);
+        let ap_id = format!("{base}/users/alice");
+        let key_id = format!("{ap_id}/main-key");
+        let peer = path_key_peer(base.clone(), FIXTURE_PUBLIC_PKCS1_PEM.to_owned());
+        let hits = Arc::clone(&peer.hits);
+        let server = spawn(listener, peer_app(peer));
+        let app = inbox_app(test_state(pool.clone()));
+        let body = activity(&ap_id, "https://test.example/users/bob");
+
+        let first = send(&app, &deliver(&key_id, FIXTURE_PRIVATE_PKCS1_PEM, &body)).await;
+        assert_eq!(
+            first.status,
+            StatusCode::OK,
+            "the first delivery: {}",
+            first.error
+        );
+        let after_first = hits.load(Ordering::SeqCst);
+        assert!(after_first >= 1, "first contact dereferenced the peer");
+
+        let second = send(&app, &deliver(&key_id, FIXTURE_PRIVATE_PKCS1_PEM, &body)).await;
+        assert_eq!(
+            second.status,
+            StatusCode::OK,
+            "the repeat delivery: {}",
+            second.error
+        );
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            after_first,
+            "the repeat is answered from the mirror, with no outbound fetch"
+        );
         server.abort();
     }
 

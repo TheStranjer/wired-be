@@ -6,8 +6,8 @@ use serde_json::json;
 use wired_be::models::follow::Follow;
 
 use super::support::{
-    ask, asking, expected_link, following, listed_entry, listed_ids, locked_user, outgoing,
-    wanted_follows, wanted_targets,
+    OUTGOING, ask, asking, following, listed_entry, locked_user, outgoing, wanted_follows,
+    wanted_targets,
 };
 use crate::common;
 
@@ -54,7 +54,7 @@ async fn the_outgoing_list_answers_the_callers_own_asks() {
     );
     let body = listed.json_value();
     assert_eq!(
-        listed_ids(&body),
+        common::ids_of(&body),
         wanted_targets(&asks),
         "the two waiting asks, newest row first; the granted follow and the \
          other account's request stay out"
@@ -115,13 +115,13 @@ async fn the_outgoing_list_pages_key_on_follow_row_ids_and_link() {
 
     let first = outgoing(&app, Some(&token), "?limit=2").await;
     assert_eq!(
-        listed_ids(&first.json_value()),
+        common::ids_of(&first.json_value()),
         wanted_users[..2],
         "two newest first"
     );
     assert_eq!(
         first.header("link"),
-        Some(expected_link(&wanted_rows[1], &wanted_rows[0]).as_str()),
+        Some(common::expected_link(OUTGOING, &wanted_rows[0], &wanted_rows[1]).as_str()),
         "the Link cursors are the page's follow row ids, not account ids"
     );
 
@@ -132,14 +132,14 @@ async fn the_outgoing_list_pages_key_on_follow_row_ids_and_link() {
     )
     .await;
     assert_eq!(
-        listed_ids(&older.json_value()),
+        common::ids_of(&older.json_value()),
         wanted_users[2..4],
         "max_id continues where the page ended"
     );
 
     let newer = outgoing(&app, Some(&token), &format!("?min_id={}", wanted_rows[3])).await;
     assert_eq!(
-        listed_ids(&newer.json_value()),
+        common::ids_of(&newer.json_value()),
         wanted_users[..3],
         "min_id answers the newest-first page just after the cursor"
     );
@@ -178,19 +178,19 @@ async fn the_outgoing_default_page_is_twenty_and_the_cap_is_forty() {
 
     let default = outgoing(&app, Some(&token), "").await;
     assert_eq!(
-        listed_ids(&default.json_value()).len(),
+        common::ids_of(&default.json_value()).len(),
         20,
         "Pleroma's default page"
     );
     let greedy = outgoing(&app, Some(&token), "?limit=100").await;
     assert_eq!(
-        listed_ids(&greedy.json_value()).len(),
+        common::ids_of(&greedy.json_value()).len(),
         40,
         "and the global cap, never more"
     );
     let between = outgoing(&app, Some(&token), "?limit=30").await;
     assert_eq!(
-        listed_ids(&between.json_value()).len(),
+        common::ids_of(&between.json_value()).len(),
         30,
         "a page under the cap goes through"
     );

@@ -3,7 +3,7 @@
 
 use axum::http::StatusCode;
 
-use super::support::{familiar_path, fixture, get, listed_ids};
+use super::support::{familiar_path, fixture, get};
 use crate::common;
 
 /// The page the batch answers: the listing cap of 40.
@@ -25,7 +25,7 @@ async fn familiar_followers_answers_only_the_first_page_of_ids() {
 
     let over = get(&app, Some(&token), &familiar_path(&asked)).await;
     common::assert_answer(&over, StatusCode::OK, "41 known ids");
-    let answered = listed_ids(&over.json_value());
+    let answered = common::ids_of(&over.json_value());
     assert_eq!(answered.len(), PAGE, "answers a page of 40 entries");
     assert_eq!(
         answered,
@@ -36,7 +36,7 @@ async fn familiar_followers_answers_only_the_first_page_of_ids() {
     let exact = get(&app, Some(&token), &familiar_path(&asked[..PAGE])).await;
     common::assert_answer(&exact, StatusCode::OK, "40 known ids");
     assert_eq!(
-        listed_ids(&exact.json_value()),
+        common::ids_of(&exact.json_value()),
         asked[..PAGE].to_vec(),
         "exactly one page is answered whole"
     );

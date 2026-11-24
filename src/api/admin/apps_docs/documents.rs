@@ -6,10 +6,11 @@ use std::path::{Path, PathBuf};
 use axum::{
     Json,
     extract::{Path as AxumPath, State},
-    http::header::{CONTENT_SECURITY_POLICY, CONTENT_TYPE},
+    http::header::CONTENT_TYPE,
     response::{IntoResponse as _, Response},
 };
 use bytes::Bytes;
+use chrono::{DateTime, Utc};
 use tracing::debug;
 
 use super::{AREA_DOCUMENTS, CLASS_READ, CLASS_WRITE};
@@ -33,11 +34,9 @@ const DOCUMENT_TOO_LARGE: &str = "File is too large (maximum is 1048576 bytes)";
 /// `content-type` of the admin document read, as Pleroma's `show` sets
 /// it.
 const HTML_TYPE: &str = "text/html";
-/// `content-type` of the public document read, with its charset.
-const HTML_UTF8_TYPE: &str = "text/html; charset=utf-8";
-/// The public document route's `Content-Security-Policy`: the page may
-/// style itself and show images, and do nothing else.
-const DOCUMENT_CSP: &str = "default-src 'none'; style-src 'unsafe-inline'; img-src * data:";
+/// The name of the one document the public JSON API reads: the terms of
+/// service, served by `GET /api/v1/instance/terms_of_service`.
+pub const TERMS_OF_SERVICE: &str = "terms-of-service";
 /// The multipart field the document upload reads its file from.
 const FILE_FIELD: &str = "file";
 /// The extension every instance document is stored and served under.
@@ -120,35 +119,6 @@ pub(super) async fn delete_document(
     }
 }
 
-/// `GET /instance/{name}.html` — the public read of a document: bytes as
-/// `text/html; charset=utf-8` behind the document CSP, no auth. The
-/// matched segment carries the `.html` suffix the route pattern cannot
-/// pin; stripped here, refused without it.
-///
-/// # Errors
-///
-/// [`AppError::RouteNotFound`] for a segment that is not a configured
-/// document's `<name>.html` or a document never uploaded;
-/// [`AppError::Internal`] for a store that refuses to be read.
-pub(super) async fn serve_document(
-    State(state): State<AppState>,
-    AxumPath(segment): AxumPath<String>,
-) -> AppResult<Response> {
-    let suffix = format!(".{DOCUMENT_EXTENSION}");
-    let name = segment
-        .strip_suffix(suffix.as_str())
-        .ok_or(AppError::RouteNotFound)?;
-    let bytes = read_document(&state.config, name).await?;
-    Ok((
-        [
-            (CONTENT_TYPE, HTML_UTF8_TYPE),
-            (CONTENT_SECURITY_POLICY, DOCUMENT_CSP),
-        ],
-        bytes,
-    )
-        .into_response())
-}
-
 /// The stored path of a configured document name: `<dir>/<name>.html`,
 /// `None` for every name the instance does not offer — off the list, or
 /// not a safe segment. That is also the traversal gate: a `../` from a
@@ -172,9 +142,8 @@ fn document_path(config: &Config, name: &str) -> Option<PathBuf> {
         })
 }
 
-/// Whether `name` may stand as one document segment: the same filename
-/// charset the frontend installer keeps, non-empty, and neither `.` nor
-/// `..`.
+/// Whether `name` may stand as one document segment: a safe filename
+/// charset, non-empty, and neither `.` nor `..`.
 fn is_document_name(name: &str) -> bool {
     !name.is_empty()
         && name != "."
@@ -184,9 +153,15 @@ fn is_document_name(name: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
 }
 
-/// The public URL of `name`: the address [`public_router`] serves it at.
+/// Where the frontend (or a proxy pointing at the document directory)
+/// serves `name`: `{FRONTEND_BASE_URL}/instance/<name>.html`. The backend
+/// serves no page there; the terms of service are read as JSON from
+/// `GET /api/v1/instance/terms_of_service`.
 fn document_url(config: &Config, name: &str) -> String {
-    format!("{}/instance/{name}.{DOCUMENT_EXTENSION}", config.base_url)
+    format!(
+        "{}/instance/{name}.{DOCUMENT_EXTENSION}",
+        config.frontend_base_url
+    )
 }
 
 /// The document bytes behind a configured name.
@@ -197,18 +172,49 @@ fn document_url(config: &Config, name: &str) -> String {
 /// [`AppError::Internal`] for any other read failure.
 async fn read_document(config: &Config, name: &str) -> AppResult<Bytes> {
     let path = document_path(config, name).ok_or(AppError::RouteNotFound)?;
-    match tokio::fs::read(&path).await {
-        Ok(bytes) => Ok(Bytes::from(bytes)),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Err(AppError::RouteNotFound),
-        Err(err) => Err(internal_store_failure(&err)),
+    let bytes = tokio::fs::read(&path)
+        .await
+        .map_err(|err| store_read_failure(&err))?;
+    Ok(Bytes::from(bytes))
+}
+
+/// The document bytes behind a configured name and the time the file was
+/// last written, the `updated_at` of the JSON API.
+///
+/// # Errors
+///
+/// [`AppError::RouteNotFound`] for the unlisted and the never-uploaded;
+/// [`AppError::Internal`] for any other read failure.
+pub async fn read_document_stamped(
+    config: &Config,
+    name: &str,
+) -> AppResult<(Bytes, DateTime<Utc>)> {
+    let path = document_path(config, name).ok_or(AppError::RouteNotFound)?;
+    let bytes = tokio::fs::read(&path)
+        .await
+        .map_err(|err| store_read_failure(&err))?;
+    let modified = tokio::fs::metadata(&path)
+        .await
+        .map_err(|err| store_read_failure(&err))?
+        .modified()
+        .map_err(|err| internal_store_failure(&err))?;
+    Ok((Bytes::from(bytes), DateTime::<Utc>::from(modified)))
+}
+
+/// The error of a failed document read: absence is the 404, anything
+/// else a 500.
+fn store_read_failure(err: &std::io::Error) -> AppError {
+    if err.kind() == std::io::ErrorKind::NotFound {
+        AppError::RouteNotFound
+    } else {
+        internal_store_failure(err)
     }
 }
 
 /// Writes the document atomically: the bytes land in a hidden staging
 /// file beside the target (same directory, so the rename is a plain
 /// move) and the rename swaps them in, replacing whatever stood there.
-/// The filesystem work runs on the blocking pool, the way the frontend
-/// installer's does.
+/// The filesystem work runs on the blocking pool.
 ///
 /// # Errors
 ///
@@ -306,14 +312,50 @@ mod tests {
         }
     }
 
-    /// The answer URL hangs off the instance origin, at the public route.
+    /// The answer URL hangs off the frontend origin, not the backend's.
     #[test]
-    fn the_document_url_is_the_public_address() {
-        let config = Config::for_tests();
+    fn the_document_url_is_the_frontend_address() {
+        let mut config = Config::for_tests();
         assert_eq!(
             document_url(&config, "terms-of-service"),
             "https://test.example/instance/terms-of-service.html"
         );
+        config.frontend_base_url = "https://fe.example".to_owned();
+        assert_eq!(
+            document_url(&config, "terms-of-service"),
+            "https://fe.example/instance/terms-of-service.html",
+            "FRONTEND_BASE_URL, not BASE_URL"
+        );
+    }
+
+    /// The stamped read returns the bytes with the file's write time, and
+    /// the unlisted and never-uploaded are the 404.
+    #[tokio::test]
+    async fn the_stamped_read_returns_bytes_and_write_time() {
+        let dir = tempfile::tempdir().expect("a docs dir");
+        let mut config = Config::for_tests();
+        config.statics.documents.dir = dir.path().to_path_buf();
+        config.statics.documents.names = vec![TERMS_OF_SERVICE.to_owned()];
+
+        let absent = read_document_stamped(&config, TERMS_OF_SERVICE)
+            .await
+            .expect_err("never uploaded");
+        assert!(matches!(absent, AppError::RouteNotFound), "{absent:?}");
+        let unlisted = read_document_stamped(&config, "privacy")
+            .await
+            .expect_err("unlisted");
+        assert!(matches!(unlisted, AppError::RouteNotFound), "{unlisted:?}");
+
+        let path = dir.path().join("terms-of-service.html");
+        store_document(path, Bytes::from_static(b"<h1>terms</h1>"))
+            .await
+            .expect("the store works");
+        let (bytes, stamp) = read_document_stamped(&config, TERMS_OF_SERVICE)
+            .await
+            .expect("the stored document reads");
+        assert_eq!(bytes.as_ref(), b"<h1>terms</h1>", "the bytes verbatim");
+        let age = Utc::now().signed_duration_since(stamp).num_seconds();
+        assert!((-5..=60).contains(&age), "the stamp is the write time");
     }
 
     /// The staging sibling sits next to the target, hidden and uniquely

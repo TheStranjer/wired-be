@@ -4,14 +4,14 @@
 //! [`note_cases`], [`public_case`]), the lookups and counts that find one
 //! activity in the mock's capture ([`delivered_for`], [`count_delivered`],
 //! [`count_at`], [`count_of`]), the entity readers ([`assert_flags`],
-//! [`id_of`], [`uri_of`], [`create_id_of`]) and the lifecycle asserts the
+//! [`uri_of`], [`create_id_of`]) and the lifecycle asserts the
 //! public-status scenario composes. Everything shared is `pub(super)`.
 
 use serde_json::{Value, json};
 use wired_be::{config::TEST_BASE_URL, models::user::User};
 
 use super::support::{ACTIVITY_JSON, AS_PUBLIC, followers_of};
-use crate::remote;
+use crate::{common, remote};
 
 // --- asserting the peer's capture ---------------------------------------------------------
 
@@ -236,14 +236,6 @@ fn object_reference(activity: &Value) -> Option<&str> {
     })
 }
 
-/// The id text of an entity's `id` field.
-pub(super) fn id_of(entity: &Value) -> String {
-    entity["id"]
-        .as_str()
-        .expect("the entity id is a string")
-        .to_owned()
-}
-
 /// The `uri` of an entity — for a boost, the id its `Announce` federates
 /// under.
 pub(super) fn uri_of(entity: &Value) -> String {
@@ -255,7 +247,7 @@ pub(super) fn uri_of(entity: &Value) -> String {
 
 /// The deterministic `Create` id of a posted status entity (decision 6).
 pub(super) fn create_id_of(entity: &Value) -> String {
-    format!("{TEST_BASE_URL}/activities/{}", id_of(entity))
+    format!("{TEST_BASE_URL}/activities/{}", common::id_of(entity))
 }
 
 /// Asserts the `Create` of the lifecycle test: decision 6's deterministic

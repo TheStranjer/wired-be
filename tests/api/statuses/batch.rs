@@ -9,8 +9,8 @@ use uuid::Uuid;
 use wired_be::models::status::Visibility;
 
 use super::support::{
-    INVALID_TOKEN, NO_SCOPE, NOT_FOUND, SCOPES, UNKNOWN_ID, batch, deleted, entity_ids, followed,
-    id_query, ids_of, reblog_of, show, user_with_token,
+    INVALID_TOKEN, NO_SCOPE, NOT_FOUND, SCOPES, UNKNOWN_ID, batch, deleted, followed, id_query,
+    ids_of, reblog_of, show, user_with_token,
 };
 use crate::common;
 
@@ -47,7 +47,7 @@ async fn the_batch_answers_the_visible_ids_in_requested_order() {
     let strangers = batch(&app, Some(bob_token.as_str()), &query).await;
     common::assert_answer(&strangers, StatusCode::OK, "a stranger's batch");
     assert_eq!(
-        entity_ids(&strangers.json_value()),
+        common::ids_of(&strangers.json_value()),
         ids_of(&[&second, &first]),
         "the two public posts, in the order they were requested"
     );
@@ -55,7 +55,7 @@ async fn the_batch_answers_the_visible_ids_in_requested_order() {
     let authors = batch(&app, Some(alice_token.as_str()), &query).await;
     common::assert_answer(&authors, StatusCode::OK, "the author's batch");
     assert_eq!(
-        entity_ids(&authors.json_value()),
+        common::ids_of(&authors.json_value()),
         ids_of(&[&second, &hidden, &first]),
         "the private post joins the page for the account that may see it"
     );
@@ -63,7 +63,7 @@ async fn the_batch_answers_the_visible_ids_in_requested_order() {
     let anonymous = batch(&app, None, &query).await;
     common::assert_answer(&anonymous, StatusCode::OK, "the anonymous batch");
     assert_eq!(
-        entity_ids(&anonymous.json_value()),
+        common::ids_of(&anonymous.json_value()),
         ids_of(&[&second, &first]),
         "anonymously the private post is skipped like every other miss"
     );
@@ -107,7 +107,7 @@ async fn the_batch_reads_every_id_spelling_and_caps_the_request() {
     ] {
         let page = batch(&app, None, &query).await;
         common::assert_answer(&page, StatusCode::OK, who);
-        assert_eq!(entity_ids(&page.json_value()), want, "{who}");
+        assert_eq!(common::ids_of(&page.json_value()), want, "{who}");
     }
 
     // A hundred ids are read; everything past them is ignored. `one` is the
@@ -119,7 +119,7 @@ async fn the_batch_reads_every_id_spelling_and_caps_the_request() {
     let crowded_page = batch(&app, None, &full).await;
     common::assert_answer(&crowded_page, StatusCode::OK, "a request of 101 ids");
     assert_eq!(
-        entity_ids(&crowded_page.json_value()),
+        common::ids_of(&crowded_page.json_value()),
         ids_of(&[&one]),
         "the id past the hundredth names nothing this endpoint reads"
     );
@@ -154,7 +154,7 @@ async fn the_batch_without_ids_is_empty_and_duplicates_answer_once() {
     let twice = batch(&app, None, &id_query("id", &[&id, &id])).await;
     common::assert_answer(&twice, StatusCode::OK, "an id named twice");
     assert_eq!(
-        entity_ids(&twice.json_value()),
+        common::ids_of(&twice.json_value()),
         ids_of(&[&post]),
         "one entity for one id, as Pleroma's `WHERE id IN` reads a repeat"
     );
@@ -213,7 +213,7 @@ async fn the_auth_gate_runs_on_both_routes() {
     .await;
     common::assert_answer(&app_only_page, StatusCode::OK, "an app-only token, batch");
     assert_eq!(
-        entity_ids(&app_only_page.json_value()),
+        common::ids_of(&app_only_page.json_value()),
         ids_of(&[&post]),
         "the batch narrows to what an anonymous viewer may see"
     );
@@ -253,7 +253,7 @@ async fn the_batch_renders_reblogs_and_their_visibility() {
     let strangers = batch(&app, Some(carol_token.as_str()), &query).await;
     common::assert_answer(&strangers, StatusCode::OK, "a stranger's batch of reblogs");
     assert_eq!(
-        entity_ids(&strangers.json_value()),
+        common::ids_of(&strangers.json_value()),
         ids_of(&[&shout]),
         "the reblog of a post the viewer may not see is invisible too"
     );
@@ -266,7 +266,7 @@ async fn the_batch_renders_reblogs_and_their_visibility() {
         "the follower's batch of reblogs",
     );
     assert_eq!(
-        entity_ids(&followers.json_value()),
+        common::ids_of(&followers.json_value()),
         ids_of(&[&shout, &whisper]),
         "following the author brings both reblogs onto the page"
     );

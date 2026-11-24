@@ -8,8 +8,8 @@ use serde_json::json;
 
 use super::messages_support::{expire_message, own_chat_id, post_message, post_text, poster};
 use super::support::{
-    MESSAGE_KEYS, READ_SCOPE, ROOT, count_messages, entity_ids, error_message, expected_link,
-    fixture, get_as, json_keys, messages_path, open_chat, parse,
+    MESSAGE_KEYS, READ_SCOPE, ROOT, count_messages, fixture, get_as, messages_path, open_chat,
+    parse,
 };
 use crate::common;
 
@@ -54,7 +54,7 @@ async fn the_message_list_orders_newest_first_and_pages_by_reference_id() {
     let full = get_as(&app, &token, &path).await;
     let listed = full.json_value();
     assert_eq!(
-        entity_ids(&listed),
+        common::ids_of(&listed),
         vec![ids[2].clone(), ids[1].clone(), ids[0].clone()],
         "newest first"
     );
@@ -62,7 +62,7 @@ async fn the_message_list_orders_newest_first_and_pages_by_reference_id() {
         listed[0]["content"], "<p>message 2</p>",
         "and it is the text"
     );
-    let want = expected_link(&path, &ids[2], &ids[0]);
+    let want = common::expected_link(&path, &ids[2], &ids[0]);
     assert_eq!(
         full.header("link"),
         Some(want.as_str()),
@@ -71,19 +71,19 @@ async fn the_message_list_orders_newest_first_and_pages_by_reference_id() {
 
     let tail = get_as(&app, &token, &format!("{path}?limit=2&max_id={}", ids[1])).await;
     assert_eq!(
-        entity_ids(&tail.json_value()),
+        common::ids_of(&tail.json_value()),
         vec![ids[0].clone()],
         "max_id walks back through the chat"
     );
     let since = get_as(&app, &token, &format!("{path}?since_id={}", ids[0])).await;
     assert_eq!(
-        entity_ids(&since.json_value()),
+        common::ids_of(&since.json_value()),
         vec![ids[2].clone(), ids[1].clone()],
         "since_id skips the cursor and everything older"
     );
     let forward = get_as(&app, &token, &format!("{path}?min_id={}", ids[0])).await;
     assert_eq!(
-        entity_ids(&forward.json_value()),
+        common::ids_of(&forward.json_value()),
         vec![ids[2].clone(), ids[1].clone()],
         "min_id answers the page after the cursor, newest first again"
     );
@@ -95,7 +95,7 @@ async fn the_message_list_orders_newest_first_and_pages_by_reference_id() {
         "a malformed cursor 400s"
     );
     assert_eq!(
-        error_message(&junk).as_deref(),
+        junk.error_field().as_deref(),
         Some("Invalid id"),
         "with the pagination module's wording"
     );
@@ -136,12 +136,12 @@ async fn the_message_list_defaults_to_twenty() {
     let path = messages_path(&chat);
 
     let default = get_as(&app, &token, &path).await.json_value();
-    assert_eq!(entity_ids(&default).len(), 20, "the default page is 20");
+    assert_eq!(common::ids_of(&default).len(), 20, "the default page is 20");
     let asked = get_as(&app, &token, &format!("{path}?limit=25"))
         .await
         .json_value();
     assert_eq!(
-        entity_ids(&asked).len(),
+        common::ids_of(&asked).len(),
         21,
         "and 25 takes everything there is"
     );
@@ -185,7 +185,7 @@ async fn a_posted_message_arrives_unread_for_the_recipient() {
     );
     let messages = listed.json_value();
     assert_eq!(
-        json_keys(&messages[0]),
+        common::sorted_keys(&messages[0]),
         MESSAGE_KEYS,
         "his own ChatMessage entity"
     );
@@ -232,7 +232,11 @@ async fn an_idempotency_key_replays_its_message_within_the_hour() {
     let first = post_text(&app, &token, &chat, "once", Some("key-1")).await;
     assert_eq!(first.status, StatusCode::OK, "keyed post: {}", first.text());
     let value = first.json_value();
-    assert_eq!(json_keys(&value), wanted, "the entity adds the key");
+    assert_eq!(
+        common::sorted_keys(&value),
+        wanted,
+        "the entity adds the key"
+    );
     assert_eq!(value["idempotency_key"], "key-1", "echoed back verbatim");
     let first_id = value["id"].as_str().expect("a reference id").to_owned();
 
@@ -246,7 +250,7 @@ async fn an_idempotency_key_replays_its_message_within_the_hour() {
         .await
         .json_value();
     assert_eq!(
-        entity_ids(&listed),
+        common::ids_of(&listed),
         vec![first_id.clone()],
         "the chat holds it once"
     );

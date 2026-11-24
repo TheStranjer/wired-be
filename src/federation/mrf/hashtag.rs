@@ -198,7 +198,7 @@ mod tests {
     use chrono::Utc;
 
     use super::*;
-    use crate::federation::mrf::{MrfConfig, simple::PUBLIC_ADDRESS};
+    use crate::federation::{mrf::MrfConfig, vocab::AS_PUBLIC};
 
     /// The remote author the fixtures post as.
     const ALICE: &str = "https://peer.example/users/alice";
@@ -231,13 +231,13 @@ mod tests {
             "id": "https://peer.example/activities/1",
             "type": "Create",
             "actor": actor,
-            "to": [PUBLIC_ADDRESS],
+            "to": [AS_PUBLIC],
             "cc": [],
             "object": {
                 "id": NOTE,
                 "type": "Note",
                 "attributedTo": actor,
-                "to": [PUBLIC_ADDRESS],
+                "to": [AS_PUBLIC],
                 "cc": [],
                 "content": "<p>hello</p>",
                 "tag": entries,
@@ -261,9 +261,9 @@ mod tests {
     fn unlisted(tags: &[&str]) -> Value {
         let mut expected = create(tags);
         expected["to"] = json!([]);
-        expected["cc"] = json!([PUBLIC_ADDRESS]);
+        expected["cc"] = json!([AS_PUBLIC]);
         expected["object"]["to"] = json!([]);
-        expected["object"]["cc"] = json!([PUBLIC_ADDRESS]);
+        expected["object"]["cc"] = json!([AS_PUBLIC]);
         expected
     }
 

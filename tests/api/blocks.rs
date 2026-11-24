@@ -26,14 +26,12 @@ use wired_be::{
     models::{
         block::{self, Block},
         follow::{self, FollowState},
-        user::{User, get_by_id},
+        user::User,
     },
 };
 
 use crate::common;
 
-/// The instance origin the fixtures live on (`Config::for_tests`).
-const BASE: &str = "https://test.example";
 /// The blocked-listing path, as the `Link` header links back to it.
 const BLOCKS: &str = "/api/v1/blocks";
 /// The 422 body `POST …/block` answers for the caller's own id: the wording
@@ -154,15 +152,6 @@ async fn block_account(app: &Router, token: &str, target: &Uuid) {
     );
 }
 
-/// The `id` of every entity of a listing response, in response order.
-fn listed_ids(body: &Value) -> Vec<String> {
-    body.as_array()
-        .expect("the listing is an array")
-        .iter()
-        .map(|account| account["id"].as_str().expect("an account id").to_owned())
-        .collect()
-}
-
 /// The blocked ids of `stored`, in order.
 fn blocked_ids(stored: &[Listed]) -> Vec<String> {
     stored.iter().map(|(_, blocked)| blocked.clone()).collect()
@@ -182,16 +171,6 @@ async fn stored_blocks(pool: &PgPool, blocker: &User) -> Vec<Listed> {
     rows.into_iter()
         .map(|(id, blocked)| (id, blocked.to_string()))
         .collect()
-}
-
-/// The `Link` header Pleroma's `add_link_headers` writes for a page of the
-/// blocked listing: `next` walks to the oldest block row, `prev` back to the
-/// newest.
-fn expected_link(oldest: &Uuid, newest: &Uuid) -> String {
-    format!(
-        "<{BASE}{BLOCKS}?max_id={oldest}>; rel=\"next\", \
-         <{BASE}{BLOCKS}?min_id={newest}>; rel=\"prev\""
-    )
 }
 
 /// The relationship `token`'s account holds to `target`, as the batch endpoint
@@ -226,11 +205,6 @@ async fn follow_pair(pool: &PgPool, follower: &User, target: &User) {
     );
 }
 
-/// The row of user `id`, for reading the denormalised counters back.
-async fn fresh_user(pool: &PgPool, id: Uuid) -> User {
-    get_by_id(pool, id).await.unwrap().expect("the user exists")
-}
-
 /// Whether the pair still has any follow row, in either direction.
 async fn follows_between(pool: &PgPool, first: &User, second: &User) -> bool {
     follow::get(pool, first.id, second.id)
@@ -257,10 +231,10 @@ async fn blocking_severs_the_pair_and_lights_both_flags() {
     follow_pair(&pool, &bob, &alice).await;
     assert_eq!(
         (
-            fresh_user(&pool, alice.id).await.followers_count,
-            fresh_user(&pool, alice.id).await.following_count,
-            fresh_user(&pool, bob.id).await.followers_count,
-            fresh_user(&pool, bob.id).await.following_count
+            common::reload_user(&pool, alice.id).await.followers_count,
+            common::reload_user(&pool, alice.id).await.following_count,
+            common::reload_user(&pool, bob.id).await.followers_count,
+            common::reload_user(&pool, bob.id).await.following_count
         ),
         (1, 1, 1, 1),
         "the mutual fixture counts both ways"
@@ -291,10 +265,10 @@ async fn blocking_severs_the_pair_and_lights_both_flags() {
     );
     assert_eq!(
         (
-            fresh_user(&pool, alice.id).await.followers_count,
-            fresh_user(&pool, alice.id).await.following_count,
-            fresh_user(&pool, bob.id).await.followers_count,
-            fresh_user(&pool, bob.id).await.following_count
+            common::reload_user(&pool, alice.id).await.followers_count,
+            common::reload_user(&pool, alice.id).await.following_count,
+            common::reload_user(&pool, bob.id).await.followers_count,
+            common::reload_user(&pool, bob.id).await.following_count
         ),
         (0, 0, 0, 0),
         "and every counter those two follows fed stepped down"
@@ -363,7 +337,7 @@ async fn unblocking_lifts_the_block_without_rewinding() {
 
     follow_pair(&pool, &alice, &bob).await;
     assert_eq!(
-        fresh_user(&pool, bob.id).await.followers_count,
+        common::reload_user(&pool, bob.id).await.followers_count,
         1,
         "the pair may follow again, and that counts"
     );
@@ -469,13 +443,13 @@ async fn the_listing_answers_accounts_newest_first() {
 
     let listed = get(&app, Some(&token), BLOCKS).await;
     assert_eq!(
-        listed_ids(&listed.json_value()),
+        common::ids_of(&listed.json_value()),
         blocked_ids(&stored),
         "the blocked accounts, newest block first"
     );
     assert_eq!(
         listed.header("link"),
-        Some(expected_link(&stored[2].0, &stored[0].0).as_str()),
+        Some(common::expected_link(BLOCKS, &stored[0].0, &stored[2].0).as_str()),
         "the Link cursors are the block row ids, not the accounts"
     );
     let first = &listed.json_value()[0];
@@ -525,13 +499,13 @@ async fn the_listing_pages_by_block_row_id() {
 
     let first = get(&app, Some(&token), &format!("{BLOCKS}?limit=2")).await;
     assert_eq!(
-        listed_ids(&first.json_value()),
+        common::ids_of(&first.json_value()),
         vec![stored[0].1.clone(), stored[1].1.clone()],
         "two newest first"
     );
     assert_eq!(
         first.header("link"),
-        Some(expected_link(&stored[1].0, &stored[0].0).as_str()),
+        Some(common::expected_link(BLOCKS, &stored[0].0, &stored[1].0).as_str()),
         "the cursors are the page's own ends"
     );
 
@@ -542,7 +516,7 @@ async fn the_listing_pages_by_block_row_id() {
     )
     .await;
     assert_eq!(
-        listed_ids(&older.json_value()),
+        common::ids_of(&older.json_value()),
         vec![stored[2].1.clone(), stored[3].1.clone()],
         "max_id continues where the page ended"
     );
@@ -554,7 +528,7 @@ async fn the_listing_pages_by_block_row_id() {
     )
     .await;
     assert_eq!(
-        listed_ids(&newer.json_value()),
+        common::ids_of(&newer.json_value()),
         vec![stored[0].1.clone(), stored[1].1.clone()],
         "min_id answers the newest-first page just after the cursor"
     );
@@ -620,20 +594,20 @@ async fn the_listing_pages_up_to_eighty_rows() {
 
     let default_page = get(&app, Some(&token), BLOCKS).await;
     assert_eq!(
-        listed_ids(&default_page.json_value()).len(),
+        common::ids_of(&default_page.json_value()).len(),
         20,
         "Pleroma's default page of twenty"
     );
 
     let big = get(&app, Some(&token), &format!("{BLOCKS}?limit=41")).await;
     assert_eq!(
-        listed_ids(&big.json_value()).len(),
+        common::ids_of(&big.json_value()).len(),
         41,
         "a page past the global 40 cap gets through: the listing's cap is 80"
     );
     assert_eq!(
         big.header("link"),
-        Some(expected_link(&stored[40].0, &stored[0].0).as_str()),
+        Some(common::expected_link(BLOCKS, &stored[0].0, &stored[40].0).as_str()),
         "and the whole page is one page, linked at both ends"
     );
 }

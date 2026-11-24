@@ -9,8 +9,7 @@ use wired_be::util::id::new_id;
 
 use super::messages_support::{post_message, poster};
 use super::support::{
-    MESSAGE_KEYS, claim_media, count_messages, entity_ids, error_message, get_as, insert_media,
-    json_keys, messages_path, open_chat,
+    MESSAGE_KEYS, claim_media, count_messages, get_as, insert_media, messages_path, open_chat,
 };
 use crate::common;
 
@@ -48,7 +47,7 @@ async fn posting_a_message_answers_the_senders_entity() {
     );
     let value = posted.json_value();
     assert_eq!(
-        json_keys(&value),
+        common::sorted_keys(&value),
         MESSAGE_KEYS,
         "exactly the ChatMessage keys"
     );
@@ -82,7 +81,7 @@ async fn posting_a_message_answers_the_senders_entity() {
         .await
         .json_value();
     assert_eq!(
-        entity_ids(&listed),
+        common::ids_of(&listed),
         vec![value["id"].as_str().expect("a reference id")],
         "the entity carries the reference id the list reads back by"
     );
@@ -185,7 +184,7 @@ async fn posting_refuses_bodies_with_nothing_to_send() {
             response.text()
         );
         assert_eq!(
-            error_message(&response).as_deref(),
+            response.error_field().as_deref(),
             Some("Cannot send an empty chat message"),
             "the ticket's wording"
         );
@@ -200,7 +199,7 @@ async fn posting_refuses_bodies_with_nothing_to_send() {
         "an empty body is an empty object"
     );
     assert_eq!(
-        error_message(&bare).as_deref(),
+        bare.error_field().as_deref(),
         Some("Cannot send an empty chat message"),
         "and reads as one"
     );
@@ -244,7 +243,7 @@ async fn unattachable_media_is_media_not_found() {
                 response.text()
             );
             assert_eq!(
-                error_message(&response).as_deref(),
+                response.error_field().as_deref(),
                 Some("Media not found"),
                 "one wording on `{junk}`"
             );
@@ -273,7 +272,7 @@ async fn content_over_the_chat_limit_is_too_long() {
         "one character over 5000 is refused"
     );
     assert_eq!(
-        error_message(&refused).as_deref(),
+        refused.error_field().as_deref(),
         Some("The message is too long"),
         "the ticket's wording"
     );
@@ -311,7 +310,7 @@ async fn the_chat_length_setting_gates_the_endpoint() {
         refused.text()
     );
     assert_eq!(
-        error_message(&refused).as_deref(),
+        refused.error_field().as_deref(),
         Some("The message is too long"),
         "the same wording, the operator's number"
     );

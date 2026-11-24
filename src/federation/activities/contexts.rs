@@ -7,12 +7,12 @@ use uuid::Uuid;
 
 #[cfg(doc)]
 use super::{
-    accept_json, activity_id, add_json, announce_json, emoji_react_json, flag_json, like_json,
-    move_json, reject_json, remove_json, undo_json,
+    accept_json, activity_id, add_json, emoji_react_json, flag_json, like_json, move_json,
+    reject_json, remove_json, undo_json,
 };
 use crate::{config::Config, federation::note::json_ld_context, util::time::mastodon_time};
 
-/// The inputs [`like_json`] and [`announce_json`] render from.
+/// The inputs [`like_json`] renders from.
 ///
 /// One object-addressed activity: the acting account, the object the
 /// activity names, the id the row stores as the activity's own, the
@@ -236,8 +236,7 @@ pub(super) fn object_json(type_name: &'static str, ctx: &ObjectActivityContext<'
 #[cfg(test)]
 mod tests {
     use super::super::{
-        accept_json, announce_json, block_json, emoji_react_json, follow_json, like_json,
-        reject_json,
+        accept_json, block_json, emoji_react_json, follow_json, like_json, reject_json,
         test_support::{
             ALICE_AP, AUTHOR_TO, BOB_AP, FOLLOWERS_CC, NO_CC, PUBLIC_CC, STATUS_URI, activity_uuid,
             config, follow_of_bob, lifecycle_documents, published, stored_id,
@@ -283,7 +282,6 @@ mod tests {
         };
         let documents = [
             ("Like", like_json(&object_ctx)),
-            ("Announce", announce_json(&object_ctx)),
             ("EmojiReact", emoji_react_json(&react_ctx)),
             (
                 "Follow",

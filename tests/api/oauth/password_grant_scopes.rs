@@ -10,7 +10,7 @@ use axum::http::StatusCode;
 use serde_json::json;
 use wired_be::models::oauth_token;
 
-use super::support::{PASSWORD, assert_no_store, error_text, fixtures, grant_body, post_json};
+use super::support::{PASSWORD, assert_no_store, fixtures, grant_body, post_json};
 use crate::common;
 
 /// A scope outside the app's registration is the 400 "Invalid scope".
@@ -26,7 +26,7 @@ async fn a_scope_outside_the_registration_is_invalid_scope() {
         StatusCode::BAD_REQUEST,
         "unregistered `write` is refused"
     );
-    assert_eq!(error_text(&response), "Invalid scope", "Pleroma's message");
+    assert_eq!(response.error_text(), "Invalid scope", "Pleroma's message");
     assert_no_store(&response);
     let rows: (i64,) = sqlx::query_as("SELECT count(*) FROM oauth_tokens")
         .fetch_one(&pool)
@@ -95,7 +95,7 @@ async fn the_default_scope_is_read() {
         StatusCode::BAD_REQUEST,
         "a `write`-only app cannot receive the default `read`"
     );
-    assert_eq!(error_text(&refused), "Invalid scope", "as Invalid scope");
+    assert_eq!(refused.error_text(), "Invalid scope", "as Invalid scope");
 }
 
 /// `username` is a nickname or an email, in any case (citext).
@@ -180,7 +180,7 @@ async fn an_unknown_grant_type_is_unsupported() {
             "`{grant}` is a 400 here"
         );
         assert_eq!(
-            error_text(&response),
+            response.error_text(),
             "unsupported_grant_type",
             "for the named reason"
         );
@@ -201,7 +201,7 @@ async fn a_missing_grant_type_is_named() {
     let response = post_json(&http, &body).await;
     assert_eq!(response.status, StatusCode::BAD_REQUEST, "a 400");
     assert_eq!(
-        error_text(&response),
+        response.error_text(),
         "Missing parameter: grant_type",
         "naming the missing parameter"
     );
@@ -218,7 +218,7 @@ async fn a_missing_grant_type_is_named() {
         "an unrelated form body"
     );
     assert_eq!(
-        error_text(&form_answer),
+        form_answer.error_text(),
         "Missing parameter: grant_type",
         "gets the same answer"
     );

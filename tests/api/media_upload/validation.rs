@@ -5,7 +5,7 @@ use axum::{body::Bytes, http::StatusCode};
 use serde_json::json;
 
 use super::support::{
-    PDF, SCOPE, TEXT, V1, V2, entity_id, entries_in, error_body, file_part, key_extension, mime_of,
+    PDF, SCOPE, TEXT, V1, V2, entries_in, error_body, file_part, key_extension, mime_of,
     original_meta, png, row_count, storage_key, stored_row, upload, upload_file, uploader,
     uploads_dir, url_of,
 };
@@ -41,7 +41,7 @@ async fn description_and_focus_are_stored() {
         "and so are the detected dimensions"
     );
 
-    let id = entity_id(&entity);
+    let id = common::id_of(&entity);
     let row = stored_row(&pool, &id).await;
     assert_eq!(
         row.description.as_deref(),
@@ -134,7 +134,7 @@ async fn an_empty_focus_stores_nothing() {
         original_meta(32, 32),
         "while the detected dimensions stay reported"
     );
-    let id = entity_id(&entity);
+    let id = common::id_of(&entity);
     let row = stored_row(&pool, &id).await;
     assert_eq!(row.focus_x, None, "and stores no x");
     assert_eq!(row.focus_y, None, "nor y");

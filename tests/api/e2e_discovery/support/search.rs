@@ -29,9 +29,9 @@ async fn search_answers_each_viewer_at_their_own_visibility() {
         json!({"status": "zeta probe direct @carol", "visibility": "direct"}),
     )
     .await;
-    let pub_id = id_of(&public);
-    let pri_id = id_of(&private);
-    let dir_id = id_of(&direct);
+    let pub_id = common::id_of(&public);
+    let pri_id = common::id_of(&private);
+    let dir_id = common::id_of(&direct);
     let zeta = format!("{SEARCH_V2}?q=zeta&type=statuses");
 
     let stranger = searched(&read(&app, &mallory_token, &zeta).await);
@@ -63,7 +63,7 @@ async fn search_answers_each_viewer_at_their_own_visibility() {
     );
     assert_eq!(
         umbra,
-        vec![id_of(&unlisted)],
+        vec![common::id_of(&unlisted)],
         "the unlisted row is searchable by anyone, its own word finding it"
     );
 
@@ -151,7 +151,7 @@ async fn search_fills_the_account_and_hashtag_arms() {
     let home = read(&app, &bob_token, HOME).await;
     assert_eq!(
         page_ids(&home),
-        vec![id_of(&tagged), id_of(&secret)],
+        vec![common::id_of(&tagged), common::id_of(&secret)],
         "the follower's home page carries both alice's posts, newest first"
     );
     let searched_home = searched(
@@ -163,7 +163,7 @@ async fn search_fills_the_account_and_hashtag_arms() {
         .await,
     );
     assert!(
-        searched_home.contains(&id_of(&secret)),
+        searched_home.contains(&common::id_of(&secret)),
         "and the follower's search agrees it is visible"
     );
 }

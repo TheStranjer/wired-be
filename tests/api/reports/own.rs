@@ -14,7 +14,7 @@ use wired_be::models::{
     user::User,
 };
 
-use super::support::{filed, fixture, json_keys, post};
+use super::support::{filed, fixture, post};
 use crate::common;
 
 /// The route of the reporter's own reports.
@@ -193,7 +193,11 @@ async fn show_answers_only_the_readers_own_report() {
     let own = read(&world.app, &world.a.1, &format!("{OWN}/{mine}")).await;
     common::assert_answer(&own, StatusCode::OK, "A's own report");
     let body = own.json_value();
-    assert_eq!(json_keys(&body), OWN_KEYS, "exactly the seven keys");
+    assert_eq!(
+        common::sorted_keys(&body),
+        OWN_KEYS,
+        "exactly the seven keys"
+    );
     assert!(body.get("notes").is_none(), "no moderator notes");
     assert_eq!(body["id"], json!(mine), "the report's id");
     assert_eq!(body["content"], json!("first"), "the reporter's words");

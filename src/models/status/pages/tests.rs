@@ -5,8 +5,8 @@ use sqlx::PgPool;
 
 use super::*;
 use crate::models::{
-    status::{NewStatus, Visibility, insert, soft_delete, test_support::*},
-    user::User,
+    status::{NewStatus, Visibility, create_reblog, insert, soft_delete, test_support::*},
+    user::{User, set_activation},
 };
 
 /// Inserts `text` as `author`'s status at the given visibility.
@@ -165,5 +165,83 @@ async fn public_replies_page_walks_oldest_first() {
         public_replies_count(&pool, other.id).await.unwrap(),
         1,
         "and counts them"
+    );
+}
+
+/// Rule 7 reaches the outbox: a reblog row whose original was deleted no
+/// longer shows, while the live reblog of a live original still does.
+#[tokio::test]
+async fn the_outbox_drops_a_reblog_of_a_deleted_original() {
+    let db = crate::test_db::test_db().await.expect("test database slot");
+    let pool = db.pool().clone();
+    let alice = user(&pool, "alice").await;
+    let bob = user(&pool, "bob").await;
+    let kept = post(&pool, &alice, "kept").await;
+    let doomed = post(&pool, &alice, "doomed").await;
+    let (boost_of_kept, _) = create_reblog(&pool, BASE, &bob, &kept, Visibility::Public)
+        .await
+        .expect("a reblog of a live post inserts");
+    let (boost_of_doomed, _) = create_reblog(&pool, BASE, &bob, &doomed, Visibility::Public)
+        .await
+        .expect("a reblog of a live post inserts");
+    assert!(
+        soft_delete(&pool, doomed.id).await.unwrap().is_some(),
+        "the original is deleted"
+    );
+
+    let page = PageParams::from_query(None, 40).expect("no query is the default page");
+    assert_eq!(
+        ids(&outbox_page(&pool, bob.id, &page).await.unwrap()),
+        vec![boost_of_kept.id],
+        "the reblog of the deleted original is gone, the other one stays"
+    );
+    assert!(
+        !ids(&outbox_page(&pool, bob.id, &page).await.unwrap()).contains(&boost_of_doomed.id),
+        "the orphaned reblog is not in the outbox"
+    );
+}
+
+/// Rule 1b reaches the outbox, the replies page and the replies count: a
+/// deactivated author's posts leave them until the account is reactivated.
+#[tokio::test]
+async fn the_outbox_drops_posts_of_a_deactivated_author() {
+    let db = crate::test_db::test_db().await.expect("test database slot");
+    let pool = db.pool().clone();
+    let alice = user(&pool, "alice").await;
+    let bob = user(&pool, "bob").await;
+    let root = post(&pool, &bob, "root").await;
+    let answer = reply(&pool, &alice, &root, "answer").await;
+    let page = PageParams::from_query(None, 40).expect("no query is the default page");
+
+    set_activation(&pool, alice.id, false)
+        .await
+        .expect("the account deactivates");
+    assert!(
+        outbox_page(&pool, alice.id, &page)
+            .await
+            .unwrap()
+            .is_empty(),
+        "a deactivated author's outbox is empty"
+    );
+    assert!(
+        public_replies_page(&pool, root.id, None, None, 20)
+            .await
+            .unwrap()
+            .is_empty(),
+        "their answer leaves the replies page"
+    );
+    assert_eq!(
+        public_replies_count(&pool, root.id).await.unwrap(),
+        0,
+        "and the replies count"
+    );
+
+    set_activation(&pool, alice.id, true)
+        .await
+        .expect("the account reactivates");
+    assert_eq!(
+        ids(&outbox_page(&pool, alice.id, &page).await.unwrap()),
+        vec![answer.id],
+        "reactivation brings the post back"
     );
 }

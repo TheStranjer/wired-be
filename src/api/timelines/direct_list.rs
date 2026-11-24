@@ -7,18 +7,18 @@ use axum::{
     extract::{OriginalUri, Path, State},
     http::HeaderMap,
 };
-use url::form_urlencoded;
 use uuid::Uuid;
 
+use super::common_filters;
 use crate::{
     api::{
-        helpers::{is_true, timeline_response},
+        helpers::{QueryPairs, timeline_response},
         lists::owned_list,
     },
     auth::AuthUser,
     entities::status::Status as StatusEntity,
     error::AppResult,
-    models::user::{Flag, User},
+    models::user::User,
     oauth::scopes::{READ_LISTS, READ_STATUSES},
     pagination::PageParams,
     services::timeline::{TimelineFilters, TimelineQuery, TimelineSource},
@@ -57,13 +57,13 @@ pub(super) async fn direct_timeline(
 
 /// The direct timeline's request parameters beyond the [`PageParams`]
 /// page: just `with_muted`, the one toggle Pleroma's `direct/2` reads
-/// besides the cursors. It is a [`Flag`] because that is what this
-/// repository models every boolean with (see [`crate::models::user`]).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// besides the cursors.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct DirectParams {
-    /// `with_muted`: skip the viewer's block/mute exclusions (Pleroma's
-    /// `with_muted`, default `false`).
-    with_muted: Flag,
+    /// The filters this route honours: only `with_muted` (skip the viewer's
+    /// block/mute exclusions, Pleroma's `with_muted`, default `false`) is
+    /// kept out of [`common_filters`]; every other field is cleared.
+    filters: TimelineFilters,
 }
 
 impl DirectParams {
@@ -71,13 +71,13 @@ impl DirectParams {
     /// returns, percent-decoding and all); the cursors and `limit` are
     /// [`PageParams`]'s to read and every other key is never looked at.
     fn parse(query: Option<&str>) -> Self {
-        let mut found = Self::default();
-        for (key, value) in form_urlencoded::parse(query.unwrap_or_default().as_bytes()) {
-            if key == "with_muted" {
-                found.with_muted = Flag::new(is_true(&value));
-            }
+        let common = common_filters(&QueryPairs::parse(query));
+        Self {
+            filters: TimelineFilters {
+                with_muted: common.with_muted,
+                ..TimelineFilters::default()
+            },
         }
-        found
     }
 
     /// Assembles the [`TimelineQuery`] the request asks for:
@@ -88,10 +88,7 @@ impl DirectParams {
         TimelineQuery {
             viewer: Some(viewer),
             source: TimelineSource::Direct,
-            filters: TimelineFilters {
-                with_muted: self.with_muted,
-                ..TimelineFilters::default()
-            },
+            filters: self.filters,
             page,
         }
     }
@@ -136,16 +133,14 @@ pub(super) async fn list_timeline(
 }
 
 /// The list timeline's request parameters beyond the [`PageParams`] page
-/// and the path id: the two toggles the ticket names. The booleans are
-/// [`Flag`]s because that is what this repository models every boolean
-/// with (see [`crate::models::user`]).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// and the path id: the two toggles the ticket names.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct ListParams {
-    /// `only_media`: keep only statuses carrying an attachment.
-    only_media: Flag,
-    /// `with_muted`: skip the viewer's block/mute exclusions (Pleroma's
-    /// `with_muted`, default `false`).
-    with_muted: Flag,
+    /// The filters this route honours: `only_media` (keep only statuses
+    /// carrying an attachment) and `with_muted` (skip the viewer's
+    /// block/mute exclusions, Pleroma's `with_muted`, default `false`) are
+    /// kept out of [`common_filters`]; every other field is cleared.
+    filters: TimelineFilters,
 }
 
 impl ListParams {
@@ -153,15 +148,14 @@ impl ListParams {
     /// returns, percent-decoding and all); the cursors and `limit` are
     /// [`PageParams`]'s to read and every other key is never looked at.
     fn parse(query: Option<&str>) -> Self {
-        let mut found = Self::default();
-        for (key, value) in form_urlencoded::parse(query.unwrap_or_default().as_bytes()) {
-            match key.as_ref() {
-                "only_media" => found.only_media = Flag::new(is_true(&value)),
-                "with_muted" => found.with_muted = Flag::new(is_true(&value)),
-                _ => {}
-            }
+        let common = common_filters(&QueryPairs::parse(query));
+        Self {
+            filters: TimelineFilters {
+                only_media: common.only_media,
+                with_muted: common.with_muted,
+                ..TimelineFilters::default()
+            },
         }
-        found
     }
 
     /// Assembles the [`TimelineQuery`] the request asks for:
@@ -173,11 +167,7 @@ impl ListParams {
         TimelineQuery {
             viewer: Some(viewer),
             source: TimelineSource::List { list_id },
-            filters: TimelineFilters {
-                only_media: self.only_media,
-                with_muted: self.with_muted,
-                ..TimelineFilters::default()
-            },
+            filters: self.filters,
             page,
         }
     }
@@ -187,17 +177,25 @@ impl ListParams {
 mod tests {
     use super::super::test_support::fixture_user;
     use super::*;
+    use crate::models::user::Flag;
 
     #[test]
     fn direct_reads_only_with_muted() {
         let on = DirectParams::parse(Some("with_muted=true&limit=5&max_id=abc"));
-        assert!(on.with_muted.get(), "`with_muted=true` is on");
+        assert!(on.filters.with_muted.get(), "`with_muted=true` is on");
         let one = DirectParams::parse(Some("with_muted=1"));
-        assert!(one.with_muted.get(), "`with_muted=1` is on too");
+        assert!(one.filters.with_muted.get(), "`with_muted=1` is on too");
         let off = DirectParams::parse(Some("with_muted=yes&with_muted=false"));
         assert!(
-            !off.with_muted.get(),
+            !off.filters.with_muted.get(),
             "the last occurrence wins, `false` is off"
+        );
+        assert_eq!(
+            DirectParams::parse(Some(
+                "local=true&remote=true&only_media=true&exclude_visibilities[]=public"
+            )),
+            DirectParams::default(),
+            "the shared keys the direct timeline does not honour are cleared"
         );
         assert_eq!(
             DirectParams::parse(Some("limit=5&since_id=7")),
@@ -214,19 +212,21 @@ mod tests {
     #[test]
     fn the_list_reads_only_only_media_and_with_muted() {
         let on = ListParams::parse(Some("only_media=true&with_muted=1&limit=5&max_id=abc"));
-        assert!(on.only_media.get(), "`only_media=true` is on");
-        assert!(on.with_muted.get(), "`with_muted=1` is on too");
+        assert!(on.filters.only_media.get(), "`only_media=true` is on");
+        assert!(on.filters.with_muted.get(), "`with_muted=1` is on too");
         let off = ListParams::parse(Some("only_media=maybe&with_muted=true&with_muted=false"));
         assert!(
-            !off.only_media.get() && !off.with_muted.get(),
+            !off.filters.only_media.get() && !off.filters.with_muted.get(),
             "junk is not true and the last occurrence wins"
         );
         let yes = ListParams::parse(Some("only_media=yes"));
-        assert!(yes.only_media.get(), "`yes` is a true spelling");
+        assert!(yes.filters.only_media.get(), "`yes` is a true spelling");
         assert_eq!(
-            ListParams::parse(Some("local=true&min_id=7")),
+            ListParams::parse(Some(
+                "local=true&remote=true&exclude_visibilities[]=public&min_id=7"
+            )),
             ListParams::default(),
-            "foreign keys and the page keys are not looked at"
+            "foreign keys, the unhonoured shared ones and the page keys are not looked at"
         );
         assert_eq!(
             ListParams::parse(None),
@@ -247,7 +247,10 @@ mod tests {
             offset: None,
         };
         let query = DirectParams {
-            with_muted: Flag::new(true),
+            filters: TimelineFilters {
+                with_muted: Flag::new(true),
+                ..TimelineFilters::default()
+            },
         }
         .into_timeline(alice, page);
         assert_eq!(query.source, TimelineSource::Direct, "the direct source");
@@ -279,8 +282,11 @@ mod tests {
             offset: None,
         };
         let query = ListParams {
-            only_media: Flag::new(true),
-            with_muted: Flag::new(false),
+            filters: TimelineFilters {
+                only_media: Flag::new(true),
+                with_muted: Flag::new(false),
+                ..TimelineFilters::default()
+            },
         }
         .into_timeline(list_id, alice, page);
         assert_eq!(

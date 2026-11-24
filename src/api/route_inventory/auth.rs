@@ -45,16 +45,6 @@ pub(super) const ROWS: &[RouteSpec] = &[
     },
     RouteSpec {
         method: "GET",
-        path: "/oauth/mfa",
-        auth: AuthClass::Public,
-    },
-    RouteSpec {
-        method: "POST",
-        path: "/oauth/mfa/verify",
-        auth: AuthClass::Public,
-    },
-    RouteSpec {
-        method: "GET",
         path: "/oauth/registration_details",
         auth: AuthClass::Public,
     },
@@ -76,6 +66,16 @@ pub(super) const ROWS: &[RouteSpec] = &[
     RouteSpec {
         method: "POST",
         path: "/oauth/register",
+        auth: AuthClass::Public,
+    },
+    RouteSpec {
+        method: "GET",
+        path: "/oauth/external/consent",
+        auth: AuthClass::Public,
+    },
+    RouteSpec {
+        method: "POST",
+        path: "/oauth/external/consent",
         auth: AuthClass::Public,
     },
     RouteSpec {

@@ -30,8 +30,6 @@ use wired_be::{
 
 use crate::common;
 
-/// The instance origin the fixtures live on (`Config::for_tests`).
-const BASE: &str = "https://test.example";
 /// The body every account miss on these routes carries (decision 8).
 const NOT_FOUND: &str = r#"{"error":"Record not found"}"#;
 /// The 401 body `MaybeAuthUser` renders for a token that does not resolve.
@@ -150,15 +148,6 @@ fn wanted_follows(pairs: &[Relationship]) -> Vec<Uuid> {
         .collect()
 }
 
-/// The `id` of every entity of a listing response, in response order.
-fn listed_ids(body: &Value) -> Vec<String> {
-    body.as_array()
-        .expect("the listing is an array")
-        .iter()
-        .map(|account| account["id"].as_str().expect("an account id").to_owned())
-        .collect()
-}
-
 /// The `pleroma.relationship` of every entity, keyed by the entry's
 /// account id, so each assertion names the account whose flags it reads.
 fn embedded_relationships(body: &Value) -> serde_json::Map<String, Value> {
@@ -170,15 +159,6 @@ fn embedded_relationships(body: &Value) -> serde_json::Map<String, Value> {
         assert!(previous.is_none(), "one entry per account");
     }
     map
-}
-
-/// The `Link` header Pleroma's `add_link_headers` writes for a page of
-/// `path`: `next` walks to the oldest row, `prev` back to the newest.
-fn expected_link(path: &str, oldest: &Uuid, newest: &Uuid) -> String {
-    format!(
-        "<{BASE}{path}?max_id={oldest}>; rel=\"next\", \
-         <{BASE}{path}?min_id={newest}>; rel=\"prev\""
-    )
 }
 
 /// Both routes list the accepted relationships newest follow first without
@@ -216,7 +196,7 @@ async fn both_listings_answer_newest_follow_first() {
             "the entities are JSON"
         );
         assert_eq!(
-            listed_ids(&response.json_value()),
+            common::ids_of(&response.json_value()),
             wanted_accounts(pairs),
             "the whole {side} list, newest follow first"
         );
@@ -246,7 +226,7 @@ async fn deactivated_accounts_are_not_listed() {
         let response = list(&app, None, &alice.id, side, "").await;
         assert_eq!(response.status, StatusCode::OK, "auth is optional");
         assert_eq!(
-            listed_ids(&response.json_value()),
+            common::ids_of(&response.json_value()),
             wanted_accounts(&[pair(&carol, row)]),
             "only the active account is in the {side} list"
         );
@@ -310,13 +290,13 @@ async fn pages_key_on_follow_row_ids_and_link() {
 
     let first = list(&app, None, &target.id, FOLLOWERS, "?limit=2").await;
     assert_eq!(
-        listed_ids(&first.json_value()),
+        common::ids_of(&first.json_value()),
         wanted_users[..2],
         "two newest first"
     );
     assert_eq!(
         first.header("link"),
-        Some(expected_link(&path, &wanted_rows[1], &wanted_rows[0]).as_str()),
+        Some(common::expected_link(&path, &wanted_rows[0], &wanted_rows[1]).as_str()),
         "the Link cursors are the page's follow row ids, not user ids"
     );
 
@@ -329,7 +309,7 @@ async fn pages_key_on_follow_row_ids_and_link() {
     )
     .await;
     assert_eq!(
-        listed_ids(&older.json_value()),
+        common::ids_of(&older.json_value()),
         wanted_users[2..4],
         "max_id continues where the page ended"
     );
@@ -343,7 +323,7 @@ async fn pages_key_on_follow_row_ids_and_link() {
     )
     .await;
     assert_eq!(
-        listed_ids(&newer.json_value()),
+        common::ids_of(&newer.json_value()),
         wanted_users[..3],
         "min_id answers the newest-first page just after the cursor"
     );
@@ -394,13 +374,13 @@ async fn the_default_page_is_twenty_and_the_cap_is_forty() {
 
     let default = list(&app, None, &target.id, FOLLOWERS, "").await;
     assert_eq!(
-        listed_ids(&default.json_value()).len(),
+        common::ids_of(&default.json_value()).len(),
         20,
         "Pleroma's @default_limit"
     );
     let greedy = list(&app, None, &target.id, FOLLOWERS, "?limit=100").await;
     assert_eq!(
-        listed_ids(&greedy.json_value()).len(),
+        common::ids_of(&greedy.json_value()).len(),
         40,
         "and @max_limit, never more"
     );
@@ -448,7 +428,7 @@ async fn locked_accounts_list_visible_and_pending_excluded() {
     );
     let after = list(&app, None, &carol.id, FOLLOWERS, "").await;
     assert_eq!(
-        listed_ids(&after.json_value()),
+        common::ids_of(&after.json_value()),
         vec![alice.id.to_string()],
         "and the answered one joins the list for everyone"
     );
@@ -486,7 +466,7 @@ async fn hidden_lists_answer_empty_to_everyone_but_the_owner() {
         }
         let shown = list(&app, Some(&own_token), &alice.id, side, "").await;
         assert_eq!(
-            listed_ids(&shown.json_value()),
+            common::ids_of(&shown.json_value()),
             vec![bob.id.to_string()],
             "the account itself always sees its own list, {side}"
         );
@@ -514,7 +494,7 @@ async fn hidden_counts_do_not_hide_the_lists() {
     for side in [FOLLOWERS, FOLLOWING] {
         let listed = list(&app, None, &bob.id, side, "").await;
         assert_eq!(
-            listed_ids(&listed.json_value()),
+            common::ids_of(&listed.json_value()),
             vec![carol.id.to_string()],
             "the count flags hide counts, not rows, {side}"
         );
@@ -560,7 +540,7 @@ async fn the_listings_gate_on_read_accounts_when_authenticated() {
         let broad = list(&app, Some(&own_broad), &alice.id, side, "").await;
         assert_eq!(broad.status, StatusCode::OK, "the broad read grants");
         assert_eq!(
-            listed_ids(&broad.json_value()),
+            common::ids_of(&broad.json_value()),
             vec![bob.id.to_string()],
             "and answers the list"
         );

@@ -7,8 +7,7 @@ use uuid::Uuid;
 
 use super::support::{
     ALL_ADMIN, BLANK, INSTANCE, PUBLIC_RULES, RULE_KEYS, RULES, TOO_LONG, a_rule, admin, app,
-    create_rule, destroy, entity_id, get, ids_of, json_keys, log_entry, patch, post_rule,
-    rule_count, texts_of,
+    create_rule, destroy, get, log_entry, patch, post_rule, rule_count, texts_of,
 };
 use crate::common;
 
@@ -30,14 +29,18 @@ async fn a_created_rule_answers_the_four_key_entity() {
         &json!({"text": "Be nice", "hint": "say hi first", "priority": 2}),
     )
     .await;
-    assert_eq!(json_keys(&full), RULE_KEYS, "exactly the view's keys");
     assert_eq!(
-        json_keys(&bare),
+        common::sorted_keys(&full),
+        RULE_KEYS,
+        "exactly the view's keys"
+    );
+    assert_eq!(
+        common::sorted_keys(&bare),
         RULE_KEYS,
         "and the same four on a bare write"
     );
     assert!(
-        Uuid::parse_str(&entity_id(&full)).is_ok(),
+        Uuid::parse_str(&common::id_of(&full)).is_ok(),
         "the id is the hyphenated uuid"
     );
     assert_eq!(full["text"], "Be nice", "the text verbatim");
@@ -54,8 +57,8 @@ async fn a_created_rule_answers_the_four_key_entity() {
     assert_eq!(
         listed.json_value(),
         json!([
-            {"id": entity_id(&bare), "text": "No spam", "hint": "", "priority": 0},
-            {"id": entity_id(&full), "text": "Be nice", "hint": "say hi first", "priority": 2},
+            {"id": common::id_of(&bare), "text": "No spam", "hint": "", "priority": 0},
+            {"id": common::id_of(&full), "text": "Be nice", "hint": "say hi first", "priority": 2},
         ]),
         "the bare array is the entities in the order the model reads them"
     );
@@ -76,7 +79,7 @@ async fn a_rule_patch_changes_only_the_fields_it_names() {
         &json!({"text": "Be nice", "hint": "say hi", "priority": 2}),
     )
     .await;
-    let id = entity_id(&stored);
+    let id = common::id_of(&stored);
 
     let moved = patch(
         &app,
@@ -126,7 +129,7 @@ async fn a_deleted_rule_leaves_the_log_and_an_empty_object() {
     let (_root, token) = admin(&pool, "root", ALL_ADMIN).await;
     let keeper = a_rule(&app, &token, "keeper", 0).await;
     let doomed = a_rule(&app, &token, "doomed", 0).await;
-    let id = entity_id(&doomed);
+    let id = common::id_of(&doomed);
 
     let moved = patch(
         &app,
@@ -144,8 +147,8 @@ async fn a_deleted_rule_leaves_the_log_and_an_empty_object() {
         "the delete answers the empty object"
     );
     assert_eq!(
-        ids_of(&get(&app, &token, RULES).await.json_value()),
-        vec![entity_id(&keeper)],
+        common::ids_of(&get(&app, &token, RULES).await.json_value()),
+        vec![common::id_of(&keeper)],
         "and the row is out of the list"
     );
 
@@ -177,7 +180,7 @@ async fn a_rule_write_logs_under_the_rules_area() {
     let (_root, write) = admin(&pool, "root", "admin:write:rules").await;
     let (_reader, read) = admin(&pool, "reader", "admin:read:rules").await;
     let written = a_rule(&app, &write, "logged", 4).await;
-    let id = entity_id(&written);
+    let id = common::id_of(&written);
 
     let moved = patch(
         &app,
@@ -236,12 +239,12 @@ async fn the_rule_listing_orders_by_priority_then_creation() {
         "priority first, creation order within one priority"
     );
     assert_eq!(
-        ids_of(&listed),
+        common::ids_of(&listed),
         vec![
-            entity_id(&top),
-            entity_id(&one),
-            entity_id(&two),
-            entity_id(&last)
+            common::id_of(&top),
+            common::id_of(&one),
+            common::id_of(&two),
+            common::id_of(&last)
         ],
         "the ids the writes answered, in that order"
     );
@@ -300,7 +303,7 @@ async fn a_rule_patch_refuses_a_text_a_create_would_refuse() {
     let app = app(&pool);
     let (_root, token) = admin(&pool, "root", ALL_ADMIN).await;
     let stored = create_rule(&app, &token, &json!({"text": "Keep me", "hint": "as is"})).await;
-    let id = entity_id(&stored);
+    let id = common::id_of(&stored);
 
     for (body, expected) in [
         (json!({"text": ""}), json!([BLANK])),
@@ -389,8 +392,8 @@ async fn the_public_rules_reads_reflect_the_admin_writes() {
     assert_eq!(
         public,
         json!([
-            {"id": entity_id(&keep), "text": "Rule one", "hint": "first"},
-            {"id": entity_id(&drop_me), "text": "Rule two", "hint": ""},
+            {"id": common::id_of(&keep), "text": "Rule one", "hint": "first"},
+            {"id": common::id_of(&drop_me), "text": "Rule two", "hint": ""},
         ]),
         "the public listing is the admin's own order, the priority left out"
     );
@@ -403,14 +406,19 @@ async fn the_public_rules_reads_reflect_the_admin_writes() {
         "and the instance document's `rules` block is the very same list"
     );
 
-    let gone = destroy(&app, &token, &format!("{RULES}/{}", entity_id(&drop_me))).await;
+    let gone = destroy(
+        &app,
+        &token,
+        &format!("{RULES}/{}", common::id_of(&drop_me)),
+    )
+    .await;
     common::assert_answer(&gone, StatusCode::OK, "deleting the second rule");
     assert_eq!(
         common::TestRequest::get(PUBLIC_RULES)
             .send(&app)
             .await
             .json_value(),
-        json!([{"id": entity_id(&keep), "text": "Rule one", "hint": "first"}]),
+        json!([{"id": common::id_of(&keep), "text": "Rule one", "hint": "first"}]),
         "the withdrawal reaches the public read too"
     );
 }

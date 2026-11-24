@@ -14,11 +14,14 @@ use serde_json::Value;
 use crate::{
     config::Config,
     error::{AppError, AppResult},
-    federation::actor::actor_json,
+    federation::{
+        actor::actor_json,
+        vocab::{ACTIVITY_JSON, AP_MEDIA_TYPES},
+    },
     models::user::User,
 };
 
-use super::{ACTIVITY_JSON, AP_MEDIA_TYPES, HTML_MEDIA_TYPE, VARY_ACCEPT};
+use super::{CHARSET_SUFFIX, HTML_MEDIA_TYPE, VARY_ACCEPT};
 
 /// Whether `headers` name an `ActivityPub` media type in `Accept`. An
 /// absent header is not one: a client that states nothing gets the
@@ -76,14 +79,19 @@ pub(super) fn document(built: AppResult<Value>) -> AppResult<Response> {
     built.map(|document| document_response(&document))
 }
 
+/// The `Content-Type` of every `ActivityPub` document response:
+/// [`ACTIVITY_JSON`] with the [`CHARSET_SUFFIX`]. Falls back to the bare
+/// media type, which cannot happen for these two ASCII constants.
+pub(super) fn activity_content_type() -> HeaderValue {
+    HeaderValue::from_str(&format!("{ACTIVITY_JSON}{CHARSET_SUFFIX}"))
+        .unwrap_or_else(|_| HeaderValue::from_static(ACTIVITY_JSON))
+}
+
 /// Any `ActivityPub` document as a response: the JSON body under the
 /// `activity+json` content type.
 pub(super) fn document_response(document: &Value) -> Response {
     (
-        [(
-            header::CONTENT_TYPE,
-            HeaderValue::from_static(ACTIVITY_JSON),
-        )],
+        [(header::CONTENT_TYPE, activity_content_type())],
         Json(document),
     )
         .into_response()
@@ -108,6 +116,15 @@ mod tests {
 
     use super::*;
     use crate::api::activitypub::test_support::headers_with_accept;
+
+    #[test]
+    fn the_document_content_type_is_activity_json_with_a_charset() {
+        assert_eq!(
+            activity_content_type(),
+            HeaderValue::from_static("application/activity+json; charset=utf-8"),
+            "the media type then the charset"
+        );
+    }
 
     #[test]
     fn the_activitypub_media_types_are_recognised() {

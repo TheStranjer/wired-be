@@ -20,8 +20,10 @@ use crate::common::{self, MultipartPart, TestRequest};
 
 /// The app listing/creation route.
 const APPS: &str = "/api/v1/pleroma/admin/oauth_app";
-/// The public document route for the terms of service.
+/// The retired public HTML route of the terms of service.
 const PUBLIC_TOS: &str = "/instance/terms-of-service.html";
+/// The public JSON route of the terms of service.
+const JSON_TOS: &str = "/api/v1/instance/terms_of_service";
 /// The admin document route for the terms of service.
 const DOC_TOS: &str = "/api/v1/pleroma/admin/instance_document/terms-of-service";
 /// The document store's 1 MiB ceiling.
@@ -38,8 +40,6 @@ const NO_ADMIN_READ: &str = "Insufficient permissions: admin:read.";
 const NO_ADMIN_WRITE: &str = "Insufficient permissions: admin:write.";
 /// The 404 body of the unknown id and the unknown document name alike.
 const NOT_FOUND: &str = "Not found";
-/// The CSP the public document route answers with.
-const DOCUMENT_CSP: &str = "default-src 'none'; style-src 'unsafe-inline'; img-src * data:";
 /// The redirect URI every app body in these tests registers.
 const OOB: &str = "urn:ietf:wg:oauth:2.0:oob";
 /// The multipart boundary every test body frames with.
@@ -87,16 +87,6 @@ fn entity_client_id(response: &common::TestResponse) -> String {
         .as_str()
         .expect("a client id")
         .to_owned()
-}
-
-/// The id list of a listing answer's `apps` array.
-fn listed_ids(page: &Value) -> Vec<String> {
-    page["apps"]
-        .as_array()
-        .expect("the apps array")
-        .iter()
-        .map(|row| row["id"].as_str().expect("an id text").to_owned())
-        .collect()
 }
 
 /// The app-CRUD fixture pair: an untrusted `Alpha` and a trusted `Beta`

@@ -7,7 +7,7 @@
 use axum::http::StatusCode;
 use serde_json::{Value, json};
 
-use super::support::{FUTURE, LOG, P_ADMIN, PAST, USERS, World, id_of, post_configs, wire};
+use super::support::{FUTURE, LOG, P_ADMIN, PAST, USERS, World, post_configs, wire};
 use crate::common;
 
 // ────────────────────────  Scenario 4: log completeness  ────────────────────────
@@ -37,7 +37,7 @@ async fn every_admin_write_records_exactly_one_moderation_log_entry() {
         &json!({"text": "Only this"}),
     )
     .await;
-    let rule_id = id_of(&rule.json_value());
+    let rule_id = common::id_of(&rule.json_value());
     let rule_update = common::api_patch(
         &world.app,
         Some(&world.admin),
@@ -61,7 +61,7 @@ async fn every_admin_write_records_exactly_one_moderation_log_entry() {
         &json!({"content": "One notice", "starts_at": PAST, "ends_at": FUTURE}),
     )
     .await;
-    let notice_id = id_of(&notice.json_value());
+    let notice_id = common::id_of(&notice.json_value());
     let tag_write = common::api_put(
         &world.app,
         Some(&world.admin),

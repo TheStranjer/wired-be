@@ -6,7 +6,7 @@
 use axum::{Router, http::StatusCode};
 use serde_json::json;
 
-use super::expectations::{count_at, id_of};
+use super::expectations::count_at;
 use super::support::{BOB, follow_by_uri, local};
 use crate::{common, remote};
 
@@ -48,7 +48,7 @@ async fn list_membership_writes_reach_no_remote_inbox() {
     let peer = remote::MockPeer::start().await;
     let (_alice, alice_token) = local(&pool, "eo-list-alice").await;
     let target = follow_by_uri(&app, &alice_token, &peer.handle(BOB)).await;
-    let bob_id = id_of(&target);
+    let bob_id = common::id_of(&target);
     let _sent = common::run_all_jobs(&state).await;
     accept_outgoing_follow(&app, &state, &peer, BOB, "eo-list-accept").await;
     let before = peer.received().len();

@@ -22,8 +22,6 @@ use wired_be::{
 
 use crate::common;
 
-/// The instance origin the fixtures live on (`Config::for_tests`).
-const BASE: &str = "https://test.example";
 /// The muted-listing path, as the `Link` header links back to it.
 const MUTES: &str = "/api/v1/mutes";
 /// The 422 body `POST …/mute` answers for the caller's own id: the wording
@@ -180,15 +178,6 @@ async fn set_expiry(pool: &PgPool, muter: &User, target: &User, seconds: i64) {
     assert_eq!(moved.rows_affected(), 1, "the pair's row was there to move");
 }
 
-/// The `id` of every entity of a listing response, in response order.
-fn listed_ids(body: &Value) -> Vec<String> {
-    body.as_array()
-        .expect("the listing is an array")
-        .iter()
-        .map(|account| account["id"].as_str().expect("an account id").to_owned())
-        .collect()
-}
-
 /// The muted ids of `stored`, in order.
 fn muted_ids(stored: &[Listed]) -> Vec<String> {
     stored.iter().map(|(_, muted, _)| muted.clone()).collect()
@@ -227,16 +216,6 @@ async fn mute_count(pool: &PgPool) -> i64 {
         .await
         .unwrap();
     row.0
-}
-
-/// The `Link` header Pleroma's `add_link_headers` writes for a page of the
-/// muted listing: `next` walks to the oldest mute row, `prev` back to the
-/// newest.
-fn expected_link(oldest: &Uuid, newest: &Uuid) -> String {
-    format!(
-        "<{BASE}{MUTES}?max_id={oldest}>; rel=\"next\", \
-         <{BASE}{MUTES}?min_id={newest}>; rel=\"prev\""
-    )
 }
 
 /// The relationship `token`'s account holds to `target`, as the batch endpoint

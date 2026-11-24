@@ -2,13 +2,12 @@
 
 use axum::http::StatusCode;
 use sqlx::PgPool;
-use uuid::Uuid;
 use wired_be::{
     config::TEST_BASE_URL,
     jobs::deletion::KIND_DELETE_REMOTE,
     models::{
         follow, instance,
-        user::{User, get_by_id, mark_deleted},
+        user::{User, mark_deleted},
     },
 };
 
@@ -63,14 +62,6 @@ async fn sweep_world(pool: &PgPool) -> Sweep {
     }
 }
 
-/// `id`'s user row, insisted upon.
-async fn fresh_user(pool: &PgPool, id: Uuid) -> User {
-    get_by_id(pool, id)
-        .await
-        .expect("the user reads")
-        .expect("the row stands")
-}
-
 /// Deleting a REMOTE instance: every fresh mirror of the domain is
 /// marked deleted and rides its own background `users.delete_remote`
 /// sweep — queued in one batch — while local rows, another domain's
@@ -113,18 +104,18 @@ async fn deleting_an_instance_stages_the_sweeps_and_clears_the_row() {
         "one job per fresh mirror — the pre-stamped row is nobody to re-delete"
     );
     for id in [world.bob.id, world.carol.id] {
-        let gone = fresh_user(&pool, id).await;
+        let gone = common::reload_user(&pool, id).await;
         assert!(!gone.is_active.get(), "{id} is deactivated");
         assert!(gone.deleted_at.is_some(), "{id} carries the deletion stamp");
     }
-    let pre = fresh_user(&pool, world.dave.id).await;
+    let pre = common::reload_user(&pool, world.dave.id).await;
     assert!(
         !pre.is_active.get() && pre.deleted_at.is_some(),
         "the pre-stamped mirror stands deleted, queued nothing again"
     );
     let untouched = [
-        fresh_user(&pool, world.alice.id).await,
-        fresh_user(&pool, world.erin.id).await,
+        common::reload_user(&pool, world.alice.id).await,
+        common::reload_user(&pool, world.erin.id).await,
     ];
     assert!(
         untouched
@@ -199,7 +190,7 @@ async fn the_instance_deletion_sweeps_run_on_the_queue() {
             .is_none(),
         "alice's follow of the swept mirror is gone"
     );
-    let alice = fresh_user(&pool, world.alice.id).await;
+    let alice = common::reload_user(&pool, world.alice.id).await;
     assert_eq!(
         alice.following_count, 1,
         "only the swept follow stepped back"

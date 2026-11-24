@@ -2,8 +2,8 @@
 //! deserialize, the reply `prepare_request` answers with, the
 //! `/oauth/authorize` parameters an `oauth_login_states` row carries across
 //! the provider round trip ([`StoredParams`]), the state check a redirect or
-//! a callback runs on ([`live_state`]), and the four flow halves —
-//! [`prepared`], [`redirected`], [`completed`] and [`details`] — the route
+//! a callback runs on ([`live_state`]), and the three flow halves —
+//! [`prepared`], [`redirected`] and [`completed`] — the route
 //! handlers of the parent run. The provider leg they call into is the
 //! sibling `provider` child's; the registration form's own data is `form`'s.
 
@@ -16,18 +16,22 @@ use crate::{
     api::oauth::authorize::{self, AuthorizeReply, Delivery},
     config::OauthProvider,
     error::{AppError, AppResult},
-    models::oauth_login_state::{self, OauthLoginState},
+    models::{
+        oauth_login_state::{self, OauthLoginState},
+        user::User,
+    },
     oauth::scopes::Scopes,
     state::AppState,
+    util::token::random_token,
 };
 
 use super::{
-    GRANT_TYPE_CODE, INVALID_STATE, REGISTRATION_DETAILS,
+    CONFIRM_TOKEN_BYTES, FRONTEND_CONSENT_PATH, FRONTEND_REGISTER_PATH, GRANT_TYPE_CODE,
+    INVALID_STATE,
     provider::{
         Landing, configured_provider, granted, identified, pending_of, provider_callback,
         provider_entry, provider_params,
     },
-    registration::{pending_form, registrable_state},
 };
 
 /// The `GET /oauth/prepare_request` parameters: the provider name beside
@@ -214,22 +218,7 @@ pub(super) async fn completed(
             let _burned = oauth_login_state::delete(&state.db, &stored.state).await?;
             authorize::denied(&params.delivery())
         }
-        Landing::Linked(user) => {
-            let _burned = oauth_login_state::delete(&state.db, &stored.state).await?;
-            let app = authorize::load_app(&state.db, Some(params.client_id.as_str())).await?;
-            if !app.trusted {
-                warn!(
-                    provider = provider.name,
-                    client_id = params.client_id,
-                    "external login refused for an untrusted application"
-                );
-                return authorize::denied_with(
-                    &params.delivery(),
-                    Some(authorize::CONSENT_REQUIRED),
-                );
-            }
-            granted(state, &user, &params).await
-        }
+        Landing::Linked(user) => linked(state, &stored, &params, &user).await,
         Landing::Unlinked(account) => {
             let pending = pending_of(&provider.name, &account);
             if !oauth_login_state::set_pending(&state.db, &stored.state, &pending).await? {
@@ -239,28 +228,45 @@ pub(super) async fn completed(
                 );
             }
             authorize::redirect_to(
-                &format!("{}{REGISTRATION_DETAILS}", state.config.base_url),
+                &format!("{}{FRONTEND_REGISTER_PATH}", state.config.frontend_base_url),
                 &[("state", stored.state.as_str())],
             )
         }
     }
 }
 
-/// The `GET /oauth/registration_details` half: the state's `pending`
-/// account, prefilled into the form.
-///
-/// # Errors
-///
-/// 400 `Invalid state` from [`registrable_state`]; any database failure
-/// arrives as [`AppError::Database`].
-///
-/// [`registrable_state`]: super::registration::registrable_state
-pub(super) async fn details(
+/// The callback of a linked provider account. A trusted application is
+/// granted its code on the spot and the state is spent; an untrusted one
+/// gets no code until the user consents (an auto-approving provider would
+/// otherwise hand the code to whatever redirect URI the app registered):
+/// the state keeps a one-time `confirm_token` and the user's id, and the
+/// browser is sent to the consent screen carrying both.
+async fn linked(
     state: &AppState,
-    presented: Option<&str>,
+    stored: &OauthLoginState,
+    params: &StoredParams,
+    user: &User,
 ) -> AppResult<AuthorizeReply> {
-    let (stored, pending, _) = registrable_state(state, presented).await?;
-    Ok(pending_form(&stored, &pending))
+    let app = authorize::load_app(&state.db, Some(params.client_id.as_str())).await?;
+    if app.trusted {
+        let _burned = oauth_login_state::delete(&state.db, &stored.state).await?;
+        return granted(state, user, params).await;
+    }
+    let token = random_token(CONFIRM_TOKEN_BYTES);
+    if !oauth_login_state::set_confirmation(&state.db, &stored.state, &token, user.id).await? {
+        return Err(AppError::BadRequest(INVALID_STATE.to_owned()));
+    }
+    warn!(
+        client_id = params.client_id,
+        "external login of an untrusted application waits for consent"
+    );
+    authorize::redirect_to(
+        &format!("{}{FRONTEND_CONSENT_PATH}", state.config.frontend_base_url),
+        &[
+            ("state", stored.state.as_str()),
+            ("confirm_token", token.as_str()),
+        ],
+    )
 }
 
 /// The state a redirect or a callback may run on: live, and issued to this

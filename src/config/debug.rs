@@ -1,7 +1,6 @@
 //! The redacting [`Debug`] impl of [`Config`]: the
-//! whole field list in declaration order, with `database_url`,
-//! `smtp_password` and the `secret_key_base` behind `hide_secret`
-//! standing in as `<redacted>`.
+//! whole field list in declaration order, with `database_url` and
+//! `smtp_password` standing in as `<redacted>`.
 
 use std::fmt;
 
@@ -17,15 +16,6 @@ impl fmt::Debug for Config {
         let debug = debug_identity_and_exposure(&mut debug, self);
         debug_delivery_and_federation(debug, self).finish()
     }
-}
-
-/// The `secret_key_base` rendered for `Debug`: the marker string in place
-/// of the secret, `None` staying `None`. A function rather than the inline
-/// closure the impl used to bind: the closure's text pushed the chain's
-/// call past rustfmt's call width, splitting the field over lines the
-/// [`Debug`] impl's line budget could not spend.
-fn hide_secret(config: &Config) -> Option<&'static str> {
-    config.secret_key_base.as_ref().map(|_| "<redacted>")
 }
 
 /// Writes the first segment of the [`Config`] `Debug` document: the
@@ -108,9 +98,8 @@ fn debug_identity_and_exposure<'a, 'b, 'd>(
 
 /// Writes the second segment of the [`Config`] `Debug` document: the job
 /// worker and its sweeps — the deleted-status purge age and the backup
-/// trio — the streaming heartbeat, the mailer (whose `smtp_password` and
-/// [`hide_secret`]'s `secret_key_base` are the impl's redactions beside
-/// `database_url`), the media, translation and fetch services, and the
+/// trio — the streaming heartbeat, the mailer (whose `smtp_password` is
+/// the impl's redaction beside `database_url`), the media, translation and fetch services, and the
 /// federation settings with the unreachable-host grace period, the MRF
 /// chain and the rate limiter. The builder arrives borrowed and leaves
 /// borrowed, so `fmt` can close the document it opened.
@@ -138,7 +127,6 @@ fn debug_delivery_and_federation<'a, 'b, 'd>(
         .field("smtp_password", &"<redacted>")
         .field("smtp_tls", &config.smtp_tls)
         .field("mail_from", &config.mail_from)
-        .field("secret_key_base", &hide_secret(config))
         .field("media_proxy", &config.media_proxy)
         .field("rich_media_ignore_hosts", &config.rich_media_ignore_hosts)
         .field("rich_media_remote", &config.rich_media_remote)

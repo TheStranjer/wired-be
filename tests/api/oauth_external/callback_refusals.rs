@@ -11,8 +11,7 @@ use wired_be::models::user_identity;
 
 use super::provider::{LINKED_UID, MockProvider, PROVIDER, REDIRECT, UNLINKED_UID};
 use super::support::{
-    assert_no_store, count_codes, error_text, fixture, link, location, prepare, query_param,
-    stored_params,
+    assert_no_store, count_codes, fixture, link, location, prepare, query_param, stored_params,
 };
 use crate::common;
 
@@ -168,7 +167,7 @@ async fn the_callback_refuses_a_deleted_application() {
         StatusCode::BAD_REQUEST,
         "no application to mint for"
     );
-    assert_eq!(error_text(&response), "Invalid client", "named as such");
+    assert_eq!(response.error_text(), "Invalid client", "named as such");
     assert_no_store(&response);
     site.provider.stop();
 }
@@ -253,8 +252,8 @@ async fn dotted_field_names_read_a_nested_document() {
     .await;
     assert_eq!(
         location(&unlinked),
-        format!("https://test.example/oauth/registration_details?state={stranger}"),
-        "the nested-field hand-off goes to the same form"
+        format!("https://fe.example/oauth/external/register?state={stranger}"),
+        "the nested-field hand-off goes to the same screen"
     );
     let (_, nested) = stored_params(&pool, &stranger).await;
     assert_eq!(
@@ -287,7 +286,7 @@ async fn the_provider_route_leaves_the_sibling_paths_alone() {
         "the consent endpoint still runs its own flow check"
     );
     assert_eq!(
-        error_text(&consent),
+        consent.error_text(),
         "unsupported_response_type",
         "with its own body"
     );
@@ -302,7 +301,7 @@ async fn the_provider_route_leaves_the_sibling_paths_alone() {
         "the token endpoint answers"
     );
     assert_eq!(
-        error_text(&token),
+        token.error_text(),
         "Invalid credentials",
         "with its own body"
     );
@@ -335,8 +334,8 @@ async fn a_link_to_a_remote_actor_is_not_a_login() {
     );
     assert_eq!(
         location(&response),
-        format!("https://test.example/oauth/registration_details?state={state}"),
-        "so the account goes to the registration form"
+        format!("https://fe.example/oauth/external/register?state={state}"),
+        "so the account goes to the registration screen"
     );
     assert_eq!(
         count_codes(&pool).await,

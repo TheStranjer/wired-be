@@ -169,18 +169,6 @@ fn titles(rows: &[Value]) -> Vec<&str> {
         .collect()
 }
 
-/// The keys of a JSON object, sorted, for exact key-set assertions.
-fn json_keys(value: &Value) -> Vec<&str> {
-    let mut keys: Vec<&str> = value
-        .as_object()
-        .expect("lists render objects")
-        .keys()
-        .map(String::as_str)
-        .collect();
-    keys.sort_unstable();
-    keys
-}
-
 /// An account with nothing stored answers 200 with the empty JSON array.
 #[tokio::test]
 async fn empty_database_answers_the_empty_list() {
@@ -212,7 +200,11 @@ async fn crud_round_trip() {
     let created = create_json(&app, &token, create_body()).await;
     assert_eq!(created.status, StatusCode::OK, "creation answers 200");
     let list = created.json_value();
-    assert_eq!(json_keys(&list), EXPECTED_KEYS, "exactly the entity keys");
+    assert_eq!(
+        common::sorted_keys(&list),
+        EXPECTED_KEYS,
+        "exactly the entity keys"
+    );
     let id = list["id"].as_str().expect("the id is text").to_owned();
     assert!(
         Uuid::parse_str(&id).is_ok(),

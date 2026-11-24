@@ -10,16 +10,17 @@ use std::collections::HashSet;
 use serde_json::{Value, json};
 
 use crate::{
+    federation::vocab::AS_PUBLIC,
     models::{
         status::{Status, Visibility},
-        user::{User, followers},
+        user::{User, followers_address},
     },
     util::time::mastodon_time,
 };
 
 use super::{
-    AS_PUBLIC, NoteContext, TYPE_NOTE, TYPE_QUESTION, activities::json_ld_context_for,
-    tags::attachments_json, tags::poll_fields, tags::tags_json,
+    NoteContext, TYPE_NOTE, TYPE_QUESTION, activities::json_ld_context_for, tags::attachments_json,
+    tags::poll_fields, tags::tags_json,
 };
 
 /// The `Note`/`Question` object of the status in `ctx`, as this instance
@@ -152,7 +153,7 @@ pub(crate) fn address_lines(
     author: &User,
     mentions: &[User],
 ) -> (Vec<Value>, Vec<Value>) {
-    let followers_addr = json!(followers(&author.ap_id));
+    let followers_addr = json!(followers_address(author));
     let mentioned = mention_addresses(mentions);
     match visibility {
         Visibility::Public => (vec![json!(AS_PUBLIC)], prepend(followers_addr, mentioned)),
@@ -299,6 +300,35 @@ mod tests {
             document["cc"],
             json!([AS_PUBLIC]),
             "and the world only sees it in cc"
+        );
+    }
+
+    #[test]
+    fn address_lines_use_the_stored_followers_url_over_the_built_one() {
+        let stored = "https://test.example/collections/alice/fans";
+        let mut alice = author();
+        alice.followers_url = Some(stored.to_owned());
+        let (to, cc) = address_lines(Visibility::Public, &alice, &[]);
+        assert_eq!(to, vec![json!(AS_PUBLIC)], "the world is addressed");
+        assert_eq!(cc, vec![json!(stored)], "the stored followers collection");
+        let (private_to, private_cc) = address_lines(Visibility::Private, &alice, &[]);
+        assert_eq!(
+            private_to,
+            vec![json!(stored)],
+            "private reaches the stored one"
+        );
+        assert!(private_cc.is_empty(), "and nobody is cc-ed");
+    }
+
+    #[test]
+    fn address_lines_build_the_followers_url_when_none_is_stored() {
+        let alice = author();
+        assert_eq!(alice.followers_url, None, "the fixture stores none");
+        let (to, _cc) = address_lines(Visibility::Unlisted, &alice, &[]);
+        assert_eq!(
+            to,
+            vec![json!(format!("{AUTHOR_AP}/followers"))],
+            "the `{{ap_id}}/followers` fallback"
         );
     }
 

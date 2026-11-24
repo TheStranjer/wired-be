@@ -27,6 +27,10 @@
 //!   filters. Sample actors land in `accounts` and group statuses in
 //!   `statuses`, expanded once per response; a status the reader may not
 //!   see drops out of `statuses` while its group keeps its `status_id`.
+//!   The caller's active filters run in the `notifications` context, as in
+//!   v1 ([`crate::api::notifications`]): a warning match sets the status's
+//!   `filtered` array, and an `irreversible` match removes the status and
+//!   every group about it from the response.
 //!   `expand_accounts` (`full` | `partial_avatars`, default `full`) is
 //!   validated per Mastodon's enum and answered the same either way: this
 //!   instance stores one avatar image per account, so Pleroma's rendering —
@@ -60,8 +64,6 @@
 //! deactivated is the shared 404 ([`account_or_404`]), like Pleroma's
 //! `grouped_index` clause that looks the account up before listing.
 
-use std::collections::HashMap;
-
 use axum::{
     Json, Router,
     extract::{OriginalUri, Path, State},
@@ -75,23 +77,25 @@ use tracing::debug;
 use uuid::Uuid;
 
 use crate::{
-    api::helpers::{StringList, account_or_404, distinct, names_of, render_visible},
+    api::helpers::{
+        FilteredStatuses, StringList, account_or_404, distinct, expand_accounts, names_of,
+        render_filtered,
+    },
     auth::AuthUser,
     entities::{
         account::{Account, AccountViewer},
         notification::{GroupedNotifications, NotificationGroup},
-        relationship::Relationship,
-        status::Status as StatusEntity,
     },
     error::{AppError, AppResult},
     extract::{ApiParams, flex},
     models::{
+        filter::{Filter, list_active},
         marker::{self, Marker},
         notification::{self, GroupInfo, GroupPageParams, NotificationFilters},
-        user::{self, User},
     },
     oauth::scopes::{READ_NOTIFICATIONS, WRITE_NOTIFICATIONS},
     pagination::{NO_EXTRA_QUERY, PageParams, keyset_link, set_link_header},
+    services::filter::FilterContext,
     state::AppState,
     util::id::parse_id,
 };
@@ -295,7 +299,8 @@ async fn list_groups(
         .iter()
         .map(|entry| (entry.group_key.as_str(), &entry.info))
         .collect();
-    let body = groups_response(&state, Some(&auth.0), &groups).await?;
+    let active = list_active(&state.db, auth.0.id).await?;
+    let body = groups_response(&state, Some(&auth.0), &groups, &active).await?;
     Ok((headers, Json(body)))
 }
 
@@ -366,7 +371,8 @@ async fn show_group(
         user = %auth.0.id,
         "notification group read"
     );
-    let body = groups_response(&state, Some(&auth.0), &[(key.as_str(), &info)]).await?;
+    let active = list_active(&state.db, auth.0.id).await?;
+    let body = groups_response(&state, Some(&auth.0), &[(key.as_str(), &info)], &active).await?;
     Ok(Json(body))
 }
 
@@ -437,22 +443,42 @@ async fn read_marker(pool: &PgPool, user_id: Uuid) -> AppResult<Option<Uuid>> {
 /// each entry rendered under its key, every sample actor expanded once
 /// into `accounts` and every group status once into `statuses`, both as
 /// seen by `viewer`.
+///
+/// The viewer's active `filters` run in the `notifications` context, as in
+/// v1: a warning match annotates the status's `filtered` array, and a group
+/// whose status an `irreversible` filter hid leaves the envelope, its
+/// actors with it.
+///
+/// # Errors
+///
+/// [`Database`](crate::error::AppError::Database) from the account, status
+/// and visibility reads.
 async fn groups_response(
     state: &AppState,
     viewer: AccountViewer<'_>,
     groups: &[(&str, &GroupInfo)],
+    filters: &[Filter],
 ) -> AppResult<GroupedNotifications> {
-    let actor_ids = collect_actor_ids(groups);
     let status_ids = collect_status_ids(groups);
+    let expanded = expand_statuses(state, viewer, &status_ids, filters).await?;
+    let shown: Vec<(&str, &GroupInfo)> = groups
+        .iter()
+        .filter(|(_, info)| {
+            !info
+                .status_id
+                .is_some_and(|id| expanded.hidden_by_filter.contains(&id))
+        })
+        .copied()
+        .collect();
+    let actor_ids = collect_actor_ids(&shown);
     let accounts = expand_accounts(state, viewer, &actor_ids).await?;
-    let statuses = expand_statuses(state, viewer, &status_ids).await?;
-    let notification_groups = groups
+    let notification_groups = shown
         .iter()
         .map(|(key, info)| NotificationGroup::from_group(key, info))
         .collect();
     Ok(GroupedNotifications {
         accounts,
-        statuses,
+        statuses: expanded.kept,
         notification_groups,
     })
 }
@@ -473,43 +499,16 @@ fn collect_status_ids(groups: &[(&str, &GroupInfo)]) -> Vec<Uuid> {
     distinct(groups.iter().filter_map(|(_, info)| info.status_id))
 }
 
-/// Expands account ids into [`Account`] entities as seen by `viewer`:
-/// every stored account once, in the requested order, with the viewer's
-/// [`Relationship`] embedded through the batched preload
-/// [`Account::from_user_for`] reads. Actors that left no row (deleted
-/// mid-request) simply drop out.
-///
-/// # Errors
-///
-/// [`Database`](crate::error::AppError::Database) from the account and
-/// relationship reads.
-async fn expand_accounts(
-    state: &AppState,
-    viewer: AccountViewer<'_>,
-    ids: &[Uuid],
-) -> AppResult<Vec<Account>> {
-    if ids.is_empty() {
-        return Ok(Vec::new());
-    }
-    let users = user::get_many(&state.db, ids).await?;
-    let mut by_id: HashMap<Uuid, User> = users.into_iter().map(|found| (found.id, found)).collect();
-    let relationships = Relationship::load_map(&state.db, viewer, ids).await?;
-    let accounts = ids
-        .iter()
-        .filter_map(|id| by_id.remove(id))
-        .map(|found| Account::from_user_for(viewer, &found, &state.config, relationships.as_ref()))
-        .collect();
-    Ok(accounts)
-}
-
-/// Expands status ids into [`StatusEntity`]s as seen by `viewer`: every
-/// stored status once, in the requested order, through [`render_visible`]
-/// (the batched visibility filter and renderer). A status with no row and
-/// one the visibility rules hide from this reader both drop out of the
-/// array — the groups still
-/// carry their `status_id`, Pleroma's id-only reference aside — and a
-/// deleted one renders as nothing, which is what the renderer answers for
-/// a tombstone.
+/// Expands status ids into status entities as seen by `viewer`: every
+/// stored status once, in the requested order, through [`render_filtered`]
+/// (the batched visibility filter and renderer, then the viewer's
+/// `filters` in the `notifications` context, the pass v1 runs too). A
+/// status with no row and one the visibility rules hide from this reader
+/// both drop out of the array — the groups still carry their `status_id`,
+/// Pleroma's id-only reference aside — and a deleted one renders as
+/// nothing, which is what the renderer answers for a tombstone. A status
+/// an `irreversible` filter removed is also out of the array, and its id
+/// is in [`FilteredStatuses::hidden_by_filter`] so its groups can go too.
 ///
 /// # Errors
 ///
@@ -519,8 +518,9 @@ async fn expand_statuses(
     state: &AppState,
     viewer: AccountViewer<'_>,
     ids: &[Uuid],
-) -> AppResult<Vec<StatusEntity>> {
-    render_visible(state, viewer, ids).await
+    filters: &[Filter],
+) -> AppResult<FilteredStatuses> {
+    render_filtered(state, viewer, ids, filters, FilterContext::Notifications).await
 }
 
 #[cfg(test)]

@@ -12,7 +12,7 @@ use wired_be::{
         favourite,
         follow::{self, Follow, FollowState},
         status::{Status, Visibility},
-        user::{Flag, User, get_by_id},
+        user::{Flag, User},
     },
 };
 
@@ -200,11 +200,6 @@ pub(super) async fn stored(pool: &PgPool, follower: &User, target: &User) -> Fol
         .expect("the fixture relationship exists")
 }
 
-/// The row of user `id` as it stands now, for reading counters back.
-pub(super) async fn fresh_user(pool: &PgPool, id: Uuid) -> User {
-    get_by_id(pool, id).await.unwrap().expect("the user exists")
-}
-
 /// The pair of `user` behind the request row `row`.
 pub(super) fn ask(user: &User, row: &Follow) -> Ask {
     (user.id.to_string(), row.id)
@@ -236,15 +231,6 @@ pub(super) fn wanted_follows(asks: &[Ask]) -> Vec<Uuid> {
         .collect()
 }
 
-/// The account ids of every entity of a listing response, in response order.
-pub(super) fn listed_ids(body: &Value) -> Vec<String> {
-    body.as_array()
-        .expect("the listing is an array")
-        .iter()
-        .map(|account| account["id"].as_str().expect("an account id").to_owned())
-        .collect()
-}
-
 /// The entity of account `id` in a listing body, however deep in the page the
 /// id's millisecond landed it.
 pub(super) fn listed_entry<'a>(body: &'a Value, id: &Uuid) -> &'a Value {
@@ -253,16 +239,6 @@ pub(super) fn listed_entry<'a>(body: &'a Value, id: &Uuid) -> &'a Value {
         .iter()
         .find(|entry| entry["id"] == id.to_string())
         .unwrap_or_else(|| panic!("account {id} is on the page"))
-}
-
-/// The `Link` header Pleroma's `add_link_headers` writes for a page of the
-/// outgoing list: `next` walks to the oldest request row, `prev` back to the
-/// newest.
-pub(super) fn expected_link(oldest: &Uuid, newest: &Uuid) -> String {
-    format!(
-        "<{BASE}{OUTGOING}?max_id={oldest}>; rel=\"next\", \
-         <{BASE}{OUTGOING}?min_id={newest}>; rel=\"prev\""
-    )
 }
 
 /// The full relationship JSON for `target` with every flag at the documented

@@ -15,8 +15,8 @@ use wired_be::{
 };
 
 use super::support::{
-    NOT_FOUND, SCOPES, batch, context, context_ids, entity_ids, id_query, ids_of, quote_of,
-    reblog_of, show, user_with_token,
+    NOT_FOUND, SCOPES, batch, context, context_ids, id_query, ids_of, quote_of, reblog_of, show,
+    user_with_token,
 };
 use crate::common;
 
@@ -219,13 +219,13 @@ async fn the_batch_omits_the_closed_locality_anonymously() {
     );
     let open_half = batch(&app, None, &mixed).await;
     assert_eq!(
-        entity_ids(&open_half.json_value()),
+        common::ids_of(&open_half.json_value()),
         ids_of(&[&remote]),
         "the remote post stays; the local post and the local reblog go"
     );
     let signed_in = batch(&app, Some(bob_token.as_str()), &mixed).await;
     assert_eq!(
-        entity_ids(&signed_in.json_value()),
+        common::ids_of(&signed_in.json_value()),
         ids_of(&[&local, &remote, &reblog]),
         "a user token reads all three"
     );
@@ -312,7 +312,7 @@ async fn the_quotes_listing_omits_the_closed_locality_anonymously() {
         .send(&app)
         .await;
     assert_eq!(
-        entity_ids(&signed_in.json_value()),
+        common::ids_of(&signed_in.json_value()),
         ids_of(&[&quote]),
         "a user token sees the quoter"
     );

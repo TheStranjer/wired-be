@@ -3,9 +3,9 @@
 
 use super::*;
 
-/// The admin document read of a never-uploaded name and the public read
-/// of the same absence: both the 404 `{"error":"Not found"}`, the
-/// public one as JSON and with no auth asked.
+/// The admin document read of a never-uploaded name and the public JSON
+/// read of the same absence: both the 404 `{"error":"Not found"}`, the
+/// public one with no auth asked.
 #[tokio::test]
 async fn absent_documents_are_the_json_404_on_both_reads() {
     let db = common::test_db().await;
@@ -21,7 +21,7 @@ async fn absent_documents_are_the_json_404_on_both_reads() {
     common::assert_answer(&missing, StatusCode::NOT_FOUND, "never uploaded is a 404");
     common::assert_error(&missing, NOT_FOUND, "the pinned wording");
 
-    let missing_public = TestRequest::get(PUBLIC_TOS).send(&app).await;
+    let missing_public = TestRequest::get(JSON_TOS).send(&app).await;
     common::assert_answer(
         &missing_public,
         StatusCode::NOT_FOUND,
@@ -35,11 +35,40 @@ async fn absent_documents_are_the_json_404_on_both_reads() {
     );
 }
 
+/// The retired public HTML route is the app-wide fallback 404 even while
+/// the document file exists, and serves no page.
+#[tokio::test]
+async fn the_retired_html_route_is_the_fallback_404() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let dir = tempfile::tempdir().expect("a docs dir");
+    let app = common::test_app_with_instance_docs_dir(pool.clone(), dir.path());
+    let token = admin(&pool, "root", "admin:write").await;
+    let uploaded = upload_sized(&app, &token, 14).await;
+    common::assert_answer(&uploaded, StatusCode::OK, "the upload answers");
+
+    let retired = TestRequest::get(PUBLIC_TOS).send(&app).await;
+    common::assert_answer(
+        &retired,
+        StatusCode::NOT_FOUND,
+        "the HTML route is gone while the file exists",
+    );
+    assert_eq!(
+        retired.header("x-wired-fallback"),
+        Some("1"),
+        "the app-wide fallback answered, no handler"
+    );
+    assert_ne!(
+        retired.header("content-type"),
+        Some("text/html; charset=utf-8"),
+        "no page is served"
+    );
+}
+
 /// The document store's full walk: the multipart upload answers the
-/// public URL, the admin read returns the bytes as `text/html`, the
-/// public route serves them with the pinned headers and no auth at all,
-/// a re-upload replaces the file whole, and the delete empties both
-/// routes behind it.
+/// frontend URL, the admin read returns the bytes as `text/html`, the
+/// public JSON endpoint answers the same text with no auth at all, and
+/// the delete empties both reads behind it.
 #[tokio::test]
 async fn documents_upload_serve_and_delete_round_trip() {
     let db = common::test_db().await;
@@ -85,36 +114,23 @@ async fn documents_upload_serve_and_delete_round_trip() {
         "as text/html, as Pleroma's show sets it"
     );
 
-    let served = TestRequest::get(PUBLIC_TOS).send(&app).await;
+    let served = TestRequest::get(JSON_TOS).send(&app).await;
     common::assert_answer(&served, StatusCode::OK, "the public read needs no auth");
-    assert_eq!(served.text(), "<h1>Terms</h1>", "the same bytes");
     assert_eq!(
         served.header("content-type"),
-        Some("text/html; charset=utf-8"),
-        "with the charset"
+        Some("application/json"),
+        "JSON, never a page"
     );
-    assert_eq!(
-        served.header("content-security-policy"),
-        Some(DOCUMENT_CSP),
-        "and the document CSP"
-    );
-
-    let no_suffix = TestRequest::get("/instance/terms-of-service")
-        .send(&app)
-        .await;
-    common::assert_answer(
-        &no_suffix,
-        StatusCode::NOT_FOUND,
-        "the suffix is part of the route",
-    );
-    let wrong_suffix = TestRequest::get("/instance/terms-of-service.htm")
-        .send(&app)
-        .await;
-    common::assert_answer(
-        &wrong_suffix,
-        StatusCode::NOT_FOUND,
-        "and it is exactly .html",
-    );
+    let document = served.json_value();
+    assert_eq!(document["content"], "<h1>Terms</h1>", "the same text");
+    let stamp = document["updated_at"]
+        .as_str()
+        .expect("the update time is a string");
+    let written = wired_be::util::time::parse_time(stamp).expect("a parseable stamp");
+    let age = chrono::Utc::now()
+        .signed_duration_since(written)
+        .num_seconds();
+    assert!((-5..=60).contains(&age), "the stamp is the write time");
 
     let deleted = TestRequest::delete(DOC_TOS).bearer(&token).send(&app).await;
     common::assert_answer(&deleted, StatusCode::OK, "the delete answers 200");
@@ -123,7 +139,7 @@ async fn documents_upload_serve_and_delete_round_trip() {
         !dir.path().join("terms-of-service.html").exists(),
         "the file is gone"
     );
-    let after_delete = TestRequest::get(PUBLIC_TOS).send(&app).await;
+    let after_delete = TestRequest::get(JSON_TOS).send(&app).await;
     common::assert_answer(&after_delete, StatusCode::NOT_FOUND, "and both reads 404");
     let delete_again = TestRequest::delete(DOC_TOS).bearer(&token).send(&app).await;
     common::assert_answer(&delete_again, StatusCode::NOT_FOUND, "Pleroma's enoent 404");
@@ -155,8 +171,12 @@ async fn a_reupload_replaces_the_document_whole() {
             .await;
         common::assert_answer(&uploaded, StatusCode::OK, "the upload answers");
     }
-    let served = TestRequest::get(PUBLIC_TOS).send(&app).await;
-    assert_eq!(served.text(), "<h1>Terms v2</h1>", "whole, not appended");
+    let served = TestRequest::get(JSON_TOS).send(&app).await;
+    assert_eq!(
+        served.json_value()["content"],
+        "<h1>Terms v2</h1>",
+        "whole, not appended"
+    );
 
     let strays = std::fs::read_dir(dir.path())
         .expect("the dir reads")
@@ -213,22 +233,6 @@ async fn unlisted_and_traversing_names_are_the_404() {
             "the store holds no `{stray}` after the refusals"
         );
     }
-
-    let public_slip = TestRequest::get("/instance/%2e%2e%2f.env").send(&app).await;
-    common::assert_answer(
-        &public_slip,
-        StatusCode::NOT_FOUND,
-        "the public traversal 404s",
-    );
-    let raw_slip = TestRequest::get("/instance/../uploads/x.html")
-        .send(&app)
-        .await;
-    common::assert_answer(
-        &raw_slip,
-        StatusCode::NOT_FOUND,
-        "the raw ../ never matches",
-    );
-    assert_eq!(raw_slip.json_value()["error"], NOT_FOUND, "as the JSON 404");
 }
 
 /// The upload's own gates: the body must carry the `file` part, and the
@@ -292,7 +296,9 @@ async fn the_upload_reads_its_file_part_at_its_ceiling() {
 }
 
 /// A name list is what the config says: an operator's `about` joins the
-/// routes and the stock defaults stop existing when replaced.
+/// admin routes, the upload answers the `FRONTEND_BASE_URL` address, and
+/// the stock default stops existing when replaced — the JSON terms of
+/// service with it.
 #[tokio::test]
 async fn the_configured_names_are_the_allow_list() {
     let db = common::test_db().await;
@@ -300,6 +306,7 @@ async fn the_configured_names_are_the_allow_list() {
     let dir = tempfile::tempdir().expect("a docs dir");
     let mut config = common::test_config_with_instance_docs_dir(dir.path());
     config.statics.documents.names = vec!["about".to_owned()];
+    config.frontend_base_url = "https://fe.example".to_owned();
     let app = common::test_app_with_config(pool.clone(), config);
     let token = admin(&pool, "root", "admin:write").await;
 
@@ -319,12 +326,26 @@ async fn the_configured_names_are_the_allow_list() {
     common::assert_answer(&uploaded, StatusCode::OK, "the configured name uploads");
     assert_eq!(
         uploaded.json_value()["url"],
-        "https://test.example/instance/about.html",
-        "at its own URL"
+        "https://fe.example/instance/about.html",
+        "at its own URL on the frontend origin"
     );
     let served = TestRequest::get("/instance/about.html").send(&app).await;
-    common::assert_answer(&served, StatusCode::OK, "and the public route serves it");
-    assert_eq!(served.text(), "<p>about</p>", "whole");
+    common::assert_answer(
+        &served,
+        StatusCode::NOT_FOUND,
+        "the backend serves no page for it",
+    );
+    assert_eq!(
+        served.header("x-wired-fallback"),
+        Some("1"),
+        "the app-wide fallback answered"
+    );
+    let terms = TestRequest::get(JSON_TOS).send(&app).await;
+    common::assert_answer(
+        &terms,
+        StatusCode::NOT_FOUND,
+        "no terms-of-service name, no JSON terms",
+    );
 
     let stock = TestRequest::patch(DOC_TOS)
         .bearer(&token)

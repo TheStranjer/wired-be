@@ -22,14 +22,12 @@ use wired_be::{
     config::TEST_BASE_URL,
     models::{
         follow::{self, Follow, FollowState},
-        user::{Flag, User, get_by_id},
+        user::{Flag, User},
     },
 };
 
 use crate::common;
 
-/// The instance origin the fixtures live on (`Config::for_tests`).
-const BASE: &str = "https://test.example";
 /// The queue listing's path, as the `Link` header links back to it.
 const QUEUE: &str = "/api/v1/follow_requests";
 /// The body every miss on the answer routes carries (decision 8).
@@ -152,16 +150,6 @@ fn wanted_follows(requests: &[Request]) -> Vec<Uuid> {
         .collect()
 }
 
-/// The account ids of every entity of a listing response, in response
-/// order.
-fn listed_ids(body: &Value) -> Vec<String> {
-    body.as_array()
-        .expect("the queue is an array")
-        .iter()
-        .map(|account| account["id"].as_str().expect("an account id").to_owned())
-        .collect()
-}
-
 /// The entity of account `id` in a listing body, however deep in the page
 /// the id's millisecond landed it.
 fn listed_entry<'a>(body: &'a Value, id: &Uuid) -> &'a Value {
@@ -170,16 +158,6 @@ fn listed_entry<'a>(body: &'a Value, id: &Uuid) -> &'a Value {
         .iter()
         .find(|entry| entry["id"] == id.to_string())
         .unwrap_or_else(|| panic!("account {id} is on the page"))
-}
-
-/// The `Link` header Pleroma's `add_link_headers` writes for a page of
-/// the queue: `next` walks to the oldest request row, `prev` back to the
-/// newest.
-fn expected_link(oldest: &Uuid, newest: &Uuid) -> String {
-    format!(
-        "<{BASE}{QUEUE}?max_id={oldest}>; rel=\"next\", \
-         <{BASE}{QUEUE}?min_id={newest}>; rel=\"prev\""
-    )
 }
 
 /// The full relationship JSON for `target` with every flag at the
@@ -212,11 +190,6 @@ fn expected_relationship(target: &Uuid, computed: &Value) -> Value {
         );
     }
     value
-}
-
-/// The row of user `id` as it stands now, for reading counters back.
-async fn fresh_user(pool: &PgPool, id: Uuid) -> User {
-    get_by_id(pool, id).await.unwrap().expect("the user exists")
 }
 
 /// The queue answers the accounts waiting on the caller — full `Account`
@@ -257,7 +230,7 @@ async fn the_queue_lists_pending_requests_newest_first() {
     );
     let body = listed.json_value();
     assert_eq!(
-        listed_ids(&body),
+        common::ids_of(&body),
         wanted_requesters(&waiting),
         "the two waiting requests, newest row first; the accepted follower, \
          the outgoing request and the other accounts' rows stay out"
@@ -317,13 +290,13 @@ async fn the_queue_pages_key_on_follow_row_ids_and_link() {
 
     let first = queue(&app, Some(&token), "?limit=2").await;
     assert_eq!(
-        listed_ids(&first.json_value()),
+        common::ids_of(&first.json_value()),
         wanted_users[..2],
         "two newest first"
     );
     assert_eq!(
         first.header("link"),
-        Some(expected_link(&wanted_rows[1], &wanted_rows[0]).as_str()),
+        Some(common::expected_link(QUEUE, &wanted_rows[0], &wanted_rows[1]).as_str()),
         "the Link cursors are the page's follow row ids, not requester ids"
     );
 
@@ -334,14 +307,14 @@ async fn the_queue_pages_key_on_follow_row_ids_and_link() {
     )
     .await;
     assert_eq!(
-        listed_ids(&older.json_value()),
+        common::ids_of(&older.json_value()),
         wanted_users[2..4],
         "max_id continues where the page ended"
     );
 
     let newer = queue(&app, Some(&token), &format!("?min_id={}", wanted_rows[3])).await;
     assert_eq!(
-        listed_ids(&newer.json_value()),
+        common::ids_of(&newer.json_value()),
         wanted_users[..3],
         "min_id answers the newest-first page just after the cursor"
     );
@@ -380,19 +353,19 @@ async fn the_default_page_is_forty_and_the_cap_is_eighty() {
 
     let default = queue(&app, Some(&token), "").await;
     assert_eq!(
-        listed_ids(&default.json_value()).len(),
+        common::ids_of(&default.json_value()).len(),
         40,
         "the account-list default, not Pleroma's 20"
     );
     let greedy = queue(&app, Some(&token), "?limit=100").await;
     assert_eq!(
-        listed_ids(&greedy.json_value()).len(),
+        common::ids_of(&greedy.json_value()).len(),
         80,
         "and the account-list cap, never more"
     );
     let between = queue(&app, Some(&token), "?limit=60").await;
     assert_eq!(
-        listed_ids(&between.json_value()).len(),
+        common::ids_of(&between.json_value()).len(),
         60,
         "a page above the global cap but under 80 goes through"
     );
@@ -439,12 +412,12 @@ async fn authorize_grants_flips_counters_and_answers_the_relationship() {
     );
     assert_eq!(stored.id, request.id, "the same row, not a new one");
     assert_eq!(
-        fresh_user(&pool, carol.id).await.followers_count,
+        common::reload_user(&pool, carol.id).await.followers_count,
         1,
         "the followee gained a follower"
     );
     assert_eq!(
-        fresh_user(&pool, alice.id).await.following_count,
+        common::reload_user(&pool, alice.id).await.following_count,
         1,
         "the requester gained a follow"
     );
@@ -464,7 +437,7 @@ async fn authorize_grants_flips_counters_and_answers_the_relationship() {
     );
     assert_eq!(twice.text(), NOT_FOUND, "decision 8's 404 body");
     assert_eq!(
-        fresh_user(&pool, carol.id).await.followers_count,
+        common::reload_user(&pool, carol.id).await.followers_count,
         1,
         "and the refused repeat moved no counters"
     );
@@ -500,12 +473,12 @@ async fn reject_removes_the_row_and_answers_the_relationship() {
         "the row is removed, not stored as rejected"
     );
     assert_eq!(
-        fresh_user(&pool, carol.id).await.followers_count,
+        common::reload_user(&pool, carol.id).await.followers_count,
         0,
         "a refused request never counted, so nothing moved"
     );
     assert_eq!(
-        fresh_user(&pool, alice.id).await.following_count,
+        common::reload_user(&pool, alice.id).await.following_count,
         0,
         "on either side"
     );
@@ -537,7 +510,7 @@ async fn only_the_target_user_sees_and_answers_requests() {
 
     let seen = queue(&app, Some(&carol_token), "").await;
     assert_eq!(
-        listed_ids(&seen.json_value()),
+        common::ids_of(&seen.json_value()),
         vec![alice.id.to_string()],
         "carol sees alice's request"
     );

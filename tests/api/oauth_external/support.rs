@@ -14,7 +14,6 @@ use wired_be::{
     config::Config,
     models::{
         oauth_app::{self, AppChanges, NewOauthApp, OauthApp},
-        oauth_login_state,
         user::User,
         user_identity,
     },
@@ -170,14 +169,6 @@ pub(super) fn assert_no_store(response: &common::TestResponse) {
     );
 }
 
-/// The `error` message of a JSON error response.
-pub(super) fn error_text(response: &common::TestResponse) -> String {
-    response.json_value()["error"]
-        .as_str()
-        .expect("errors carry a string error field")
-        .to_owned()
-}
-
 /// The parameters stored against `state`, and its provider.
 pub(super) async fn stored_params(pool: &PgPool, state: &str) -> (String, Value) {
     sqlx::query_as("SELECT provider, params FROM oauth_login_states WHERE state = $1")
@@ -271,13 +262,4 @@ pub(super) async fn count_users(pool: &PgPool) -> i64 {
         .fetch_one(pool)
         .await
         .expect("the user count runs")
-}
-
-/// Writes a `pending` document of the test's choosing onto `state`, the
-/// way an unlinked callback would.
-pub(super) async fn set_pending(pool: &PgPool, state: &str, pending: &Value) {
-    let written = oauth_login_state::set_pending(pool, state, pending)
-        .await
-        .expect("the pending fixture writes");
-    assert!(written, "the state row is live to take the write");
 }

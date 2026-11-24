@@ -13,7 +13,7 @@ use wired_be::{
     config::DEFAULT_OAUTH_TOKEN_TTL_SECS, models::oauth_token, util::token::sha256_hex,
 };
 
-use super::support::{PASSWORD, assert_no_store, error_text, fixtures, grant_body, post_json};
+use super::support::{PASSWORD, assert_no_store, fixtures, grant_body, post_json};
 use crate::common;
 
 /// The full password grant over JSON: the documented body, the entity
@@ -196,7 +196,7 @@ async fn bad_client_credentials_are_invalid_credentials() {
         "a wrong secret is a 400"
     );
     assert_eq!(
-        error_text(&secret_answer),
+        secret_answer.error_text(),
         "Invalid credentials",
         "one message for every credential failure"
     );
@@ -211,7 +211,7 @@ async fn bad_client_credentials_are_invalid_credentials() {
         "an unknown client id is a 400"
     );
     assert_eq!(
-        error_text(&client_answer),
+        client_answer.error_text(),
         "Invalid credentials",
         "same message"
     );
@@ -226,7 +226,7 @@ async fn bad_client_credentials_are_invalid_credentials() {
         "absent credentials are a 400"
     );
     assert_eq!(
-        error_text(&bare_answer),
+        bare_answer.error_text(),
         "Invalid credentials",
         "same message"
     );
@@ -256,7 +256,7 @@ async fn bad_user_credentials_are_invalid_credentials() {
         "a wrong password is a 400"
     );
     assert_eq!(
-        error_text(&password_answer),
+        password_answer.error_text(),
         "Invalid credentials",
         "its message"
     );
@@ -269,7 +269,7 @@ async fn bad_user_credentials_are_invalid_credentials() {
         "an unknown user is a 400"
     );
     assert_eq!(
-        error_text(&user_answer),
+        user_answer.error_text(),
         "Invalid credentials",
         "the same message, deliberately"
     );
@@ -292,7 +292,7 @@ async fn missing_user_parameters_are_invalid_credentials() {
             "without `{missing}` the grant fails"
         );
         assert_eq!(
-            error_text(&response),
+            response.error_text(),
             "Invalid credentials",
             "with Pleroma's answer"
         );

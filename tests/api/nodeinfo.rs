@@ -678,3 +678,37 @@ async fn federation_is_the_same_answer_the_instance_documents_give() {
         }
     }
 }
+
+/// `metadata.federation.enabled` follows `FEDERATION_ENABLED` on `NodeInfo`
+/// and on the instance documents alike: true by default, false when the
+/// switch is off.
+#[tokio::test]
+async fn federation_enabled_follows_the_federation_switch() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    for federating in [true, false] {
+        let mut config = common::test_config();
+        config.federation_enabled = Toggle::new(federating);
+        let app = common::test_app_with_config(pool.clone(), config);
+        let nodeinfo = get_document(&app, "/nodeinfo/2.0").await;
+        assert_eq!(
+            nodeinfo["metadata"]["federation"]["enabled"], federating,
+            "FEDERATION_ENABLED={federating}: NodeInfo reports it"
+        );
+        let instance = get_document(&app, "/api/v1/instance").await;
+        assert_eq!(
+            instance["pleroma"]["metadata"]["federation"]["enabled"], federating,
+            "FEDERATION_ENABLED={federating}: the instance document reports it"
+        );
+    }
+}
+
+/// The default test configuration federates, so `enabled` is true without
+/// any override.
+#[tokio::test]
+async fn federation_is_enabled_by_default() {
+    let db = common::test_db().await;
+    let app = common::test_app(db.pool().clone());
+    let nodeinfo = get_document(&app, "/nodeinfo/2.0").await;
+    assert_eq!(nodeinfo["metadata"]["federation"]["enabled"], true);
+}

@@ -136,7 +136,10 @@ async fn nodeinfo(
 /// fixed keys. The configuration read is the pipeline's own cached one —
 /// the same answer [`crate::api::instance`] serves.
 async fn federation_block(state: &AppState) -> Federation {
-    Federation::with_mrf(&mrf::describe(state).await)
+    Federation::with_mrf(
+        state.config.federation_enabled.get(),
+        &mrf::describe(state).await,
+    )
 }
 
 /// The two `NodeInfo` schema versions this server documents, the values the

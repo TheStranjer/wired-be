@@ -7,7 +7,7 @@
 //! answered with 413. Logging never emits the `Authorization` header, the
 //! value of a secret query parameter (`access_token`, `mfa_token`, `code`,
 //! `state`, `token`), or the secret segment of a password-reset,
-//! email-confirmation or unsubscribe path.
+//! or email-confirmation path.
 
 use std::{borrow::Cow, time::Duration};
 
@@ -42,10 +42,9 @@ const REDACTED_PARAMS: [&str; 5] = ["access_token", "mfa_token", "code", "state"
 
 /// Route prefixes whose path carries a secret, each with whether the first
 /// segment after the prefix (a user id) is kept and only the rest redacted.
-const SECRET_PATH_PREFIXES: [(&str, bool); 3] = [
+const SECRET_PATH_PREFIXES: [(&str, bool); 2] = [
     ("/api/v1/pleroma/password_reset/", false),
     ("/api/account/confirm_email/", true),
-    ("/mailer/unsubscribe/", false),
 ];
 
 /// Stands in for a redacted value in logged URIs.
@@ -126,8 +125,7 @@ fn sanitized_uri(uri: &Uri) -> String {
 }
 
 /// The path with the secret segment of each secret-bearing route replaced by
-/// [`REDACTED`]: everything after the password-reset and unsubscribe prefixes,
-/// and the token (last segment) after the email-confirmation prefix, whose
+/// [`REDACTED`]: everything after the password-reset prefix, and the token (last segment) after the email-confirmation prefix, whose
 /// leading user id is kept. Any other path is returned as is.
 fn redact_path(path: &str) -> Cow<'_, str> {
     for (prefix, keeps_leading_segment) in SECRET_PATH_PREFIXES {
@@ -408,7 +406,7 @@ mod tests {
                 .unwrap()
         }
 
-        /// An MFA detour request, whose query carries the MFA token.
+        /// A request whose query carries an MFA challenge token.
         fn mfa_request() -> Request<Body> {
             Request::get(format!("/oauth/mfa?mfa_token={SECRET}&lang=en").as_str())
                 .body(Body::empty())
@@ -481,19 +479,10 @@ mod tests {
     }
 
     #[test]
-    fn unsubscribe_token_path_is_redacted() {
-        let uri = Uri::from_static("/mailer/unsubscribe/tok%20en?lang=en");
-        assert_eq!(
-            sanitized_uri(&uri),
-            "/mailer/unsubscribe/[redacted]?lang=en"
-        );
-    }
-
-    #[test]
     fn secret_prefix_without_a_segment_is_left_as_is() {
         assert_eq!(
-            redact_path("/mailer/unsubscribe/"),
-            "/mailer/unsubscribe/",
+            redact_path("/api/v1/pleroma/password_reset/"),
+            "/api/v1/pleroma/password_reset/",
             "nothing to redact"
         );
         assert!(

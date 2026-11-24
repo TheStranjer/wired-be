@@ -197,7 +197,28 @@ pub async fn ingest_note(
     author: &User,
     object: &Value,
 ) -> Result<IngestOutcome, FederationError> {
-    ingest_note_delivered(state, author, object, None).await
+    ingest_note_at_depth(state, author, object, 0).await
+}
+
+/// [`ingest_note`] for an object fetched at a known thread-walk depth.
+///
+/// The object sits `backfill_depth` links above the reply that started the
+/// walk. The `federator.backfill` job queued for the new row carries that
+/// depth, so the walk's depth limit binds across jobs instead of restarting
+/// at zero. A depth at or past
+/// [`FetchLimits::thread_fetch_depth`](crate::config::FetchLimits::thread_fetch_depth)
+/// queues no backfill at all.
+///
+/// # Errors
+///
+/// As [`ingest_note`].
+pub async fn ingest_note_at_depth(
+    state: &AppState,
+    author: &User,
+    object: &Value,
+    backfill_depth: i64,
+) -> Result<IngestOutcome, FederationError> {
+    ingest_note_inner(state, author, object, None, backfill_depth).await
 }
 
 /// [`ingest_note`] for a delivery to a personal inbox: `owner` is the local
@@ -220,6 +241,19 @@ pub async fn ingest_note_delivered(
     author: &User,
     object: &Value,
     owner: Option<&User>,
+) -> Result<IngestOutcome, FederationError> {
+    ingest_note_inner(state, author, object, owner, 0).await
+}
+
+/// The fold itself, shared by [`ingest_note_delivered`] and
+/// [`ingest_note_at_depth`]: `backfill_depth` is the depth the new row's
+/// backfill job is queued at.
+async fn ingest_note_inner(
+    state: &AppState,
+    author: &User,
+    object: &Value,
+    owner: Option<&User>,
+    backfill_depth: i64,
 ) -> Result<IngestOutcome, FederationError> {
     let parsed = note_parser::parse_note(object, author, Utc::now()).map_err(|err| {
         FederationError::Permanent(format!("the object is not ingestable: {err}"))
@@ -257,7 +291,7 @@ pub async fn ingest_note_delivered(
     let new = build_new_status(&parsed, &reply, quote_of_id, &mentioned);
     let row = write_ingested(state, &new, &parsed).await?;
     after_status_created(state, &row).await;
-    enqueue_backfill(state, &row).await;
+    enqueue_backfill(state, &row, backfill_depth).await;
     debug!(
         status = %row.id,
         visibility = %row.visibility,
@@ -274,13 +308,26 @@ pub async fn ingest_note_delivered(
 /// refusing a post whose row is already committed, and the same unique
 /// key keeps a redelivered `Create` from queueing the work twice.
 ///
+/// The job is queued at `depth`, the row's distance from the reply that
+/// started the walk. At or past the configured thread-fetch depth nothing is
+/// queued: the walk ends at this row, so a hostile endless `inReplyTo` chain
+/// cannot keep the queue fetching.
+///
 /// [`federator.backfill`]: crate::federation::fetch_object::KIND_BACKFILL
-async fn enqueue_backfill(state: &AppState, row: &Status) {
+async fn enqueue_backfill(state: &AppState, row: &Status, depth: i64) {
     let Some(parent_ap_id) = row.in_reply_to_ap_id.as_deref() else {
         return;
     };
+    let limit = i64::try_from(state.config.fetch.limits.thread_fetch_depth).unwrap_or(i64::MAX);
+    if depth >= limit {
+        debug!(
+            status = %row.id,
+            depth, limit, "the thread backfill stops at its depth limit"
+        );
+        return;
+    }
     let unique_key = backfill_key(row.id);
-    let args = json!({ "status_id": row.id.to_string(), "depth": 0 });
+    let args = json!({ "status_id": row.id.to_string(), "depth": depth });
     debug!(status = %row.id, parent = %parent_ap_id, "queueing the thread backfill of a deferred reply");
     let new_job = NewJob {
         queue: QUEUE_BACKGROUND,

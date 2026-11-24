@@ -22,17 +22,14 @@ use sqlx::PgPool;
 use uuid::Uuid;
 use wired_be::{
     config::TEST_BASE_URL,
-    federation::delivery::KIND_DELIVER,
     models::{
         follow,
         user::{Flag, User, get_by_id},
     },
 };
 
-use crate::common;
+use crate::common::{self, delivery_jobs};
 
-/// The instance origin the fixtures live on (`Config::for_tests`).
-const BASE: &str = "https://test.example";
 /// The listing's path, as the `Link` header links back to it.
 const BLOCKS: &str = "/api/v1/domain_blocks";
 /// The 401 body `AuthUser` renders when no token was presented at all.
@@ -161,16 +158,6 @@ fn domains(blocks: &[Block]) -> Vec<String> {
     blocks.iter().map(|(_, domain)| domain.clone()).collect()
 }
 
-/// The `Link` header Pleroma's `add_link_headers` writes for a page of
-/// the listing: `next` walks to the oldest block row, `prev` back to the
-/// newest.
-fn expected_link(oldest: &Uuid, newest: &Uuid) -> String {
-    format!(
-        "<{BASE}{BLOCKS}?max_id={oldest}>; rel=\"next\", \
-         <{BASE}{BLOCKS}?min_id={newest}>; rel=\"prev\""
-    )
-}
-
 /// The domain strings a listing response answered.
 fn listed_domains(response: &common::TestResponse) -> Vec<String> {
     response
@@ -223,7 +210,7 @@ async fn add_list_and_remove() {
     );
     assert_eq!(
         body.header("link"),
-        Some(expected_link(&stored[1].0, &stored[0].0).as_str()),
+        Some(common::expected_link(BLOCKS, &stored[0].0, &stored[1].0).as_str()),
         "the Link cursors are the block row ids, not the domains"
     );
 
@@ -437,7 +424,7 @@ async fn the_listing_pages_key_on_block_row_ids_and_link() {
     );
     assert_eq!(
         first.header("link"),
-        Some(expected_link(&stored[1].0, &stored[0].0).as_str()),
+        Some(common::expected_link(BLOCKS, &stored[0].0, &stored[1].0).as_str()),
         "the Link cursors are the page's block row ids"
     );
 
@@ -647,15 +634,6 @@ async fn relationships_carry_the_domain_blocking_flag() {
         !flag(2),
         "and a local account never, not even under its own instance's domain"
     );
-}
-
-/// The args of every queued `federator.deliver` job, in insertion order.
-async fn delivery_jobs(pool: &PgPool) -> Vec<Value> {
-    sqlx::query_scalar::<_, Value>("SELECT args FROM jobs WHERE kind = $1 ORDER BY inserted_at, id")
-        .bind(KIND_DELIVER)
-        .fetch_all(pool)
-        .await
-        .expect("the delivery jobs read")
 }
 
 /// Whether a follow row of the pair is stored.

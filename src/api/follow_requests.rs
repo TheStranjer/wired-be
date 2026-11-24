@@ -59,7 +59,9 @@ use crate::{
         user::User,
     },
     oauth::scopes::{FOLLOW, READ_FOLLOWS, WRITE_FOLLOWS},
-    pagination::{NO_EXTRA_QUERY, PageParams, keyset_link, set_link_header},
+    pagination::{
+        ACCOUNT_LIST_MAX_LIMIT, NO_EXTRA_QUERY, PageParams, keyset_link, set_link_header,
+    },
     services::{federation_out, notify},
     state::AppState,
     util::id::parse_id,
@@ -69,10 +71,6 @@ use crate::{
 /// where Pleroma's global [`PageParams`] default is 20 — the ticket pins
 /// this endpoint to the account-list pair.
 const DEFAULT_LIMIT: i64 = 40;
-
-/// Page size cap of the queue: Mastodon's account-list limit (80), above
-/// [`crate::pagination::MAX_LIMIT`].
-const MAX_LIMIT: i64 = 80;
 
 /// The `/api/v1/follow_requests` router, merged into [`crate::api::v1`].
 pub fn router() -> Router<AppState> {
@@ -100,7 +98,8 @@ async fn list_follow_requests(
     OriginalUri(uri): OriginalUri,
 ) -> AppResult<(HeaderMap, Json<Vec<Account>>)> {
     auth.require(READ_FOLLOWS)?;
-    let page = PageParams::from_query_with_default(uri.query(), DEFAULT_LIMIT, MAX_LIMIT)?;
+    let page =
+        PageParams::from_query_with_default(uri.query(), DEFAULT_LIMIT, ACCOUNT_LIST_MAX_LIMIT)?;
     let entries = follow::pending_requests_for(&state.db, auth.0.id, page).await?;
     debug!(
         count = entries.len(),

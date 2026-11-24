@@ -6,6 +6,7 @@
 use sqlx::{Postgres, QueryBuilder};
 
 use super::pleroma_list::{ListFilters, ListParams};
+use crate::util::like;
 
 /// Appends the `WHERE` arms of [`ListFilters`], grouped by what they weigh:
 /// origin, account state, roles.
@@ -65,7 +66,7 @@ fn push_roles(builder: &mut QueryBuilder<Postgres>, filters: ListFilters) {
 /// the [`actor_types`](ListParams::actor_types) membership.
 pub(super) fn push_criteria(builder: &mut QueryBuilder<Postgres>, params: &ListParams) {
     if let Some(needle) = &params.query {
-        let pattern = contains_pattern(needle);
+        let pattern = like::contains(needle);
         let _three: &mut _ = builder
             .push(" AND (nickname::text ILIKE ")
             .push_bind(pattern.clone())
@@ -78,7 +79,7 @@ pub(super) fn push_criteria(builder: &mut QueryBuilder<Postgres>, params: &ListP
     if let Some(needle) = &params.name {
         let _name: &mut _ = builder
             .push(" AND name ILIKE ")
-            .push_bind(contains_pattern(needle));
+            .push_bind(like::contains(needle));
     }
     if let Some(address) = &params.email {
         let _email: &mut _ = builder
@@ -95,23 +96,6 @@ pub(super) fn push_criteria(builder: &mut QueryBuilder<Postgres>, params: &ListP
             .push_bind(params.actor_types.clone())
             .push(")");
     }
-}
-
-/// The `ILIKE` pattern of a substring criterion: `%` around `needle`, whose
-/// own metacharacters (`%`, `_` and the escape character) are
-/// backslash-escaped so a search matches what was typed (Pleroma's
-/// `ilike(u.nickname, "%#{query}%")` over `escape_ilike`).
-pub(super) fn contains_pattern(needle: &str) -> String {
-    let mut pattern = String::with_capacity(needle.len() + 2);
-    pattern.push('%');
-    for symbol in needle.chars() {
-        if matches!(symbol, '%' | '_' | '\\') {
-            pattern.push('\\');
-        }
-        pattern.push(symbol);
-    }
-    pattern.push('%');
-    pattern
 }
 
 /// Appends the order and the window: the nickname order the ticket pins
@@ -307,18 +291,5 @@ mod tests {
             (25, 75),
             "an ordinary page is Pleroma's offset"
         );
-    }
-
-    /// The substring pattern: `%` wrapped around the needle, whose own
-    /// wildcards and escape character are backslash-prefixed.
-    #[test]
-    fn the_substring_pattern_wraps_and_escapes() {
-        assert_eq!(contains_pattern("alice"), "%alice%", "an ordinary needle");
-        assert_eq!(
-            contains_pattern("50%_off"),
-            "%50\\%\\_off%",
-            "metacharacters stay literal"
-        );
-        assert_eq!(contains_pattern(""), "%%", "an empty needle matches all");
     }
 }

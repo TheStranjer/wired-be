@@ -177,6 +177,7 @@ mod tests {
             chat::ChatMessage as MessageRow,
             user::{DEFAULT_SCOPE, Flag},
         },
+        test_fixtures::json_keys,
         util::id::parse_id,
     };
 
@@ -404,18 +405,6 @@ mod tests {
     /// `message` rendered to a JSON value; these structs always serialize.
     fn render(message: &ChatMessage) -> Value {
         serde_json::to_value(message).unwrap()
-    }
-
-    /// The rendered object's keys, sorted, for exact key-set assertions.
-    fn json_keys(value: &Value) -> Vec<&str> {
-        let mut keys: Vec<&str> = value
-            .as_object()
-            .expect("entities render objects")
-            .keys()
-            .map(String::as_str)
-            .collect();
-        keys.sort_unstable();
-        keys
     }
 
     /// Whether `value` carries `key` at all, whatever its value.

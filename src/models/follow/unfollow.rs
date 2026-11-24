@@ -4,13 +4,11 @@
 
 use sqlx::{PgConnection, PgPool};
 
-use crate::{
-    error::AppResult,
-    models::{endorsement, user::User},
-};
+use crate::{error::AppResult, models::user::User};
 
 use super::{
     counters::step_counters,
+    dependents::clear_dependents,
     types::{Follow, FollowState},
 };
 
@@ -20,16 +18,6 @@ pub(super) const UNFOLLOW_SQL: &str = "DELETE FROM follows
       WHERE follower_id = $1 AND followee_id = $2
         AND state IN ('pending', 'accepted')
   RETURNING *";
-
-/// [`unfollow`]: the memberships the unfollowing account kept of the account
-/// they just stopped following. An account in someone's list is an account
-/// they follow (the rule [`crate::api::lists`] enforces on the way in), so
-/// taking the follow back takes those rows with it: the delete runs over the
-/// list's *owner*, which is why the follower's rows in other people's lists
-/// are untouched.
-const UNFOLLOW_LIST_MEMBERSHIPS_SQL: &str = "DELETE FROM list_members AS lm
-     USING lists AS l
-     WHERE l.id = lm.list_id AND l.user_id = $1 AND lm.user_id = $2";
 
 /// Removes `follower`'s follow of `target`, reporting whether an open
 /// relationship was there to remove.
@@ -76,13 +64,7 @@ pub(super) async fn unfollow_conn(
     if follow.state == FollowState::Accepted {
         step_counters(&mut *conn, &follow, -1).await?;
     }
-    endorsement::unendorse(&mut *conn, follower.id, target.id).await?;
-    sqlx::query(UNFOLLOW_LIST_MEMBERSHIPS_SQL)
-        .bind(follower.id)
-        .bind(target.id)
-        .execute(&mut *conn)
-        .await
-        .map(drop)?;
+    clear_dependents(conn, follower.id, target.id).await?;
     Ok(true)
 }
 

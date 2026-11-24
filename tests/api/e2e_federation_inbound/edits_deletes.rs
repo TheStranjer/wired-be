@@ -4,8 +4,8 @@ use axum::http::StatusCode;
 use serde_json::{Value, json};
 
 use super::support::{
-    BOB, REACTIONS, STATUSES, activity, create_note, deliver, entry_for, get, id_of, list, local,
-    lookup, merge, note_object, post_status, public_timeline, told_of, uri_of,
+    BOB, REACTIONS, STATUSES, activity, create_note, deliver, entry_for, get, list, local, lookup,
+    merge, note_object, post_status, public_timeline, told_of, uri_of,
 };
 use crate::{common, remote};
 
@@ -47,7 +47,7 @@ async fn a_remote_custom_emoji_reaction_carries_its_image_url() {
     };
     deliver(&app, &state, &peer, BOB, &react).await;
 
-    let id = id_of(&posted);
+    let id = common::id_of(&posted);
     let reactions = list(
         &app,
         Some(&alice_token),
@@ -92,7 +92,7 @@ async fn an_update_of_a_remote_note_edits_it_and_keeps_the_history() {
     let original = create_note(&peer, &actor, "edit-1", "<p>first draft</p>", json!({}));
     deliver(&app, &state, &peer, BOB, &original).await;
     let public = public_timeline(&app).await;
-    let id = id_of(entry_for(&public, &uri));
+    let id = common::id_of(entry_for(&public, &uri));
 
     let first_edit = note_object(
         &peer,
@@ -177,13 +177,13 @@ async fn a_delete_of_a_remote_note_takes_it_down_and_ignores_a_late_create() {
 
     let public = public_timeline(&app).await;
     let parent_entry = entry_for(&public, &parent_uri);
-    let parent_id = id_of(parent_entry);
+    let parent_id = common::id_of(parent_entry);
     assert_eq!(
         parent_entry["replies_count"],
         json!(1),
         "the child counted on its parent"
     );
-    let child_id = id_of(entry_for(&public, &child_uri));
+    let child_id = common::id_of(entry_for(&public, &child_uri));
 
     let delete = activity(&peer, "Delete", "del-act", &actor, json!(child_uri));
     deliver(&app, &state, &peer, BOB, &delete).await;

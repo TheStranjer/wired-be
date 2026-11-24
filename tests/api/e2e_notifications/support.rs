@@ -61,17 +61,9 @@ pub(super) async fn user(pool: &PgPool, nickname: &str) -> (User, String) {
     (created, token)
 }
 
-/// The `id` of a rendered entity, as its JSON spells it.
-pub(super) fn entity_id(entity: &Value) -> String {
-    entity["id"]
-        .as_str()
-        .expect("the entity carries its id")
-        .to_owned()
-}
-
 /// The `id` strings of rendered entities, in answer order.
 pub(super) fn ids_of(rows: &[Value]) -> Vec<String> {
-    rows.iter().map(entity_id).collect()
+    rows.iter().map(common::id_of).collect()
 }
 
 /// The `GET` of `path` as `token`, asserted 200 and answered as JSON.
@@ -320,7 +312,7 @@ pub(super) async fn mix(app: &Router, pool: &PgPool) -> Mixed {
     let (carol, carol_token) = user(pool, "carol").await;
     let (dave, dave_token) = user(pool, "dave").await;
     let (eve, eve_token) = user(pool, "eve").await;
-    let subject = entity_id(&post(app, &alice_token, "tell me everything").await);
+    let subject = common::id_of(&post(app, &alice_token, "tell me everything").await);
 
     let granted = follow(app, &bob_token, &alice.id.to_string()).await;
     assert_eq!(
@@ -331,8 +323,8 @@ pub(super) async fn mix(app: &Router, pool: &PgPool) -> Mixed {
     let _liked = status_action(app, &bob_token, &subject, "favourite").await;
     let _boosted = status_action(app, &carol_token, &subject, "reblog").await;
     let _reacted = react(app, &bob_token, &subject, THUMB_SEGMENT).await;
-    let carol_post = entity_id(&post(app, &carol_token, "hello @alice").await);
-    let dave_post = entity_id(&post(app, &dave_token, "@alice, once more").await);
+    let carol_post = common::id_of(&post(app, &carol_token, "hello @alice").await);
+    let dave_post = common::id_of(&post(app, &dave_token, "@alice, once more").await);
     let _also_liked = status_action(app, &dave_token, &subject, "favourite").await;
 
     // The self-actions an open inbox must stay silent about.

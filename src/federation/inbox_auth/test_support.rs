@@ -23,10 +23,10 @@ use axum::{
 use chrono::Utc;
 use serde_json::{Value, json};
 use sqlx::PgPool;
-use tokio::{net::TcpListener, task::JoinHandle};
 use tower::ServiceExt as _;
 
 use super::SignedActivity;
+pub(super) use crate::test_server::{bind, origin, spawn};
 use crate::{
     config::Config,
     federation::signature::{SigningKey, sign_request},
@@ -114,7 +114,7 @@ async fn echo_activity(activity: SignedActivity) -> Response {
 
 /// The `Person` actor document a peer serves for `id`, vouching for
 /// `public_pem` as its signing key.
-fn actor_document(id: &str, public_pem: &str) -> Value {
+fn actor_document(id: &str, public_pem: &str, key_id: &str) -> Value {
     json!({
         "@context": "https://www.w3.org/ns/activitystreams",
         "type": "Person",
@@ -123,7 +123,7 @@ fn actor_document(id: &str, public_pem: &str) -> Value {
         "name": "Alice",
         "inbox": format!("{id}/inbox"),
         "publicKey": {
-            "id": format!("{id}#main-key"),
+            "id": key_id,
             "owner": id,
             "publicKeyPem": public_pem,
         },
@@ -149,6 +149,9 @@ pub(super) struct Peer {
     pub(super) hits: Arc<AtomicUsize>,
     /// The public key the actor document carries.
     pub(super) public_pem: String,
+    /// Whether the actor names its key path-style (`{id}/main-key`, as
+    /// `GoToSocial` does) instead of with a `#main-key` fragment.
+    pub(super) path_style_key: bool,
 }
 
 /// A peer at `base` serving `public_pem`.
@@ -157,16 +160,32 @@ pub(super) fn peer(base: String, public_pem: String) -> Peer {
         base,
         hits: Arc::new(AtomicUsize::new(0)),
         public_pem,
+        path_style_key: false,
+    }
+}
+
+/// A peer at `base` whose actor names its key `{id}/main-key`, the
+/// `GoToSocial` shape no fragment strip maps back to the actor.
+pub(super) fn path_key_peer(base: String, public_pem: String) -> Peer {
+    Peer {
+        path_style_key: true,
+        ..peer(base, public_pem)
     }
 }
 
 /// Counts the hit and answers the self-identifying actor document.
+///
+/// Also answers at the path-style key URL, as `GoToSocial` does: the document
+/// names its own `id`, so the fetcher follows it.
 async fn serve_actor(State(peer): State<Peer>) -> Response {
     let _hits = peer.hits.fetch_add(1, Ordering::SeqCst);
-    actor_response(&actor_document(
-        &format!("{}/users/alice", peer.base),
-        &peer.public_pem,
-    ))
+    let id = format!("{}/users/alice", peer.base);
+    let key_id = if peer.path_style_key {
+        format!("{id}/main-key")
+    } else {
+        format!("{id}#main-key")
+    };
+    actor_response(&actor_document(&id, &peer.public_pem, &key_id))
 }
 
 /// Counts the hit and answers the standalone key object whose `owner`
@@ -187,25 +206,6 @@ async fn status_only(State(status): State<StatusCode>) -> StatusCode {
     status
 }
 
-/// Binds an unused loopback port.
-pub(super) async fn bind() -> TcpListener {
-    TcpListener::bind("127.0.0.1:0").await.unwrap()
-}
-
-/// The `http://{addr}` origin a listener answers on.
-pub(super) fn origin(listener: &TcpListener) -> String {
-    format!("http://{}", listener.local_addr().unwrap())
-}
-
-/// Serves `app` on `listener` until the test aborts the task.
-pub(super) fn spawn(listener: TcpListener, app: Router) -> JoinHandle<()> {
-    tokio::spawn(async move {
-        if let Err(err) = axum::serve(listener, app).await {
-            tracing::debug!("test server stopped: {err}");
-        }
-    })
-}
-
 /// A mock peer answering `/users/alice` (actor), `/keys/1` (key
 /// object), `/gone` (410) and `/missing` (404). Routes with different
 /// state types get their state erased and the pieces merged, the
@@ -214,6 +214,7 @@ pub(super) fn peer_app(peer: Peer) -> Router {
     let actor_peer = peer.clone();
     Router::new()
         .route("/users/alice", get(serve_actor))
+        .route("/users/alice/main-key", get(serve_actor))
         .with_state(actor_peer)
         .merge(
             Router::new()

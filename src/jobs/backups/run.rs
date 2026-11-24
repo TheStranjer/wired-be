@@ -2,11 +2,8 @@
 //! [`KIND_RUN`](crate::api::backups::KIND_RUN) handler that builds the
 //! requested account's [`BackupArchive`](super::archive::BackupArchive),
 //! stores it under [`storage_key`], and marks the row processed — with
-//! [`RunArgs`]'s parsing, the [`retry`] the two queue handlers share, and
-//! [`KIND_PURGE`], the kind [`handle_purge`](super::purge::handle_purge)
-//! answers to.
-
-use std::fmt;
+//! [`RunArgs`] and [`KIND_PURGE`], the kind
+//! [`handle_purge`](super::purge::handle_purge) answers to.
 
 use bytes::Bytes;
 use serde::Deserialize;
@@ -16,11 +13,8 @@ use uuid::Uuid;
 
 use super::archive::build;
 use crate::{
-    jobs::{AttemptInfo, HandlerFuture, JobError},
-    models::{
-        backup,
-        user::{self, User},
-    },
+    jobs::{AttemptInfo, HandlerFuture, JobError, load_user, parse_args, retry},
+    models::backup,
     state::AppState,
 };
 
@@ -42,20 +36,8 @@ struct RunArgs {
     backup_id: Uuid,
 }
 
-/// Reads [`RunArgs`] out of a claimed job's payload; arguments this shape
-/// cannot deserialize are permanent — the job is discarded, never retried.
-fn parse_args(args: &Value) -> Result<Uuid, JobError> {
-    serde_json::from_value::<RunArgs>(args.clone())
-        .map(|parsed| parsed.backup_id)
-        .map_err(|err| JobError::Discard(format!("backup job arguments are unusable: {err}")))
-}
-
-/// Lifts a failure outside the queue's discard arms into a retry, naming
-/// the step that hit it; every remaining step of a run converges on a
-/// rerun, so another pass costs nothing but the wait.
-pub(super) fn retry(step: &str, err: &dyn fmt::Display) -> JobError {
-    JobError::Retry(format!("backup {step} failed: {err}"))
-}
+/// The job name in the discard text of unusable [`RunArgs`].
+const RUN_JOB: &str = "backup";
 
 /// The storage key of the archive `file_name` belonging to `user_id`:
 /// `backups/{user_id}/{file_name}` inside the uploads store. Both parts
@@ -82,25 +64,28 @@ pub(super) fn storage_key(user_id: Uuid, file_name: &str) -> String {
 /// it, at the latest when this handler returns.
 pub fn handle_run(state: AppState, _attempt: AttemptInfo, args: Value) -> HandlerFuture {
     Box::pin(async move {
-        let backup_id = parse_args(&args)?;
+        let backup_id = parse_args::<RunArgs>(&args, RUN_JOB)?.backup_id;
         let row = load_backup(&state, backup_id).await?;
-        let owner = load_owner(&state, row.user_id).await?;
+        // The id comes from the row, so a vanished owner is the race the
+        // account's delete won between the two reads. A deactivated owner
+        // still gets the archive they asked for.
+        let owner = load_user(&state, row.user_id, "backup", false).await?;
         let archive = build(&state, &owner, &row.file_name)
             .await
-            .map_err(|err| retry("archive build", &err))?;
+            .map_err(|err| retry("backup archive build", &err))?;
         let key = storage_key(owner.id, archive.file_name());
         let bytes = tokio::fs::read(archive.temp.path())
             .await
-            .map_err(|err| retry("archive read", &err))?;
+            .map_err(|err| retry("backup archive read", &err))?;
         state
             .uploader
             .put(&key, Bytes::from(bytes), ARCHIVE_CONTENT_TYPE)
             .await
-            .map_err(|err| retry("archive upload", &err))?;
+            .map_err(|err| retry("backup archive upload", &err))?;
         let size = i64::try_from(archive.size()).unwrap_or(i64::MAX);
         let marked = backup::mark_processed(&state.db, row.id, size, &key)
             .await
-            .map_err(|err| retry("row mark", &err))?;
+            .map_err(|err| retry("backup row mark", &err))?;
         if let Some(marked) = marked {
             debug!(
                 backup = %marked.id,
@@ -133,25 +118,7 @@ async fn load_backup(state: &AppState, id: Uuid) -> Result<backup::Backup, JobEr
         Ok(None) => Err(JobError::Discard(format!(
             "the backup job's backup {id} no longer exists"
         ))),
-        Err(err) => Err(retry("row read", &err)),
-    }
-}
-
-/// The account whose archive the row requests. A vanished owner is
-/// permanent (discard), exactly as in [`load_backup`]; the id comes from
-/// the row, so this is the race the delete won between the two reads.
-///
-/// # Errors
-///
-/// [`JobError::Discard`] when the user row is gone, [`JobError::Retry`]
-/// on a database failure.
-async fn load_owner(state: &AppState, user_id: Uuid) -> Result<User, JobError> {
-    match user::get_by_id(&state.db, user_id).await {
-        Ok(Some(owner)) => Ok(owner),
-        Ok(None) => Err(JobError::Discard(format!(
-            "the backup job's user {user_id} no longer exists"
-        ))),
-        Err(err) => Err(retry("owner read", &err)),
+        Err(err) => Err(retry("backup row read", &err)),
     }
 }
 

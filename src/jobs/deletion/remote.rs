@@ -6,9 +6,9 @@ use tracing::debug;
 
 #[cfg(doc)]
 use super::KIND_DELETE_REMOTE;
-use super::{SweepCounts, clear_shared, local::load_account, parse_args};
+use super::{DELETE_JOB, DeleteArgs, SweepCounts, clear_shared, local::load_account};
 use crate::{
-    jobs::{AttemptInfo, HandlerFuture, JobError},
+    jobs::{AttemptInfo, HandlerFuture, JobError, parse_args},
     models::user,
     state::AppState,
 };
@@ -26,7 +26,7 @@ use crate::{
 /// retries, the writes being idempotent.
 pub fn handle_delete_remote(state: AppState, _attempt: AttemptInfo, args: Value) -> HandlerFuture {
     Box::pin(async move {
-        let user_id = parse_args(&args)?;
+        let user_id = parse_args::<DeleteArgs>(&args, DELETE_JOB)?.user_id;
         let account = load_account(&state, user_id).await?;
         clear_remote_data(&state, &account).await?;
         debug!(account = %account.nickname, "remote account deletion finished");
@@ -312,7 +312,7 @@ mod tests {
 
         let outcome = run_remote(&broken_state().await, alice.id).await;
         assert!(
-            matches!(&outcome, Err(JobError::Retry(detail)) if detail.starts_with("account delete pass failed")),
+            matches!(&outcome, Err(JobError::Retry(detail)) if detail.starts_with("delete user read failed")),
             "a closed pool retries: {outcome:?}"
         );
     }

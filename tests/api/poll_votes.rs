@@ -28,7 +28,6 @@ use serde_json::{Value, json};
 use sqlx::PgPool;
 use uuid::Uuid;
 use wired_be::{
-    federation::dispatch::handle_incoming,
     models::{
         notification::TYPE_POLL,
         poll::{self, Poll, PollOption},
@@ -38,30 +37,12 @@ use wired_be::{
     state::AppState,
 };
 
-use crate::common;
+use crate::common::{self, deliver, delivering_state};
 
 /// The remote voter every fixture delivers as.
 const BOB: &str = "https://remote.example/users/bob";
 /// The addressing a public answer carries.
 const PUBLIC: &str = "https://www.w3.org/ns/activitystreams#Public";
-
-/// The job args the inbox routes write for a delivery signed by `who`.
-fn incoming_args(activity: &Value, who: &User) -> Value {
-    json!({"activity": activity, "signer_id": who.id.to_string(), "inbox_owner": null})
-}
-
-/// Runs one activity through the real dispatcher and fails the test if
-/// the job wants a retry or refuses the document.
-async fn deliver(state: &AppState, activity: &Value, who: &User) {
-    handle_incoming(state.clone(), incoming_args(activity, who))
-        .await
-        .expect("the vote fixture delivery completes the job");
-}
-
-/// The dispatcher state over the stock test config.
-fn delivering_state(pool: &PgPool) -> AppState {
-    common::test_app_state(pool.clone(), common::test_config())
-}
 
 /// The host segment of an actor id, for building activity and object ids
 /// that containment will accept from that actor.

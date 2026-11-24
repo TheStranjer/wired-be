@@ -103,18 +103,6 @@ const TYPE_EVENT: &str = "Event";
 /// in the array (including Pleroma's `Hashtag`-typed leftovers) is skipped.
 const ATTACHMENT_TYPES: [&str; 5] = ["Document", "Image", "Video", "Audio", "Link"];
 
-/// The three spellings of the public addressing recipient: the full
-/// `ActivityStreams` iri, the prefix form Pleroma emits, and the bare word
-/// older software sends (Pleroma's `fix_addressing_public` normalizes all
-/// three to the iri). Shared with
-/// [`crate::federation::publisher`], which likewise never treats any of
-/// them as a deliverable recipient.
-pub(crate) const PUBLIC_RECIPIENTS: [&str; 3] = [
-    "https://www.w3.org/ns/activitystreams#Public",
-    "as:Public",
-    "Public",
-];
-
 /// The quote-reference fields, tried in order: the FEP-044f `quote`,
 /// Mastodon's and Fedibird's `quoteUrl`/`quoteUri` and Misskey's
 /// `_misskey_quote` (Pleroma's `CommonFixes.fix_quote_url`).

@@ -58,18 +58,6 @@ const ACTOR_KEYS: [&str; 21] = [
     "url",
 ];
 
-/// The sorted key set of `document`.
-fn key_set(document: &Value) -> Vec<&str> {
-    let mut keys: Vec<&str> = document
-        .as_object()
-        .expect("an actor document is a JSON object")
-        .keys()
-        .map(String::as_str)
-        .collect();
-    keys.sort_unstable();
-    keys
-}
-
 /// `GET /internal/fetch` on `app` and the document it answers.
 async fn fetch_instance_actor(app: &Router) -> Value {
     let response = common::TestRequest::get(INSTANCE_ACTOR_PATH)
@@ -145,7 +133,7 @@ async fn the_instance_actor_document_is_served_and_created_once() {
         "the key is generated on first use"
     );
     assert_eq!(
-        key_set(&document),
+        common::sorted_keys(&document),
         ACTOR_KEYS,
         "the same builder as the user documents"
     );

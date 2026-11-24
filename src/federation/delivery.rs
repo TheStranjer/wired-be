@@ -78,7 +78,7 @@ mod send_signing;
 #[cfg(test)]
 mod test_support;
 
-pub use enqueue::{best_inbox, enqueue_delivery};
+pub use enqueue::{best_inbox, enqueue_checked, enqueue_delivery};
 pub use send::{handle, is_local_inbox};
 
 /// The job kind of one inbox delivery, on
@@ -93,9 +93,6 @@ pub const KIND_DELIVER: &str = "federator.deliver";
 /// leaves the pair undelivered; seven is that handful, and the queue's
 /// [`backoff`](crate::jobs::backoff) keeps the last attempts hours apart.
 pub const MAX_ATTEMPTS: i32 = 7;
-
-/// The media type a delivery POST carries and asks for.
-const ACTIVITY_JSON: &str = "application/activity+json";
 
 /// The prefix of a delivery's deduplication key.
 const UNIQUE_KEY_PREFIX: &str = "deliver";

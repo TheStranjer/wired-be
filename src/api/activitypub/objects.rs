@@ -8,7 +8,7 @@
 use axum::{
     Json,
     extract::{Path, State},
-    http::{HeaderMap, HeaderValue, Method, StatusCode, Uri, header},
+    http::{HeaderMap, Method, StatusCode, Uri, header},
     response::{IntoResponse as _, Response},
 };
 use uuid::Uuid;
@@ -29,9 +29,9 @@ use crate::{
     util::id::parse_id,
 };
 
-use super::ACTIVITY_JSON;
 use super::negotiation::{
-    document, document_response, frontend_redirect, wants_activity_json, wants_html, with_vary,
+    activity_content_type, document, document_response, frontend_redirect, wants_activity_json,
+    wants_html, with_vary,
 };
 
 /// `GET /objects/{uuid}/replies` — the replies collection of one local
@@ -241,10 +241,7 @@ pub(super) async fn read_admitted(
 fn tombstone_response(status: &Status) -> Response {
     (
         StatusCode::GONE,
-        [(
-            header::CONTENT_TYPE,
-            HeaderValue::from_static(ACTIVITY_JSON),
-        )],
+        [(header::CONTENT_TYPE, activity_content_type())],
         Json(tombstone_json(status)),
     )
         .into_response()

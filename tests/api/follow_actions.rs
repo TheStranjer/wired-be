@@ -29,7 +29,7 @@ use wired_be::{
     config::TEST_BASE_URL,
     models::{
         follow::{self, Follow, FollowState},
-        user::{Flag, User, get_by_id},
+        user::{Flag, User},
     },
 };
 
@@ -132,11 +132,6 @@ async fn locked_user(pool: &PgPool, nickname: &str) -> User {
     .await
 }
 
-/// The row of user `id` as it stands now, for reading counters back.
-async fn fresh_user(pool: &PgPool, id: Uuid) -> User {
-    get_by_id(pool, id).await.unwrap().expect("the user exists")
-}
-
 /// The stored relationship of the pair, which the test expects to exist.
 async fn relation(pool: &PgPool, follower: &User, target: &User) -> Follow {
     follow::get(pool, follower.id, target.id)
@@ -221,8 +216,8 @@ async fn following_an_open_account_is_granted() {
     );
     assert_eq!(
         (
-            fresh_user(&pool, bob.id).await.followers_count,
-            fresh_user(&pool, alice.id).await.following_count
+            common::reload_user(&pool, bob.id).await.followers_count,
+            common::reload_user(&pool, alice.id).await.following_count
         ),
         (1, 1),
         "both denormalised counters moved once"
@@ -242,8 +237,8 @@ async fn following_an_open_account_is_granted() {
     );
     assert_eq!(
         (
-            fresh_user(&pool, bob.id).await.followers_count,
-            fresh_user(&pool, alice.id).await.following_count
+            common::reload_user(&pool, bob.id).await.followers_count,
+            common::reload_user(&pool, alice.id).await.following_count
         ),
         (1, 1),
         "following twice is not following twice"
@@ -284,9 +279,9 @@ async fn following_a_locked_or_remote_account_is_requested() {
     );
     assert_eq!(
         (
-            fresh_user(&pool, carol.id).await.followers_count,
-            fresh_user(&pool, erin.id).await.followers_count,
-            fresh_user(&pool, alice.id).await.following_count,
+            common::reload_user(&pool, carol.id).await.followers_count,
+            common::reload_user(&pool, erin.id).await.followers_count,
+            common::reload_user(&pool, alice.id).await.following_count,
         ),
         (0, 0, 0),
         "requests count for nothing, on either end"
@@ -325,8 +320,8 @@ async fn follow_toggles_are_stored_with_the_follow() {
     assert_eq!(row_count(&pool).await, 1, "one pair, one row");
     assert_eq!(
         (
-            fresh_user(&pool, bob.id).await.followers_count,
-            fresh_user(&pool, alice.id).await.following_count
+            common::reload_user(&pool, bob.id).await.followers_count,
+            common::reload_user(&pool, alice.id).await.following_count
         ),
         (1, 1),
         "and the toggled follow counted exactly once"
@@ -539,8 +534,8 @@ async fn unfollowing_takes_the_follow_back() {
     );
     assert_eq!(
         (
-            fresh_user(&pool, bob.id).await.followers_count,
-            fresh_user(&pool, alice.id).await.following_count
+            common::reload_user(&pool, bob.id).await.followers_count,
+            common::reload_user(&pool, alice.id).await.following_count
         ),
         (0, 0),
         "the removed follow came off both counters, and carol's standing request never counted"
@@ -586,8 +581,8 @@ async fn unfollowing_takes_the_follow_back() {
     );
     assert_eq!(
         (
-            fresh_user(&pool, alice.id).await.followers_count,
-            fresh_user(&pool, dave.id).await.following_count
+            common::reload_user(&pool, alice.id).await.followers_count,
+            common::reload_user(&pool, dave.id).await.following_count
         ),
         (1, 1),
         "counted as it was, and still is"
@@ -638,7 +633,7 @@ async fn following_yourself_is_the_documented_422() {
         "answered as the caller's own default relationship"
     );
     assert_eq!(
-        fresh_user(&pool, alice.id).await.following_count,
+        common::reload_user(&pool, alice.id).await.following_count,
         0,
         "the whole sequence counted nothing"
     );
@@ -786,7 +781,7 @@ async fn the_routes_require_a_user_token() {
     }
     assert_eq!(row_count(&pool).await, 0, "none of them reached the write");
     assert_eq!(
-        fresh_user(&pool, alice.id).await.following_count,
+        common::reload_user(&pool, alice.id).await.following_count,
         0,
         "and none of them counted anything"
     );
@@ -899,7 +894,7 @@ async fn both_routes_share_the_relations_actions_bucket() {
         "the follow, its unfollow and the refused retry left no row"
     );
     assert_eq!(
-        fresh_user(&pool, alice.id).await.following_count,
+        common::reload_user(&pool, alice.id).await.following_count,
         0,
         "and nothing moved the counters either"
     );

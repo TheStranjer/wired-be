@@ -145,14 +145,6 @@ pub(super) fn uri_of(entity: &Value) -> String {
         .to_owned()
 }
 
-/// The `id` text of an entity.
-pub(super) fn id_of(entity: &Value) -> String {
-    entity["id"]
-        .as_str()
-        .expect("the entity carries an id string")
-        .to_owned()
-}
-
 /// Whether `entries` carry a status with object uri `uri`.
 pub(super) fn carries_uri(entries: &[Value], uri: &str) -> bool {
     entries.iter().any(|entry| entry["uri"] == json!(uri))

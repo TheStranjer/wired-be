@@ -97,18 +97,6 @@ async fn webfinger_with_accept(
         .await
 }
 
-/// The sorted key names of `object`.
-fn key_set(object: &Value) -> Vec<&str> {
-    let mut keys: Vec<&str> = object
-        .as_object()
-        .expect("a JSON object")
-        .keys()
-        .map(String::as_str)
-        .collect();
-    keys.sort_unstable();
-    keys
-}
-
 /// The JSON answer to an `acct:` lookup: subject, aliases and the three
 /// links, with nothing else — exact key sets included.
 #[tokio::test]
@@ -126,22 +114,22 @@ async fn acct_resource_resolves_the_local_user() {
     let document = response.json_value();
     assert_eq!(document, alice_jrd(), "the exact JRD document");
     assert_eq!(
-        key_set(&document),
+        common::sorted_keys(&document),
         ["aliases", "links", "subject"],
         "top-level keys"
     );
     assert_eq!(
-        key_set(&document["links"][0]),
+        common::sorted_keys(&document["links"][0]),
         ["href", "rel", "type"],
         "profile link keys"
     );
     assert_eq!(
-        key_set(&document["links"][1]),
+        common::sorted_keys(&document["links"][1]),
         ["href", "rel", "type"],
         "self link keys"
     );
     assert_eq!(
-        key_set(&document["links"][2]),
+        common::sorted_keys(&document["links"][2]),
         ["rel", "template"],
         "the subscribe link has no type or href"
     );

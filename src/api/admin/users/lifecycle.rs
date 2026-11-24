@@ -24,6 +24,10 @@ use crate::{
     state::AppState,
 };
 
+/// The 403 body of a toggle that would deactivate the caller's own account,
+/// worded like the Mastodon admin API's refusal of the same kind.
+const SELF_DEACTIVATION: &str = "This action is not allowed";
+
 /// `DELETE /api/v1/pleroma/admin/users` — Pleroma's `delete`: every named
 /// account that exists starts its deletion, and the answer is the JSON
 /// array of the nicknames started. Two divergences from Pleroma's
@@ -90,25 +94,11 @@ pub(super) async fn write_activation(
     active: bool,
 ) -> AppResult<Json<AdminAccounts>> {
     let found = admin::resolve_nicknames(&state.db, nicknames).await?;
-    let mut moved = Vec::with_capacity(found.len());
-    for account in &found {
-        if !active && account.id == actor.id {
-            continue;
-        }
-        if let Some(updated) = admin::set_active(&state.db, account.id, active).await? {
-            moved.push(updated);
-        }
-    }
-    let logged = if active {
-        moderation_log::activate(&state.db, actor, &moved).await?
-    } else {
-        moderation_log::deactivate(&state.db, actor, &moved).await?
-    };
-    debug!(
-        log = %logged.id,
-        moved = moved.len(),
-        active, "admin changed account activations"
-    );
+    let subjects: Vec<User> = found
+        .into_iter()
+        .filter(|account| active || account.id != actor.id)
+        .collect();
+    let moved = helpers::set_activation(state, actor, &subjects, active).await?;
     Ok(Json(AdminAccounts::from_users(&moved, &state.config)))
 }
 
@@ -151,14 +141,17 @@ pub(super) async fn deactivate_users(
 /// segment names (nickname or id, the show's lookup, mirror included),
 /// answer its single admin entity and log the move that was made — an
 /// activation logged `activate`, a deactivation `deactivate`, Pleroma's
-/// own choice of action for the entry. Unlike the bulk pair, no account is
-/// protected: the admin who toggles their own console off gets the entity
-/// of a deactivated self, the state Pleroma's route answers too.
+/// own choice of action for the entry. Like the bulk deactivation, it
+/// refuses to lock the caller out: toggling the caller's own active account
+/// is a 403 and writes nothing (a deactivated caller cannot reach this
+/// route, so only the deactivating flip is ever refused).
 ///
 /// # Errors
 ///
 /// [`AppError::Unauthorized`] / [`AppError::Forbidden`] from [`AdminUser`]
-/// and its `admin:write` gate; [`AppError::RouteNotFound`] from
+/// and its `admin:write` gate, and [`AppError::Forbidden`] with
+/// [`SELF_DEACTIVATION`] for the caller's own active account;
+/// [`AppError::RouteNotFound`] from
 /// [`named_account`] or from the write matching no row;
 /// [`AppError::Database`] from the write and the log.
 pub(super) async fn toggle_activation(
@@ -168,18 +161,15 @@ pub(super) async fn toggle_activation(
 ) -> AppResult<Json<AdminAccount>> {
     admin.require(CLASS_WRITE, AREA_ACCOUNTS)?;
     let found = named_account(&state, &raw).await?;
+    if found.id == admin.0.id && found.is_active.get() {
+        return Err(AppError::Forbidden(SELF_DEACTIVATION.to_owned()));
+    }
     let activate = !found.is_active.get();
-    let updated = admin::set_active(&state.db, found.id, activate)
+    let updated = helpers::set_activation(&state, &admin.0, slice::from_ref(&found), activate)
         .await?
+        .pop()
         .ok_or(AppError::RouteNotFound)?;
-    let subjects = slice::from_ref(&found);
-    let logged = if activate {
-        moderation_log::activate(&state.db, &admin.0, subjects).await?
-    } else {
-        moderation_log::deactivate(&state.db, &admin.0, subjects).await?
-    };
     debug!(
-        log = %logged.id,
         id = %found.id,
         nickname = %found.nickname,
         activated = activate,

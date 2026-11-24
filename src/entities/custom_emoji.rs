@@ -72,6 +72,7 @@ mod tests {
 
     use super::*;
     use crate::config::{TEST_BASE_URL, TEST_DATABASE_URL};
+    use crate::test_fixtures::json_keys;
     use crate::util::time::parse_time;
 
     /// The hyphenated lowercase id every fixture row carries.
@@ -168,18 +169,6 @@ mod tests {
             serde_json::json!(format!("{BASE}/emoji/custom/cat.png")),
             "and so is its still variant"
         );
-    }
-
-    /// The rendered object's keys, sorted, for exact key-set assertions.
-    fn json_keys(value: &serde_json::Value) -> Vec<&str> {
-        let mut keys: Vec<&str> = value
-            .as_object()
-            .unwrap()
-            .keys()
-            .map(String::as_str)
-            .collect();
-        keys.sort_unstable();
-        keys
     }
 
     #[test]

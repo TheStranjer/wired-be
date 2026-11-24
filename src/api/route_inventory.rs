@@ -23,7 +23,9 @@
 //! The table holds one row per Pleroma route this backend replicates, in the
 //! order of the router file's scopes. Routes Pleroma has and Wired does not —
 //! the frontend uploader's `POST /api/v1/pleroma/uploader_callback/:upload_path`,
-//! Phoenix's dev and test routes, `/phoenix/live_dashboard`, the SPA
+//! the OAuth MFA code-entry page `GET /oauth/mfa` and its
+//! `POST /oauth/mfa/verify` form, Phoenix's dev and test routes,
+//! `/phoenix/live_dashboard`, the SPA
 //! fallbacks (`GET /:maybe_nickname_or_id` and `GET /*path`) and the Shout
 //! channel socket (`/socket`) — are deliberately absent; the README's
 //! "API coverage" section names them.
@@ -110,9 +112,9 @@ mod tests {
     use super::{AuthClass, ROUTES, RouteSpec, routes};
 
     /// The assembled table is exactly the one that lived in this file before
-    /// the split: twelve sections, none of them empty, 370 rows, opening
-    /// with the instance metadata route and closing with the instance's HTML
-    /// pages.
+    /// the split: twelve sections, none of them empty, 366 rows, opening
+    /// with the instance metadata route and closing with the custom emoji
+    /// files.
     #[test]
     fn routes_assembles_the_whole_table_in_order() {
         assert_eq!(ROUTES.len(), 12, "one section per surface");
@@ -123,7 +125,7 @@ mod tests {
         let rows: Vec<&RouteSpec> = routes().collect();
         assert_eq!(
             rows.len(),
-            370,
+            366,
             "the assembled table holds every row exactly once"
         );
         assert_eq!(
@@ -139,10 +141,10 @@ mod tests {
             rows.last(),
             Some(&&RouteSpec {
                 method: "GET",
-                path: "/instance/:name.html",
+                path: "/emoji/:pack/:file",
                 auth: AuthClass::Public,
             }),
-            "the table closes with the instance's HTML pages"
+            "the table closes with the custom emoji files"
         );
     }
 }

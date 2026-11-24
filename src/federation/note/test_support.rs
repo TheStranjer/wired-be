@@ -17,6 +17,10 @@ use crate::{
 
 use super::{NoteContext, litepub_context_json, note_json};
 
+// Every field of a rendered document, sorted — the exact key-set assertion
+// the goldens pair with.
+pub(super) use crate::test_fixtures::json_keys;
+
 /// The instance origin of [`Config::for_tests`].
 pub(super) const BASE: &str = "https://test.example";
 /// The schema URL every document's `@context` names.
@@ -36,19 +40,6 @@ pub(super) const PARENT_URI: &str = "https://remote.example/objects/parent-post"
 pub(super) const PUBLISHED: &str = "2024-01-31T12:34:56.789Z";
 /// The moment the tombstone fixture reports its deletion.
 pub(super) const DELETED: &str = "2024-02-01T08:00:00.000Z";
-
-/// Every field of a rendered document, sorted — the exact key-set
-/// assertion the goldens pair with.
-pub(super) fn json_keys(value: &Value) -> Vec<&str> {
-    let mut keys: Vec<&str> = value
-        .as_object()
-        .expect("a document is a JSON object")
-        .keys()
-        .map(String::as_str)
-        .collect();
-    keys.sort_unstable();
-    keys
-}
 
 /// A [`User`] row named `nickname` at `ap_id`, local or not as asked:
 /// the mention and author fixtures.

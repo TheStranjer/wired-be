@@ -139,10 +139,6 @@ async fn show_renders_the_public_pleroma_block_without_auth() {
         .expect("every account renders a pleroma block");
     assert_eq!(pleroma["ap_id"], alice.ap_id, "ap_id repeats the actor id");
     assert_eq!(
-        pleroma["deactivated"], false,
-        "an active account is not deactivated"
-    );
-    assert_eq!(
         pleroma["confirmation_pending"], false,
         "a stored account is confirmed by default"
     );
@@ -154,7 +150,6 @@ async fn show_renders_the_public_pleroma_block_without_auth() {
         pleroma["accepts_chat_messages"], true,
         "a local account always answers for its own capability"
     );
-    assert_eq!(pleroma["tags"], json!([]), "no tags is the empty array");
     assert_eq!(
         pleroma["background_image"],
         Value::Null,
@@ -173,10 +168,13 @@ async fn show_renders_the_public_pleroma_block_without_auth() {
         "chat_token",
         "birthday",
         "show_birthday",
+        "allow_following_move",
+        "deactivated",
+        "tags",
     ] {
         assert!(
             pleroma.get(hidden).is_none(),
-            "`{hidden}` is only ever rendered for the account itself"
+            "`{hidden}` is never rendered for an anonymous viewer"
         );
     }
 }

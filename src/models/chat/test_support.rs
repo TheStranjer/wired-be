@@ -8,12 +8,12 @@ use uuid::Uuid;
 use crate::{
     config::TEST_BASE_URL,
     error::AppError,
-    models::user::{NewUser, User, insert},
+    models::user::User,
     pagination::{MAX_LIMIT, PageParams},
     util::id::new_id,
 };
 
-pub(super) use crate::test_fixtures::local_user as local;
+pub(super) use crate::test_fixtures::{local_user as local, remote_user as remote};
 
 use super::{
     Chat, ChatFilter, ChatMessage, ChatMessageReference, NewChatMessage, add_message,
@@ -22,21 +22,6 @@ use super::{
 
 /// The whole list in one page.
 pub(super) const ALL: &str = "limit=40";
-
-/// Inserts a mirror of `nickname` on `remote.example`.
-pub(super) async fn remote(pool: &PgPool, nickname: &str) -> User {
-    insert(
-        pool,
-        &NewUser {
-            nickname: format!("{nickname}@remote.example"),
-            ap_id: format!("https://remote.example/users/{nickname}"),
-            domain: Some("remote.example".to_owned()),
-            ..NewUser::default()
-        },
-    )
-    .await
-    .expect("fixture remote user inserts")
-}
 
 /// Sends `text` from `sender` to `recipient` in a transaction of its own —
 /// what a caller of [`add_message`] does — and returns what it answered.

@@ -52,8 +52,8 @@ mod activitypub;
 mod admin;
 
 /// The admin OAuth-app maintenance and instance-document endpoints over
-/// HTTP (`/oauth_app`, `/instance_document/{name}` and the public
-/// `GET /instance/{name}.html`, WBE-205): the CRUD walk and its filters,
+/// HTTP (`/oauth_app`, `/instance_document/{name}` and the public JSON
+/// `GET /api/v1/instance/terms_of_service`, WBE-205): the CRUD walk and its filters,
 /// the `trusted` flag, the `{"errors": …}` refusals, the document
 /// upload/read/delete cycle with its headers, size gate and traversal
 /// refusals, and both areas' scope gates.
@@ -83,7 +83,7 @@ mod admin_content;
 mod admin_federation;
 
 /// The admin ops endpoints over HTTP: the media-proxy cache ledger, the
-/// frontend catalogue and installer, and the admin backup trigger.
+/// admin backup trigger, and the unported frontend installer routes.
 mod admin_ops;
 
 /// The admin reports surface over HTTP (`/api/v1/pleroma/admin/reports`,
@@ -355,10 +355,6 @@ mod follow_requests;
 /// The `/health` endpoint and the `common` harness itself.
 mod health;
 
-/// The HTML helper pages (the unsubscribe page, the module's shared page
-/// builders and the retired embed card and player).
-mod html_pages;
-
 /// Remote-note ingestion over HTTP: fixture `Create` activities run through
 /// the real dispatcher and the statuses they land, seen from the client
 /// API.
@@ -454,7 +450,8 @@ mod oauth;
 /// The external OAuth login endpoints.
 mod oauth_external;
 
-/// The OAuth MFA challenge flow (`/oauth/mfa` and the token grant's challenge).
+/// The OAuth MFA challenge flow (`/oauth/mfa/challenge`, the token grant's
+/// challenge and the retired `/oauth/mfa` pages).
 mod oauth_mfa;
 
 /// OAuth token management (`/api/oauth_tokens` and the pleroma apps).
@@ -535,8 +532,8 @@ pub mod remote;
 
 /// Remote interaction over HTTP (`src/api/remote_interaction.rs`): the
 /// `POST /api/v1/pleroma/remote_interaction` refusals, the
-/// retired `/ostatus_subscribe` pair, the `/authorize_interaction`
-/// frontend redirects and the retired `/main/ostatus` pair.
+/// retired `/ostatus_subscribe` pair, the retired `/authorize_interaction`
+/// and the retired `/main/ostatus` pair.
 mod remote_interaction;
 
 /// `POST /api/v1/accounts/{id}/remove_from_followers`.

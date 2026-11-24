@@ -81,6 +81,25 @@ pub async fn get_by_ap_id(pool: &PgPool, ap_id: &str) -> AppResult<Option<User>>
     Ok(user)
 }
 
+/// Fetches the user whose document named `key_id` as its `publicKey.id`.
+///
+/// `None` when no mirror stored it. The comparison is exact and served by
+/// the unique partial index on the column; it is how an inbox signature's
+/// `keyId` finds a path-style key (`GoToSocial`'s `.../users/alice/main-key`)
+/// that is not the actor URL plus a fragment.
+///
+/// # Errors
+///
+/// Any database failure (connection, encoding) arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn get_by_public_key_id(pool: &PgPool, key_id: &str) -> AppResult<Option<User>> {
+    let user = sqlx::query_as::<_, User>("SELECT * FROM users WHERE public_key_id = $1")
+        .bind(key_id)
+        .fetch_optional(pool)
+        .await?;
+    Ok(user)
+}
+
 /// Fetches the local user whose email is `email`, `None` when absent.
 ///
 /// The comparison is case-insensitive because the column is citext (the
@@ -440,6 +459,48 @@ mod tests {
                 "`{acct}` must resolve to {expected:?}, got {got:?}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn get_by_public_key_id_finds_the_stored_id_and_nothing_else() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let mirror = insert(
+            &pool,
+            &NewUser {
+                nickname: "mirror@remote.example".to_owned(),
+                ap_id: "https://remote.example/users/mirror".to_owned(),
+                domain: Some("remote.example".to_owned()),
+                ..NewUser::default()
+            },
+        )
+        .await
+        .expect("the remote fixture inserts");
+        let key_id = "https://remote.example/users/mirror/main-key";
+
+        assert!(
+            get_by_public_key_id(&pool, key_id).await.unwrap().is_none(),
+            "an unknown key id finds nobody"
+        );
+
+        let _stored = sqlx::query("UPDATE users SET public_key_id = $1 WHERE id = $2")
+            .bind(key_id)
+            .bind(mirror.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let found = get_by_public_key_id(&pool, key_id)
+            .await
+            .unwrap()
+            .expect("the stored key id finds its row");
+        assert_eq!(found.id, mirror.id, "the row that stores it");
+        assert!(
+            get_by_public_key_id(&pool, "https://remote.example/users/mirror")
+                .await
+                .unwrap()
+                .is_none(),
+            "the actor id is not a key id"
+        );
     }
 
     #[tokio::test]

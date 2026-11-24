@@ -5,8 +5,8 @@
 use axum::http::StatusCode;
 
 use super::support::{
-    READ_SCOPE, ROOT, SCOPE, V2_ROOT, assert_refused, error_message, fixture, get_anonymous,
-    get_as, open_path, post_empty, thread,
+    READ_SCOPE, ROOT, SCOPE, V2_ROOT, assert_refused, fixture, get_anonymous, get_as, open_path,
+    post_empty, thread,
 };
 use crate::common;
 
@@ -114,7 +114,7 @@ async fn creating_a_chat_demands_write_chats() {
         reader.text()
     );
     assert_eq!(
-        error_message(&reader).as_deref(),
+        reader.error_field().as_deref(),
         Some("Insufficient permissions: write:chats."),
         "the scope refusal wording"
     );
@@ -126,7 +126,7 @@ async fn creating_a_chat_demands_write_chats() {
         "no token is a 401 on create too"
     );
     assert_eq!(
-        error_message(&anonymous).as_deref(),
+        anonymous.error_field().as_deref(),
         Some("Invalid credentials"),
         "the missing-token wording"
     );
@@ -138,7 +138,7 @@ async fn creating_a_chat_demands_write_chats() {
         "an app-only token may not open chats"
     );
     assert_eq!(
-        error_message(&wrong_kind).as_deref(),
+        wrong_kind.error_field().as_deref(),
         Some("This API requires an authenticated user"),
         "the user refusal wording"
     );

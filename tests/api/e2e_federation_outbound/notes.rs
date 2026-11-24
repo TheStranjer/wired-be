@@ -9,7 +9,7 @@ use serde_json::json;
 use super::expectations::{
     Expected, assert_delivered, assert_lifecycle_create, assert_lifecycle_delete,
     assert_lifecycle_update, count_delivered, count_of, create_id_of, delivered_for, expected_case,
-    id_of, note_cases, uri_of,
+    note_cases, uri_of,
 };
 use super::support::{
     BOB, DAVE, destroy, edit, followers_of, local, peer_follows, personal, post, post_text,
@@ -33,7 +33,7 @@ async fn a_public_status_lifecycle_travels_signed_to_the_follower_inbox() {
     let host = peer.host();
 
     let posted = post(&app, &alice_token, json!({"status": "first draft"})).await;
-    let id = id_of(&posted);
+    let id = common::id_of(&posted);
     let uri = uri_of(&posted);
     let create_id = create_id_of(&posted);
     let _create_delivered = common::run_all_jobs(&state).await;
@@ -101,7 +101,7 @@ async fn every_visibility_shapes_and_sends_the_note_its_own_way() {
         "edited inside",
     ];
     for (entity, text) in posted.iter().zip(drafts) {
-        let id = id_of(entity);
+        let id = common::id_of(entity);
         let _edited = edit(&app, &alice_token, &id, text).await;
     }
     let _drained = common::run_all_jobs(&state).await;
@@ -164,7 +164,7 @@ async fn each_delete_comes_down_exactly_where_its_post_went_up() {
     }
     let _up = common::run_all_jobs(&state).await;
     for entity in &posted {
-        destroy(&app, &alice_token, &id_of(entity)).await;
+        destroy(&app, &alice_token, &common::id_of(entity)).await;
     }
     let _down = common::run_all_jobs(&state).await;
 
@@ -199,7 +199,7 @@ async fn a_local_only_status_leaves_nothing_at_all() {
     peer_follows(&app, &state, &peer, BOB, &alice).await;
 
     let posted = post_text(&app, &alice_token, "stays inside", Some("local")).await;
-    let id = id_of(&posted);
+    let id = common::id_of(&posted);
     let _edited = edit(&app, &alice_token, &id, "still inside").await;
     let _first = common::run_all_jobs(&state).await;
     destroy(&app, &alice_token, &id).await;

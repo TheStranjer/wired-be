@@ -18,10 +18,10 @@
 //! `/activities/{uuid}` route and the outbound federation tickets are the
 //! callers, and they are the reason each builder is named after its activity
 //! type. `Create` lives in [`note`](crate::federation::note) and is not
-//! duplicated here; a reblog row's `Announce` has a delivery rendering here
-//! ([`announce_json`], addressed by the outbound hook) and its own served
-//! rendering in [`note`](crate::federation::note), which the object and
-//! outbox routes keep.
+//! duplicated here, and neither is a reblog row's `Announce`: its one
+//! renderer, [`announce_activity_json`](crate::federation::note::announce_activity_json), lives in
+//! [`note`](crate::federation::note) and serves the delivery, the object
+//! route and the outbox alike.
 //!
 //! [`activity_id`] is the one minting rule: `{BASE_URL}/activities/{id}`,
 //! the shape [`note`](crate::federation::note) stamps into a `Create` and
@@ -38,8 +38,8 @@
 //! outbound tickets have one shape to deliver against: every document
 //! starts with the same JSON-LD `@context` the note builder writes, and
 //! carries both `to` and `cc`, always present. The activity builders that
-//! speak of one object — [`like_json`], [`emoji_react_json`] and
-//! [`announce_json`] — render the `to` and `cc` their caller computed from
+//! speak of one object — [`like_json`] and [`emoji_react_json`] — render
+//! the `to` and `cc` their caller computed from
 //! the interacted-with status (the outbound hooks in
 //! [`crate::services::federation_out`] derive them; the C2S serving route
 //! keeps this module's public-address convention), while the two-actor
@@ -69,20 +69,14 @@ pub use contexts::{
     AnsweredActivity, EmojiReactContext, FlagContext, ObjectActivityContext,
     TargetedActivityContext,
 };
-pub use interactions::{announce_json, emoji_react_json, like_json, undo_json};
+pub use interactions::{emoji_react_json, like_json, undo_json};
 pub use relations::{
     FollowActivity, accept_json, add_json, block_json, flag_json, follow_json, follow_json_to,
     move_json, reject_json, remove_json,
 };
 
-/// The `ActivityStreams` public addressing collection: the `cc` entry of a
-/// publicly-addressed interaction, and the `to` the C2S route keeps on the
-/// relation documents it serves.
-pub const AS_PUBLIC: &str = "https://www.w3.org/ns/activitystreams#Public";
 /// The activity type of a favourite.
 const TYPE_LIKE: &str = "Like";
-/// The activity type of a boost.
-const TYPE_ANNOUNCE: &str = "Announce";
 /// The activity type of an emoji reaction.
 const TYPE_EMOJI_REACT: &str = "EmojiReact";
 /// The activity type of a follow request.

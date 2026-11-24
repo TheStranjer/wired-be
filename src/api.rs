@@ -32,21 +32,13 @@
 //! providers are configured to answer to; and pack images
 //! live at `/emoji/{pack}/{file}`, the address
 //! [`crate::services::emoji_packs`] stores in `custom_emojis`.
-//! [`html_pages::router`] joins it at the root too: the shared HTML helper
-//! pages live at the top-level path Pleroma routes them on,
-//! `/mailer/unsubscribe/{token}`.
-//! [`remote_interaction::router`] joins it at the root as well: the
-//! `GET /authorize_interaction` lives at the top-level path Pleroma
-//! routes it on, while [`remote_interaction::pleroma_router`] rides on [`v1`] for
+//! [`remote_interaction::pleroma_router`] rides on [`v1`] for
 //! `POST /api/v1/pleroma/remote_interaction`.
 //! [`password_reset::auth_router`] joins it at `POST /auth/password`, the
 //! address Pleroma routes the reset request on outside `/api` (its two
 //! `/api/v1/pleroma/password_reset` pages ride on [`v1`]).
-//! [`admin::apps_docs::public_router`] is the router of a nested area
-//! that [`crate::app`] merges at the root: the public instance documents
-//! `GET /instance/{name}.html` live at the top-level path Pleroma's
-//! `InstanceStatic` plug serves, while the maintenance routes of the
-//! area ride on [`v1`] under `/pleroma/admin`.
+//! The instance-document maintenance routes ride on [`v1`] under
+//! `/pleroma/admin`; no instance document is served at the top level.
 
 pub mod account_lists;
 pub mod accounts;
@@ -67,7 +59,6 @@ pub mod federation_status;
 pub mod filters;
 pub mod follow_requests;
 pub mod helpers;
-pub mod html_pages;
 pub mod instance;
 pub mod lists;
 pub mod markers;
@@ -95,6 +86,7 @@ pub mod pleroma_settings;
 pub mod polls;
 pub mod push;
 pub mod remote_interaction;
+pub mod report_render;
 pub mod reports;
 pub mod route_inventory;
 pub mod scheduled_statuses;

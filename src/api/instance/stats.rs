@@ -149,19 +149,10 @@ mod tests {
         config::Config,
         models::{
             status::{self, NewStatus},
-            user::{NewUser, User, insert, local_ap_id},
+            user::{NewUser, insert},
         },
+        test_fixtures::{local_new, local_user},
     };
-
-    /// Inserts a local user named `nickname`.
-    async fn local_user(pool: &PgPool, nickname: &str) -> User {
-        insert(
-            pool,
-            &NewUser::local(nickname, &local_ap_id("https://test.example", nickname)),
-        )
-        .await
-        .expect("the local fixture inserts")
-    }
 
     #[tokio::test]
     async fn counters_are_cached_until_the_window_closes() {
@@ -206,7 +197,7 @@ mod tests {
             &pool,
             &NewUser {
                 last_active_at: Some(now - TimeDelta::days(1)),
-                ..NewUser::local("recent", &local_ap_id("https://test.example", "recent"))
+                ..local_new("recent")
             },
         )
         .await
@@ -215,7 +206,7 @@ mod tests {
             &pool,
             &NewUser {
                 last_status_at: Some(now - TimeDelta::days(100)),
-                ..NewUser::local("posted", &local_ap_id("https://test.example", "posted"))
+                ..local_new("posted")
             },
         )
         .await

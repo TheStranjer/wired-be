@@ -29,14 +29,6 @@ pub(super) async fn post_json(app: &Router, body: &Value) -> common::TestRespons
         .await
 }
 
-/// The `error` message of a JSON error response.
-pub(super) fn error_text(response: &common::TestResponse) -> String {
-    response.json_value()["error"]
-        .as_str()
-        .expect("errors carry a string error field")
-        .to_owned()
-}
-
 /// Assert the no-store cache headers every answer carries (RFC 6749 §5.1).
 pub(super) fn assert_no_store(response: &common::TestResponse) {
     assert_eq!(

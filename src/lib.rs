@@ -31,6 +31,8 @@ pub mod streaming;
 pub mod test_db;
 #[cfg(any(test, feature = "integration-tests"))]
 pub mod test_fixtures;
+#[cfg(test)]
+pub mod test_server;
 pub mod uploads;
 pub mod util;
 
@@ -57,13 +59,7 @@ use crate::{
 /// `/oauth` ([`api::oauth`]), the `/oauth` provider-login paths
 /// ([`api::oauth_external`]), `POST /auth/password` ([`api::password_reset`],
 /// Pleroma routes the reset request outside `/api`) — are merged at the
-/// top level, together with the HTML helper pages of
-/// [`api::html_pages`] (`/mailer/unsubscribe/{token}`), the
-/// remote-interaction page of [`api::remote_interaction`]
-/// (`/authorize_interaction`)
-/// and the public instance documents of [`api::admin::apps_docs::public_router`]
-/// (`/instance/{name}.html`, the terms-of-service pages an admin
-/// uploads).
+/// top level.
 /// Paths no route matches get the standard JSON error response (decision 8),
 /// marked with `x-wired-fallback: 1` so a test can tell the fallback's own
 /// 404 from a handler's.
@@ -88,9 +84,6 @@ pub fn app(state: AppState) -> Router {
             .merge(media_files::router())
             .merge(media_proxy::router())
             .merge(api::emoji_packs::files_router())
-            .merge(api::html_pages::router())
-            .merge(api::remote_interaction::router())
-            .merge(api::admin::apps_docs::public_router())
             .fallback(not_found)
             .with_state(state),
     )

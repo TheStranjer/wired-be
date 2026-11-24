@@ -11,7 +11,7 @@ use url::Url;
 use uuid::Uuid;
 
 use super::{
-    ACTIVITY_JSON, DeliveryArgs,
+    DeliveryArgs,
     outcome::{delivery_outcome, note_answer, note_transport_failure, transport_error},
 };
 use crate::{
@@ -19,6 +19,7 @@ use crate::{
     federation::{
         actor::MAIN_KEY_FRAGMENT,
         signature::{SignedHeaders, SigningKey, sign_request},
+        vocab::ACTIVITY_JSON,
     },
     jobs::{AttemptInfo, HandlerFuture, JobError},
     models::user::{self, User},

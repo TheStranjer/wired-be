@@ -58,7 +58,7 @@ pub use inboxes::all_remote_inboxes;
 pub use insert::{CountDelta, insert};
 pub use lookup::{
     active_local_ids, find_password_reset_target, get_by_acct, get_by_ap_id, get_by_email,
-    get_by_id, get_by_nickname, get_many, require_local_active,
+    get_by_id, get_by_nickname, get_by_public_key_id, get_many, require_local_active,
 };
 pub use mrf_preload::{counts_by_ap_id, local_tags_by_ap_id, tags_by_ap_id};
 pub use new_user::NewUser;
@@ -179,6 +179,18 @@ pub fn outbox(ap_id: &str) -> String {
 #[must_use]
 pub fn followers(ap_id: &str) -> String {
     format!("{ap_id}/followers")
+}
+
+/// The address naming `user`'s followers collection.
+///
+/// It is the stored `followers_url` (what the publisher expands, and what a
+/// peer's own documents name), with the [`followers`] construction behind a
+/// row that carries none.
+#[must_use]
+pub fn followers_address(user: &User) -> String {
+    user.followers_url
+        .clone()
+        .unwrap_or_else(|| followers(&user.ap_id))
 }
 
 /// The following collection of actor `ap_id`: `{ap_id}/following`.

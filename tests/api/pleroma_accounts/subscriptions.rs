@@ -6,8 +6,8 @@ use serde_json::json;
 use wired_be::models::follow::{self, Follow, FollowState};
 
 use super::support::{
-    NOT_FOLLOWING, asking, expected_relationship, following, fresh_user, locked_user,
-    relationship_batch, stored, subscription,
+    NOT_FOLLOWING, asking, expected_relationship, following, locked_user, relationship_batch,
+    stored, subscription,
 };
 use crate::common;
 
@@ -128,8 +128,8 @@ async fn subscribe_sets_both_flags_and_answers_the_relationship() {
     );
     assert_eq!(
         (
-            fresh_user(&pool, bob.id).await.followers_count,
-            fresh_user(&pool, alice.id).await.following_count
+            common::reload_user(&pool, bob.id).await.followers_count,
+            common::reload_user(&pool, alice.id).await.following_count
         ),
         (1, 1),
         "subscribing moves no counters: the follow already counted"

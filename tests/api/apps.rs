@@ -30,14 +30,6 @@ async fn post_json(app: &Router, body: &Value) -> common::TestResponse {
         .await
 }
 
-/// The `error` message of a JSON error response.
-fn error_text(response: &common::TestResponse) -> String {
-    response.json_value()["error"]
-        .as_str()
-        .expect("errors carry a string error field")
-        .to_owned()
-}
-
 /// The instance VAPID key the entity's `vapid_key` carries, read straight
 /// from the service that also seeds the pair on first use.
 async fn instance_vapid_key(pool: &PgPool) -> String {
@@ -270,7 +262,7 @@ async fn missing_client_name_is_unprocessable() {
         "errors answer with JSON"
     );
     assert!(
-        error_text(&response).contains("client_name"),
+        response.error_text().contains("client_name"),
         "the message names the missing field"
     );
 }
@@ -380,7 +372,7 @@ async fn an_unknown_scope_is_unprocessable() {
         "an unknown scope is a 422"
     );
     assert!(
-        error_text(&response).contains("bogus"),
+        response.error_text().contains("bogus"),
         "the message names the bad scope"
     );
     let rows: (i64,) = sqlx::query_as("SELECT count(*) FROM oauth_apps")

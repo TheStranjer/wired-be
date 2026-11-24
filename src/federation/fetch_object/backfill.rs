@@ -3,18 +3,15 @@
 
 use std::fmt;
 
-use serde_json::{Value, json};
+use serde_json::Value;
 use tracing::debug;
 use uuid::Uuid;
 
-use super::{KIND_BACKFILL, resolve::resolve_status};
+use super::resolve::resolve_status_at_depth;
 use crate::{
     federation::dispatch::FederationError,
-    jobs::{AttemptInfo, HandlerFuture, JobError, QUEUE_BACKGROUND},
-    models::{
-        job::{self, NewJob},
-        status::{self, Status},
-    },
+    jobs::{AttemptInfo, HandlerFuture, JobError},
+    models::status::{self, Status},
     state::AppState,
 };
 
@@ -27,17 +24,20 @@ pub const BACKFILL_MAX_ATTEMPTS: i32 = 3;
 const BACKFILL_KEY_PREFIX: &str = "backfill:";
 
 /// The [`HandlerFn`](crate::jobs::HandlerFn) `crate::serve` binds to
-/// [`KIND_BACKFILL`].
+/// [`KIND_BACKFILL`](super::KIND_BACKFILL).
 pub fn handle(state: AppState, _attempt: AttemptInfo, args: Value) -> HandlerFuture {
     Box::pin(async move { handle_backfill(state, args).await })
 }
 
-/// The `federator.backfill` handler: closes one deferred reply link —
-/// resolve the parent the status answers, link the child to it, and queue
-/// the parent's own unresolved parent at `depth + 1`.
+/// The `federator.backfill` handler: closes one deferred reply link.
 ///
-/// `args` is the object [`crate::services::ingest`] or this handler
-/// enqueued: `{"status_id": "<uuid>", "depth": <n>}`; a missing or broken
+/// It resolves the parent the status answers and links the child to it. A
+/// parent fetched here is ingested at `depth + 1`, which queues the parent's
+/// own backfill at that depth.
+///
+/// `args` is the object [`crate::services::ingest`] enqueued:
+/// `{"status_id": "<uuid>", "depth": <n>}`, `depth` being the status'
+/// distance from the reply that started the walk; a missing or broken
 /// `depth` reads as the first walk.
 ///
 /// # Errors
@@ -45,7 +45,7 @@ pub fn handle(state: AppState, _attempt: AttemptInfo, args: Value) -> HandlerFut
 /// [`JobError::Discard`] for args no enqueue should have built or for a
 /// parent the peer refuses as unparseable; [`JobError::Retry`] for a
 /// database or network failure that may pass on a later attempt. A parent
-/// that is gone (`Ok(None)` from [`resolve_status`]) or a walk that reaches
+/// that is gone (`Ok(None)` from [`resolve_status_at_depth`]) or a walk that reaches
 /// `THREAD_FETCH_DEPTH` is a quiet completion.
 pub async fn handle_backfill(state: AppState, args: Value) -> Result<(), JobError> {
     let Some(raw_id) = args.get("status_id").and_then(Value::as_str) else {
@@ -65,10 +65,10 @@ pub async fn handle_backfill(state: AppState, args: Value) -> Result<(), JobErro
     backfill_one(&state, status_id, depth).await
 }
 
-/// One backfill walk: the parent the child answers (`None` — complete —
-/// when the child is gone, the link is already closed by a previous pass
-/// whose parent vanished, or the deferred parent never resolves to a
-/// foldable status), then the walk continues up the chain.
+/// One backfill walk: closes the child's deferred parent link. A child
+/// that is gone, or whose link a previous pass already closed, is complete.
+/// The walk continues up the chain through the parent's own job, which the
+/// parent's ingest queued at `depth + 1`.
 async fn backfill_one(state: &AppState, child_id: Uuid, depth: i64) -> Result<(), JobError> {
     let child = status::get_by_id(&state.db, child_id)
         .await
@@ -77,24 +77,19 @@ async fn backfill_one(state: &AppState, child_id: Uuid, depth: i64) -> Result<()
         debug!(%child_id, "the status a backfill was queued for is gone");
         return Ok(());
     };
-    let parent = match child.in_reply_to_id {
-        Some(parent_id) => status::get_by_id(&state.db, parent_id)
-            .await
-            .map_err(|err| retry("the parent read", &err))?,
-        None => resolve_deferred_parent(state, &child, depth).await?,
-    };
-    match parent {
-        Some(parent) => continue_chain(state, &parent, depth).await,
-        None => Ok(()),
+    if child.in_reply_to_id.is_some() {
+        return Ok(());
     }
+    resolve_deferred_parent(state, &child, depth).await
 }
 
 /// The deferred arm of [`backfill_one`]: a child whose parent link is an
 /// id only. Past [`FetchLimits::thread_fetch_depth`] ancestors the walk stops
-/// quietly; otherwise [`resolve_status`] answers the parent and
-/// [`link_backfilled_reply`] closes the link and steps the parent's
-/// `replies_count` — idempotent, so a retry of a half-finished pass links
-/// nothing twice.
+/// quietly; otherwise [`resolve_status_at_depth`] answers the parent — a
+/// freshly fetched one is ingested at `depth + 1`, which is the depth its
+/// own backfill job is queued at — and [`link_backfilled_reply`] closes the
+/// link and steps the parent's `replies_count` — idempotent, so a retry of a
+/// half-finished pass links nothing twice.
 ///
 /// [`link_backfilled_reply`]: crate::models::status::link_backfilled_reply
 /// [`FetchLimits::thread_fetch_depth`]: crate::config::FetchLimits::thread_fetch_depth
@@ -102,19 +97,19 @@ async fn resolve_deferred_parent(
     state: &AppState,
     child: &Status,
     depth: i64,
-) -> Result<Option<Status>, JobError> {
+) -> Result<(), JobError> {
     let limit = i64::try_from(state.config.fetch.limits.thread_fetch_depth).unwrap_or(i64::MAX);
     if depth >= limit {
         debug!(
             status = %child.id,
             depth, limit, "the thread backfill stops at its depth limit"
         );
-        return Ok(None);
+        return Ok(());
     }
     let Some(parent_uri) = child.in_reply_to_ap_id.as_deref() else {
-        return Ok(None);
+        return Ok(());
     };
-    let parent = match resolve_status(state, parent_uri).await {
+    let parent = match resolve_status_at_depth(state, parent_uri, depth.saturating_add(1)).await {
         Ok(Some(parent)) => parent,
         Ok(None) => {
             debug!(
@@ -122,7 +117,7 @@ async fn resolve_deferred_parent(
                 parent = %parent_uri,
                 "the answered object is gone or unfoldable; the thread stays as stored"
             );
-            return Ok(None);
+            return Ok(());
         }
         Err(FederationError::Transient(detail)) => return Err(JobError::Retry(detail)),
         Err(FederationError::Permanent(detail)) => return Err(JobError::Discard(detail)),
@@ -133,59 +128,11 @@ async fn resolve_deferred_parent(
     if linked {
         debug!(status = %child.id, parent = %parent.id, "a backfilled thread link closed");
     }
-    Ok(Some(parent))
-}
-
-/// The chain arm: when the parent *itself* answers an unstored object, its
-/// own backfill runs at `depth + 1`. Ingest queued that job at depth `0`
-/// the moment the parent's row was created (see
-/// [`crate::services::ingest`]) — this walk's depth bookkeeping wins, so
-/// the pending pass is cancelled and re-queued one deeper, which is what
-/// makes the limit bind on a chain fetched end to end. One step from the
-/// limit, the cancelled pass is not re-queued and the walk ends.
-async fn continue_chain(state: &AppState, parent: &Status, depth: i64) -> Result<(), JobError> {
-    if parent.in_reply_to_ap_id.is_none() {
-        return Ok(());
-    }
-    let unique_key = backfill_key(parent.id);
-    // Cancel parent's own queued pass unconditionally when it carries a
-    // deferred link: this walk owns the depth bookkeeping from here, so at
-    // the limit the pending pass is dropped rather than left to restart the
-    // walk uncounted.
-    if let Err(err) = job::cancel_pending(&state.db, &unique_key).await {
-        debug!(%err, parent = %parent.id, "the pending backfill cancel failed; queueing anyway");
-    }
-    let limit = i64::try_from(state.config.fetch.limits.thread_fetch_depth).unwrap_or(i64::MAX);
-    if depth + 1 >= limit {
-        debug!(
-            parent = %parent.id,
-            depth, limit, "the thread backfill stops at its depth limit"
-        );
-        return Ok(());
-    }
-    let args = json!({ "status_id": parent.id.to_string(), "depth": depth + 1 });
-    let new_job = NewJob {
-        queue: QUEUE_BACKGROUND,
-        kind: KIND_BACKFILL,
-        args,
-        run_at: None,
-        max_attempts: Some(BACKFILL_MAX_ATTEMPTS),
-        unique_key: Some(&unique_key),
-    };
-    job::enqueue(&state.db, new_job)
-        .await
-        .map(drop)
-        .map_err(|err| {
-            // The child's link is already committed; a lost deeper job costs
-            // the chain one pass, and this attempt reports it for retry — the
-            // link write reruns as the no-op it is.
-            retry("the backfill enqueue", &err)
-        })
+    Ok(())
 }
 
 /// The dedupe key of the backfill job for the status `status_id`: one
-/// live job per deferred reply, shared by the ingest enqueue and the
-/// chain walk.
+/// live job per deferred reply, queued by ingest.
 #[must_use]
 pub fn backfill_key(status_id: Uuid) -> String {
     format!("{BACKFILL_KEY_PREFIX}{status_id}")

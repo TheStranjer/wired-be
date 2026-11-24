@@ -23,21 +23,31 @@
 //! [`KIND_SWEEP`] is the safety net, the twin of the
 //! [statuses expiry sweep](super::statuses::KIND_SWEEP): a lost or failed
 //! per-row job must not leave a schedule unfired forever, so every five
-//! minutes the sweep walks [`fetch_due`](scheduled_status::fetch_due) rows,
-//! [`SWEEP_BATCH`] at a time, and publishes each through the same private
+//! minutes the sweep walks [`fetch_due_ids`](scheduled_status::fetch_due_ids)
+//! ids, [`SWEEP_BATCH`] at a time, and publishes each through the same private
 //! `publish_one` the per-row handler runs.
+//!
+//! Both runners can reach one row at its moment, so `publish_one` claims it
+//! first: a transaction locks the row `FOR UPDATE SKIP LOCKED` only once it
+//! is due, publishes, deletes the row and commits. The runner that finds the
+//! row locked, gone or not yet due does nothing, so a schedule posts at most
+//! once and never before its `scheduled_at`.
 
 use chrono::Utc;
 use serde::Deserialize;
 use serde_json::{Value, json};
+use sqlx::{PgConnection, Postgres, Transaction};
 use tracing::{debug, warn};
 use uuid::Uuid;
 
 use crate::{
     error::AppError,
-    jobs::{AttemptInfo, HandlerFuture, JobError, QUEUE_SCHEDULED, scheduler::PeriodicJob},
+    jobs::{
+        AttemptInfo, HandlerFuture, JobError, QUEUE_SCHEDULED, enqueue_keyed, load_user,
+        parse_args, retry, scheduler::PeriodicJob,
+    },
     models::{
-        job::{NewJob, cancel_pending, enqueue},
+        job::{NewJob, cancel_pending},
         scheduled_status::{self, ScheduledStatus},
         user,
     },
@@ -76,7 +86,7 @@ pub fn job_args(scheduled_id: Uuid) -> Value {
 /// The dedupe key of schedule `scheduled_id`'s publish job.
 ///
 /// At most one live fire per schedule, however many times its create is
-/// replayed ([`enqueue`]'s `None` swallows the second claim).
+/// replayed ([`enqueue`](crate::models::job::enqueue)'s `None` swallows the second claim).
 #[must_use]
 pub fn unique_key(scheduled_id: Uuid) -> String {
     format!("sched:{scheduled_id}")
@@ -119,20 +129,7 @@ pub async fn schedule(state: &AppState, row: &ScheduledStatus) {
         max_attempts: None,
         unique_key: Some(&key),
     };
-    match enqueue(&state.db, request).await {
-        Ok(Some(job)) => debug!(
-            job = %job.id,
-            scheduled = %row.id,
-            due = %row.scheduled_at,
-            "scheduled status queued"
-        ),
-        Ok(None) => debug!(scheduled = %row.id, "scheduled status already queued"),
-        Err(err) => warn!(
-            %err,
-            scheduled = %row.id,
-            "could not schedule status publication; the sweep will publish it"
-        ),
-    }
+    drop(enqueue_keyed(&state.db, request, "scheduled status").await);
 }
 
 /// Re-queues `row`'s fire at the moment it now carries, replacing the one
@@ -144,8 +141,9 @@ pub async fn schedule(state: &AppState, row: &ScheduledStatus) {
 /// [`cancel_pending`] therefore takes that row out first — the one state
 /// it can take back being `available`, since a fire already in a worker's
 /// hands or awaiting its retry is the queue's to finish. What survives there
-/// is harmless either way: the publish reads the row afresh, and
-/// [`sweep_job`]'s pass publishes any schedule whose job did not.
+/// is harmless either way: the publish claims the row afresh and only while
+/// it is due, so a stale fire finds a moved schedule not yet due and does
+/// nothing, and [`sweep_job`]'s pass publishes any schedule whose job did not.
 ///
 /// Like [`schedule`], this logs a queue it cannot write rather than failing
 /// the caller: the row already holds its new moment, and that is the fact the
@@ -165,53 +163,104 @@ pub async fn reschedule(state: &AppState, row: &ScheduledStatus) {
         Err(err) => warn!(
             %err,
             scheduled = %row.id,
-            "could not cancel a scheduled status's previous fire; the sweep may publish it twice"
+            "could not cancel a scheduled status's previous fire; it will find the row not yet due"
         ),
     }
     schedule(state, row).await;
 }
 
-/// Reads [`PublishArgs`] out of a claimed job's payload; arguments this
-/// shape cannot deserialize are permanent — the job is discarded, never
-/// retried.
-fn parse_args(args: &Value) -> Result<Uuid, JobError> {
-    serde_json::from_value::<PublishArgs>(args.clone())
-        .map(|parsed| parsed.scheduled_id)
-        .map_err(|err| {
-            JobError::Discard(format!(
-                "scheduled status publish job arguments are unusable: {err}"
-            ))
-        })
-}
+/// The job name in the discard text of unusable [`PublishArgs`].
+const PUBLISH_JOB: &str = "scheduled status publish";
 
-/// Lifts a database failure into the queue's retry arm; the row survives
-/// every retryable failure, so another pass costs nothing but the wait.
-fn retry(err: &AppError) -> JobError {
-    JobError::Retry(format!("scheduled status publication failed: {err}"))
-}
+/// The job name in the retry text of a failed pass; the row survives every
+/// retryable failure, so another pass costs nothing but the wait.
+const PASS_JOB: &str = "scheduled status publication";
 
 /// The [`JobRegistry`](super::JobRegistry) handler for [`KIND_PUBLISH`]:
-/// publish the scheduled row the arguments name, if it is still stored.
+/// publish the scheduled row the arguments name, if this runner can claim it.
 ///
-/// A row already gone — fired by the sweep, or cancelled — completes the job
-/// silently: there is nothing left to fire. Unusable arguments are a
-/// [`JobError::Discard`]; a database failure is a [`JobError::Retry`].
+/// A row already gone — fired by the sweep, or cancelled — or one another
+/// runner is publishing right now, or one a reschedule moved past this fire's
+/// moment, completes the job silently: there is nothing left for it to fire.
+/// Unusable arguments are a [`JobError::Discard`]; a database failure is a
+/// [`JobError::Retry`].
 pub fn handle_publish(state: AppState, _attempt: AttemptInfo, args: Value) -> HandlerFuture {
     Box::pin(async move {
-        let scheduled_id = parse_args(&args)?;
-        match scheduled_status::get_by_id(&state.db, scheduled_id).await {
-            Ok(Some(row)) => publish_one(&state, &row).await,
-            Ok(None) => {
-                debug!(scheduled = %scheduled_id, "scheduled status is already gone");
-                Ok(())
-            }
-            Err(err) => Err(retry(&err)),
-        }
+        let scheduled_id = parse_args::<PublishArgs>(&args, PUBLISH_JOB)?.scheduled_id;
+        let _claimed = publish_one(&state, scheduled_id).await?;
+        Ok(())
     })
 }
 
-/// The publish job's body: replay the row's stored params through the
-/// ordinary create path as its author, then take the row out of the table.
+/// Ends the claim's transaction without a commit, releasing the row lock.
+///
+/// Rolled back explicitly rather than by drop, which only queues the rollback
+/// until the connection is next used: the next runner must find the row free.
+/// A failure to roll back is logged — the connection is discarded by the pool
+/// then, which releases the lock all the same.
+async fn roll_back(tx: Transaction<'_, Postgres>) {
+    if let Err(err) = tx.rollback().await {
+        warn!(%err, "could not roll back a scheduled-status claim");
+    }
+}
+
+/// The publish job's body, shared by the per-row fire and the sweep: claim
+/// schedule `id` under a row lock, publish it, and remove the row in the same
+/// transaction.
+///
+/// [`lock_due`](scheduled_status::lock_due) takes the row `FOR UPDATE SKIP
+/// LOCKED` only while its moment has passed, so of two runners reaching one
+/// row only one gets it, and a stale fire can never post a schedule that was
+/// moved into the future. The lock is held on the transaction's connection
+/// while [`create_status`] works through the pool — it only reads
+/// `scheduled_statuses`, which the lock does not block — and the delete and
+/// commit release it. A runner that finds nothing to claim (the row is gone,
+/// not due, or held by another runner) rolls back and reports `Ok(false)`.
+///
+/// Returns `Ok(true)` when this runner claimed the row — published it or
+/// dropped it as unpublishable — and `Ok(false)` when it did not.
+///
+/// # Errors
+///
+/// [`JobError::Retry`] on a database or internal failure; the transaction is
+/// rolled back, so the row stays in place and unlocked.
+async fn publish_one(state: &AppState, id: Uuid) -> Result<bool, JobError> {
+    let mut tx = state
+        .db
+        .begin()
+        .await
+        .map_err(|err| retry(PASS_JOB, &AppError::from(err)))?;
+    let row = match scheduled_status::lock_due(&mut tx, id).await {
+        Ok(Some(row)) => row,
+        Ok(None) => {
+            roll_back(tx).await;
+            debug!(scheduled = %id, "scheduled status is gone, not due or held elsewhere");
+            return Ok(false);
+        }
+        Err(err) => {
+            roll_back(tx).await;
+            return Err(retry(PASS_JOB, &err));
+        }
+    };
+    match publish_locked(state, &mut tx, &row).await {
+        Ok(()) => {
+            tx.commit()
+                .await
+                .map_err(|err| retry(PASS_JOB, &AppError::from(err)))?;
+            Ok(true)
+        }
+        Err(err) => {
+            roll_back(tx).await;
+            Err(err)
+        }
+    }
+}
+
+/// Publishes `row`, which the caller holds locked on `conn`, and deletes it on
+/// `conn`: replay the row's stored params through the ordinary create path as
+/// its author, then take the row out of the table.
+///
+/// The caller commits (or rolls back on `Err`).
 ///
 /// The params deserialize straight into [`CreateStatusParams`]: unknown keys
 /// are ignored by serde, so whatever else the endpoint parked beside them
@@ -227,32 +276,30 @@ pub fn handle_publish(state: AppState, _attempt: AttemptInfo, args: Value) -> Ha
 ///
 /// [`JobError::Retry`] on a database or internal failure, including one that
 /// strikes while dropping an unpublishable row.
-async fn publish_one(state: &AppState, row: &ScheduledStatus) -> Result<(), JobError> {
+async fn publish_locked(
+    state: &AppState,
+    conn: &mut PgConnection,
+    row: &ScheduledStatus,
+) -> Result<(), JobError> {
     let params = match serde_json::from_value::<CreateStatusParams>(row.params.clone()) {
         Ok(params) => params,
         Err(err) => {
             return drop_row(
-                state,
+                conn,
                 row,
                 &format!("stored create-status params are unusable: {err}"),
             )
             .await;
         }
     };
-    let author = match user::get_by_id(&state.db, row.user_id).await {
-        Ok(Some(author)) => author,
-        Ok(None) => return drop_row(state, row, "the scheduling account is gone").await,
-        Err(err) => return Err(retry(&err)),
+    // An author who is gone or can no longer post means the row can never
+    // fire: the loader's discard is this job's drop-the-row arm.
+    let author = match load_user(state, row.user_id, "scheduled status", true).await {
+        Ok(author) => author,
+        Err(JobError::Discard(reason)) => return drop_row(conn, row, &reason).await,
+        Err(other) => return Err(other),
     };
-    if author.deleted_at.is_some()
-        || matches!(
-            author.account_status(),
-            user::AccountStatus::Deactivated | user::AccountStatus::ApprovalPending
-        )
-    {
-        return drop_row(state, row, "the scheduling account can no longer post").await;
-    }
-    publish_params(state, row, &author, params).await
+    publish_params(state, conn, row, &author, params).await
 }
 
 /// Runs the create and sorts its outcome into the ticket's three arms:
@@ -273,14 +320,15 @@ async fn publish_one(state: &AppState, row: &ScheduledStatus) -> Result<(), JobE
 /// the row delete that follows a published one.
 async fn publish_params(
     state: &AppState,
+    conn: &mut PgConnection,
     row: &ScheduledStatus,
     author: &user::User,
     params: CreateStatusParams,
 ) -> Result<(), JobError> {
     match create_status(state, author, None, params).await {
         Ok(created) => {
-            if let Err(err) = scheduled_status::delete(&state.db, row.id).await {
-                return Err(retry(&err));
+            if let Err(err) = scheduled_status::delete_on(conn, row.id).await {
+                return Err(retry(PASS_JOB, &err));
             }
             debug!(scheduled = %row.id, status = %created.id, "scheduled status published");
             Ok(())
@@ -290,53 +338,62 @@ async fn publish_params(
             | AppError::NotFound
             | AppError::Forbidden(_)
             | AppError::Gone),
-        ) => drop_row(state, row, &refusal.to_string()).await,
-        Err(err) => Err(retry(&err)),
+        ) => drop_row(conn, row, &refusal.to_string()).await,
+        Err(err) => Err(retry(PASS_JOB, &err)),
     }
 }
 
-/// Deletes a schedule that can never fire and logs the reason: a spent
-/// schedule leaves the table exactly the way the endpoint's cancel does, so
-/// neither the listings nor the sweep see it again. A database failure in
-/// the delete is still a [`JobError::Retry`] — the row, and the reason,
-/// survive for another attempt.
+/// Deletes a schedule that can never fire, on the claim's connection, and
+/// logs the reason: a spent schedule leaves the table exactly the way the
+/// endpoint's cancel does, so neither the listings nor the sweep see it
+/// again. A database failure in the delete is still a [`JobError::Retry`] —
+/// the row, and the reason, survive for another attempt.
 ///
 /// # Errors
 ///
 /// [`JobError::Retry`] when the delete itself fails on the database.
-async fn drop_row(state: &AppState, row: &ScheduledStatus, reason: &str) -> Result<(), JobError> {
-    match scheduled_status::delete(&state.db, row.id).await {
+async fn drop_row(
+    conn: &mut PgConnection,
+    row: &ScheduledStatus,
+    reason: &str,
+) -> Result<(), JobError> {
+    match scheduled_status::delete_on(conn, row.id).await {
         Ok(deleted) => {
             warn!(scheduled = %row.id, deleted, "scheduled status dropped unpublished: {reason}");
             Ok(())
         }
-        Err(err) => Err(retry(&err)),
+        Err(err) => Err(retry(PASS_JOB, &err)),
     }
 }
 
-/// The [`JobRegistry`](super::JobRegistry) handler for [`KIND_SWEEP`]: walk
-/// every schedule due by now — [`fetch_due`](scheduled_status::fetch_due)
-/// rows, [`SWEEP_BATCH`] at a time — publishing each through the private
-/// `publish_one`, the same helper [`handle_publish`] runs.
+/// The [`JobRegistry`](super::JobRegistry) handler for [`KIND_SWEEP`]: publish
+/// every schedule due by now.
+///
+/// It walks [`fetch_due_ids`](scheduled_status::fetch_due_ids) ids,
+/// [`SWEEP_BATCH`] at a time, publishing each through the private
+/// `publish_one`, the same claim-and-publish [`handle_publish`] runs.
 ///
 /// The walk ends on the first short batch: rows the pass published or
 /// dropped leave the sweep query, so a full batch only ever means more work,
-/// and an instance with nothing due costs one read. A database failure is a
-/// [`JobError::Retry`]; the scheduler enqueues the next period regardless,
-/// and the per-row jobs still fire whatever the failed pass left behind.
+/// and an instance with nothing due costs one read. It also ends on a batch
+/// in which this pass claimed nothing — every row was held by another runner
+/// or not yet due by the database clock, and reading the same rows again
+/// would never end. A database failure is a [`JobError::Retry`]; the
+/// scheduler enqueues the next period regardless, and the per-row jobs still
+/// fire whatever the failed pass left behind.
 pub fn handle_sweep(state: AppState, _attempt: AttemptInfo, _args: Value) -> HandlerFuture {
     Box::pin(async move {
         let mut total = 0_i64;
         loop {
-            let batch = match scheduled_status::fetch_due(&state.db, Utc::now(), SWEEP_BATCH).await
-            {
-                Ok(rows) => rows,
-                Err(err) => return Err(retry(&err)),
-            };
-            let count = i64::try_from(batch.len()).unwrap_or(SWEEP_BATCH);
-            publish_batch(&state, &batch).await?;
-            total += count;
-            if count < SWEEP_BATCH {
+            let ids =
+                match scheduled_status::fetch_due_ids(&state.db, Utc::now(), SWEEP_BATCH).await {
+                    Ok(ids) => ids,
+                    Err(err) => return Err(retry(PASS_JOB, &err)),
+                };
+            let count = i64::try_from(ids.len()).unwrap_or(SWEEP_BATCH);
+            let claimed = publish_batch(&state, &ids).await?;
+            total += claimed;
+            if count < SWEEP_BATCH || claimed == 0 {
                 break;
             }
         }
@@ -347,23 +404,26 @@ pub fn handle_sweep(state: AppState, _attempt: AttemptInfo, _args: Value) -> Han
     })
 }
 
-/// Publishes one sweep batch. Each row's fire is its own statements, so a
-/// retried pass finds the earlier rows already gone and picks up where the
-/// failure stopped.
+/// Publishes one sweep batch and counts the rows this pass claimed. Each
+/// row's fire is its own transaction, so a retried pass finds the earlier
+/// rows already gone and picks up where the failure stopped.
 ///
 /// # Errors
 ///
 /// [`JobError::Retry`] on the first row whose publish cannot be completed.
-async fn publish_batch(state: &AppState, batch: &[ScheduledStatus]) -> Result<(), JobError> {
-    for row in batch {
-        publish_one(state, row).await?;
+async fn publish_batch(state: &AppState, ids: &[Uuid]) -> Result<i64, JobError> {
+    let mut claimed = 0_i64;
+    for id in ids {
+        if publish_one(state, *id).await? {
+            claimed += 1;
+        }
     }
-    Ok(())
+    Ok(claimed)
 }
 
 #[cfg(test)]
 mod tests {
-    use chrono::{DateTime, SubsecRound as _, TimeDelta, Utc};
+    use chrono::{DateTime, TimeDelta, Utc};
     use serde_json::json;
     use sqlx::PgPool;
 
@@ -375,23 +435,14 @@ mod tests {
             media_attachment::{self, NewMediaAttachment},
             scheduled_status::NewScheduledStatus,
             status::{Status, Visibility},
-            user::{NewUser, User, insert, local_ap_id},
+            user::User,
         },
+        test_fixtures::local_user,
     };
 
     /// Test state over `pool` with the fixed test config.
     fn app_state(pool: &PgPool) -> AppState {
         AppState::for_tests(pool.clone(), Config::for_tests())
-    }
-
-    /// Inserts a local user named `nickname`.
-    async fn local_user(pool: &PgPool, nickname: &str) -> User {
-        insert(
-            pool,
-            &NewUser::local(nickname, &local_ap_id(TEST_BASE_URL, nickname)),
-        )
-        .await
-        .expect("the local fixture inserts")
     }
 
     /// A schedule for `who`, due `when`, with `params` stored as given.
@@ -463,151 +514,14 @@ mod tests {
     }
 
     mod barred_authors;
+    mod claims;
+    mod queueing;
 
     /// The handler's attempt info: the first of however many the job gets.
     const FIRST_ATTEMPT: AttemptInfo = AttemptInfo {
         attempts: 1,
         max_attempts: 5,
     };
-
-    #[tokio::test]
-    async fn schedule_queues_one_job_due_exactly_at_the_parked_moment() {
-        let db = crate::test_db::test_db().await.expect("test database slot");
-        let pool = db.pool().clone();
-        let alice = local_user(&pool, "alice").await;
-        let row = parked(
-            &pool,
-            &alice,
-            Utc::now() + TimeDelta::hours(1),
-            json!({ "status": "hello tomorrow" }),
-        )
-        .await;
-        let state = app_state(&pool);
-
-        schedule(&state, &row).await;
-        // The dedupe key swallows the second claim, so a replayed create
-        // cannot queue the same fire twice.
-        schedule(&state, &row).await;
-
-        let rows = sqlx::query_as::<_, crate::models::job::Job>(
-            "SELECT * FROM jobs WHERE kind = $1 ORDER BY id",
-        )
-        .bind(KIND_PUBLISH)
-        .fetch_all(&pool)
-        .await
-        .expect("the job rows read");
-        assert_eq!(rows.len(), 1, "one job per schedule, second call deduped");
-        let job = &rows[0];
-        assert_eq!(job.queue, QUEUE_SCHEDULED, "on the scheduled queue");
-        assert_eq!(
-            job.args,
-            job_args(row.id),
-            "the args name exactly the schedule id"
-        );
-        assert_eq!(
-            job.args["scheduled_id"],
-            row.id.to_string(),
-            "the key is scheduled_id"
-        );
-        assert_eq!(
-            job.run_at, row.scheduled_at,
-            "due at the parked moment, to the microsecond"
-        );
-        assert_eq!(
-            job.unique_key.as_deref(),
-            Some(unique_key(row.id).as_str()),
-            "the ticket's dedupe key"
-        );
-        assert_eq!(job.max_attempts, 5, "default attempts");
-    }
-
-    /// The `scheduled_statuses.publish` job rows, oldest id first.
-    async fn publish_jobs(pool: &PgPool) -> Vec<crate::models::job::Job> {
-        sqlx::query_as::<_, crate::models::job::Job>(
-            "SELECT * FROM jobs WHERE kind = $1 ORDER BY id",
-        )
-        .bind(KIND_PUBLISH)
-        .fetch_all(pool)
-        .await
-        .expect("the job rows read")
-    }
-
-    #[tokio::test]
-    async fn reschedule_replaces_the_waiting_fire_at_the_new_moment() {
-        let db = crate::test_db::test_db().await.expect("test database slot");
-        let pool = db.pool().clone();
-        let alice = local_user(&pool, "alice").await;
-        let row = parked(
-            &pool,
-            &alice,
-            Utc::now() + TimeDelta::hours(1),
-            json!({ "status": "hello tomorrow" }),
-        )
-        .await;
-        let state = app_state(&pool);
-        schedule(&state, &row).await;
-        let waiting = publish_jobs(&pool).await;
-        assert_eq!(waiting.len(), 1, "the create queued one fire");
-        assert_eq!(waiting[0].run_at, row.scheduled_at, "due at the old moment");
-
-        // The endpoint's own move, then the re-queue it runs afterwards.
-        // Whole microseconds, because that is what a `timestamptz` keeps and
-        // the comparison below is against a row read back out of one.
-        let later = Utc::now().trunc_subsecs(6) + TimeDelta::hours(6);
-        let moved = scheduled_status::reschedule(&pool, row.id, alice.id, later)
-            .await
-            .expect("the reschedule runs")
-            .expect("the owner's row moved");
-        reschedule(&state, &moved).await;
-
-        let after = publish_jobs(&pool).await;
-        assert_eq!(
-            after.len(),
-            1,
-            "the old fire went and the new one took its place"
-        );
-        assert_eq!(after[0].run_at, later, "due at the new moment");
-        assert_ne!(
-            after[0].id, waiting[0].id,
-            "a fresh row, not the old one edited"
-        );
-        assert_eq!(
-            after[0].unique_key.as_deref(),
-            Some(unique_key(row.id).as_str()),
-            "and still exactly one key per schedule"
-        );
-    }
-
-    #[tokio::test]
-    async fn reschedule_queues_a_fire_when_none_was_waiting() {
-        let db = crate::test_db::test_db().await.expect("test database slot");
-        let pool = db.pool().clone();
-        let alice = local_user(&pool, "alice").await;
-        let row = parked(
-            &pool,
-            &alice,
-            Utc::now() + TimeDelta::hours(2),
-            json!({ "status": "never queued" }),
-        )
-        .await;
-        let state = app_state(&pool);
-        assert!(
-            publish_jobs(&pool).await.is_empty(),
-            "the fixture row has no fire waiting"
-        );
-
-        // A lost or already-claimed job leaves nothing to cancel; the moved
-        // schedule still gets its fire, and twice over the key holds one.
-        reschedule(&state, &row).await;
-        reschedule(&state, &row).await;
-
-        let after = publish_jobs(&pool).await;
-        assert_eq!(after.len(), 1, "one fire for the row, deduped by key");
-        assert_eq!(
-            after[0].run_at, row.scheduled_at,
-            "due at the moment the row carries"
-        );
-    }
 
     #[tokio::test]
     async fn a_plain_post_publishes_the_stored_params_as_its_author() {
@@ -762,7 +676,9 @@ mod tests {
             updated_at: row.updated_at,
         };
 
-        let outcome = publish_one(&app_state(&pool), &orphan).await;
+        let mut tx = pool.begin().await.expect("the claim transaction opens");
+        let outcome = publish_locked(&app_state(&pool), &mut tx, &orphan).await;
+        tx.commit().await.expect("the claim commits");
 
         assert_eq!(
             outcome,
@@ -803,7 +719,9 @@ mod tests {
             updated_at: row.updated_at,
         };
 
-        let outcome = publish_one(&app_state(&pool), &broken).await;
+        let mut tx = pool.begin().await.expect("the claim transaction opens");
+        let outcome = publish_locked(&app_state(&pool), &mut tx, &broken).await;
+        tx.commit().await.expect("the claim commits");
 
         assert_eq!(
             outcome,

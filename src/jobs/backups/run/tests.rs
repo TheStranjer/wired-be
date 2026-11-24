@@ -211,7 +211,7 @@ async fn unusable_args_a_missing_row_and_a_missing_user_discard() {
     // A row cannot outlive its owner in the table — the foreign key's
     // cascade takes it — so the owner arm is what races between the
     // handler's two reads: it is proven on the read itself.
-    let orphan = load_owner(&state, Uuid::now_v7()).await;
+    let orphan = load_user(&state, Uuid::now_v7(), "backup", false).await;
     assert!(
         matches!(&orphan, Err(JobError::Discard(detail)) if detail.contains("user") && detail.contains("no longer exists")),
         "a vanished owner must discard, not {orphan:?}"

@@ -8,9 +8,10 @@ use uuid::Uuid;
 
 use super::server::{SCOPES, Server, Verb, action_ok, call, expect, write_ok};
 use super::sockets::{
-    account, assert_absent, follow, frame_payload, id_of, list_stream, next_json, open,
-    post_status, read_until, read_until_json, send, settled, streams_of, user_stream,
+    account, assert_absent, follow, frame_payload, list_stream, next_json, open, post_status,
+    read_until, read_until_json, send, settled, streams_of, user_stream,
 };
+use crate::common;
 
 // ────────────────────  Scenario 1: streaming sockets  ────────────────────
 
@@ -25,7 +26,7 @@ async fn a_public_status_streams_create_edit_and_delete() {
     let mut client = open(&srv.ws_url("stream=public")).await;
 
     let entity = post_status(&srv, &author_token, "the lifecycle post", "public").await;
-    let id = id_of(&entity);
+    let id = common::id_of(&entity);
     let created = next_json(&mut client).await;
     assert_eq!(created["event"], "update", "the create arrives as update");
     assert_eq!(
@@ -105,7 +106,7 @@ async fn hashtag_frames_subscribe_and_unsubscribe_a_live_socket() {
     let (_author, author_token) = account(&srv, "rt226-tag-author", SCOPES).await;
     let mut client = open(&srv.ws_url("stream=hashtag&tag=alpha")).await;
 
-    let first = id_of(&post_status(&srv, &author_token, "#Alpha one", "public").await);
+    let first = common::id_of(&post_status(&srv, &author_token, "#Alpha one", "public").await);
     let arrived = next_json(&mut client).await;
     assert_eq!(arrived["event"], "update", "the tagged post arrives");
     assert_eq!(
@@ -121,7 +122,7 @@ async fn hashtag_frames_subscribe_and_unsubscribe_a_live_socket() {
     .await;
     settled(&mut client).await;
     let second = post_status(&srv, &author_token, "#Beta two", "public").await;
-    let second_id = id_of(&second);
+    let second_id = common::id_of(&second);
     let beta = next_json(&mut client).await;
     assert!(
         beta["payload"]
@@ -144,7 +145,7 @@ async fn hashtag_frames_subscribe_and_unsubscribe_a_live_socket() {
         &json!({ "status": "#Alpha edited again" }),
     )
     .await;
-    let control = id_of(&post_status(&srv, &author_token, "#Beta control", "public").await);
+    let control = common::id_of(&post_status(&srv, &author_token, "#Beta control", "public").await);
     let frames = read_until(&mut client, &control).await;
     assert_absent(&frames, &[r#""event":"status.update""#, &first]);
     assert!(
@@ -192,7 +193,7 @@ async fn public_local_carries_local_posts_to_authenticated_unfiltered_viewers() 
         open(&srv.ws_url(&format!("stream=public:local&access_token={muter_token}"))).await;
 
     let local_post = post_status(&srv, &author_token, "kept at home", "local").await;
-    let local_id = id_of(&local_post);
+    let local_id = common::id_of(&local_post);
     let seen = next_json(&mut watcher_socket).await;
     assert_eq!(seen["event"], "update", "the local viewer sees the post");
     assert_eq!(
@@ -207,7 +208,8 @@ async fn public_local_carries_local_posts_to_authenticated_unfiltered_viewers() 
         "rendered with the status itself"
     );
 
-    let control = id_of(&post_status(&srv, &mate_token, "the local control", "public").await);
+    let control =
+        common::id_of(&post_status(&srv, &mate_token, "the local control", "public").await);
     let anonymous = read_until(&mut anon_socket, &control).await;
     assert_absent(&anonymous, &[&local_id, "kept at home"]);
     let blocked = read_until(&mut blocker_socket, &control).await;
@@ -248,7 +250,7 @@ async fn home_and_list_sockets_stream_the_followed_and_listed_post() {
         &json!({ "title": "Realtime" }),
     )
     .await;
-    let list_id = Uuid::parse_str(&id_of(&list)).expect("the list id is a uuid");
+    let list_id = Uuid::parse_str(&common::id_of(&list)).expect("the list id is a uuid");
     let _members = write_ok(
         &srv,
         Verb::Post,
@@ -268,7 +270,7 @@ async fn home_and_list_sockets_stream_the_followed_and_listed_post() {
     settled(&mut home).await;
     settled(&mut list_socket).await;
 
-    let id = id_of(&post_status(&srv, &author_token, "for home and list", "public").await);
+    let id = common::id_of(&post_status(&srv, &author_token, "for home and list", "public").await);
     let home_frame = read_until_json(&mut home, &id).await;
     assert_eq!(home_frame["event"], "update", "the home socket sees it");
     assert_eq!(

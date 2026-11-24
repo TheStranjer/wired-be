@@ -163,7 +163,7 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
-    use crate::util::time::parse_time;
+    use crate::{test_fixtures::json_keys, util::time::parse_time};
 
     /// The filter id, as a client sees it.
     const FILTER_ID: &str = "01934567-89ab-7cde-f012-3456789abcde";
@@ -199,18 +199,6 @@ mod tests {
     /// `row` rendered as a JSON value; entities always serialize.
     fn render(row: &FilterRow) -> Value {
         serde_json::to_value(Filter::from_row(row)).expect("an entity serializes")
-    }
-
-    /// The rendered object's keys, sorted, for exact key-set assertions.
-    fn json_keys(value: &Value) -> Vec<&str> {
-        let mut keys: Vec<&str> = value
-            .as_object()
-            .expect("filters render objects")
-            .keys()
-            .map(String::as_str)
-            .collect();
-        keys.sort_unstable();
-        keys
     }
 
     #[test]

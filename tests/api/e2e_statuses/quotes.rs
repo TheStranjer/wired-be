@@ -5,8 +5,8 @@ use axum::{Router, http::StatusCode};
 use serde_json::{Value, json};
 
 use super::support::{
-    ACCOUNTS, EVERYONE, NOT_FOUND, OPEN, STATUSES, Shape, UNKNOWN_ID, World, entity_id, get,
-    posted, sweep, world,
+    ACCOUNTS, EVERYONE, NOT_FOUND, OPEN, STATUSES, Shape, UNKNOWN_ID, World, get, posted, sweep,
+    world,
 };
 use super::thread_support::{context, context_arms, page_ids};
 use crate::common;
@@ -24,7 +24,7 @@ async fn quote_pair(app: &Router, world: &World) -> (Value, Value) {
     let quote = posted(
         app,
         &world.author.token,
-        json!({"status": "quoting in public", "quote_id": entity_id(&original)}),
+        json!({"status": "quoting in public", "quote_id": common::id_of(&original)}),
     )
     .await;
     (original, quote)
@@ -85,7 +85,7 @@ async fn a_quote_create_nests_its_original_and_counts_it_once() {
     let shown = get(
         &app,
         Some(&world.author.token),
-        &format!("{STATUSES}/{}", entity_id(&original)),
+        &format!("{STATUSES}/{}", common::id_of(&original)),
     )
     .await;
     common::assert_answer(&shown, StatusCode::OK, "the author reads the original");
@@ -114,7 +114,7 @@ async fn a_quote_shows_its_original_only_to_viewers_that_reach_it() {
     let (original, quote) = quote_pair(&app, &world).await;
 
     let shape = Shape {
-        id: entity_id(&quote),
+        id: common::id_of(&quote),
         visibility: "public",
         content: json!("<p>quoting in public</p>"),
         acct: "author",
@@ -172,14 +172,14 @@ async fn a_quote_hangs_from_no_thread_in_either_context() {
         ("the author", Some(world.author.token.as_str())),
         ("the stranger", Some(world.stranger.token.as_str())),
     ] {
-        let response = context(&app, token, &entity_id(&quote)).await;
+        let response = context(&app, token, &common::id_of(&quote)).await;
         common::assert_answer(&response, StatusCode::OK, &format!("{who} at the quote"));
         let (ancestors, descendants) = context_arms(&response.json_value(), who);
         assert!(ancestors.is_empty(), "{who}: a quote replies to nothing");
         assert!(descendants.is_empty(), "{who}: nothing threaded the quote");
     }
 
-    let below = context(&app, Some(&world.author.token), &entity_id(&original)).await;
+    let below = context(&app, Some(&world.author.token), &common::id_of(&original)).await;
     common::assert_answer(&below, StatusCode::OK, "the author at the original");
     let (_ancestors, descendants) = context_arms(&below.json_value(), "the author at the original");
     assert!(
@@ -202,8 +202,8 @@ async fn a_quote_of_an_invisible_original_is_the_shared_404() {
     let (original, quote) = quote_pair(&app, &world).await;
 
     let bodies = [
-        json!({"status": "a stranger cannot", "quote_id": entity_id(&original)}),
-        json!({"status": "a block outranks", "quote_id": entity_id(&quote)}),
+        json!({"status": "a stranger cannot", "quote_id": common::id_of(&original)}),
+        json!({"status": "a block outranks", "quote_id": common::id_of(&quote)}),
         json!({"status": "nothing stored", "quote_id": UNKNOWN_ID}),
         json!({"status": "not an id", "quote_id": "not-an-id"}),
     ];
@@ -251,7 +251,7 @@ async fn a_refused_quote_writes_no_row_and_moves_no_counter() {
     let (original, _quote) = quote_pair(&app, &world).await;
 
     for probe in [
-        json!({"status": "a stranger cannot", "quote_id": entity_id(&original)}),
+        json!({"status": "a stranger cannot", "quote_id": common::id_of(&original)}),
         json!({"status": "nothing stored", "quote_id": UNKNOWN_ID}),
     ] {
         let refused = create_probe(&app, &world.stranger.token, probe).await;
@@ -261,7 +261,7 @@ async fn a_refused_quote_writes_no_row_and_moves_no_counter() {
     let shown = get(
         &app,
         Some(&world.author.token),
-        &format!("{STATUSES}/{}", entity_id(&original)),
+        &format!("{STATUSES}/{}", common::id_of(&original)),
     )
     .await;
     assert_eq!(
@@ -314,7 +314,7 @@ async fn the_blocked_viewer_reads_nothing_of_the_author_and_their_own_everything
     .await;
 
     let mut blind = Vec::new();
-    for id in [entity_id(&open), entity_id(&dm)] {
+    for id in [common::id_of(&open), common::id_of(&dm)] {
         blind.push(
             get(
                 &app,
@@ -332,7 +332,7 @@ async fn the_blocked_viewer_reads_nothing_of_the_author_and_their_own_everything
     );
 
     let own_shape = Shape {
-        id: entity_id(&own),
+        id: common::id_of(&own),
         visibility: "public",
         content: json!("<p>the blocked still post</p>"),
         acct: "blocker",

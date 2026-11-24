@@ -4,9 +4,7 @@ use axum::http::StatusCode;
 use serde_json::{Value, json};
 use wired_be::models::status::Visibility;
 
-use super::support::{
-    ACTIVITY_JSON, AS_PUBLIC, BASE, fetch_ap, key_set, outbox_fixture, stored_user,
-};
+use super::support::{ACTIVITY_JSON, AS_PUBLIC, BASE, fetch_ap, outbox_fixture, stored_user};
 use crate::common;
 
 /// The outbox root: the collection's address, the page link, and the
@@ -36,7 +34,7 @@ async fn the_outbox_root_is_a_paged_collection_summary() {
     );
     let document = response.json_value();
     assert_eq!(
-        key_set(&document),
+        common::sorted_keys(&document),
         ["@context", "first", "id", "totalItems", "type"],
         "the root's documented keys — no items at this level"
     );
@@ -151,13 +149,13 @@ async fn the_outbox_items_are_the_federated_activities() {
     assert_eq!(announce["actor"], fixture.alice.ap_id, "the booster speaks");
     assert_eq!(
         announce["to"],
-        json!([format!("{BASE}/users/alice/followers"), fixture.bob.ap_id]),
-        "Pleroma's announce addressing: the booster's followers and the boosted author"
+        json!([AS_PUBLIC]),
+        "a public boost names the world in to, as it was delivered"
     );
     assert_eq!(
         announce["cc"],
-        json!([AS_PUBLIC]),
-        "and the public collection on cc"
+        json!([format!("{BASE}/users/alice/followers"), fixture.bob.ap_id]),
+        "and the booster's followers and the boosted author in cc"
     );
 
     let create = &items[1];

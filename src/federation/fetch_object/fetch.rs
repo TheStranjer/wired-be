@@ -2,18 +2,19 @@
 //! dereference and the containment checks on the document it returns.
 
 use serde_json::Value;
-use url::Url;
 
 use super::{FetchBudget, FetchError};
 use crate::{
     config::Config,
-    federation::fetch_actor::{
-        Signer, ensure_not_redirected, ensure_same_host, fetch_document, fetch_signer,
-        names_served_url,
+    federation::{
+        fetch_actor::{
+            ContainmentRules, CrossHost, FetchError as ActorError, fetch_contained_document,
+            fetch_signer,
+        },
+        mrf,
     },
     http_client::{HttpClient, user_agent},
     state::AppState,
-    util::url::same_origin,
 };
 
 /// Cap on one fetched object document: 2 MiB. Notes carry content, tags
@@ -58,50 +59,42 @@ pub(super) async fn fetch_contained(
     url: &str,
     budget: &FetchBudget,
 ) -> Result<Value, FetchError> {
+    refuse(state, url).await?;
     let http = object_client(&state.config);
     let signer = fetch_signer(state).await?;
-    let (document, served) = fetch_bounded(&http, url, signer.as_ref(), budget).await?;
-    ensure_same_host(url, &served)?;
-    let claimed = declared_id(&document)?;
-    if names_served_url(url, &served, claimed) {
-        return Ok(document);
-    }
-    if !same_authority(url, claimed) {
-        return Err(FetchError::Invalid(format!(
-            "the object fetched from `{url}` names `{claimed}`, a different origin"
-        )));
-    }
-    // Same origin but a different id than the URL that served it: follow
-    // the claim exactly once, without a redirect, and accept only a
-    // document that names itself.
-    let (refetched, refetched_from) =
-        fetch_bounded(&http, claimed, signer.as_ref(), budget).await?;
-    ensure_not_redirected(claimed, &refetched_from)?;
-    let refetched_id = declared_id(&refetched)?;
-    if refetched_id != claimed {
-        return Err(FetchError::Invalid(format!(
-            "the object `{claimed}` identifies itself as `{refetched_id}`"
-        )));
-    }
-    Ok(refetched)
+    // The claimed id, when it differs from `url`, is on `url`'s authority
+    // (`CrossHost::Deny`), so the host refused above covers it too.
+    let rules = ContainmentRules {
+        max_bytes: MAX_OBJECT_BODY_BYTES,
+        cross_host: CrossHost::Deny,
+    };
+    fetch_contained_document(&http, url, signer.as_ref(), rules, |target| {
+        take_budget(budget, target)
+    })
+    .await
+    .map_err(FetchError::from)
 }
 
-/// One budgeted document `GET`: spends a dereference and runs the shared
-/// signed federation fetch against the object body cap.
-async fn fetch_bounded(
-    http: &HttpClient,
-    url: &str,
-    signer: Option<&Signer>,
-    budget: &FetchBudget,
-) -> Result<(Value, Url), FetchError> {
-    if !budget.take() {
-        return Err(FetchError::Invalid(format!(
-            "the per-activity object fetch budget is spent (`{url}` not fetched)"
-        )));
-    }
-    fetch_document(http, url, signer, MAX_OBJECT_BODY_BYTES)
+/// Refuses to dereference `url` when the MRF policy rejects its host.
+///
+/// The refusal is a [`FetchError::Invalid`], a permanent failure to the
+/// callers: nothing is sent to a domain the instance federates with no
+/// one at.
+async fn refuse(state: &AppState, url: &str) -> Result<(), FetchError> {
+    mrf::refuse_rejected(state, url)
         .await
-        .map_err(FetchError::from)
+        .map_err(FetchError::Invalid)
+}
+
+/// Spends one dereference of `budget` for the `GET` of `url`. Fails in the
+/// actor fetcher's vocabulary, which the shared containment speaks.
+fn take_budget(budget: &FetchBudget, url: &str) -> Result<(), ActorError> {
+    if budget.take() {
+        return Ok(());
+    }
+    Err(ActorError::Invalid(format!(
+        "the per-activity object fetch budget is spent (`{url}` not fetched)"
+    )))
 }
 
 /// The client the object fetches run on: the instance's outbound identity
@@ -113,23 +106,4 @@ fn object_client(config: &Config) -> HttpClient {
         config.fetch.http_allow_private_hosts,
         MAX_OBJECT_REDIRECTS,
     )
-}
-
-/// The document's self-declared `id`: every containment rule compares it
-/// against the URL the document was fetched from.
-fn declared_id(document: &Value) -> Result<&str, FetchError> {
-    document
-        .get("id")
-        .and_then(Value::as_str)
-        .ok_or_else(|| FetchError::Invalid("the object document carries no string `id`".to_owned()))
-}
-
-/// Whether two absolute URLs name the same origin: the scheme-less
-/// authority (`host:port`) compared on the parsed URL, the same measure
-/// [`is_local_ap_id`] keeps. An unparsable side matches nothing.
-fn same_authority(left: &str, right: &str) -> bool {
-    let (Ok(parsed_left), Ok(parsed_right)) = (Url::parse(left), Url::parse(right)) else {
-        return false;
-    };
-    same_origin(&parsed_left, &parsed_right)
 }

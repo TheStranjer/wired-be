@@ -25,8 +25,6 @@ use wired_be::{
 
 use crate::common;
 
-/// The instance origin the fixtures live on (`Config::for_tests`).
-const BASE: &str = "https://test.example";
 /// The 422 body both pin routes answer without an accepted follow (the
 /// wording this endpoint's ticket pins).
 const NOT_FOLLOWING: &str = r#"{"error":"You must follow this user to endorse them"}"#;
@@ -136,15 +134,6 @@ fn list_path(prefix: &str, account: &str, query: &str) -> String {
 /// The Mastodon and Pleroma listing prefixes this ticket shares.
 const LIST_PREFIXES: [&str; 2] = ["/api/v1", "/api/v1/pleroma"];
 
-/// The `id` of every entity of a listing response, in response order.
-fn listed_ids(body: &Value) -> Vec<String> {
-    body.as_array()
-        .expect("the listing is an array")
-        .iter()
-        .map(|account| account["id"].as_str().expect("an account id").to_owned())
-        .collect()
-}
-
 /// The stored `(id, target_id)` rows of `endorser`'s endorsements, newest
 /// first — read from storage so same-millisecond `UUIDv7`s cannot make an
 /// expectation depend on insert timing (decision 4).
@@ -156,15 +145,6 @@ async fn stored_endorsements(pool: &PgPool, endorser: &User) -> Vec<(Uuid, Uuid)
     .fetch_all(pool)
     .await
     .expect("the stored rows read")
-}
-
-/// The `Link` header Pleroma's `add_link_headers` writes for a page of
-/// `path`: `next` walks to the oldest row, `prev` back to the newest.
-fn expected_link(path: &str, oldest: &Uuid, newest: &Uuid) -> String {
-    format!(
-        "<{BASE}{path}?max_id={oldest}>; rel=\"next\", \
-         <{BASE}{path}?min_id={newest}>; rel=\"prev\""
-    )
 }
 
 /// Pinning demands an accepted follow: without one both action spellings
@@ -501,7 +481,7 @@ async fn own_endorsements_lists_the_callers_pins() {
         "the entities are JSON"
     );
     assert_eq!(
-        listed_ids(&body.json_value()),
+        common::ids_of(&body.json_value()),
         stored
             .iter()
             .map(|(_, target)| target.to_string())
@@ -510,10 +490,10 @@ async fn own_endorsements_lists_the_callers_pins() {
     );
     assert_eq!(
         body.header("link"),
-        Some(expected_link(
+        Some(common::expected_link(
             "/api/v1/endorsements",
-            &stored[1].0,
-            &stored[0].0
+            &stored[0].0,
+            &stored[1].0
         ))
         .as_deref(),
         "the Link header cursors are the endorsement row ids"
@@ -591,7 +571,7 @@ async fn own_endorsements_pages_by_endorsement_id() {
 
     let first = get(&app, Some(&token), "/api/v1/endorsements?limit=2").await;
     assert_eq!(
-        listed_ids(&first.json_value()),
+        common::ids_of(&first.json_value()),
         stored[..2]
             .iter()
             .map(|(_, target)| target.to_string())
@@ -600,10 +580,10 @@ async fn own_endorsements_pages_by_endorsement_id() {
     );
     assert_eq!(
         first.header("link"),
-        Some(expected_link(
+        Some(common::expected_link(
             "/api/v1/endorsements",
-            &stored[1].0,
-            &stored[0].0
+            &stored[0].0,
+            &stored[1].0
         ))
         .as_deref(),
         "the page links its own cursors"
@@ -616,7 +596,7 @@ async fn own_endorsements_pages_by_endorsement_id() {
     )
     .await;
     assert_eq!(
-        listed_ids(&older.json_value()),
+        common::ids_of(&older.json_value()),
         vec![stored[2].1.to_string()],
         "max_id continues where the page ended"
     );
@@ -628,7 +608,7 @@ async fn own_endorsements_pages_by_endorsement_id() {
     )
     .await;
     assert_eq!(
-        listed_ids(&newer.json_value()),
+        common::ids_of(&newer.json_value()),
         stored[..2]
             .iter()
             .map(|(_, target)| target.to_string())
@@ -683,7 +663,7 @@ async fn account_endorsements_are_public_on_both_prefixes() {
             let body = get(&app, viewer, &path).await;
             assert_eq!(body.status, StatusCode::OK, "auth is optional");
             assert_eq!(
-                listed_ids(&body.json_value()),
+                common::ids_of(&body.json_value()),
                 vec![pinned.id.to_string()],
                 "the target's pin, `{prefix}` alike"
             );
@@ -696,7 +676,7 @@ async fn account_endorsements_are_public_on_both_prefixes() {
         );
         assert_eq!(
             anonymous.header("link"),
-            Some(expected_link(&path, &stored[0].0, &stored[0].0)).as_deref(),
+            Some(common::expected_link(&path, &stored[0].0, &stored[0].0)).as_deref(),
             "the Link header targets the request's own prefix"
         );
     }
@@ -817,7 +797,7 @@ async fn hidden_follows_hides_another_accounts_endorsements() {
         }
         let own = get(&app, Some(&owner_token), &path).await;
         assert_eq!(
-            listed_ids(&own.json_value()),
+            common::ids_of(&own.json_value()),
             vec![pinned.id.to_string()],
             "the account itself always sees its pins"
         );
@@ -830,7 +810,7 @@ async fn hidden_follows_hides_another_accounts_endorsements() {
     )
     .await;
     assert_eq!(
-        listed_ids(&visible.json_value()),
+        common::ids_of(&visible.json_value()),
         vec![pinned.id.to_string()],
         "hiding the follower count does not hide the pins"
     );

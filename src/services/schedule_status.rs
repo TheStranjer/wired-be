@@ -77,7 +77,7 @@ use crate::{
         status::NewStatus,
         user::User,
     },
-    services::create_status::{CreateStatusParams, prepared_new_status},
+    services::create_status::{CreateStatusParams, Prepared, prepared_new_status},
     state::AppState,
     util::time::parse_time,
 };
@@ -142,7 +142,7 @@ pub async fn schedule_status(
     // shape rides along in the serialised params below, and the publish
     // replays them through the create arms, which check it again — at the
     // fire's own moment, the way `expires_in` is counted from it.
-    let (new, _poll) = prepared_new_status(state, user, app, &params).await?;
+    let Prepared { new, .. } = prepared_new_status(state, user, app, &params).await?;
     check_window(&state.config, at)?;
     check_media(state, user.id, &new.media_ids).await?;
     let stored = stored_params(&params, &new, idempotency, app)?;

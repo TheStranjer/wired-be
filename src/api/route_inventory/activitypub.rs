@@ -107,11 +107,6 @@ pub(super) const ROWS: &[RouteSpec] = &[
     },
     RouteSpec {
         method: "GET",
-        path: "/mailer/unsubscribe/:token",
-        auth: AuthClass::Public,
-    },
-    RouteSpec {
-        method: "GET",
         path: "/api/ap/whoami",
         auth: AuthClass::User,
     },
@@ -152,11 +147,6 @@ pub(super) const ROWS: &[RouteSpec] = &[
     },
     RouteSpec {
         method: "GET",
-        path: "/authorize_interaction",
-        auth: AuthClass::Public,
-    },
-    RouteSpec {
-        method: "GET",
         path: "/proxy/:sig/:url",
         auth: AuthClass::Public,
     },
@@ -183,11 +173,6 @@ pub(super) const ROWS: &[RouteSpec] = &[
     RouteSpec {
         method: "GET",
         path: "/emoji/:pack/:file",
-        auth: AuthClass::Public,
-    },
-    RouteSpec {
-        method: "GET",
-        path: "/instance/:name.html",
         auth: AuthClass::Public,
     },
 ];

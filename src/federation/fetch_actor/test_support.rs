@@ -8,7 +8,6 @@ use std::sync::{
 };
 
 use axum::{
-    Router,
     extract::State,
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse as _, Response},
@@ -16,9 +15,9 @@ use axum::{
 use reqwest::header::CONTENT_TYPE;
 use serde_json::{Value, json};
 use sqlx::PgPool;
-use tokio::{net::TcpListener, task::JoinHandle};
 
 use super::ACTOR_ACCEPT;
+pub(super) use crate::test_server::{bind, origin, spawn};
 use crate::{config::Config, http_client::HttpClient, state::AppState};
 
 /// `User-Agent` for the test clients.
@@ -45,31 +44,12 @@ pub(super) fn client() -> HttpClient {
     HttpClient::new_for_tests(TEST_UA)
 }
 
-/// Binds an unused loopback port.
-pub(super) async fn bind() -> TcpListener {
-    TcpListener::bind("127.0.0.1:0").await.unwrap()
-}
-
-/// The `http://{addr}` origin a listener answers on.
-pub(super) fn origin(listener: &TcpListener) -> String {
-    format!("http://{}", listener.local_addr().unwrap())
-}
-
 /// The `host:port` authority of an `http://{addr}` origin — what the
 /// mirror's `user@host` nickname and `domain` column now carry, port
 /// included (decision 7, and the handle a `WebFinger` round trip on a
 /// loopback peer resolves to).
 pub(super) fn authority_of(base: &str) -> &str {
     base.split_once("://").map_or(base, |(_scheme, rest)| rest)
-}
-
-/// Serves `app` on `listener` until the test aborts the task.
-pub(super) fn spawn(listener: TcpListener, app: Router) -> JoinHandle<()> {
-    tokio::spawn(async move {
-        if let Err(err) = axum::serve(listener, app).await {
-            tracing::debug!("test server stopped: {err}");
-        }
-    })
 }
 
 /// A minimal actor document for `id`, the way a Mastodon peer serves

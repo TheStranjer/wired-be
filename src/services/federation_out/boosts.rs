@@ -9,9 +9,9 @@
 
 use serde_json::Value;
 
-use super::{PUBLIC, StatusAction, followers_address, queue_activity, status_action, withdrawal};
+use super::{StatusAction, queue_activity, status_action, withdrawal};
 use crate::{
-    federation::activities::{ObjectActivityContext, announce_json},
+    federation::note::announce_activity_json,
     models::status::{Status, Visibility},
     state::AppState,
 };
@@ -46,42 +46,50 @@ pub async fn after_reblog_changed(state: &AppState, reblog: &Status, reblogging:
     let Some(action) = status_action(state, reblog.user_id, original_id).await else {
         return;
     };
-    let document = reblog_activity(state, reblog, &action, !reblogging);
+    let Some(document) = reblog_activity(state, reblog, &action, !reblogging) else {
+        return;
+    };
     queue_activity(state, &action.actor, &document, "reblog").await;
 }
 
 /// The `Announce` behind the reblog row `reblog`, in the undo arm wrapped
 /// in the `Undo` that withdraws it; both travel under the addressing the
 /// boost's visibility states ([`after_reblog_changed`]'s module-doc rule).
+///
+/// The `Announce` is [`announce_activity_json`], the one renderer the
+/// object and outbox routes serve from too, so what a peer re-fetches is
+/// what was delivered; the `Undo` repeats that document's own `to` and
+/// `cc`. `None` for a `local` boost, which federates nothing.
 pub(super) fn reblog_activity(
     state: &AppState,
     reblog: &Status,
     action: &StatusAction,
     undo: bool,
-) -> Value {
-    let followers = followers_address(&action.actor);
-    let author = action.author.ap_id.as_str();
-    let (to, cc): (Vec<&str>, Vec<&str>) = match reblog.visibility {
-        Visibility::Public => (vec![PUBLIC], vec![followers.as_str(), author]),
-        Visibility::Unlisted => (vec![followers.as_str()], vec![author, PUBLIC]),
-        Visibility::Private | Visibility::Direct | Visibility::Local => {
-            (vec![followers.as_str()], vec![author])
-        }
-    };
-    let announce = announce_json(&ObjectActivityContext {
-        config: &state.config,
-        id: &reblog.uri,
-        actor_ap_id: &action.actor.ap_id,
-        object_uri: &action.status.uri,
-        to: &to,
-        cc: &cc,
-        published: &reblog.inserted_at,
-    });
-    if undo {
-        withdrawal(state, &action.actor.ap_id, &to, &cc, &announce)
-    } else {
-        announce
+) -> Option<Value> {
+    let announce = announce_activity_json(
+        reblog,
+        &action.actor,
+        &action.status.uri,
+        &action.author.ap_id,
+        &state.config,
+    )?;
+    if !undo {
+        return Some(announce);
     }
+    let to = address_line(&announce, "to");
+    let cc = address_line(&announce, "cc");
+    Some(withdrawal(state, &action.actor.ap_id, &to, &cc, &announce))
+}
+
+/// The entries of `document`'s addressing line `name` (`to` or `cc`), in
+/// order; a missing or malformed line reads as empty.
+fn address_line<'a>(document: &'a Value, name: &str) -> Vec<&'a str> {
+    document[name]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect()
 }
 
 #[cfg(test)]
@@ -92,6 +100,7 @@ mod tests {
 
     use crate::{
         config::TEST_BASE_URL,
+        federation::vocab::AS_PUBLIC,
         models::{
             emoji_reaction::{self, NewReaction},
             favourite,
@@ -142,7 +151,7 @@ mod tests {
         );
         assert_eq!(
             activity["to"],
-            json!([PUBLIC]),
+            json!([AS_PUBLIC]),
             "a public boost addresses the world"
         );
         assert_eq!(
@@ -195,7 +204,7 @@ mod tests {
         );
         assert_eq!(
             activity["cc"],
-            json!([bob.ap_id, PUBLIC]),
+            json!([bob.ap_id, AS_PUBLIC]),
             "the author and the public address ride cc"
         );
     }
@@ -234,7 +243,7 @@ mod tests {
                 !activity[line]
                     .as_array()
                     .expect("the line is an array")
-                    .contains(&json!(PUBLIC)),
+                    .contains(&json!(AS_PUBLIC)),
                 "no public address in {line}"
             );
         }
@@ -276,7 +285,7 @@ mod tests {
         );
         assert_eq!(
             activity["cc"],
-            json!([bob.ap_id, PUBLIC]),
+            json!([bob.ap_id, AS_PUBLIC]),
             "and its cc line, public address included"
         );
     }
@@ -361,7 +370,7 @@ mod tests {
         );
         assert_eq!(
             activity["to"],
-            json!([PUBLIC]),
+            json!([AS_PUBLIC]),
             "the boost's to line repeats"
         );
         assert_eq!(

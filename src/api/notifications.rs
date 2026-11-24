@@ -84,14 +84,13 @@ use uuid::Uuid;
 use crate::{
     api::{
         chats::message_of,
-        helpers::{StringList, distinct, keyed_json, render_visible},
+        helpers::{StringList, accounts_with_relationships, distinct, keyed_json, render_filtered},
         notifications_v2::{account_filter, type_filters},
     },
     auth::AuthUser,
     entities::{
         account::{Account, AccountViewer},
         notification::Notification as NotificationEntity,
-        relationship::{Relationship, RelationshipMap},
     },
     error::{AppError, AppResult},
     extract::{ApiBody, ApiParams, flex},
@@ -101,11 +100,11 @@ use crate::{
         notification::{
             self, FlatPageParams, Notification as NotificationRow, NotificationFilters,
         },
-        user::{self, User},
+        user::User,
     },
     oauth::scopes::{READ_NOTIFICATIONS, WRITE_NOTIFICATIONS},
     pagination::{NO_EXTRA_QUERY, PageParams, keyset_link, set_link_header},
-    services::filter::{FilterContext, apply_filters},
+    services::filter::FilterContext,
     state::AppState,
     util::id::parse_id,
 };
@@ -602,17 +601,8 @@ pub(crate) async fn render_notifications(
     }
     let actor_ids = distinct(rows.iter().map(|row| row.from_account_id));
     let status_ids = distinct(rows.iter().filter_map(|row| row.status_id));
-    let users = user::get_many(&state.db, &actor_ids)
-        .await?
-        .into_iter()
-        .map(|found| (found.id, found))
-        .collect::<HashMap<Uuid, User>>();
-    let relationships = Relationship::load_many(&state.db, viewer.id, &actor_ids)
-        .await?
-        .into_iter()
-        .zip(actor_ids)
-        .map(|(relationship, target)| (target, relationship))
-        .collect::<RelationshipMap>();
+    let (users, relationships) =
+        accounts_with_relationships(state, Some(viewer), &actor_ids).await?;
     let statuses = visible_statuses(state, Some(viewer), &status_ids, filters).await?;
     let chat_messages = rendered_chat_messages(state, viewer, rows).await?;
     let mut entities = Vec::with_capacity(rows.len());
@@ -634,11 +624,12 @@ pub(crate) async fn render_notifications(
             .and_then(|id| chat_messages.get(&id).cloned());
         entities.push(NotificationEntity::from_row(
             row,
-            Account::from_user_for(Some(viewer), actor, &state.config, Some(&relationships)),
+            Account::from_user_for(Some(viewer), actor, &state.config, relationships.as_ref()),
             status,
             chat_message,
             relationships
-                .get(&row.from_account_id)
+                .as_ref()
+                .and_then(|map| map.get(&row.from_account_id))
                 .is_some_and(|found| found.muting.0),
         ));
     }
@@ -724,9 +715,9 @@ struct RenderedStatuses {
 }
 
 /// The distinct status ids of `ids`, rendered as seen by `viewer`, run
-/// through [`apply_filters`] in the `notifications` context, serialized,
+/// through [`render_filtered`] in the `notifications` context, serialized,
 /// and keyed by their row ids: rows that name no row, that a delete took,
-/// or that [`render_visible`] hides from this reader are not in the map
+/// or that the visibility rules hide from this reader are not in the map
 /// (see [`RenderedStatuses`] for what the map and the hidden list carry).
 ///
 /// # Errors
@@ -741,31 +732,10 @@ async fn visible_statuses(
     ids: &[Uuid],
     filters: &[Filter],
 ) -> AppResult<RenderedStatuses> {
-    if ids.is_empty() {
-        return Ok(RenderedStatuses {
-            rendered: HashMap::new(),
-            hidden_by_filter: Vec::new(),
-        });
-    }
-    let page = render_visible(state, viewer, ids).await?;
-    let mut all_ids: Vec<Uuid> = page
-        .iter()
-        .filter_map(|entity| parse_id(&entity.id))
-        .collect();
-    let kept = apply_filters(
-        page,
-        filters,
-        FilterContext::Notifications,
-        viewer.map(|user| user.id),
-    );
-    let rendered = keyed_json(kept)?;
-    // What the render produced but the filtered page did not keep is what
-    // an `irreversible` match removed — invisible rows never entered the
-    // render at all, so the two hides stay distinguishable.
-    all_ids.retain(|id| !rendered.contains_key(id));
+    let shared = render_filtered(state, viewer, ids, filters, FilterContext::Notifications).await?;
     Ok(RenderedStatuses {
-        rendered,
-        hidden_by_filter: all_ids,
+        rendered: keyed_json(shared.kept)?,
+        hidden_by_filter: shared.hidden_by_filter,
     })
 }
 

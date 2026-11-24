@@ -75,6 +75,12 @@ fn offered_code<'a>(error: Option<&'a str>, code: Option<&'a str>) -> Option<&'a
     code.filter(|text| !text.is_empty())
 }
 
+/// The 403 body of an external login for an MFA-enabled account: the
+/// server renders no code-entry page, and a browser redirect cannot carry
+/// the password grant's `mfa_token` challenge, so the account signs in
+/// with the password grant instead.
+const MFA_UNSUPPORTED: &str = "Two-factor accounts cannot sign in through an external provider";
+
 /// The login a finished flow earned, from the callback's linked user or a
 /// completed registration: the stored application, redirect URI and
 /// scopes re-checked the way the consent submission checks its round-tripped
@@ -83,7 +89,8 @@ fn offered_code<'a>(error: Option<&'a str>, code: Option<&'a str>) -> Option<&'a
 /// # Errors
 ///
 /// 403 `account_is_disabled` from
-/// [`crate::api::oauth`]'s account gate, a 400 refusal of the stored
+/// [`crate::api::oauth`]'s account gate, a 403 [`MFA_UNSUPPORTED`] for an
+/// MFA-enabled account, a 400 refusal of the stored
 /// application, redirect URI or scopes, or any database failure as
 /// [`AppError::Database`].
 pub(super) async fn granted(
@@ -97,7 +104,7 @@ pub(super) async fn granted(
     authorize::check_scopes_subset(&scopes, &app)?;
     check_account_ready(user)?;
     if mfa::required(user) {
-        return authorize::mfa_detour(state, user, &app, &scopes, &params.delivery()).await;
+        return Err(AppError::Forbidden(MFA_UNSUPPORTED.to_owned()));
     }
     authorize::grant_code(state, user, &app, &scopes, &params.delivery()).await
 }

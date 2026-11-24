@@ -53,7 +53,9 @@ async fn boost_withdrawal(state: &AppState, deleted: &Status, original_id: Uuid)
     let Some(action) = status_action(state, deleted.user_id, original_id).await else {
         return;
     };
-    let document = reblog_activity(state, deleted, &action, true);
+    let Some(document) = reblog_activity(state, deleted, &action, true) else {
+        return;
+    };
     queue_activity(state, &action.actor, &document, "boost withdrawal").await;
 }
 
@@ -139,14 +141,12 @@ mod tests {
 
     use crate::{
         config::TEST_BASE_URL,
+        federation::vocab::AS_PUBLIC,
         models::status,
-        services::federation_out::{
-            PUBLIC,
-            test_support::{
-                accepted_follow, app_state, delivered_inboxes, local, local_post, local_status,
-                publish_jobs, queued_activity, remote, remote_status, run_publishes,
-                the_single_activity,
-            },
+        services::federation_out::test_support::{
+            accepted_follow, app_state, delivered_inboxes, local, local_post, local_status,
+            publish_jobs, queued_activity, remote, remote_status, run_publishes,
+            the_single_activity,
         },
         util::time::mastodon_time,
     };
@@ -225,7 +225,7 @@ mod tests {
         );
         assert_eq!(
             activity["to"],
-            json!([PUBLIC]),
+            json!([AS_PUBLIC]),
             "the addressing the post carried"
         );
         assert_eq!(

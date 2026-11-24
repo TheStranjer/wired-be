@@ -16,7 +16,9 @@
 //! attachments (`only_media`), visibility (`exclude_visibilities[]`) and the
 //! viewer's own exclusions (`with_muted`). Auth is optional: an anonymous
 //! request reads the same public page, a presented user token must grant
-//! `read:statuses` (Pleroma's `OAuthScopesPlug` on the `hashtag` action).
+//! `read:statuses` (Pleroma's `OAuthScopesPlug` on the `hashtag` action). The
+//! same `RESTRICT_UNAUTHENTICATED` gate as the public timeline's (see below,
+//! `ensure_open`) refuses an anonymous tag read, keyed on `local`.
 //!
 //! `GET /api/v1/timelines/public` (WBE-101) answers the
 //! [`TimelineSource::Public`] page — `public` statuses, and `local` ones too
@@ -80,8 +82,11 @@
 use axum::{Router, routing::get};
 
 use crate::{
+    api::helpers::{QueryPairs, is_true, push_visibility},
+    config::Config,
     error::{AppError, AppResult},
-    services::timeline::ReplyVisibility,
+    models::user::Flag,
+    services::timeline::{ReplyVisibility, TimelineFilters},
     state::AppState,
 };
 
@@ -89,7 +94,6 @@ use crate::{
 use crate::{
     api::helpers::timeline_response,
     auth::AuthUser,
-    config::Config,
     pagination::PageParams,
     services::timeline::{TimelineQuery, TimelineSource},
 };
@@ -133,6 +137,32 @@ pub(crate) const fn timeline_area(local: bool) -> &'static str {
     } else {
         TIMELINES_FEDERATED
     }
+}
+
+/// Pleroma's `restrict_unauthenticated?` gate, in `timeline_controller.ex`,
+/// shared by the public and the hashtag timelines.
+///
+/// With no user behind the request, the `local=true` page belongs to the
+/// [`TIMELINES_LOCAL`] area and every other read to [`TIMELINES_FEDERATED`]
+/// (chosen by [`timeline_area`]), and a listed area refuses the request
+/// [`AUTHENTICATION_REQUIRED`]. An authenticated request (`authenticated` — a
+/// live *user* token was presented; an app-only one is unauthenticated here,
+/// as in Pleroma's `conn.assigns[:user]`) and every unlisted area pass.
+/// `local` is the request's `local` parameter, a [`Flag`] to keep the
+/// signature free of a second bare `bool`.
+///
+/// # Errors
+///
+/// [`AppError::Forbidden`] with [`AUTHENTICATION_REQUIRED`] when the
+/// anonymous read of this page's area is restricted.
+fn ensure_open(config: &Config, authenticated: bool, local: Flag) -> AppResult<()> {
+    if authenticated {
+        return Ok(());
+    }
+    if config.restricts(timeline_area(local.get())) {
+        return Err(AppError::Forbidden(AUTHENTICATION_REQUIRED.to_owned()));
+    }
+    Ok(())
 }
 
 /// The `/api/v1/timelines` router, merged into [`crate::api::v1`].
@@ -191,4 +221,198 @@ fn parse_public_reply_visibility(text: &str) -> Option<ReplyVisibility> {
 fn parse_instance(text: &str) -> Option<String> {
     let domain = text.trim();
     (!domain.is_empty()).then(|| domain.to_owned())
+}
+
+/// The five narrowings every timeline route shares, read out of `pairs`.
+///
+/// `local`, `remote`, `only_media` and `with_muted` are [`Flag`]s read with
+/// [`is_true`] (the last occurrence of a key wins, an empty value is off),
+/// and `exclude_visibilities` fills from both the bracketed and the bare
+/// spelling in occurrence order through [`push_visibility`], so a name that
+/// is not one of the five stored visibilities narrows nothing. Every other
+/// [`TimelineFilters`] field stays at its [`Default`]; a route sets its own
+/// extras on top with struct-update syntax, and one that honours fewer than
+/// these five clears the rest.
+fn common_filters(pairs: &QueryPairs) -> TimelineFilters {
+    let flag = |key: &str| Flag::new(pairs.value(key).is_some_and(|text| is_true(&text)));
+    let mut exclude_visibilities = Vec::new();
+    for name in pairs.values("exclude_visibilities") {
+        push_visibility(&mut exclude_visibilities, &name);
+    }
+    TimelineFilters {
+        local_only: flag("local"),
+        remote_only: flag("remote"),
+        only_media: flag("only_media"),
+        with_muted: flag("with_muted"),
+        exclude_visibilities,
+        ..TimelineFilters::default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::{http::StatusCode, response::IntoResponse as _};
+
+    use super::*;
+    use crate::models::status::Visibility;
+
+    /// A [`Config`] whose `RESTRICT_UNAUTHENTICATED` lists `areas`.
+    fn restricted(areas: &[&str]) -> Config {
+        let mut config = Config::for_tests();
+        config.restrict_unauthenticated = areas.iter().map(|area| (*area).to_owned()).collect();
+        config
+    }
+
+    #[test]
+    fn the_restriction_gate_leaves_every_open_read_through() {
+        let open = Config::for_tests();
+        ensure_open(&open, false, Flag::new(true))
+            .expect("an open instance answers an anonymous `local=true`");
+        ensure_open(&open, false, Flag::new(false))
+            .expect("an open instance answers an anonymous federated read");
+        ensure_open(&open, true, Flag::new(false))
+            .expect("an authenticated read was never the gate's business");
+    }
+
+    #[test]
+    fn timelines_local_restricted_refuses_only_the_anonymous_local_read() {
+        let config = restricted(&[TIMELINES_LOCAL]);
+        let refusal = ensure_open(&config, false, Flag::new(true))
+            .expect_err("the anonymous `local=true` read is refused");
+        assert_eq!(
+            refusal.to_string(),
+            AUTHENTICATION_REQUIRED,
+            "the refusal states the ticket's exact wording"
+        );
+        assert_eq!(
+            refusal.into_response().status(),
+            StatusCode::FORBIDDEN,
+            "and answers it as a 403"
+        );
+        ensure_open(&config, false, Flag::new(false))
+            .expect("a non-local read is the federated page, and that one is open");
+        ensure_open(&config, true, Flag::new(true))
+            .expect("an authenticated `local=true` read passes");
+    }
+
+    #[test]
+    fn timelines_federated_restricted_refuses_every_other_anonymous_read() {
+        let config = restricted(&[TIMELINES_FEDERATED]);
+        let refusal = ensure_open(&config, false, Flag::new(false))
+            .expect_err("the anonymous federated read is refused");
+        assert_eq!(
+            refusal.to_string(),
+            AUTHENTICATION_REQUIRED,
+            "the refusal is the same wording"
+        );
+        ensure_open(&config, false, Flag::new(true))
+            .expect("the `local=true` page belongs to the other area and stays open");
+        ensure_open(&config, true, Flag::new(false))
+            .expect("an authenticated federated read passes");
+    }
+
+    #[test]
+    fn both_areas_restricted_refuse_the_whole_anonymous_timeline() {
+        let config = restricted(&[TIMELINES_LOCAL, TIMELINES_FEDERATED]);
+        for local in [Flag::new(false), Flag::new(true)] {
+            let refusal = ensure_open(&config, false, local)
+                .expect_err("a listed area refuses every anonymous read");
+            assert_eq!(
+                refusal.to_string(),
+                AUTHENTICATION_REQUIRED,
+                "both areas listed, every anonymous read is the same refusal"
+            );
+            ensure_open(&config, true, local)
+                .expect("and an authenticated read passes whatever is listed");
+        }
+    }
+
+    /// [`common_filters`] over a raw query string.
+    fn common(query: &str) -> TimelineFilters {
+        common_filters(&QueryPairs::parse(Some(query)))
+    }
+
+    #[test]
+    fn no_query_is_every_filter_off() {
+        for query in [
+            "",
+            "foo=bar&limit=5&reply_visibility=self&instance=x.example",
+        ] {
+            assert_eq!(
+                common(query),
+                TimelineFilters::default(),
+                "`{query}` narrows nothing"
+            );
+        }
+        assert_eq!(
+            common_filters(&QueryPairs::parse(None)),
+            TimelineFilters::default(),
+            "an absent query is no pairs"
+        );
+    }
+
+    #[test]
+    fn the_four_flags_read_truthy_text_and_the_last_occurrence_wins() {
+        let on = common("local=true&remote=1&only_media=TRUE&with_muted=yes");
+        assert!(on.local_only.get(), "`local=true`");
+        assert!(on.remote_only.get(), "`remote=1`");
+        assert!(on.only_media.get(), "`only_media` is case-insensitive");
+        assert!(on.with_muted.get(), "`yes` is a true spelling");
+        let off = common("local=false&remote=&only_media=maybe&with_muted=true&with_muted=false");
+        assert!(
+            !off.local_only.get()
+                && !off.remote_only.get()
+                && !off.only_media.get()
+                && !off.with_muted.get(),
+            "`false`, empty and junk are off and the last occurrence wins"
+        );
+        assert!(
+            !common("local=true&local=").local_only.get(),
+            "a later empty value overrides an earlier true one"
+        );
+    }
+
+    #[test]
+    fn exclude_visibilities_fills_from_both_spellings_in_order() {
+        let filters = common(
+            "exclude_visibilities[]=public&exclude_visibilities=private\
+             &exclude_visibilities[]=direct",
+        );
+        assert_eq!(
+            filters.exclude_visibilities,
+            vec![Visibility::Public, Visibility::Private, Visibility::Direct],
+            "the bracketed and the bare spelling fill one list, in order"
+        );
+        assert_eq!(
+            common("exclude_visibilities=unlisted").exclude_visibilities,
+            vec![Visibility::Unlisted],
+            "the bare spelling alone works"
+        );
+        assert_eq!(
+            common("exclude_visibilities[]=unlisted").exclude_visibilities,
+            vec![Visibility::Unlisted],
+            "the bracketed spelling alone works"
+        );
+    }
+
+    #[test]
+    fn exclude_visibilities_ignores_names_that_are_not_stored_spellings() {
+        let filters = common(
+            "exclude_visibilities[]=Public&exclude_visibilities[]=&exclude_visibilities=nope\
+             &exclude_visibilities[]=direct",
+        );
+        assert_eq!(
+            filters.exclude_visibilities,
+            vec![Visibility::Direct],
+            "a capitalization, an empty value and junk narrow nothing"
+        );
+    }
+
+    #[test]
+    fn the_route_extras_are_left_at_their_defaults() {
+        let filters = common("local=true&reply_visibility=self&instance=x.example");
+        assert_eq!(filters.reply_visibility, None, "the route's own extra");
+        assert_eq!(filters.instance, None, "the route's own extra");
+        assert!(!filters.exclude_replies.get(), "never a shared key");
+    }
 }

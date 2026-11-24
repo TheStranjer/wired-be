@@ -116,28 +116,6 @@ async fn get(app: &Router, token: Option<&str>, path: &str) -> common::TestRespo
     }
 }
 
-/// The ids of a rendered timeline page, in answer order.
-fn ids_of(body: &Value) -> Vec<String> {
-    body.as_array()
-        .expect("a timeline page is a JSON array")
-        .iter()
-        .map(|status| {
-            status["id"]
-                .as_str()
-                .expect("every Status entity carries its id")
-                .to_owned()
-        })
-        .collect()
-}
-
-/// The `id` of a status entity, as its JSON spells it.
-fn entity_id(entity: &Value) -> String {
-    entity["id"]
-        .as_str()
-        .expect("the entity carries its id")
-        .to_owned()
-}
-
 /// How many `statuses` rows the database holds.
 async fn status_count(pool: &PgPool) -> i64 {
     sqlx::query_scalar::<_, i64>("SELECT count(*) FROM statuses")
@@ -182,12 +160,14 @@ async fn unsettled_jobs(pool: &PgPool) -> i64 {
     .expect("the count reads")
 }
 
-/// Moves the schedule's one fire into the past, so the next claim round
-/// finds it due: rows only, the one `UPDATE` the harness contract allows.
+/// Moves the schedule's one fire and the schedule's own moment into the
+/// past, so the next claim round finds the job due and the fire finds the
+/// row due (it refuses a row whose `scheduled_at` has not come): rows only,
+/// the `UPDATE`s the harness contract allows.
 ///
 /// # Panics
 ///
-/// If the update hits anything but exactly one row.
+/// If either update hits anything but exactly one row.
 async fn backdate_publish_jobs(pool: &PgPool) {
     let hit = sqlx::query("UPDATE jobs SET run_at = now() - interval '1 minute' WHERE kind = $1")
         .bind(KIND_PUBLISH)
@@ -199,6 +179,12 @@ async fn backdate_publish_jobs(pool: &PgPool) {
         1,
         "the parked schedule queued exactly one fire"
     );
+    let due =
+        sqlx::query("UPDATE scheduled_statuses SET scheduled_at = now() - interval '1 minute'")
+            .execute(pool)
+            .await
+            .expect("the schedule backdate runs");
+    assert_eq!(due.rows_affected(), 1, "the one parked schedule is now due");
 }
 
 /// `POST /api/v1/media` with the `MP3` part as `token`, and the entity id
@@ -218,7 +204,7 @@ async fn upload_media(app: &Router, token: &str) -> String {
         .send(app)
         .await;
     common::assert_answer(&response, StatusCode::OK, "an audio upload");
-    entity_id(&response.json_value())
+    common::id_of(&response.json_value())
 }
 
 /// A throwaway uploads directory, removed when the returned guard drops.
@@ -277,11 +263,11 @@ async fn assert_parked_writes_nothing(pool: &PgPool, app: &Router, token: &str, 
         "exactly the parked schedule"
     );
     assert!(
-        ids_of(&get(app, None, PUBLIC).await.json_value()).is_empty(),
+        common::ids_of(&get(app, None, PUBLIC).await.json_value()).is_empty(),
         "nothing on the public timeline"
     );
     assert!(
-        ids_of(&get(app, Some(token), HOME).await.json_value()).is_empty(),
+        common::ids_of(&get(app, Some(token), HOME).await.json_value()).is_empty(),
         "nothing on the author's home timeline"
     );
     let missing = get(app, None, &format!("{STATUSES}/{schedule_id}")).await;
@@ -314,19 +300,19 @@ async fn assert_fired_and_visible(
         vec!["completed".to_owned()],
         "the drained publish job reached its terminal state"
     );
-    let public = ids_of(&get(app, None, PUBLIC).await.json_value());
+    let public = common::ids_of(&get(app, None, PUBLIC).await.json_value());
     assert_eq!(
         public.len(),
         1,
         "the published status is on the public timeline: {public:?}"
     );
     assert_eq!(
-        ids_of(&get(app, Some(token), HOME).await.json_value()),
+        common::ids_of(&get(app, Some(token), HOME).await.json_value()),
         public,
         "and the author's home timeline answers it too"
     );
     assert_eq!(
-        ids_of(&get(app, None, &format!("{TAG}/rust")).await.json_value()),
+        common::ids_of(&get(app, None, &format!("{TAG}/rust")).await.json_value()),
         public,
         "and so does the tag the parked text carried"
     );
@@ -386,7 +372,7 @@ async fn a_scheduled_post_publishes_when_the_queue_drains() {
     common::assert_answer(&parked, StatusCode::OK, "a future scheduled_at");
     let entity = parked.json_value();
     assert_parked_entity(&entity, &at, &media_id);
-    let schedule_id = entity_id(&entity);
+    let schedule_id = common::id_of(&entity);
     assert_parked_writes_nothing(&pool, &app, &token, &schedule_id).await;
 
     backdate_publish_jobs(&pool).await;
@@ -434,8 +420,8 @@ async fn one_idempotency_key_replays_one_status() {
     common::assert_answer(&first, StatusCode::OK, "the keyed post");
     common::assert_answer(&retry, StatusCode::OK, "the replay of the same key");
     assert_eq!(
-        entity_id(&retry.json_value()),
-        entity_id(&first.json_value()),
+        common::id_of(&retry.json_value()),
+        common::id_of(&first.json_value()),
         "one key answers one status id"
     );
     assert_eq!(
@@ -453,8 +439,8 @@ async fn one_idempotency_key_replays_one_status() {
     let other = post_keyed(&app, &token, "K-2", body).await;
     common::assert_answer(&other, StatusCode::OK, "a post under a fresh key");
     assert_ne!(
-        entity_id(&other.json_value()),
-        entity_id(&first.json_value()),
+        common::id_of(&other.json_value()),
+        common::id_of(&first.json_value()),
         "a different key is a different post"
     );
     assert_eq!(status_count(&pool).await, 2, "and stored a second row");
@@ -479,7 +465,7 @@ async fn a_preview_renders_the_entity_and_writes_nothing() {
 
     let live = post_json(&app, &token, json!({"status": "the real post"})).await;
     common::assert_answer(&live, StatusCode::OK, "the real post");
-    let live_id = entity_id(&live.json_value());
+    let live_id = common::id_of(&live.json_value());
 
     let preview = post_json(
         &app,
@@ -489,7 +475,7 @@ async fn a_preview_renders_the_entity_and_writes_nothing() {
     .await;
     common::assert_answer(&preview, StatusCode::OK, "a preview");
     let entity = preview.json_value();
-    let preview_id = entity_id(&entity);
+    let preview_id = common::id_of(&entity);
     assert_ne!(preview_id, live_id, "the preview minted its own fresh id");
     assert_eq!(
         entity["content"],
@@ -505,17 +491,17 @@ async fn a_preview_renders_the_entity_and_writes_nothing() {
 
     assert_eq!(status_count(&pool).await, 1, "only the real post is stored");
     assert_eq!(
-        ids_of(&get(&app, None, PUBLIC).await.json_value()),
+        common::ids_of(&get(&app, None, PUBLIC).await.json_value()),
         vec![live_id.clone()],
         "the public timeline holds the real post alone"
     );
     assert_eq!(
-        ids_of(&get(&app, Some(&token), HOME).await.json_value()),
+        common::ids_of(&get(&app, Some(&token), HOME).await.json_value()),
         vec![live_id.clone()],
         "and so does the author's home"
     );
     assert!(
-        ids_of(&get(&app, None, &format!("{TAG}/rust")).await.json_value()).is_empty(),
+        common::ids_of(&get(&app, None, &format!("{TAG}/rust")).await.json_value()).is_empty(),
         "the tag the preview mentioned links nothing: a preview stores no tags"
     );
 

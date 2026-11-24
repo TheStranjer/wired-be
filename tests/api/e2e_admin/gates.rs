@@ -13,7 +13,7 @@ use sqlx::PgPool;
 
 use super::support::{
     Account, CONFIG, LOG, M_ADMIN_REPORTS, NO_ADMIN_READ, NO_ADMIN_WRITE, NOT_ADMIN, NOT_STAFF,
-    P_ADMIN, PASSWORD, REPORTS, USERS, World, id_of, post_status,
+    P_ADMIN, PASSWORD, REPORTS, USERS, World, post_status,
 };
 use crate::common;
 
@@ -31,7 +31,7 @@ async fn staff_half(world: &World, target: &Account, status_id: &str) {
     )
     .await;
     common::assert_answer(&filed, StatusCode::OK, "the staff-probe filing");
-    let report_id = id_of(&filed.json_value());
+    let report_id = common::id_of(&filed.json_value());
     for (what, response) in [
         (
             "the report listing",
@@ -212,7 +212,7 @@ async fn the_admin_surface_refuses_moderators_scopes_and_the_anonymous() {
     let world = World::open(pool.clone()).await;
     let reporter = world.register("reporter").await;
     let post = post_status(&world, &reporter, "in scope").await;
-    let post_id = id_of(&post);
+    let post_id = common::id_of(&post);
 
     staff_half(&world, &reporter, &post_id).await;
     admin_half_denied(&world).await;

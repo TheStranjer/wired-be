@@ -236,24 +236,6 @@ async fn liked_pairs(pool: &PgPool, user_id: Uuid) -> Vec<(Uuid, Uuid)> {
     .expect("the pairs read")
 }
 
-/// The account ids of an `Account` array, in answer order.
-fn account_ids(body: &Value) -> Vec<String> {
-    body.as_array()
-        .expect("the answer is an array")
-        .iter()
-        .map(|entry| entry["id"].as_str().unwrap_or_default().to_owned())
-        .collect()
-}
-
-/// The status ids of a `Status` array, in answer order.
-fn status_ids(body: &Value) -> Vec<String> {
-    body.as_array()
-        .expect("the answer is an array")
-        .iter()
-        .map(|entry| entry["id"].as_str().unwrap_or_default().to_owned())
-        .collect()
-}
-
 /// A `Link` header keyed on favourite row ids: `next` walks to `oldest`,
 /// `prev` back to `newest`.
 fn assert_like_keyed_link(link: Option<&str>, path: &str, newest: Uuid, oldest: Uuid) {
@@ -510,7 +492,7 @@ async fn favourited_by_lists_accounts_keyed_on_like_ids() {
         .iter()
         .map(|(_, liker_id)| liker_id.to_string())
         .collect();
-    assert_eq!(account_ids(&body), want, "newest like first");
+    assert_eq!(common::ids_of(&body), want, "newest like first");
     assert_eq!(
         body[0]["pleroma"]["relationship"],
         Value::Object(Map::new()),
@@ -521,7 +503,7 @@ async fn favourited_by_lists_accounts_keyed_on_like_ids() {
     let first = favourited_by(&app, None, &status_id, "limit=2").await;
     common::assert_answer(&first, StatusCode::OK, "a sized page answers");
     assert_eq!(
-        account_ids(&first.json_value()),
+        common::ids_of(&first.json_value()),
         vec![all[0].1.to_string(), all[1].1.to_string()],
         "the two newest likes"
     );
@@ -530,14 +512,14 @@ async fn favourited_by_lists_accounts_keyed_on_like_ids() {
     let tail = favourited_by(&app, None, &status_id, &format!("max_id={}", all[1].0)).await;
     common::assert_answer(&tail, StatusCode::OK, "the continuation answers");
     assert_eq!(
-        account_ids(&tail.json_value()),
+        common::ids_of(&tail.json_value()),
         vec![all[2].1.to_string()],
         "max_id walks to the older like, keyed on the like id"
     );
 
     let forward = favourited_by(&app, None, &status_id, &format!("min_id={}", all[2].0)).await;
     assert_eq!(
-        account_ids(&forward.json_value()),
+        common::ids_of(&forward.json_value()),
         vec![all[0].1.to_string(), all[1].1.to_string()],
         "min_id answers the newer page, still newest-first"
     );
@@ -576,13 +558,13 @@ async fn hide_favorites_never_gates_the_favourited_by_list() {
     let as_author = favourited_by(&app, Some(&token), &status.id.to_string(), "").await;
     common::assert_answer(&as_author, StatusCode::OK, "the author sees the list");
     assert_eq!(
-        account_ids(&as_author.json_value()),
+        common::ids_of(&as_author.json_value()),
         vec![liker.id.to_string()],
         "hide_favorites does not gate it"
     );
     let anonymous = favourited_by(&app, None, &status.id.to_string(), "").await;
     assert_eq!(
-        account_ids(&anonymous.json_value()),
+        common::ids_of(&anonymous.json_value()),
         vec![liker.id.to_string()],
         "and neither does it gate anyone else"
     );
@@ -636,7 +618,7 @@ async fn the_favourites_list_pages_on_like_ids_and_drops_the_invisible() {
         .iter()
         .map(|(_, status_id)| status_id.to_string())
         .collect();
-    assert_eq!(status_ids(&body), want, "newest favourite first");
+    assert_eq!(common::ids_of(&body), want, "newest favourite first");
     assert!(
         body.as_array()
             .expect("an array")
@@ -652,7 +634,7 @@ async fn the_favourites_list_pages_on_like_ids_and_drops_the_invisible() {
     let tail = favourites(&app, &token, &format!("max_id={}", all[1])).await;
     common::assert_answer(&tail, StatusCode::OK, "the continuation answers");
     assert_eq!(
-        status_ids(&tail.json_value()),
+        common::ids_of(&tail.json_value()),
         vec![live[2].1.to_string()],
         "max_id walks alice's own like ids, not status ids"
     );
@@ -668,7 +650,7 @@ async fn the_favourites_list_pages_on_like_ids_and_drops_the_invisible() {
     let narrowed = favourites(&app, &token, "").await;
     common::assert_answer(&narrowed, StatusCode::OK, "the narrowed page answers");
     assert_eq!(
-        status_ids(&narrowed.json_value()),
+        common::ids_of(&narrowed.json_value()),
         vec![live[0].1.to_string(), live[2].1.to_string()],
         "the private one dropped out and the order stayed"
     );
@@ -688,7 +670,7 @@ async fn the_favourites_list_pages_on_like_ids_and_drops_the_invisible() {
         .expect("the fixture tombstones the newest post");
     let rest = favourites(&app, &token, "").await;
     assert_eq!(
-        status_ids(&rest.json_value()),
+        common::ids_of(&rest.json_value()),
         vec![live[2].1.to_string()],
         "only the still-visible favourite is left"
     );
@@ -776,7 +758,7 @@ async fn favourited_by_omits_deactivated_accounts() {
     let page = favourited_by(&app, None, &status_id, "").await;
     common::assert_answer(&page, StatusCode::OK, "the list answers");
     assert_eq!(
-        account_ids(&page.json_value()),
+        common::ids_of(&page.json_value()),
         vec![bob.id.to_string()],
         "the deactivated favouriter is absent"
     );
@@ -802,14 +784,14 @@ async fn favourited_by_omits_the_viewers_blocked_accounts() {
     let as_alice = favourited_by(&app, Some(&alice_token), &status_id, "").await;
     common::assert_answer(&as_alice, StatusCode::OK, "the list answers the blocker");
     assert_eq!(
-        account_ids(&as_alice.json_value()),
+        common::ids_of(&as_alice.json_value()),
         vec![bob.id.to_string()],
         "the blocked account is absent for the blocker"
     );
 
     let anonymous = favourited_by(&app, None, &status_id, "").await;
     assert_eq!(
-        account_ids(&anonymous.json_value()),
+        common::ids_of(&anonymous.json_value()),
         vec![carol.id.to_string(), bob.id.to_string()],
         "an anonymous request still sees both"
     );
@@ -835,6 +817,10 @@ async fn favourited_by_link_names_the_raw_page_edges() {
     let likes = likes_of(&pool, status.id).await;
 
     let page = favourited_by(&app, Some(&alice_token), &status_id, "").await;
-    assert_eq!(account_ids(&page.json_value()).len(), 1, "only bob renders");
+    assert_eq!(
+        common::ids_of(&page.json_value()).len(),
+        1,
+        "only bob renders"
+    );
     assert_like_keyed_link(page.header("link"), &path, likes[0].0, likes[1].0);
 }

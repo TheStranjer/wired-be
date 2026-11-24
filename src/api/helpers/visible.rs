@@ -2,7 +2,7 @@
 //! listings share ([`render_visible`]) and the JSON-keying helper its map
 //! callers use ([`keyed_json`]).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use serde_json::Value;
 use uuid::Uuid;
@@ -11,11 +11,15 @@ use crate::{
     entities::status::Status as StatusEntity,
     error::{AppError, AppResult},
     models::{
+        filter::Filter,
         status::{self, Status},
         status_visibility,
         user::User,
     },
-    services::render_status::{ViewerMode, render_statuses},
+    services::{
+        filter::{FilterContext, apply_filters},
+        render_status::{ViewerMode, render_statuses},
+    },
     state::AppState,
     util::id::parse_id,
 };
@@ -46,6 +50,53 @@ pub async fn render_visible(
     let ordered: Vec<Status> = ids.iter().filter_map(|id| by_id.remove(id)).collect();
     let visible = status_visibility::filter_visible(&state.db, ordered, viewer).await?;
     render_statuses(state, ViewerMode::User(viewer), &visible).await
+}
+
+/// What [`render_filtered`] produced: the statuses that survived the
+/// caller's filters, and the ids an `irreversible` filter removed.
+#[derive(Debug)]
+pub struct FilteredStatuses {
+    /// The visible, rendered statuses the filters kept, each carrying its
+    /// `filtered` annotation, in the requested order.
+    pub kept: Vec<StatusEntity>,
+    /// The ids that rendered but that an `irreversible` filter match took
+    /// out of `kept`. Invisible and unknown ids are in neither list.
+    pub hidden_by_filter: Vec<Uuid>,
+}
+
+/// [`render_visible`], then [`apply_filters`] in `context` for `viewer`
+/// with their active `filters`: the one status expansion the notification
+/// endpoints (v1 and v2) share, so both drop and annotate the same rows.
+///
+/// # Errors
+///
+/// [`AppError::Database`] from the status and visibility reads and from
+/// the renderer.
+pub async fn render_filtered(
+    state: &AppState,
+    viewer: Option<&User>,
+    ids: &[Uuid],
+    filters: &[Filter],
+    context: FilterContext,
+) -> AppResult<FilteredStatuses> {
+    let page = render_visible(state, viewer, ids).await?;
+    let mut hidden_by_filter: Vec<Uuid> = page
+        .iter()
+        .filter_map(|entity| parse_id(&entity.id))
+        .collect();
+    let kept = apply_filters(page, filters, context, viewer.map(|user| user.id));
+    // What the render produced but the filtered page did not keep is what
+    // an `irreversible` match removed — invisible rows never entered the
+    // render at all, so the two hides stay distinguishable.
+    let survivors: HashSet<Uuid> = kept
+        .iter()
+        .filter_map(|entity| parse_id(&entity.id))
+        .collect();
+    hidden_by_filter.retain(|id| !survivors.contains(id));
+    Ok(FilteredStatuses {
+        kept,
+        hidden_by_filter,
+    })
 }
 
 /// Serializes `entities` to JSON values keyed by their row ids; an entity

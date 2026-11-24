@@ -13,8 +13,7 @@ use wired_be::{
 };
 
 use super::support::{
-    CHAT_KEYS, READ_SCOPE, ROOT, V2_ROOT, error_message, expected_link, fixture, get_as, json_keys,
-    listed_ids, open_chat, parse, send,
+    CHAT_KEYS, READ_SCOPE, ROOT, V2_ROOT, fixture, get_as, open_chat, parse, send,
 };
 use crate::common;
 
@@ -50,7 +49,7 @@ async fn walk_chats(app: &Router, token: &str) -> Vec<Uuid> {
             "the walk keeps answering: {}",
             page.text()
         );
-        let Some(first) = listed_ids(&page.json_value()).first().cloned() else {
+        let Some(first) = common::ids_of(&page.json_value()).first().cloned() else {
             break;
         };
         let id = parse(&first);
@@ -97,7 +96,7 @@ async fn the_v1_list_orders_by_activity_and_pages_by_id() {
         response.text()
     );
     let value = response.json_value();
-    let ids = listed_ids(&value);
+    let ids = common::ids_of(&value);
     assert_eq!(
         ids,
         vec![
@@ -109,12 +108,12 @@ async fn the_v1_list_orders_by_activity_and_pages_by_id() {
     );
     for chat in value.as_array().expect("the list is an array") {
         assert_eq!(
-            json_keys(chat),
+            common::sorted_keys(chat),
             CHAT_KEYS,
             "every entry is the full Chat entity"
         );
     }
-    let want = expected_link(ROOT, &ids[0], &ids[2]);
+    let want = common::expected_link(ROOT, &ids[0], &ids[2]);
     assert_eq!(
         response.header("link"),
         Some(want.as_str()),
@@ -132,13 +131,13 @@ async fn the_v1_list_orders_by_activity_and_pages_by_id() {
     let smallest = walked.last().expect("three visits");
     let newer = get_as(&app, &token, &format!("{ROOT}?since_id={smallest}")).await;
     assert_eq!(
-        listed_ids(&newer.json_value()).len(),
+        common::ids_of(&newer.json_value()).len(),
         2,
         "since_id skips the cursor and its past"
     );
     let min = get_as(&app, &token, &format!("{ROOT}?min_id={smallest}")).await;
     assert_eq!(
-        listed_ids(&min.json_value()).len(),
+        common::ids_of(&min.json_value()).len(),
         2,
         "min_id answers the newer chats too"
     );
@@ -150,7 +149,7 @@ async fn the_v1_list_orders_by_activity_and_pages_by_id() {
         "a malformed cursor is a 400"
     );
     assert_eq!(
-        error_message(&junk).as_deref(),
+        junk.error_field().as_deref(),
         Some("Invalid id"),
         "with the pagination module's wording"
     );
@@ -180,7 +179,7 @@ async fn the_lists_filter_by_pinned_and_tolerate_with_muted() {
         .await
         .json_value();
     assert_eq!(
-        listed_ids(&pinned),
+        common::ids_of(&pinned),
         vec![with_carol.id.to_string()],
         "the pinned filter names the one chat"
     );
@@ -188,7 +187,7 @@ async fn the_lists_filter_by_pinned_and_tolerate_with_muted() {
         .await
         .json_value();
     assert_eq!(
-        listed_ids(&pinned_v2),
+        common::ids_of(&pinned_v2),
         vec![with_carol.id.to_string()],
         "v2 reads the same filter in the form client's spelling"
     );
@@ -196,7 +195,7 @@ async fn the_lists_filter_by_pinned_and_tolerate_with_muted() {
         .await
         .json_value();
     assert_eq!(
-        listed_ids(&rest),
+        common::ids_of(&rest),
         vec![with_bob.id.to_string()],
         "the unpinned half gets the rest"
     );
@@ -204,7 +203,7 @@ async fn the_lists_filter_by_pinned_and_tolerate_with_muted() {
         .await
         .json_value();
     let mut want = vec![with_bob.id.to_string(), with_carol.id.to_string()];
-    let mut got = listed_ids(&muted);
+    let mut got = common::ids_of(&muted);
     want.sort();
     got.sort();
     assert_eq!(
@@ -261,7 +260,7 @@ async fn the_v2_list_orders_by_the_last_message_and_pages_by_id() {
         response.text()
     );
     let value = response.json_value();
-    let ids = listed_ids(&value);
+    let ids = common::ids_of(&value);
     assert_eq!(
         ids,
         vec![with_alice.id.to_string(), with_carol.id.to_string()],
@@ -276,7 +275,7 @@ async fn the_v2_list_orders_by_the_last_message_and_pages_by_id() {
         value[1]["last_message"].is_null(),
         "carol's chat never had a message at all"
     );
-    let want = expected_link(V2_ROOT, &ids[0], &ids[1]);
+    let want = common::expected_link(V2_ROOT, &ids[0], &ids[1]);
     assert_eq!(
         response.header("link"),
         Some(want.as_str()),
@@ -293,7 +292,7 @@ async fn the_v2_list_orders_by_the_last_message_and_pages_by_id() {
         .await
         .json_value();
     assert_eq!(
-        listed_ids(&since),
+        common::ids_of(&since),
         vec![newer.to_string()],
         "since_id keeps only the chat with the newer id"
     );
@@ -301,7 +300,7 @@ async fn the_v2_list_orders_by_the_last_message_and_pages_by_id() {
         .await
         .json_value();
     assert_eq!(
-        listed_ids(&tail),
+        common::ids_of(&tail),
         vec![older.to_string()],
         "and max_id walks back to the older one"
     );
@@ -322,18 +321,18 @@ async fn the_lists_default_to_twenty_and_v1_caps_at_thirty() {
 
     let legacy = get_as(&app, &token, ROOT).await;
     assert_eq!(
-        listed_ids(&legacy.json_value()).len(),
+        common::ids_of(&legacy.json_value()).len(),
         20,
         "the v1 default page is 20"
     );
     assert_eq!(
-        listed_ids(&get_as(&app, &token, V2_ROOT).await.json_value()).len(),
+        common::ids_of(&get_as(&app, &token, V2_ROOT).await.json_value()).len(),
         20,
         "and so is v2's"
     );
     let big_legacy = get_as(&app, &token, &format!("{ROOT}?limit=35")).await;
     assert_eq!(
-        listed_ids(&big_legacy.json_value()).len(),
+        common::ids_of(&big_legacy.json_value()).len(),
         30,
         "the legacy page stops at its cap of 30"
     );
@@ -343,7 +342,7 @@ async fn the_lists_default_to_twenty_and_v1_caps_at_thirty() {
     );
     let big_v2 = get_as(&app, &token, &format!("{V2_ROOT}?limit=35")).await;
     assert_eq!(
-        listed_ids(&big_v2.json_value()).len(),
+        common::ids_of(&big_v2.json_value()).len(),
         32,
         "v2 lets a page of 35 through — every chat fits under its cap"
     );
@@ -390,7 +389,7 @@ async fn the_lists_hide_blocked_and_muted_counterparts() {
     for root in [ROOT, V2_ROOT] {
         let default = get_as(&app, &token, root).await.json_value();
         let mut want = vec![with_dave.id.to_string(), with_erin.id.to_string()];
-        let mut got = listed_ids(&default);
+        let mut got = common::ids_of(&default);
         want.sort();
         got.sort();
         assert_eq!(got, want, "{root}: blocked and live-muted chats are hidden");
@@ -403,7 +402,7 @@ async fn the_lists_hide_blocked_and_muted_counterparts() {
             with_dave.id.to_string(),
             with_erin.id.to_string(),
         ];
-        let mut got_all = listed_ids(&with_muted);
+        let mut got_all = common::ids_of(&with_muted);
         want_all.sort();
         got_all.sort();
         assert_eq!(

@@ -146,6 +146,11 @@ pub struct NewRemoteUser {
     pub featured_url: Option<String>,
     /// The required `publicKey.publicKeyPem` signing key.
     pub public_key: String,
+    /// The `publicKey.id` the document names its key by, when it is an
+    /// `http(s)` URL on the actor's own host: what an inbox signature's
+    /// `keyId` is looked up by. A key id on another host is dropped, so one
+    /// actor cannot claim a key id that belongs to someone else's server.
+    pub public_key_id: Option<String>,
     /// The `alsoKnownAs` entries, stored by the upsert on every fetch.
     pub also_known_as: Vec<String>,
     /// The `movedTo` actor id (the column exists; the upsert does not write it).

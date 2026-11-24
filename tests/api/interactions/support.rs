@@ -15,42 +15,20 @@ use sqlx::PgPool;
 use uuid::Uuid;
 use wired_be::{
     config::TEST_BASE_URL,
-    federation::dispatch::handle_incoming,
     models::{
         follow,
         notification::{TYPE_EMOJI_REACTION, TYPE_FAVOURITE, TYPE_REBLOG},
         status::{self, NewStatus, Status, Visibility},
         user::User,
     },
-    state::AppState,
 };
 
-use crate::common;
+use crate::common::{self, deliver, delivering_state};
 
 /// The remote actors the fixtures deliver as, and the public address.
 const BOB: &str = "https://remote.example/users/bob";
 const MALLORY: &str = "https://remote.example/users/mallory";
 const PUBLIC: &str = "https://www.w3.org/ns/activitystreams#Public";
-
-/// The job args the inbox routes write for a delivery signed by `who`.
-fn incoming_args(activity: &Value, who: &User) -> Value {
-    json!({"activity": activity, "signer_id": who.id.to_string(), "inbox_owner": null})
-}
-
-/// Runs one activity through the real dispatcher and fails the test if
-/// the job wants a retry or refuses the document. (An ignored activity
-/// completes the same: the fold's refusals are outcomes, not errors.)
-async fn deliver(state: &AppState, activity: &Value, who: &User) {
-    handle_incoming(state.clone(), incoming_args(activity, who))
-        .await
-        .expect("the interaction fixture delivery completes the job");
-}
-
-/// The dispatcher state over the stock test config — whose
-/// `HTTP_ALLOW_PRIVATE_HOSTS` lets the resolver's client reach the mocks.
-fn delivering_state(pool: &PgPool) -> AppState {
-    common::test_app_state(pool.clone(), common::test_config())
-}
 
 // --- the delivered activities --------------------------------------------------
 

@@ -30,6 +30,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     config::Config,
     error::{AppError, AppResult},
+    federation::vocab::ACTIVITY_JSON,
     models::user::{User, get_by_ap_id, get_by_nickname},
     state::AppState,
     util::sanitize::escape_html,
@@ -57,8 +58,6 @@ const SUBSCRIBE_REL: &str = "http://ostatus.org/schema/1.0/subscribe";
 /// `type` of the profile link: an HTML page (which, for a remote fetcher,
 /// is where the `ActivityPub` document gets negotiated from).
 const TEXT_HTML: &str = "text/html";
-/// `type` of the self link: the actor's `ActivityPub` document.
-const ACTIVITY_JSON: &str = "application/activity+json";
 /// The 400 body message when the `resource` query parameter is absent.
 const MISSING_RESOURCE: &str = "Missing resource";
 

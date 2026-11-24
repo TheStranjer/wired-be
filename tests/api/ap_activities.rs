@@ -38,7 +38,10 @@ use sqlx::PgPool;
 use uuid::Uuid;
 use wired_be::{
     config::{Config, Toggle},
-    federation::signature::{SignedHeaders, SigningKey, sign_request},
+    federation::{
+        publisher,
+        signature::{SignedHeaders, SigningKey, sign_request},
+    },
     models::{
         block, emoji_reaction, favourite, follow,
         status::{self, NewStatus, Status, Visibility},
@@ -557,6 +560,66 @@ async fn a_reblogs_announce_is_gated_by_its_visibility() {
         secret_document["object"], other.uri,
         "its own boosted original"
     );
+}
+
+/// The `Announce` a boost queued for delivery and the one `/activities/{id}`
+/// serves a signed re-fetch are one document: the same `to` and `cc`, for a
+/// public and an unlisted boost alike.
+#[tokio::test]
+async fn a_boosts_served_announce_matches_the_delivered_one() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let alice = common::create_local_user(&pool, "alice").await;
+    let bob = common::create_local_user(&pool, "bob").await;
+    let carol = signer_user(&pool, "carol").await;
+    let token = common::create_app_and_token(&pool, &alice, "write:statuses").await;
+    let app = common::test_app(pool.clone());
+
+    for (visibility, body) in [
+        (Visibility::Public, json!({})),
+        (Visibility::Unlisted, json!({"visibility": "unlisted"})),
+    ] {
+        let original = common::create_status(&pool, &bob, "boost me", Visibility::Public).await;
+        let response =
+            common::TestRequest::post(&format!("/api/v1/statuses/{}/reblog", original.id))
+                .bearer(&token)
+                .json(&body)
+                .send(&app)
+                .await;
+        common::assert_answer(&response, StatusCode::OK, "the boost is accepted");
+
+        let delivered = sqlx::query_as::<_, (Value,)>(
+            "SELECT args->'activity' FROM jobs WHERE kind = $1 \
+             AND args->'activity'->>'object' = $2",
+        )
+        .bind(publisher::KIND_PUBLISH)
+        .bind(&original.uri)
+        .fetch_one(&pool)
+        .await
+        .expect("the boost queued exactly one publish job")
+        .0;
+        assert_eq!(
+            delivered["type"], "Announce",
+            "{visibility:?}: the delivery"
+        );
+        let id = delivered["id"].as_str().expect("the announce has an id");
+        let path = id.strip_prefix(BASE).expect("the id is under this origin");
+
+        let signed = signed_get_as(&carol, path);
+        let refetched = served(&app, path, Some(&signed)).await;
+        assert_eq!(
+            refetched["to"], delivered["to"],
+            "{visibility:?}: to agrees"
+        );
+        assert_eq!(
+            refetched["cc"], delivered["cc"],
+            "{visibility:?}: cc agrees"
+        );
+        assert_eq!(
+            refetched, delivered,
+            "{visibility:?}: the whole document agrees"
+        );
+    }
 }
 
 /// A tombstoned status or reblog names no activity at all: its id is the

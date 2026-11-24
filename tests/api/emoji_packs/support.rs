@@ -78,11 +78,6 @@ pub(super) fn read_zip(body: &[u8]) -> BTreeMap<String, Vec<u8>> {
     entries
 }
 
-/// The `error` string of a JSON error response.
-pub(super) fn error_message(response: &common::TestResponse) -> Option<String> {
-    Some(response.json_value().get("error")?.as_str()?.to_owned())
-}
-
 /// The keys of the `packs` object of a listing body, in serialization
 /// order.
 pub(super) fn pack_names(body: &Value) -> Vec<&str> {

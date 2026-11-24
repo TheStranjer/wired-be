@@ -1,6 +1,5 @@
 //! The admin's OAuth-app maintenance and instance-document endpoints under
-//! `/api/v1/pleroma/admin`, plus the public instance-document route
-//! (WBE-205).
+//! `/api/v1/pleroma/admin` (WBE-205).
 //!
 //! The references are Pleroma's `AdminAPI.OAuthAppController`
 //! (`lib/pleroma/web/admin_api/controllers/o_auth_app_controller.ex`) and
@@ -64,18 +63,19 @@
 //!   document never uploaded.
 //! - `PATCH /instance_document/{name}` (`update`) — the multipart `file`
 //!   part, at most 1 MiB, written atomically (a hidden staging file
-//!   renamed into place, the same move the frontend installer makes);
-//!   200 `{"url":"{BASE_URL}/instance/<name>.html"}`. A body without the
+//!   renamed into place);
+//!   200 `{"url":"{FRONTEND_BASE_URL}/instance/<name>.html"}`. A body without the
 //!   part is 400 `{"error":"Missing parameter: file"}`, an oversize one
 //!   413.
 //! - `DELETE /instance_document/{name}` (`delete`) — 200 `{}` once the
 //!   file is gone, 404 when it was not there.
-//! - `GET /instance/{name}.html` ([`public_router`], merged at the root
-//!   of [`crate::app`]) — the public read: no auth,
-//!   `text/html; charset=utf-8`, and the ticket's
-//!   `Content-Security-Policy` that lets the page style itself and show
-//!   images but nothing else. An unlisted or absent document is the JSON
-//!   404 `{"error":"Not found"}`.
+//!
+//! The backend serves no HTML page: the `terms-of-service` document is
+//! read by the public JSON `GET /api/v1/instance/terms_of_service`
+//! ([`crate::api::instance`]), which answers the stored text in
+//! `content`. The upload answer's `url` names where the frontend (or a
+//! proxy pointing at `INSTANCE_DOCS_DIR`) serves the page:
+//! `{FRONTEND_BASE_URL}/instance/<name>.html`.
 //!
 //! Only names from `INSTANCE_DOCUMENT_NAMES` are ever touched, and a
 //! configured name must itself be a safe single path segment
@@ -92,11 +92,12 @@ use axum::{
 
 use self::{
     apps::{create_app, delete_app, list_apps, update_app},
-    documents::{delete_document, serve_document, show_document, update_document},
+    documents::{delete_document, show_document, update_document},
 };
 #[cfg(doc)]
 use crate::{auth::admin::AdminUser, entities::admin::AdminOauthApp};
 use crate::{config::Config, extract::multipart::upload_body_limit, state::AppState};
+pub use documents::{TERMS_OF_SERVICE, read_document_stamped};
 
 mod apps;
 mod documents;
@@ -129,15 +130,4 @@ pub fn router(config: &Config) -> Router<AppState> {
                 .delete(delete_document),
         )
         .layer(upload_body_limit(config))
-}
-
-/// The public `GET /instance/{name}.html` router, merged at the top level
-/// of [`crate::app`]: the address the upload answer names as the
-/// document's own.
-///
-/// The router forbids a parameter with a static suffix in one segment, so
-/// the route takes the whole last segment and `serve_document` holds the
-/// `.html` spelling: every other segment under `/instance/` is the 404.
-pub fn public_router() -> Router<AppState> {
-    Router::new().route("/instance/{name}", get(serve_document))
 }

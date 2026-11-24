@@ -1,8 +1,9 @@
 //! Integration tests for the external OAuth login endpoints: `GET
 //! /oauth/prepare_request`, `GET /oauth/{provider}`, `GET
-//! /oauth/{provider}/callback` and the registration form that picks up an
-//! unlinked account — `GET /oauth/registration_details` and `POST
-//! /oauth/register` (`docs/ARCHITECTURE.md` decision 13).
+//! /oauth/{provider}/callback` and the JSON registration endpoints behind
+//! the frontend's screens — `GET /oauth/registration_details` and `POST
+//! /oauth/register` (`docs/ARCHITECTURE.md` decision 13). The callback hands
+//! the browser to `https://fe.example`, the fixture's `FRONTEND_BASE_URL`.
 //!
 //! A mock provider runs on a loopback port — its authorize route answers
 //! 500, because the flow must only *redirect* a browser there and never
@@ -22,29 +23,37 @@
 //! endpoints; `support` holds the `Site` fixture and the helpers every
 //! section draws on; `prepare` runs `prepare_request` and the provider
 //! redirect; `callback` walks the callback's successes and
-//! `callback_refusals` its failures and edges; and `registration` and
-//! `registration_modes` cover the hand-off form and the registration modes
-//! that replace its code with a message page.
+//! `callback_refusals` its failures and edges; `callback_untrusted` the
+//! hand-off to consent; `registration` and `registration_modes` cover the
+//! registration routes answering JSON only and the modes around them; and
+//! `json_registration`, `json_registration_modes` and `json_consent` the
+//! registration and consent screens' JSON endpoints in detail.
 
 #![cfg(test)]
 
 /// The callback's successes: the login, the echo, the oob code and the
 /// unlinked hand-off.
 mod callback;
-/// The callback of an MFA-enabled linked account: the detour and the
-/// verification that delivers the code.
+/// The callback of an MFA-enabled linked account: refused with a 403.
 mod callback_mfa;
 /// The callback's refusals, the provider-call failures and the route edges.
 mod callback_refusals;
-/// The callback of a linked account for an untrusted application: refused.
+/// The callback of a linked account for an untrusted application: sent to
+/// consent.
 mod callback_untrusted;
+/// The consent endpoints a linked login of an untrusted app is sent to.
+mod json_consent;
+/// The JSON registration details and `POST /oauth/register`.
+mod json_registration;
+/// The JSON registration under the closed, approval and activation modes.
+mod json_registration_modes;
 /// `GET /oauth/prepare_request` and the provider redirect it feeds.
 mod prepare;
 /// The flow's consts and the mock provider on its own loopback port.
 mod provider;
-/// The registration form and the hand-off that creates the user.
+/// The registration routes: JSON only, bad states, the next callback.
 mod registration;
-/// Closed, approval-required and activation-required registrations.
+/// Registration under activation-required and for an out-of-band client.
 mod registration_modes;
 /// Shared fixtures and helpers every submodule of this area draws on.
 mod support;

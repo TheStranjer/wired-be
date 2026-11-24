@@ -42,8 +42,10 @@
 //!   a remote actor), and only a stored status the actor authored can be
 //!   pinned ([`pinned_status::pin`](crate::models::pinned_status::pin) /
 //!   [`pinned_status::unpin`](crate::models::pinned_status::unpin), idempotent
-//!   both ways). An unknown status is ignored — fetching it is the later
-//!   inbox-fetch ticket's job.
+//!   both ways). An `Add` of a status this instance has not stored is
+//!   fetched as the actor's own post when it lives on the actor's host
+//!   (`resolve_status_as_actor`, as Mastodon's `Add` does); a `Remove`, or
+//!   an object on another host, is ignored.
 //! * [`handle_move`] is the account-migration announcement: the object
 //!   must be the actor's own id, the target is fetched
 //!   ([`get_or_fetch_by_ap_id`](crate::federation::fetch_actor::get_or_fetch_by_ap_id)) and must have claimed the old actor in
@@ -146,7 +148,7 @@ mod tests {
         federation::{dispatch::FederationError, handlers::misc::test_support::*},
         http_client::HttpClient,
         models::{
-            block, pinned_status,
+            block, pinned_status, status,
             user::{NewUser, insert},
         },
         state::AppState,
@@ -389,6 +391,194 @@ mod tests {
         assert!(
             matches!(failed, Err(FederationError::Transient(_))),
             "a failing peer is a retry, not a verdict: {failed:?}"
+        );
+        peer.server.abort();
+    }
+
+    /// The running loopback peer of one featured-`Add` test: it serves a
+    /// single note authored by its own `alice`.
+    #[derive(Debug)]
+    struct NotePeer {
+        /// The `http://{addr}` origin the peer answers on.
+        base: String,
+        /// The id of the note the peer serves.
+        note_id: String,
+        /// The requests the peer has answered.
+        hits: Arc<AtomicUsize>,
+        /// The server task, aborted when the test ends.
+        server: JoinHandle<()>,
+    }
+
+    /// Counts the hit and answers the note document.
+    async fn serve_note(State((document, hits)): State<(Value, Arc<AtomicUsize>)>) -> Response {
+        let _hits = hits.fetch_add(1, Ordering::SeqCst);
+        (
+            [(CONTENT_TYPE, "application/activity+json")],
+            document.to_string(),
+        )
+            .into_response()
+    }
+
+    /// Serves one public note by alice at `/objects/one` on a fresh loopback
+    /// port.
+    async fn note_peer() -> NotePeer {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a loopback port binds");
+        let base = format!(
+            "http://{}",
+            listener.local_addr().expect("the bound address")
+        );
+        let note_id = format!("{base}/objects/one");
+        let document = json!({
+            "id": note_id,
+            "type": "Note",
+            "attributedTo": format!("{base}/users/alice"),
+            "to": ["https://www.w3.org/ns/activitystreams#Public"],
+            "content": "<p>an older post</p>",
+            "published": "2024-03-01T10:00:00.000Z",
+        });
+        let hits = Arc::new(AtomicUsize::new(0));
+        let app = Router::new()
+            .route("/objects/one", get(serve_note))
+            .with_state((document, Arc::clone(&hits)));
+        let server = tokio::spawn(async move {
+            if let Err(err) = axum::serve(listener, app).await {
+                tracing::debug!("test server stopped: {err}");
+            }
+        });
+        NotePeer {
+            base,
+            note_id,
+            hits,
+            server,
+        }
+    }
+
+    /// Alice on the loopback peer, with her featured collection stored.
+    async fn loopback_alice(pool: &PgPool, base: &str) -> User {
+        let authority = base
+            .strip_prefix("http://")
+            .expect("the loopback base is an http url");
+        insert(
+            pool,
+            &NewUser {
+                nickname: format!("alice@{authority}"),
+                ap_id: format!("{base}/users/alice"),
+                domain: Some(authority.to_owned()),
+                featured_url: Some(format!("{base}/users/alice/collections/featured")),
+                ..NewUser::default()
+            },
+        )
+        .await
+        .expect("the loopback alice inserts")
+    }
+
+    /// An `Add`/`Remove` of `object` to alice's featured collection.
+    fn featured_change(kind: &str, n: &str, alice: &User, object: &str) -> ActivityView {
+        view(
+            kind,
+            n,
+            &alice.ap_id,
+            json!({
+                "object": object,
+                "target": alice.featured_url.clone().expect("alice has a featured url"),
+            }),
+        )
+    }
+
+    /// An `Add` of the actor's own post this instance has never received
+    /// is fetched from the actor's host and pinned.
+    #[tokio::test]
+    async fn an_add_of_an_unstored_own_status_fetches_and_pins_it() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let peer = note_peer().await;
+        let alice = loopback_alice(&pool, &peer.base).await;
+        let alice_id = alice.id;
+
+        let added = handle_add(
+            loopback_state(&pool),
+            featured_change("Add", "fetch-add", &alice, &peer.note_id),
+            alice,
+        )
+        .await;
+
+        assert_handled(&added);
+        assert_eq!(peer.hits.load(Ordering::SeqCst), 1, "fetched exactly once");
+        let fetched = status::get_by_uri(&pool, &peer.note_id)
+            .await
+            .unwrap()
+            .expect("the fetched status is stored");
+        assert_eq!(fetched.user_id, alice_id, "authored by the pinning actor");
+        assert_eq!(
+            pinned_status::list_for_user(&pool, alice_id)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|pinned| pinned.id)
+                .collect::<Vec<_>>(),
+            vec![fetched.id],
+            "and pinned"
+        );
+        peer.server.abort();
+    }
+
+    /// An `Add` of an unstored object on a host other than the actor's is
+    /// ignored without any request.
+    #[tokio::test]
+    async fn an_add_of_an_unstored_foreign_host_status_is_ignored_without_fetching() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let peer = note_peer().await;
+        let alice = loopback_alice(&pool, &peer.base).await;
+        let alice_id = alice.id;
+        // Same listener, another host name: the actor's host does not match.
+        let foreign = peer.note_id.replacen("127.0.0.1", "localhost", 1);
+
+        let added = handle_add(
+            loopback_state(&pool),
+            featured_change("Add", "foreign-add", &alice, &foreign),
+            alice,
+        )
+        .await;
+
+        assert!(
+            ignored(added).contains("not a stored status"),
+            "an object on another host is not fetched on the actor's say-so"
+        );
+        assert_eq!(peer.hits.load(Ordering::SeqCst), 0, "nothing was fetched");
+        assert_eq!(pinned_status::count(&pool, alice_id).await.unwrap(), 0);
+        peer.server.abort();
+    }
+
+    /// A `Remove` of an unstored own status stays lookup-only: ignored,
+    /// not fetched, not stored.
+    #[tokio::test]
+    async fn a_remove_of_an_unstored_status_is_still_ignored() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let peer = note_peer().await;
+        let alice = loopback_alice(&pool, &peer.base).await;
+
+        let removed = handle_remove(
+            loopback_state(&pool),
+            featured_change("Remove", "fetch-remove", &alice, &peer.note_id),
+            alice,
+        )
+        .await;
+
+        assert!(
+            ignored(removed).contains("not a stored status"),
+            "a Remove has nothing to take back"
+        );
+        assert_eq!(peer.hits.load(Ordering::SeqCst), 0, "nothing was fetched");
+        assert!(
+            status::get_by_uri(&pool, &peer.note_id)
+                .await
+                .unwrap()
+                .is_none(),
+            "and nothing was stored"
         );
         peer.server.abort();
     }

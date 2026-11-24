@@ -5,7 +5,7 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 use wired_be::models::status::Visibility;
 
-use super::support::{BASE, fetch_ap, key_set, reply_to, unpost};
+use super::support::{BASE, fetch_ap, reply_to, unpost};
 use crate::common;
 
 /// The replies collection: the root counts the publicly visible answers,
@@ -32,7 +32,7 @@ async fn the_replies_collection_lists_public_answers_oldest_first() {
     common::assert_answer(&collection, StatusCode::OK, "the replies root");
     let document = collection.json_value();
     assert_eq!(
-        key_set(&document),
+        common::sorted_keys(&document),
         ["@context", "first", "id", "totalItems", "type"],
         "the summary: two public answers"
     );

@@ -191,18 +191,6 @@ async fn source(app: &Router, token: &str, id: &str) -> common::TestResponse {
         .await
 }
 
-/// The rendered object's keys, sorted, for exact key-set assertions.
-fn json_keys(value: &Value) -> Vec<&str> {
-    let mut keys: Vec<&str> = value
-        .as_object()
-        .expect("a JSON object")
-        .keys()
-        .map(String::as_str)
-        .collect();
-    keys.sort_unstable();
-    keys
-}
-
 /// The `content` of every entry of a history array.
 fn contents_of(body: &Value) -> Vec<&str> {
     body.as_array()

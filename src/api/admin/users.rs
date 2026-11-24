@@ -54,8 +54,9 @@
 //!   put on pending reset: the admin just set the password itself.
 //! - `GET /users/{nickname}/password_reset` — Pleroma's
 //!   `get_password_reset`: mints a reset token for the LOCAL account and
-//!   answers `{token, link}`, the link the `POST
-//!   /api/v1/pleroma/password_reset` form spends like the emailed one.
+//!   answers `{token, link}`, the frontend reset-screen link (`{FRONTEND_BASE_URL}
+//!   /password_reset/{token}`) whose token the `POST
+//!   /api/v1/pleroma/password_reset` call spends like the emailed one's.
 //!   Gated `admin:write:accounts` as Pleroma's scope pair has it, and
 //!   logged nowhere: it is a read-shaped mint, and Pleroma does not log it.
 //! - `PATCH /users/force_password_reset` (Pleroma's path) and its alias
@@ -168,8 +169,8 @@
 //! - `PATCH /users/{nickname}/toggle_activation` — Pleroma's
 //!   `toggle_activation`: flips one account's flag, answers its single
 //!   admin entity and logs the move it made under the other pair's
-//!   actions. Unlike the bulk pair it does not protect the caller: the
-//!   segment that names an account names it.
+//!   actions. Like the bulk deactivation it protects the caller: toggling
+//!   the caller's own active account is a 403 and writes nothing.
 //! - `PATCH /users/approve` — `nicknames[]`: every named account still
 //!   awaiting staff clears `approval_pending` and gets the
 //!   `account_approved` letter; an already-approved one answers unchanged

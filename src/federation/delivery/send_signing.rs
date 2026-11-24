@@ -13,14 +13,12 @@ mod tests {
     use serde_json::Value;
 
     use crate::federation::{
-        delivery::{
-            ACTIVITY_JSON,
-            test_support::{
-                ACTOR_KEY_ID, SIGNED_LINES, actor, attempt_to, first_attempt, header_text,
-                signature_param, test_state, verifying_inbox,
-            },
+        delivery::test_support::{
+            ACTOR_KEY_ID, SIGNED_LINES, actor, attempt_to, first_attempt, header_text,
+            signature_param, test_state, verifying_inbox,
         },
         signature::digest_header,
+        vocab::ACTIVITY_JSON,
     };
     use crate::util::url::{host_with_port, parse_http_url};
 

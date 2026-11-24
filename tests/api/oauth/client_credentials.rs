@@ -10,9 +10,7 @@ use serde_json::json;
 use uuid::Uuid;
 use wired_be::{config::DEFAULT_OAUTH_TOKEN_TTL_SECS, models::oauth_token};
 
-use super::support::{
-    PASSWORD, assert_no_store, client_credentials_body, error_text, fixtures, post_json,
-};
+use super::support::{PASSWORD, assert_no_store, client_credentials_body, fixtures, post_json};
 use crate::common;
 
 /// The full `client_credentials` grant over JSON with the credentials in
@@ -135,7 +133,7 @@ async fn client_credentials_bad_client_credentials_are_invalid_credentials() {
         "a wrong secret is a 400"
     );
     assert_eq!(
-        error_text(&secret_answer),
+        secret_answer.error_text(),
         "Invalid credentials",
         "one message for every credential failure"
     );
@@ -153,7 +151,7 @@ async fn client_credentials_bad_client_credentials_are_invalid_credentials() {
         "an unknown client id is a 400"
     );
     assert_eq!(
-        error_text(&client_answer),
+        client_answer.error_text(),
         "Invalid credentials",
         "same message"
     );
@@ -179,7 +177,7 @@ async fn client_credentials_scope_outside_the_registration_is_invalid_scope() {
         StatusCode::BAD_REQUEST,
         "unregistered `write` is refused"
     );
-    assert_eq!(error_text(&response), "Invalid scope", "Pleroma's message");
+    assert_eq!(response.error_text(), "Invalid scope", "Pleroma's message");
     assert_no_store(&response);
 
     let write_only = common::create_app(&pool, "write").await;
@@ -191,7 +189,7 @@ async fn client_credentials_scope_outside_the_registration_is_invalid_scope() {
         StatusCode::BAD_REQUEST,
         "a `write`-only app cannot receive the default `read`"
     );
-    assert_eq!(error_text(&refused), "Invalid scope", "as Invalid scope");
+    assert_eq!(refused.error_text(), "Invalid scope", "as Invalid scope");
 
     let rows: (i64,) = sqlx::query_as("SELECT count(*) FROM oauth_tokens")
         .fetch_one(&pool)
@@ -240,7 +238,7 @@ async fn a_granted_app_only_token_serves_app_auth_but_not_user_auth() {
         "AuthUser refuses an app-only token"
     );
     assert_eq!(
-        error_text(&user_endpoint),
+        user_endpoint.error_text(),
         "This API requires an authenticated user",
         "Pleroma's wording"
     );

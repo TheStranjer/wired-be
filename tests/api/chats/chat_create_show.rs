@@ -11,8 +11,7 @@ use wired_be::{
 };
 
 use super::support::{
-    CHAT_KEYS, READ_SCOPE, ROOT, SCOPE, error_message, fixture, get_as, json_keys, listed_ids,
-    open_path, post_empty, send,
+    CHAT_KEYS, READ_SCOPE, ROOT, SCOPE, fixture, get_as, open_path, post_empty, send,
 };
 use crate::common;
 
@@ -52,7 +51,11 @@ async fn creating_a_chat_gets_the_same_row_every_time() {
         "the entity is JSON"
     );
     let value = first.json_value();
-    assert_eq!(json_keys(&value), CHAT_KEYS, "exactly the Chat keys");
+    assert_eq!(
+        common::sorted_keys(&value),
+        CHAT_KEYS,
+        "exactly the Chat keys"
+    );
     let chat = value["id"]
         .as_str()
         .expect("the chat id is a string")
@@ -83,7 +86,7 @@ async fn creating_a_chat_gets_the_same_row_every_time() {
 
     let listed = get_as(&app, &alice_read, ROOT).await.json_value();
     assert_eq!(
-        listed_ids(&listed),
+        common::ids_of(&listed),
         vec![chat.clone()],
         "alice lists her own chat, not bob's"
     );
@@ -133,7 +136,7 @@ async fn the_chat_gates_refuse_self_a_silent_recipient_and_nobody() {
         self_chat.text()
     );
     assert_eq!(
-        error_message(&self_chat).as_deref(),
+        self_chat.error_field().as_deref(),
         Some("Can't chat with yourself"),
         "the ticket's spelling of Pleroma's refusal"
     );
@@ -147,7 +150,7 @@ async fn the_chat_gates_refuse_self_a_silent_recipient_and_nobody() {
             silent.nickname
         );
         assert_eq!(
-            error_message(&response).as_deref(),
+            response.error_field().as_deref(),
             Some("Recipient doesn't accept chat messages"),
             "the refusal names the flag"
         );
@@ -164,7 +167,7 @@ async fn the_chat_gates_refuse_self_a_silent_recipient_and_nobody() {
             "`{nobody}` is no one to chat with"
         );
         assert_eq!(
-            error_message(&response).as_deref(),
+            response.error_field().as_deref(),
             Some("Record not found"),
             "the one 404 wording on `{nobody}`"
         );
@@ -205,7 +208,11 @@ async fn show_answers_the_chat_to_its_owner_alone() {
         shown.text()
     );
     let value = shown.json_value();
-    assert_eq!(json_keys(&value), CHAT_KEYS, "exactly the Chat keys");
+    assert_eq!(
+        common::sorted_keys(&value),
+        CHAT_KEYS,
+        "exactly the Chat keys"
+    );
     assert_eq!(value["id"], bob_ref.chat_id.to_string());
     assert_eq!(
         value["account"]["id"],
@@ -235,7 +242,7 @@ async fn show_answers_the_chat_to_its_owner_alone() {
         "alice cannot show bob's row of the same conversation"
     );
     assert_eq!(
-        error_message(&stranger).as_deref(),
+        stranger.error_field().as_deref(),
         Some("Record not found"),
         "the plain 404 wording"
     );

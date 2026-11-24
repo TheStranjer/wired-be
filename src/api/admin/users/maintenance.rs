@@ -13,8 +13,9 @@ use tracing::debug;
 
 use super::{AREA_ACCOUNTS, AREA_FOLLOWS, CLASS_WRITE, OK, local_account};
 use crate::{
-    api::{accounts::after_follow_changed, password_reset::RESET_PATH},
+    api::{accounts::after_follow_changed, password_reset::frontend_link},
     auth::admin::AdminUser,
+    config::Config,
     error::{AppError, AppResult},
     extract::ApiBody,
     models::{
@@ -31,8 +32,8 @@ use crate::{
 pub(super) struct PasswordResetLink {
     /// The minted token's secret text.
     token: String,
-    /// The full reset URL: [`RESET_PATH`] with the token as its segment,
-    /// hung on the instance's own origin.
+    /// The full reset URL: [`frontend_link`], the frontend's reset screen
+    /// with the token as its last segment.
     link: String,
 }
 
@@ -48,14 +49,13 @@ impl fmt::Debug for PasswordResetLink {
 }
 
 impl PasswordResetLink {
-    /// Answers `token` and the link `{base_url}{RESET_PATH}/{token}`: the
-    /// route the `POST /api/v1/pleroma/password_reset` form already serves
-    /// (see [`crate::api::password_reset`]), so an admin's link completes a
-    /// reset exactly like the emailed one.
-    pub(super) fn new(base_url: &str, token: &str) -> Self {
+    /// Answers `token` and the link [`frontend_link`] builds for it, so an
+    /// admin's link opens the same reset screen as the emailed one (see
+    /// [`crate::api::password_reset`]).
+    pub(super) fn new(config: &Config, token: &str) -> Self {
         Self {
             token: token.to_owned(),
-            link: format!("{base_url}{RESET_PATH}/{token}"),
+            link: frontend_link(config, token),
         }
     }
 }
@@ -85,10 +85,7 @@ pub(super) async fn get_password_reset(
         nickname = %found.nickname,
         "admin issued a password reset token"
     );
-    Ok(Json(PasswordResetLink::new(
-        &state.config.base_url,
-        &issued.token,
-    )))
+    Ok(Json(PasswordResetLink::new(&state.config, &issued.token)))
 }
 
 /// The body of the nickname-list actions: Pleroma's `nicknames` parameter,

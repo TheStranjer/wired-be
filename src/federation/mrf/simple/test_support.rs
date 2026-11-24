@@ -8,7 +8,10 @@ use std::sync::Arc;
 use chrono::Utc;
 use serde_json::{Map, Value, json};
 
-use crate::federation::mrf::{MrfConfig, MrfContext, MrfPolicy as _, MrfResult};
+use crate::federation::{
+    mrf::{MrfConfig, MrfContext, MrfPolicy as _, MrfResult},
+    vocab::AS_PUBLIC,
+};
 
 use super::{PARAMS_KEY, SimpleConfig, SimplePolicy};
 
@@ -22,7 +25,7 @@ pub(super) const ALICE: &str = "https://peer.example/users/alice";
 /// convention the policy falls back to.
 pub(super) const FOLLOWERS: &str = "https://peer.example/users/alice/followers";
 /// The public address, full `ActivityStreams` spelling.
-pub(super) const PUBLIC: &str = "https://www.w3.org/ns/activitystreams#Public";
+pub(super) const PUBLIC: &str = AS_PUBLIC;
 /// A second recipient the fixtures keep in `cc`.
 pub(super) const BOB: &str = "https://remote.example/users/bob";
 /// The note a fixture `Create` announces.

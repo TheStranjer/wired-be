@@ -8,10 +8,13 @@
 //! body naming neither `email` nor `nickname` — and only the known local
 //! active account gets a token and a queued `mailer.send` letter; the
 //! limiter's `password_reset` headers ride on the calls it counts. The
-//! token page renders the escaped form for a live token and the "Invalid
-//! Token" page for unknown, spent and lapsed ones. Completion validates
-//! the token, `MIN_PASSWORD_LENGTH` and the confirmation (each failure
-//! re-renders the form with its message), then changes the password,
+//! mailed link is the frontend's `{FRONTEND_BASE_URL}/password_reset/{token}`.
+//! The token check answers 200 `{"nickname"}` for a live token and 404
+//! `{"error"}` for unknown, spent and lapsed ones, and completion answers
+//! 204 or 422 `{"error"}`, whatever the `Accept` header — no HTML anywhere.
+//! Completion validates
+//! the token, `MIN_PASSWORD_LENGTH` and the confirmation (each failure is
+//! a 422 with its message), then changes the password,
 //! spends the token, deletes the account's other tokens, revokes every
 //! OAuth token it holds and clears `password_reset_pending` — and a
 //! pending account is refused the `/oauth/token` password grant with 403
@@ -48,6 +51,7 @@ const SCOPES: &str = "read write";
 fn mail_config() -> Config {
     let mut config = common::test_config();
     config.smtp_host = Some("smtp.example.org".to_owned());
+    config.frontend_base_url = "https://fe.example".to_owned();
     config
 }
 
@@ -102,14 +106,17 @@ async fn stored_tokens(pool: &PgPool, user: &User) -> Vec<password_reset::Passwo
     .expect("the token table reads back")
 }
 
+/// The frontend's reset-screen prefix the mailed link starts with.
+const FRONTEND_RESET: &str = "https://fe.example/password_reset";
+
 /// The raw reset token in the link of the mailed `letter`: the characters
-/// after `{RESET}/` up to the first one a token never carries.
+/// after `{FRONTEND_RESET}/` up to the first one a token never carries.
 fn mailed_token(letter: &Value) -> String {
     let body = letter["text_body"]
         .as_str()
         .expect("the letter has a text body");
     let (_, after) = body
-        .split_once(&format!("{RESET}/"))
+        .split_once(&format!("{FRONTEND_RESET}/"))
         .expect("the letter carries the reset link");
     after
         .chars()
@@ -233,12 +240,12 @@ async fn known_accounts_get_204_and_the_reset_letter() {
             json!("Password reset"),
             "Pleroma's subject"
         );
-        let link = format!("https://test.example{RESET}/{response}");
+        let link = format!("{FRONTEND_RESET}/{response}");
         assert!(
             letters[0]["text_body"]
                 .as_str()
                 .is_some_and(|body| body.contains(&link)),
-            "the BASE_URL-built link is in the body: {}",
+            "the FRONTEND_BASE_URL-built link is in the body: {}",
             letters[0]["text_body"]
         );
     }
@@ -295,11 +302,10 @@ async fn nothing_found_still_answers_204_with_no_letter() {
     assert_eq!(stored, 0, "and no token was minted");
 }
 
-/// A valid token's page is 200 HTML carrying the account's nickname and a
-/// form that posts the nested fields and the hidden token back to the
-/// completion endpoint.
+/// A valid token's check without any `Accept` header is still JSON: 200
+/// `{"nickname"}`, never `text/html`.
 #[tokio::test]
-async fn token_page_renders_the_form_for_a_live_token() {
+async fn token_check_without_accept_answers_json_for_a_live_token() {
     let db = common::test_db().await;
     let pool = db.pool().clone();
     let user = account(&pool, "alice").await;
@@ -308,27 +314,26 @@ async fn token_page_renders_the_form_for_a_live_token() {
     let response = common::TestRequest::get(&format!("{RESET}/{token}"))
         .send(&http)
         .await;
-    common::assert_answer(&response, StatusCode::OK, "the live token page");
-    assert_eq!(
-        response.header("content-type"),
-        Some("text/html; charset=utf-8"),
-        "the page is HTML"
-    );
-    let page = response.text();
-    assert!(page.contains("Password Reset for alice"), "{page}");
-    assert!(page.contains(&format!("action=\"{RESET}\"")), "{page}");
-    assert!(page.contains("name=\"data[password]\""), "{page}");
+    common::assert_answer(&response, StatusCode::OK, "the live token check");
     assert!(
-        page.contains("name=\"data[password_confirmation]\""),
-        "{page}"
+        response
+            .header("content-type")
+            .is_some_and(|value| value.starts_with("application/json")),
+        "the answer is JSON: {:?}",
+        response.header("content-type")
     );
-    assert!(page.contains(&format!("value=\"{token}\"")), "{page}");
+    assert_eq!(
+        response.json_value(),
+        json!({"nickname": "alice"}),
+        "{}",
+        response.text()
+    );
 }
 
-/// Unknown, spent and lapsed tokens all answer the same 200 "Invalid
-/// Token" page with no form on it.
+/// Unknown, spent and lapsed tokens all answer the same 404 JSON error
+/// without any `Accept` header.
 #[tokio::test]
-async fn token_page_answers_invalid_for_unknown_spent_and_lapsed() {
+async fn token_check_without_accept_answers_404_for_unknown_spent_and_lapsed() {
     let db = common::test_db().await;
     let pool = db.pool().clone();
     let user = account(&pool, "alice").await;
@@ -356,16 +361,14 @@ async fn token_page_answers_invalid_for_unknown_spent_and_lapsed() {
         let response = common::TestRequest::get(&format!("{RESET}/{token}"))
             .send(&http)
             .await;
-        common::assert_answer(&response, StatusCode::OK, "the invalid-token page");
-        let page = response.text();
-        assert!(page.contains("Invalid Token"), "{page}");
-        assert!(!page.contains("<form"), "no form to submit: {page}");
+        common::assert_answer(&response, StatusCode::NOT_FOUND, "the invalid-token check");
+        common::assert_error(&response, "Invalid Token", "the invalid token");
     }
 }
 
 /// Completing with a live token changes the password (the old one stops
 /// logging in, the new one starts), spends the token, deletes the
-/// account's other tokens and answers "Password changed!".
+/// account's other tokens and answers 204.
 #[tokio::test]
 async fn completion_changes_the_password_and_spends_the_token() {
     let db = common::test_db().await;
@@ -378,12 +381,7 @@ async fn completion_changes_the_password_and_spends_the_token() {
         .expect("the rival token mints");
 
     let response = complete_nested(&http, &token, NEW_PASSWORD, NEW_PASSWORD).await;
-    common::assert_answer(&response, StatusCode::OK, "the completion");
-    assert!(
-        response.text().contains("Password changed!"),
-        "{}",
-        response.text()
-    );
+    assert_no_content(&response, "the completion");
 
     let after = wired_be::models::user::get_by_id(&pool, user.id)
         .await
@@ -416,10 +414,8 @@ async fn completion_changes_the_password_and_spends_the_token() {
         "the account's other token is gone"
     );
     let again = complete_nested(&http, &token, NEW_PASSWORD, NEW_PASSWORD).await;
-    assert!(
-        again.text().contains("Invalid Token"),
-        "spent once, never again"
-    );
+    common::assert_answer(&again, StatusCode::UNPROCESSABLE_ENTITY, "the replay");
+    common::assert_error(&again, "Invalid Token", "spent once, never again");
 }
 
 /// Completion accepts the flat parameter spellings and a JSON `data`
@@ -439,11 +435,7 @@ async fn completion_accepts_flat_fields_and_json() {
         ])
         .send(&http)
         .await;
-    assert!(
-        response.text().contains("Password changed!"),
-        "{}",
-        response.text()
-    );
+    assert_no_content(&response, "the flat form completion");
 
     let second_user = account(&pool, "nestedjson").await;
     let second = request_reset(&http, &pool, &second_user, "nickname").await;
@@ -457,39 +449,189 @@ async fn completion_accepts_flat_fields_and_json() {
         }))
         .send(&http)
         .await;
-    assert!(
-        json_done.text().contains("Password changed!"),
+    assert_no_content(&json_done, "the JSON completion");
+}
+
+/// The token page as a JSON client asks for it.
+async fn json_page(app: &Router, token: &str) -> common::TestResponse {
+    common::TestRequest::get(&format!("{RESET}/{token}"))
+        .header("accept", "application/json")
+        .send(app)
+        .await
+}
+
+/// The completion as a JSON client posts it (flat fields).
+async fn complete_json(
+    app: &Router,
+    token: &str,
+    password: &str,
+    confirmation: &str,
+) -> common::TestResponse {
+    common::TestRequest::post(RESET)
+        .json(&json!({
+            "token": token,
+            "password": password,
+            "password_confirmation": confirmation,
+        }))
+        .send(app)
+        .await
+}
+
+/// A live token's JSON page is 200 `{"nickname"}` and nothing else.
+#[tokio::test]
+async fn json_token_page_names_the_account_for_a_live_token() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let user = account(&pool, "alice").await;
+    let http = mail_app(pool.clone());
+    let token = request_reset(&http, &pool, &user, "nickname").await;
+    let response = json_page(&http, &token).await;
+    common::assert_answer(&response, StatusCode::OK, "the live JSON page");
+    assert_eq!(
+        response.json_value(),
+        json!({"nickname": "alice"}),
         "{}",
-        json_done.text()
+        response.text()
     );
 }
 
-/// A short password and a mismatching confirmation re-render the form with
-/// their message, and neither changes the password nor spends the token.
+/// Unknown, spent and lapsed tokens answer 404 `{"error": "Invalid Token"}`.
 #[tokio::test]
-async fn completion_refuses_short_and_mismatched_passwords() {
+async fn json_token_page_answers_404_for_unknown_spent_and_lapsed() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let user = account(&pool, "alice").await;
+    let http = mail_app(pool.clone());
+    let spent = request_reset(&http, &pool, &user, "nickname").await;
+    let lapsed = password_reset::create_for_user(&pool, user.id)
+        .await
+        .expect("the second token mints")
+        .token;
+    // Completing deletes the account's other tokens, so the lapsed row is
+    // only backdated here; the spend below removes it, and an expired or
+    // deleted token must answer the same 404.
+    lapse_token(&pool, &lapsed).await;
+    let lapsed_answer = json_page(&http, &lapsed).await;
+    common::assert_answer(
+        &lapsed_answer,
+        StatusCode::NOT_FOUND,
+        "the lapsed JSON page",
+    );
+    common::assert_error(&lapsed_answer, "Invalid Token", "the lapsed token");
+    let done = complete_json(&http, &spent, NEW_PASSWORD, NEW_PASSWORD).await;
+    assert_no_content(&done, "the spending completion");
+
+    for token in ["never-minted".to_owned(), spent, lapsed] {
+        let response = json_page(&http, &token).await;
+        common::assert_answer(&response, StatusCode::NOT_FOUND, "the invalid JSON page");
+        common::assert_error(&response, "Invalid Token", "the invalid token");
+    }
+}
+
+/// A JSON completion changes the password, spends the token and answers
+/// 204; the same token a second time is 422 `Invalid Token`.
+#[tokio::test]
+async fn json_completion_changes_the_password_and_spends_the_token() {
     let db = common::test_db().await;
     let pool = db.pool().clone();
     let user = account(&pool, "alice").await;
     let http = mail_app(pool.clone());
     let token = request_reset(&http, &pool, &user, "nickname").await;
 
-    let short = complete_nested(&http, &token, "tiny", "tiny").await;
+    let response = complete_json(&http, &token, NEW_PASSWORD, NEW_PASSWORD).await;
+    assert_no_content(&response, "the JSON completion");
     assert!(
-        short.text().contains("Password is too short"),
-        "{}",
-        short.text()
+        wired_be::models::user::register::authenticate(&pool, "alice", NEW_PASSWORD)
+            .await
+            .is_some(),
+        "the new password logs in"
     );
     assert!(
-        short.text().contains("<form"),
-        "the form comes back for a retry"
+        wired_be::models::user::register::authenticate(&pool, "alice", OLD_PASSWORD)
+            .await
+            .is_none(),
+        "the old password does not"
     );
-    let mismatch = complete_nested(&http, &token, NEW_PASSWORD, "something else").await;
+    let left = stored_tokens(&pool, &user).await;
+    assert!(left.iter().all(|row| row.used), "the token is spent");
+
+    let again = complete_json(
+        &http,
+        &token,
+        "another long password!",
+        "another long password!",
+    )
+    .await;
+    common::assert_answer(&again, StatusCode::UNPROCESSABLE_ENTITY, "the replay");
+    common::assert_error(&again, "Invalid Token", "the replay");
     assert!(
-        mismatch.text().contains("Passwords do not match"),
-        "{}",
-        mismatch.text()
+        wired_be::models::user::register::authenticate(&pool, "alice", NEW_PASSWORD)
+            .await
+            .is_some(),
+        "the replay changed nothing"
     );
+}
+
+/// `Accept: application/json` alone (a form body) also gets the JSON
+/// answers.
+#[tokio::test]
+async fn completion_with_a_json_accept_answers_json() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let user = account(&pool, "alice").await;
+    let http = mail_app(pool.clone());
+    let token = request_reset(&http, &pool, &user, "nickname").await;
+    let refused = common::TestRequest::post(RESET)
+        .header("accept", "application/json")
+        .form(&[
+            ("data[token]", token.as_str()),
+            ("data[password]", "tiny"),
+            ("data[password_confirmation]", "tiny"),
+        ])
+        .send(&http)
+        .await;
+    common::assert_answer(&refused, StatusCode::UNPROCESSABLE_ENTITY, "the short form");
+    common::assert_error(&refused, "Password is too short", "the short form");
+    let done = common::TestRequest::post(RESET)
+        .header("accept", "application/json")
+        .form(&[
+            ("data[token]", token.as_str()),
+            ("data[password]", NEW_PASSWORD),
+            ("data[password_confirmation]", NEW_PASSWORD),
+        ])
+        .send(&http)
+        .await;
+    assert_no_content(&done, "the form with a JSON accept");
+}
+
+/// A short password and a mismatch are 422 with their messages; neither
+/// changes the password nor spends the token. An unknown token is 422
+/// `Invalid Token`.
+#[tokio::test]
+async fn json_completion_refuses_short_mismatched_and_unknown() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let user = account(&pool, "alice").await;
+    let http = mail_app(pool.clone());
+    let token = request_reset(&http, &pool, &user, "nickname").await;
+
+    let short = complete_json(&http, &token, "tiny", "tiny").await;
+    common::assert_answer(
+        &short,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "the short password",
+    );
+    common::assert_error(&short, "Password is too short", "the short password");
+    let mismatch = complete_json(&http, &token, NEW_PASSWORD, "something else").await;
+    common::assert_answer(&mismatch, StatusCode::UNPROCESSABLE_ENTITY, "the mismatch");
+    common::assert_error(&mismatch, "Passwords do not match", "the mismatch");
+    let unknown = complete_json(&http, "never-minted", NEW_PASSWORD, NEW_PASSWORD).await;
+    common::assert_answer(
+        &unknown,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "the unknown token",
+    );
+    common::assert_error(&unknown, "Invalid Token", "the unknown token");
 
     assert!(
         password_reset::get_valid(&pool, &token, std::time::Duration::from_secs(60))
@@ -506,8 +648,100 @@ async fn completion_refuses_short_and_mismatched_passwords() {
     );
 }
 
-/// A used or lapsed token cannot complete the reset: the answer is the
-/// form again carrying "Invalid Token".
+/// A browser's `Accept` no longer buys HTML: the token check and the form
+/// post answer the same JSON, and no answer is `text/html`.
+#[tokio::test]
+async fn a_browser_accept_still_gets_json() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let user = account(&pool, "alice").await;
+    let http = mail_app(pool.clone());
+    let token = request_reset(&http, &pool, &user, "nickname").await;
+    let browser = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8";
+
+    let page = common::TestRequest::get(&format!("{RESET}/{token}"))
+        .header("accept", browser)
+        .send(&http)
+        .await;
+    common::assert_answer(&page, StatusCode::OK, "the browser token check");
+    assert_eq!(page.json_value(), json!({"nickname": "alice"}), "the check");
+    let missing = common::TestRequest::get(&format!("{RESET}/never-minted"))
+        .header("accept", browser)
+        .send(&http)
+        .await;
+    common::assert_answer(&missing, StatusCode::NOT_FOUND, "the browser invalid check");
+    common::assert_error(&missing, "Invalid Token", "the browser invalid check");
+    for answer in [&page, &missing] {
+        assert!(
+            answer
+                .header("content-type")
+                .is_none_or(|value| !value.contains("text/html")),
+            "no HTML answer: {:?}",
+            answer.header("content-type")
+        );
+    }
+
+    let refused = common::TestRequest::post(RESET)
+        .header("accept", browser)
+        .form(&[
+            ("data[token]", token.as_str()),
+            ("data[password]", "tiny"),
+            ("data[password_confirmation]", "tiny"),
+        ])
+        .send(&http)
+        .await;
+    common::assert_answer(
+        &refused,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "the browser refusal",
+    );
+    common::assert_error(&refused, "Password is too short", "the browser refusal");
+    let done = common::TestRequest::post(RESET)
+        .header("accept", browser)
+        .form(&[
+            ("data[token]", token.as_str()),
+            ("data[password]", NEW_PASSWORD),
+            ("data[password_confirmation]", NEW_PASSWORD),
+        ])
+        .send(&http)
+        .await;
+    assert_no_content(&done, "the browser completion");
+}
+
+/// A short password and a mismatching confirmation answer 422 with their
+/// message, and neither changes the password nor spends the token.
+#[tokio::test]
+async fn completion_refuses_short_and_mismatched_passwords() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let user = account(&pool, "alice").await;
+    let http = mail_app(pool.clone());
+    let token = request_reset(&http, &pool, &user, "nickname").await;
+
+    let short = complete_nested(&http, &token, "tiny", "tiny").await;
+    common::assert_answer(&short, StatusCode::UNPROCESSABLE_ENTITY, "the short form");
+    common::assert_error(&short, "Password is too short", "the short form");
+    let mismatch = complete_nested(&http, &token, NEW_PASSWORD, "something else").await;
+    common::assert_answer(&mismatch, StatusCode::UNPROCESSABLE_ENTITY, "the mismatch");
+    common::assert_error(&mismatch, "Passwords do not match", "the mismatch");
+
+    assert!(
+        password_reset::get_valid(&pool, &token, std::time::Duration::from_secs(60))
+            .await
+            .expect("the lookup runs")
+            .is_some(),
+        "the refused attempts spent nothing"
+    );
+    assert!(
+        wired_be::models::user::register::authenticate(&pool, "alice", OLD_PASSWORD)
+            .await
+            .is_some(),
+        "the old password still logs in"
+    );
+}
+
+/// A used or lapsed token cannot complete the reset: the answer is 422
+/// "Invalid Token".
 #[tokio::test]
 async fn completion_refuses_spent_and_lapsed_tokens() {
     let db = common::test_db().await;
@@ -517,11 +751,12 @@ async fn completion_refuses_spent_and_lapsed_tokens() {
     let lapsed = request_reset(&http, &pool, &user, "nickname").await;
     lapse_token(&pool, &lapsed).await;
     let response = complete_nested(&http, &lapsed, NEW_PASSWORD, NEW_PASSWORD).await;
-    assert!(
-        response.text().contains("Invalid Token"),
-        "{}",
-        response.text()
+    common::assert_answer(
+        &response,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "the lapsed token",
     );
+    common::assert_error(&response, "Invalid Token", "the lapsed token");
     assert!(
         wired_be::models::user::register::authenticate(&pool, "alice", OLD_PASSWORD)
             .await
@@ -547,7 +782,7 @@ async fn completion_revokes_the_accounts_oauth_tokens() {
 
     let token = request_reset(&http, &pool, &user, "nickname").await;
     let done = complete_nested(&http, &token, NEW_PASSWORD, NEW_PASSWORD).await;
-    assert!(done.text().contains("Password changed!"), "{}", done.text());
+    assert_no_content(&done, "the completion");
 
     let after = common::TestRequest::get("/api/v1/accounts/verify_credentials")
         .bearer(&bearer)
@@ -582,7 +817,7 @@ async fn pending_reset_blocks_login_until_the_reset_completes() {
 
     let token = request_reset(&http, &pool, &user, "nickname").await;
     let done = complete_nested(&http, &token, NEW_PASSWORD, NEW_PASSWORD).await;
-    assert!(done.text().contains("Password changed!"), "{}", done.text());
+    assert_no_content(&done, "the completion");
     let after = grant(&http, &grant_body(&app, "alice", NEW_PASSWORD)).await;
     common::assert_answer(&after, StatusCode::OK, "the grant works again");
     let row = wired_be::models::user::get_by_id(&pool, user.id)

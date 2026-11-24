@@ -19,11 +19,12 @@ use crate::{
     error::{AppError, AppResult},
     federation::{
         activities::{
-            AS_PUBLIC, EmojiReactContext, ObjectActivityContext, activity_id, block_json,
-            emoji_react_json, follow_json, like_json,
+            EmojiReactContext, ObjectActivityContext, activity_id, block_json, emoji_react_json,
+            follow_json, like_json,
         },
         authorized_fetch::{fetch_allowed, fetch_signer},
         note::{announce_activity_json, create_activity_json, load_note_context, note_json},
+        vocab::AS_PUBLIC,
     },
     models::{
         activity::{self, LocalActivity, LocalActivityKind},

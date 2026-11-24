@@ -193,7 +193,7 @@ async fn spoiler_sensitive_and_language_edit_their_fields() {
         "and the type the text was written in"
     );
     assert_eq!(
-        json_keys(&source_read),
+        common::sorted_keys(&source_read),
         vec!["content_type", "id", "spoiler_text", "text"],
         "and exactly those four keys (decision 1: Pleroma's `content_type` \
          rides Mastodon's shape)"

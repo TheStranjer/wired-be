@@ -226,8 +226,9 @@ mod tests {
         config::TEST_BASE_URL,
         models::{
             status::{self, Status},
-            user::{Flag, NewUser, insert, local_ap_id},
+            user::{Flag, NewUser, insert},
         },
+        test_fixtures::local_user,
     };
 
     /// The remote signer every direct-call fixture here delivers as.
@@ -256,12 +257,7 @@ mod tests {
 
     /// A local author named `nickname` and one public post of theirs.
     async fn local_post(pool: &PgPool, nickname: &str) -> Status {
-        let author = insert(
-            pool,
-            &NewUser::local(nickname, &local_ap_id(TEST_BASE_URL, nickname)),
-        )
-        .await
-        .expect("the author fixture inserts");
+        let author = local_user(pool, nickname).await;
         status::insert(
             pool,
             TEST_BASE_URL,
@@ -330,12 +326,7 @@ mod tests {
             .expect("an ignore is not a failure");
         assert_eq!(outcome, Outcome::Ignored(NO_INNER_ID));
 
-        let local = insert(
-            &pool,
-            &NewUser::local("self-bob", &local_ap_id(TEST_BASE_URL, "self-bob")),
-        )
-        .await
-        .expect("the local fixture inserts");
+        let local = local_user(&pool, "self-bob").await;
         let posted = local_post(&pool, "guard-author").await;
         let guarded = view(
             "Like",

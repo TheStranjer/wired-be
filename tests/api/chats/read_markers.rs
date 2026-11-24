@@ -14,9 +14,8 @@ use wired_be::{
 };
 
 use super::support::{
-    CHAT_KEYS, MESSAGE_KEYS, SCOPE, all_page, error_message, fixture, insert_attachment, json_keys,
-    marker_body, message_read_path, parse, post_empty, post_json, read_path, send, stored_unread,
-    thread,
+    CHAT_KEYS, MESSAGE_KEYS, SCOPE, all_page, fixture, insert_attachment, marker_body,
+    message_read_path, parse, post_empty, post_json, read_path, send, stored_unread, thread,
 };
 use crate::common;
 
@@ -57,7 +56,11 @@ async fn chat_read_marks_up_to_the_marker_and_counts_what_remains() {
 
     let value = read_chat(&app, &started.token, &chat, started.refs[1]).await;
 
-    assert_eq!(json_keys(&value), CHAT_KEYS, "exactly the Chat keys");
+    assert_eq!(
+        common::sorted_keys(&value),
+        CHAT_KEYS,
+        "exactly the Chat keys"
+    );
     assert_eq!(value["id"], chat, "bob's own chat id");
     assert_eq!(value["unread"], 1, "only the newest message stays unread");
     assert_eq!(value["pinned"], false, "reading does not pin");
@@ -74,7 +77,11 @@ async fn chat_read_marks_up_to_the_marker_and_counts_what_remains() {
         "the Mastodon time format"
     );
     let last = &value["last_message"];
-    assert_eq!(json_keys(last), MESSAGE_KEYS, "the chat's newest message");
+    assert_eq!(
+        common::sorted_keys(last),
+        MESSAGE_KEYS,
+        "the chat's newest message"
+    );
     assert_eq!(last["id"], started.refs[2].to_string(), "by reference id");
     assert_eq!(last["unread"], true, "which the marker did not reach");
 
@@ -193,7 +200,7 @@ async fn a_read_without_the_marker_is_a_400() {
                 "no last_read_id is a 400 on {path}"
             );
             assert_eq!(
-                error_message(&response).as_deref(),
+                response.error_field().as_deref(),
                 Some("Missing parameter: last_read_id"),
                 "Pleroma's wording on {path}"
             );
@@ -231,7 +238,7 @@ async fn a_malformed_marker_is_a_400() {
             "`{junk}` is not an id"
         );
         assert_eq!(
-            error_message(&response).as_deref(),
+            response.error_field().as_deref(),
             Some("Invalid parameter: last_read_id"),
             "the marker is named in the refusal"
         );
@@ -270,7 +277,7 @@ async fn marking_one_message_read_returns_it() {
     );
     let value = response.json_value();
     assert_eq!(
-        json_keys(&value),
+        common::sorted_keys(&value),
         MESSAGE_KEYS,
         "exactly the ChatMessage keys"
     );
@@ -410,7 +417,7 @@ async fn a_message_of_another_chat_is_not_there() {
         response.text()
     );
     assert_eq!(
-        error_message(&response).as_deref(),
+        response.error_field().as_deref(),
         Some("Record not found"),
         "the plain 404 wording"
     );

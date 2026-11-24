@@ -13,7 +13,6 @@ use serde_json::{Value, json};
 use sqlx::PgPool;
 use uuid::Uuid;
 use wired_be::{
-    config::TEST_BASE_URL,
     jobs::scheduled_statuses::{KIND_PUBLISH, job_args, unique_key},
     models::{
         scheduled_status::{self, NewScheduledStatus},
@@ -193,20 +192,6 @@ pub(super) async fn cancel(app: &Router, token: &str, id: &str) -> common::TestR
         .await
 }
 
-/// The `id` of every entity in a listing answer, in the order they came.
-pub(super) fn entity_ids(body: &Value) -> Vec<String> {
-    body.as_array()
-        .expect("the listing is an array")
-        .iter()
-        .map(|entity| {
-            entity["id"]
-                .as_str()
-                .expect("every entity carries its id")
-                .to_owned()
-        })
-        .collect()
-}
-
 /// The `params.text` echo of every entity in a listing answer: which parked
 /// post each row is, so an order reads as text.
 pub(super) fn entity_texts(body: &Value) -> Vec<String> {
@@ -225,13 +210,4 @@ pub(super) fn entity_texts(body: &Value) -> Vec<String> {
 /// The ids of `rows`, in the order handed in.
 pub(super) fn row_ids(rows: &[&scheduled_status::ScheduledStatus]) -> Vec<String> {
     rows.iter().map(|row| row.id.to_string()).collect()
-}
-
-/// The `Link` header a page of the listing carries between `newest` and
-/// `oldest`: Pleroma's `add_link_headers` over the request's own path.
-pub(super) fn expected_link(newest: &str, oldest: &str) -> String {
-    format!(
-        "<{TEST_BASE_URL}{SCHEDULES}?max_id={oldest}>; rel=\"next\", \
-         <{TEST_BASE_URL}{SCHEDULES}?min_id={newest}>; rel=\"prev\""
-    )
 }

@@ -7,10 +7,11 @@ use serde_json::{Value, json};
 
 use super::server::{SCOPES, Server, Verb, action_ok, write_ok};
 use super::sockets::{
-    account, assert_absent, direct_stream, favourite, follow, frame_payload, id_of,
-    notification_stream, open, open_with_protocol, post_status, read_until, read_until_json,
-    settled, streams_of, user_stream,
+    account, assert_absent, direct_stream, favourite, follow, frame_payload, notification_stream,
+    open, open_with_protocol, post_status, read_until, read_until_json, settled, streams_of,
+    user_stream,
 };
+use crate::common;
 
 /// Real interactions land real `notification` frames: Bob's favourite of
 /// Alice's post over HTTP renders Mastodon's notification on Alice's
@@ -24,7 +25,7 @@ async fn favourites_and_follows_stream_notification_frames() {
     let (alice, alice_token) = account(&srv, "rt226-notif-alice", SCOPES).await;
     let (bob, bob_token) = account(&srv, "rt226-notif-bob", SCOPES).await;
     let (bystander, bystander_token) = account(&srv, "rt226-notif-outsider", SCOPES).await;
-    let status_id = id_of(&post_status(&srv, &alice_token, "to be liked", "public").await);
+    let status_id = common::id_of(&post_status(&srv, &alice_token, "to be liked", "public").await);
 
     let alice_stream = notification_stream(alice.id);
     let other_stream = notification_stream(bystander.id);
@@ -111,7 +112,7 @@ async fn a_direct_post_streams_update_and_conversation_frames() {
         "direct",
     )
     .await;
-    let message_id = id_of(&message);
+    let message_id = common::id_of(&message);
     let frames = read_until(&mut client, r#""event":"conversation""#).await;
     let update: Value = serde_json::from_str(
         frames
@@ -176,14 +177,14 @@ async fn chat_messages_and_filter_writes_stream_their_tellings() {
         &alice_token,
     )
     .await;
-    let alice_chat_id = id_of(&alice_chat);
+    let alice_chat_id = common::id_of(&alice_chat);
     let bob_chat = action_ok(
         &srv,
         &format!("/api/v1/pleroma/chats/by-account-id/{}", alice.id),
         &bob_token,
     )
     .await;
-    let bob_chat_id = id_of(&bob_chat);
+    let bob_chat_id = common::id_of(&bob_chat);
 
     let mut chat_socket = open(&srv.ws_url(&format!(
         "stream=user:pleroma_chat&access_token={alice_token}"
@@ -281,7 +282,7 @@ async fn tokens_in_the_query_and_in_the_subprotocol_open_their_sockets() {
     settled(&mut query_socket).await;
     settled(&mut protocol_socket).await;
 
-    let id = id_of(&post_status(&srv, &alice_token, "query and protocol", "public").await);
+    let id = common::id_of(&post_status(&srv, &alice_token, "query and protocol", "public").await);
     let alice_own = user_stream(alice.id);
     let bob_own = user_stream(bob.id);
 

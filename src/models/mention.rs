@@ -25,7 +25,9 @@ use std::collections::{HashMap, HashSet};
 use sqlx::{PgConnection, PgPool, Postgres, QueryBuilder};
 use uuid::Uuid;
 
-use crate::{error::AppResult, models::user::User, pagination::PageParams};
+use crate::{
+    error::AppResult, models::user::User, pagination::PageParams, util::collections::group_pairs,
+};
 
 /// [`link`]: one statement for a whole batch. Each account takes the next
 /// free `position` of the status — the stored maximum plus its one-based
@@ -192,11 +194,9 @@ pub async fn for_statuses(pool: &PgPool, ids: &[Uuid]) -> AppResult<HashMap<Uuid
         .bind(&ids)
         .fetch_all(pool)
         .await?;
-    let mut grouped: HashMap<Uuid, Vec<User>> = HashMap::new();
-    for row in rows {
-        grouped.entry(row.status_id).or_default().push(row.user);
-    }
-    Ok(grouped)
+    Ok(group_pairs(
+        rows.into_iter().map(|row| (row.status_id, row.user)),
+    ))
 }
 
 /// The ids of the statuses mentioning `user_id`, paged by `page` and

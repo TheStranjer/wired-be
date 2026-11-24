@@ -7,10 +7,13 @@
 //! the module root; the reaction twin is [`super::reactions`] and the boost
 //! twin [`super::boosts`].
 
-use super::{PUBLIC, followers_address, queue_activity, status_action, withdrawal};
+use super::{queue_activity, status_action, withdrawal};
 use crate::{
-    federation::activities::{ObjectActivityContext, like_json},
-    models::favourite::Favourite,
+    federation::{
+        activities::{ObjectActivityContext, like_json},
+        vocab::AS_PUBLIC,
+    },
+    models::{favourite::Favourite, user::followers_address},
     state::AppState,
 };
 
@@ -44,7 +47,7 @@ pub async fn after_favourite_changed(state: &AppState, favourite: &Favourite, fa
     let followers = followers_address(&action.actor);
     let to = [action.author.ap_id.as_str()];
     let cc: Vec<&str> = if action.public {
-        vec![followers.as_str(), PUBLIC]
+        vec![followers.as_str(), AS_PUBLIC]
     } else {
         Vec::new()
     };
@@ -123,7 +126,7 @@ mod tests {
         assert_eq!(activity["to"][0], bob.ap_id);
         assert_eq!(
             activity["cc"],
-            json!([format!("{}/followers", alice.ap_id), PUBLIC]),
+            json!([format!("{}/followers", alice.ap_id), AS_PUBLIC]),
             "the followers collection and the public address ride cc \
              because the status is public"
         );
@@ -187,7 +190,7 @@ mod tests {
         );
         assert_eq!(
             activity["cc"],
-            json!([format!("{}/followers", alice.ap_id), PUBLIC]),
+            json!([format!("{}/followers", alice.ap_id), AS_PUBLIC]),
             "and its cc"
         );
 
@@ -267,7 +270,7 @@ mod tests {
         );
         assert_eq!(
             activity["cc"],
-            json!([format!("{}/followers", alice.ap_id), PUBLIC]),
+            json!([format!("{}/followers", alice.ap_id), AS_PUBLIC]),
             "and the public fan-out line rides along"
         );
 
@@ -353,7 +356,7 @@ mod tests {
         let activity = the_single_activity(&pool).await;
         assert_eq!(
             activity["cc"],
-            json!([format!("{}/followers", bare.ap_id), PUBLIC]),
+            json!([format!("{}/followers", bare.ap_id), AS_PUBLIC]),
             "the built address stands in for the missing column"
         );
 

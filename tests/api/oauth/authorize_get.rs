@@ -16,7 +16,7 @@ use wired_be::models::{
     user::User,
 };
 
-use super::support::{REDIRECT, error_text, fixtures};
+use super::support::{REDIRECT, fixtures};
 use crate::common;
 
 /// The frontend origin the redirect tests configure.
@@ -247,7 +247,7 @@ async fn get_authorize_refuses_unknown_clients() {
             .send(&http)
             .await;
     assert_eq!(unknown.status, StatusCode::BAD_REQUEST, "a 400");
-    assert_eq!(error_text(&unknown), "Invalid client", "Pleroma's body");
+    assert_eq!(unknown.error_text(), "Invalid client", "Pleroma's body");
     assert!(unknown.header("location").is_none(), "never a redirect");
     assert_cache_no_store(&unknown);
 
@@ -261,7 +261,7 @@ async fn get_authorize_refuses_unknown_clients() {
         StatusCode::BAD_REQUEST,
         "a request without any client_id"
     );
-    assert_eq!(error_text(&missing), "Invalid client", "is refused alike");
+    assert_eq!(missing.error_text(), "Invalid client", "is refused alike");
     assert!(missing.header("location").is_none(), "never a redirect");
 }
 
@@ -292,7 +292,7 @@ async fn get_authorize_refuses_unregistered_redirect_uris() {
             StatusCode::BAD_REQUEST,
             "`{unregistered}` is refused"
         );
-        assert_eq!(error_text(&response), "Invalid redirect_uri", "by name");
+        assert_eq!(response.error_text(), "Invalid redirect_uri", "by name");
         assert!(
             response.header("location").is_none(),
             "`{unregistered}` is not redirected to"
@@ -318,7 +318,7 @@ async fn get_authorize_refuses_scopes_outside_the_registration() {
     .send(&http)
     .await;
     assert_eq!(broad.status, StatusCode::BAD_REQUEST, "unregistered write");
-    assert_eq!(error_text(&broad), "Invalid scope", "is Invalid scope");
+    assert_eq!(broad.error_text(), "Invalid scope", "is Invalid scope");
     assert!(broad.header("location").is_none(), "never a redirect");
     assert_cache_no_store(&broad);
 
@@ -332,7 +332,7 @@ async fn get_authorize_refuses_scopes_outside_the_registration() {
         StatusCode::BAD_REQUEST,
         "the default `read` does not fit a `write`-only app"
     );
-    assert_eq!(error_text(&defaulted), "Invalid scope", "alike");
+    assert_eq!(defaulted.error_text(), "Invalid scope", "alike");
 }
 
 /// `response_type` must name the code flow: anything else, absent
@@ -352,7 +352,7 @@ async fn get_authorize_requires_the_code_response_type() {
     .await;
     assert_eq!(other.status, StatusCode::BAD_REQUEST, "a foreign flow");
     assert_eq!(
-        error_text(&other),
+        other.error_text(),
         "unsupported_response_type",
         "is refused by its RFC name"
     );
@@ -367,7 +367,7 @@ async fn get_authorize_requires_the_code_response_type() {
     .await;
     assert_eq!(absent.status, StatusCode::BAD_REQUEST, "absent likewise");
     assert_eq!(
-        error_text(&absent),
+        absent.error_text(),
         "unsupported_response_type",
         "with the same body"
     );

@@ -48,6 +48,7 @@
 //! `timelines_federated` every other one, each refused with the 403
 //! `{"error":"Authentication is required to access this resource."}`;
 //! an authenticated request and the default configuration read normally.
+//! The tag timeline shares that gate, keyed the same way on `local`.
 
 #![cfg(test)]
 
@@ -67,3 +68,5 @@ mod public_restrictions;
 mod support;
 /// The tag timeline: the path tag's page, set operations and narrows.
 mod tag;
+/// The `RESTRICT_UNAUTHENTICATED` gate on the tag timeline's reads.
+mod tag_restrictions;

@@ -44,7 +44,7 @@ pub(super) async fn password_grant(
     let user = authenticate_user(&state.db, params).await?;
     check_account_ready(&user)?;
     if mfa::required(&user) {
-        let challenge = mfa::start_challenge(state, &user, &app, &scopes, "").await?;
+        let challenge = mfa::start_challenge(state, &user, &app, &scopes).await?;
         return Ok(TokenReply::MfaRequired(Json(MfaRequiredResponse {
             error: MFA_REQUIRED,
             mfa_token: challenge,
@@ -132,8 +132,7 @@ pub(super) const SUPPORTED_CHALLENGE_TYPES: &str = "totp";
 
 /// The 403 body of a refused password grant: Pleroma's
 /// `MFAView.render("mfa_response.json")`, carrying the fresh challenge
-/// token a client takes to `POST /oauth/mfa/challenge` (or the browser
-/// to `/oauth/mfa`).
+/// token a client takes to `POST /oauth/mfa/challenge`.
 #[derive(Debug, Serialize)]
 pub(super) struct MfaRequiredResponse {
     /// The machine-readable error, always [`MFA_REQUIRED`].

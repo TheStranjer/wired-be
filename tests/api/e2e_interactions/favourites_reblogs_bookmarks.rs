@@ -6,7 +6,7 @@ use serde_json::{Value, json};
 
 use super::support::{
     BOOKMARKS, FAVOURITES, FOLDERS, HOME, STATUSES, UNKNOWN_ID, acted, assert_every, assert_gone,
-    entity_id, follows, get, ids_of, post, posted, representations, row_of, user,
+    follows, get, post, posted, representations, row_of, user,
 };
 use crate::common;
 
@@ -22,7 +22,7 @@ async fn a_favourite_moves_the_count_the_flag_and_the_list() {
     let app = common::test_app(pool.clone());
     let (alice, alice_token) = user(&pool, "alice").await;
     let (_bob, bob_token) = user(&pool, "bob").await;
-    let id = entity_id(&post(&app, &alice_token, "favourite me").await);
+    let id = common::id_of(&post(&app, &alice_token, "favourite me").await);
     follows(&app, &bob_token, &alice.id.to_string()).await;
     let (on, off) = (json!(true), json!(false));
     let (one, zero) = (json!(1), json!(0));
@@ -52,7 +52,7 @@ async fn a_favourite_moves_the_count_the_flag_and_the_list() {
 
     let listed = get(&app, Some(&bob_token), FAVOURITES).await.json_value();
     assert_eq!(
-        ids_of(&listed),
+        common::ids_of(&listed),
         vec![id.clone()],
         "the favourites list round-trips the like"
     );
@@ -73,7 +73,7 @@ async fn a_favourite_moves_the_count_the_flag_and_the_list() {
     );
     let emptied = get(&app, Some(&bob_token), FAVOURITES).await.json_value();
     assert!(
-        ids_of(&emptied).is_empty(),
+        common::ids_of(&emptied).is_empty(),
         "the favourites list empties with it"
     );
 }
@@ -91,12 +91,12 @@ async fn a_reblog_nests_the_original_and_rides_the_follower_home_once() {
     let (alice, alice_token) = user(&pool, "alice").await;
     let (bob, bob_token) = user(&pool, "bob").await;
     let (_carol, carol_token) = user(&pool, "carol").await;
-    let id = entity_id(&post(&app, &alice_token, "boost me").await);
+    let id = common::id_of(&post(&app, &alice_token, "boost me").await);
     follows(&app, &bob_token, &alice.id.to_string()).await;
     follows(&app, &carol_token, &bob.id.to_string()).await;
 
     let boost = acted(&app, &bob_token, &format!("{STATUSES}/{id}/reblog")).await;
-    let boost_id = entity_id(&boost);
+    let boost_id = common::id_of(&boost);
     assert_ne!(boost_id, id, "the answer is the boost, not the post");
     assert_eq!(
         boost["content"], "",
@@ -143,7 +143,7 @@ async fn a_reblog_nests_the_original_and_rides_the_follower_home_once() {
 
     let home = get(&app, Some(&carol_token), HOME).await.json_value();
     assert_eq!(
-        ids_of(&home),
+        common::ids_of(&home),
         vec![boost_id.clone()],
         "the follower's home carries the boost exactly once"
     );
@@ -160,7 +160,7 @@ async fn a_reblog_nests_the_original_and_rides_the_follower_home_once() {
     assert_gone(&app, Some(&bob_token), &boost_id, "the withdrawn boost").await;
     let settled = get(&app, Some(&carol_token), HOME).await.json_value();
     assert!(
-        ids_of(&settled).is_empty(),
+        common::ids_of(&settled).is_empty(),
         "the boost left the home with it"
     );
 }
@@ -178,7 +178,7 @@ async fn a_filed_bookmark_round_trips_the_folder_and_the_list() {
     let app = common::test_app(pool.clone());
     let (alice, alice_token) = user(&pool, "alice").await;
     let (_bob, bob_token) = user(&pool, "bob").await;
-    let id = entity_id(&post(&app, &alice_token, "save this").await);
+    let id = common::id_of(&post(&app, &alice_token, "save this").await);
     follows(&app, &bob_token, &alice.id.to_string()).await;
     let folder_id = create_folder(&app, &bob_token, "Reading list").await;
 
@@ -245,10 +245,10 @@ async fn a_filed_bookmark_round_trips_the_folder_and_the_list() {
 async fn create_folder(app: &Router, token: &str, name: &str) -> String {
     let folder = posted(app, token, FOLDERS, json!({"name": name})).await;
     assert_eq!(folder["name"], json!(name), "the folder answers its name");
-    let folder_id = entity_id(&folder);
+    let folder_id = common::id_of(&folder);
     let shelves = get(app, Some(token), FOLDERS).await.json_value();
     assert_eq!(
-        ids_of(&shelves),
+        common::ids_of(&shelves),
         vec![folder_id.clone()],
         "the folder list holds it, in creation order"
     );
@@ -271,7 +271,7 @@ async fn bookmarks_page(app: &Router, token: &str, query: &str) -> Value {
 /// The bookmarks page for `query` answers exactly the ids in `want`.
 async fn assert_bookmarks(app: &Router, token: &str, query: &str, want: &[String]) {
     assert_eq!(
-        ids_of(&bookmarks_page(app, token, query).await),
+        common::ids_of(&bookmarks_page(app, token, query).await),
         want,
         "the bookmarks list answers"
     );

@@ -18,7 +18,10 @@ use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use crate::{error::AppResult, util::id::new_id};
+use crate::{
+    error::AppResult,
+    util::{id::new_id, like},
+};
 
 /// One row of `custom_emojis`: a single shortcode-to-image mapping.
 #[derive(Clone, Debug, sqlx::FromRow)]
@@ -282,7 +285,7 @@ pub async fn delete_local_under(
     url_prefix: &str,
     keep: &[String],
 ) -> AppResult<u64> {
-    let pattern = format!("{}%", escape_like(url_prefix));
+    let pattern = like::prefix(url_prefix);
     let deleted = sqlx::query(
         "DELETE FROM custom_emojis
           WHERE domain IS NULL
@@ -294,20 +297,6 @@ pub async fn delete_local_under(
     .execute(pool)
     .await?;
     Ok(deleted.rows_affected())
-}
-
-/// Escapes the LIKE metacharacters (`\\`, `%`, `_`) in `text` so it matches
-/// those bytes literally, letting [`delete_local_under`] build its pattern
-/// from an untrusted URL prefix.
-fn escape_like(text: &str) -> String {
-    let mut escaped = String::with_capacity(text.len());
-    for c in text.chars() {
-        if matches!(c, '\\' | '%' | '_') {
-            escaped.push('\\');
-        }
-        escaped.push(c);
-    }
-    escaped
 }
 
 #[cfg(test)]
@@ -784,15 +773,5 @@ mod tests {
             1,
             "the look-alike host survives"
         );
-    }
-
-    #[test]
-    fn escape_like_quotes_every_wildcard() {
-        assert_eq!(
-            escape_like(r"a%b_c\d"),
-            r"a\%b\_c\\d",
-            "backslash, percent and underscore are all escaped"
-        );
-        assert_eq!(escape_like("plain/text"), "plain/text", "nothing to escape");
     }
 }

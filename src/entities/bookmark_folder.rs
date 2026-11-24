@@ -61,6 +61,7 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
+    use crate::test_fixtures::json_keys;
 
     /// The folder id, as a client sees it.
     const FOLDER_ID: &str = "01934567-89ab-7cde-f012-3456789abcde";
@@ -92,18 +93,6 @@ mod tests {
     fn render(row: &BookmarkFolderRow, emoji_url: Option<&str>) -> Value {
         serde_json::to_value(BookmarkFolder::from_row(row, emoji_url))
             .expect("an entity serializes")
-    }
-
-    /// The rendered object's keys, sorted, for exact key-set assertions.
-    fn json_keys(value: &Value) -> Vec<&str> {
-        let mut keys: Vec<&str> = value
-            .as_object()
-            .expect("folders render objects")
-            .keys()
-            .map(String::as_str)
-            .collect();
-        keys.sort_unstable();
-        keys
     }
 
     #[test]
