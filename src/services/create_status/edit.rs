@@ -15,6 +15,7 @@ use uuid::Uuid;
 use super::{
     CreateStatusParams, POLL_WITH_MEDIA, TOO_MANY_ATTACHMENTS,
     edit_media::{MediaAttribute, into_changes},
+    quote_fallback::edit_fallback,
     render_status_fields,
     validate::{Backing, check_body_backed},
 };
@@ -205,8 +206,12 @@ pub async fn edit_status(
         return Err(AppError::Unprocessable(POLL_WITH_MEDIA.to_owned()));
     }
     let fields = render_status_fields(state, checked.text, checked.content_type).await?;
+    let mut content = fields.content;
+    if let Some(paragraph) = edit_fallback(state, row, checked.text).await? {
+        content.push_str(&paragraph);
+    }
     let edit = status_edit::EditParams {
-        content: fields.content,
+        content,
         raw_text: checked.text.to_owned(),
         content_type: checked.content_type.to_owned(),
         spoiler_text: checked.spoiler_text.to_owned(),

@@ -177,9 +177,10 @@ pub(super) async fn created_entity(
     Ok(entity)
 }
 
-/// The `quote_of_id` a body's `quote_id` names: `None` when the body named no
-/// target (absent or `null` — posting without a quote is untouched), the id
-/// of the quotable original once the target has been read and checked.
+/// The original a body's `quote_id` names: `None` when the body named no
+/// target (absent or `null` — posting without a quote is untouched), the
+/// quotable original's row once the target has been read and checked; its
+/// id is the `quote_of_id` to store.
 ///
 /// The checks run in the order the ticket pins them, and every miss on the
 /// target is decision 8's shared 404 so a probe learns nothing:
@@ -203,7 +204,7 @@ pub(super) async fn quote_target(
     state: &AppState,
     user: &User,
     quote_id: Option<&str>,
-) -> AppResult<Option<Uuid>> {
+) -> AppResult<Option<status::Status>> {
     let Some(text) = quote_id else {
         return Ok(None);
     };
@@ -218,7 +219,7 @@ pub(super) async fn quote_target(
     {
         return Err(AppError::Unprocessable(QUOTE_NOT_ALLOWED.to_owned()));
     }
-    Ok(Some(target.id))
+    Ok(Some(target))
 }
 
 /// Follows `row`'s reblog links through to the original a quote of it names:

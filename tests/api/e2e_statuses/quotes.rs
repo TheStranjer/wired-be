@@ -113,10 +113,21 @@ async fn a_quote_shows_its_original_only_to_viewers_that_reach_it() {
     let (app, world) = world(&pool).await;
     let (original, quote) = quote_pair(&app, &world).await;
 
+    let url = original["url"].as_str().expect("the original has a URL");
+    let naked = url.trim_start_matches("https://");
+    let display: String = naked.chars().take(30).collect();
+    let ellipsis = if naked.chars().count() > 30 {
+        "…"
+    } else {
+        ""
+    };
     let shape = Shape {
         id: common::id_of(&quote),
         visibility: "public",
-        content: json!("<p>quoting in public</p>"),
+        content: json!(format!(
+            "<p>quoting in public</p><p class=\"quote-inline\">RE: <a href=\"{url}\" \
+             rel=\"ugc nofollow noopener noreferrer\">{display}{ellipsis}</a></p>"
+        )),
         acct: "author",
     };
     let admitted = sweep(&app, &world, &shape, &OPEN).await;
