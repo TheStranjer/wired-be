@@ -196,10 +196,11 @@ pub const DEFAULT_EMOJI_DIR: &str = "./emoji";
 /// `InstanceStatic` plug serves at the top level; the same shape with one
 /// setting folded in.
 pub const DEFAULT_INSTANCE_DOCS_DIR: &str = "./instance";
-/// Document names used when `INSTANCE_DOCUMENT_NAMES` is unset: the two
-/// documents Pleroma's `Pleroma.Web.InstanceDocument` map knows, spelled
-/// as the `<name>.html` storage this server writes them under.
-pub const DEFAULT_INSTANCE_DOCUMENT_NAMES: &str = "terms-of-service,instance-panel";
+/// Document names used when `INSTANCE_DOCUMENT_NAMES` is unset: only the
+/// terms of service, the one document the JSON API reads
+/// (`GET /api/v1/instance/terms_of_service`), stored as
+/// `terms-of-service.html`.
+pub const DEFAULT_INSTANCE_DOCUMENT_NAMES: &str = "terms-of-service";
 /// Path appended to `BASE_URL` for the media URL prefix when
 /// `MEDIA_BASE_URL` is unset: the route in [`crate::api::media_files`].
 pub const DEFAULT_MEDIA_URL_PATH: &str = "/media";

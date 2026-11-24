@@ -111,8 +111,8 @@ mod tests {
 
     /// The assembled table is exactly the one that lived in this file before
     /// the split: twelve sections, none of them empty, 374 rows, opening
-    /// with the instance metadata route and closing with the instance's HTML
-    /// pages.
+    /// with the instance metadata route and closing with the custom emoji
+    /// files.
     #[test]
     fn routes_assembles_the_whole_table_in_order() {
         assert_eq!(ROUTES.len(), 12, "one section per surface");
@@ -139,10 +139,10 @@ mod tests {
             rows.last(),
             Some(&&RouteSpec {
                 method: "GET",
-                path: "/instance/:name.html",
+                path: "/emoji/:pack/:file",
                 auth: AuthClass::Public,
             }),
-            "the table closes with the instance's HTML pages"
+            "the table closes with the custom emoji files"
         );
     }
 }

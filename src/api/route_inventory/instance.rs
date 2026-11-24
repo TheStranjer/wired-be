@@ -36,6 +36,11 @@ pub(super) const ROWS: &[RouteSpec] = &[
     },
     RouteSpec {
         method: "GET",
+        path: "/api/v1/instance/terms_of_service",
+        auth: AuthClass::Public,
+    },
+    RouteSpec {
+        method: "GET",
         path: "/api/v2/instance",
         auth: AuthClass::Public,
     },

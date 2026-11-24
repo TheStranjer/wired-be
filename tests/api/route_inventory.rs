@@ -46,8 +46,7 @@ const UUID_PARAMS: [&str; 7] = [
 ///
 /// `method` is `totp` because that MFA route is registered per method rather
 /// than with a wildcard (the only method Wired implements); `name` is a
-/// document name, which both `/instance/:name.html` and
-/// `/api/v1/pleroma/admin/instance_document/:name` read.
+/// document name, which `/api/v1/pleroma/admin/instance_document/:name` reads.
 const FIXED_PARAMS: [(&str, &str); 18] = [
     ("nickname", "alice"),
     ("instance", "remote.example"),
@@ -83,9 +82,8 @@ fn concrete_path(path: &str) -> String {
 }
 
 /// One `/`-separated `segment` of an inventory path: either it is literal, or
-/// it starts with a `:name` parameter and may carry a literal suffix after it
-/// — Pleroma writes the instance-document route `/instance/:name.html`, where
-/// `.html` is part of the path and `name` is what the handler reads.
+/// it starts with a `:name` parameter and may carry a literal suffix
+/// (such as `:name.html`; no row has one today) after it.
 fn concrete_segment(segment: &str) -> String {
     let Some(rest) = segment.strip_prefix(':') else {
         return (*segment).to_owned();

@@ -52,8 +52,8 @@ mod activitypub;
 mod admin;
 
 /// The admin OAuth-app maintenance and instance-document endpoints over
-/// HTTP (`/oauth_app`, `/instance_document/{name}` and the public
-/// `GET /instance/{name}.html`, WBE-205): the CRUD walk and its filters,
+/// HTTP (`/oauth_app`, `/instance_document/{name}` and the public JSON
+/// `GET /api/v1/instance/terms_of_service`, WBE-205): the CRUD walk and its filters,
 /// the `trusted` flag, the `{"errors": …}` refusals, the document
 /// upload/read/delete cycle with its headers, size gate and traversal
 /// refusals, and both areas' scope gates.
