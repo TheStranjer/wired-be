@@ -22,6 +22,8 @@ pub(super) const ACCOUNT_ID: &str = "01934567-89ab-7cde-f012-3456789abcde";
 /// A second id, for a fixture account that must not be the same row as
 /// [`ACCOUNT_ID`].
 pub(super) const OTHER_ACCOUNT_ID: &str = "01934567-89ab-7cde-f012-3456789abcdf";
+/// A third id, for the staff viewer fixtures.
+pub(super) const STAFF_ACCOUNT_ID: &str = "01934567-89ab-7cde-f012-3456789abce0";
 /// The instance origin of [`Config::for_tests`].
 pub(super) const BASE: &str = "https://test.example";
 /// Every JSON key the core entity must emit, sorted.
@@ -54,12 +56,30 @@ pub(super) const EXPECTED_KEYS: [&str; 27] = [
     "url",
     "username",
 ];
-/// The `pleroma` keys a viewer who is not the account sees: without
-/// the seven owner-only keys, and without `birthday` when the account
-/// hides it.
-pub(super) const PLEROMA_KEYS_FOR_OTHERS: [&str; 17] = [
+/// The `pleroma` keys a viewer who is neither the account nor staff
+/// sees: without the seven owner-only keys, without `birthday` when the
+/// account hides it, and without `allow_following_move`, `deactivated`
+/// and `tags`.
+pub(super) const PLEROMA_KEYS_FOR_OTHERS: [&str; 14] = [
     "accepts_chat_messages",
-    "allow_following_move",
+    "ap_id",
+    "background_image",
+    "confirmation_pending",
+    "favicon",
+    "hide_favorites",
+    "hide_followers",
+    "hide_followers_count",
+    "hide_follows",
+    "hide_follows_count",
+    "is_admin",
+    "is_moderator",
+    "relationship",
+    "skip_thread_containment",
+];
+/// The `pleroma` keys a staff viewer sees on another account: the list
+/// above plus `deactivated` and `tags`, sorted.
+pub(super) const PLEROMA_KEYS_FOR_STAFF: [&str; 16] = [
+    "accepts_chat_messages",
     "ap_id",
     "background_image",
     "confirmation_pending",
@@ -76,10 +96,10 @@ pub(super) const PLEROMA_KEYS_FOR_OTHERS: [&str; 17] = [
     "skip_thread_containment",
     "tags",
 ];
-/// Every `pleroma` key that can ever appear — the list above plus the
-/// seven the account sees only for itself — sorted for key-set
-/// assertions.
-pub(super) const ALL_PLEROMA_KEYS: [&str; 24] = [
+/// Every `pleroma` key the account sees on itself — the public list, the
+/// seven owner-only keys, `birthday`, `allow_following_move` and `tags`,
+/// but not `deactivated` (staff only) — sorted for key-set assertions.
+pub(super) const PLEROMA_KEYS_FOR_OWNER: [&str; 23] = [
     "accepts_chat_messages",
     "allow_following_move",
     "ap_id",
@@ -87,7 +107,6 @@ pub(super) const ALL_PLEROMA_KEYS: [&str; 24] = [
     "birthday",
     "chat_token",
     "confirmation_pending",
-    "deactivated",
     "favicon",
     "hide_favorites",
     "hide_followers",
@@ -228,7 +247,6 @@ pub(super) fn pleroma_of(value: &Value) -> Value {
 pub(super) fn pleroma_block(ap_id: &str, accepts_chat: Option<bool>) -> Value {
     json!({
         "background_image": null,
-        "tags": [],
         "relationship": {},
         "is_admin": false,
         "is_moderator": false,
@@ -241,10 +259,28 @@ pub(super) fn pleroma_block(ap_id: &str, accepts_chat: Option<bool>) -> Value {
         "accepts_chat_messages": accepts_chat,
         "favicon": null,
         "skip_thread_containment": false,
-        "allow_following_move": true,
-        "deactivated": false,
         "ap_id": ap_id,
     })
+}
+
+/// A local admin viewer, distinct from [`alice_with_pleroma_profile`] and
+/// [`mallory`], for the staff-only keys.
+pub(super) fn staff_admin() -> User {
+    let mut admin = base_user("root", &format!("{BASE}/users/root"));
+    admin.id = Uuid::parse_str(STAFF_ACCOUNT_ID).unwrap();
+    admin.local = Flag::new(true);
+    admin.is_admin = Flag::new(true);
+    admin
+}
+
+/// A local moderator viewer, the other half of staff.
+pub(super) fn staff_moderator() -> User {
+    let mut moderator = staff_admin();
+    moderator.nickname = "mod".to_owned();
+    moderator.ap_id = format!("{BASE}/users/mod");
+    moderator.is_admin = Flag::new(false);
+    moderator.is_moderator = Flag::new(true);
+    moderator
 }
 
 /// The rendered object's keys, sorted, for exact key-set assertions.

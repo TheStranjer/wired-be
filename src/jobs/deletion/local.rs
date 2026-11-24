@@ -287,7 +287,7 @@ mod tests {
             ),
             "the header is the default"
         );
-        assert!(account.pleroma.tags.is_empty(), "the tags are gone");
+        assert!(reloaded.tags.is_empty(), "the tags are gone");
         assert!(
             account.pleroma.background_image.is_none(),
             "the background is gone"
