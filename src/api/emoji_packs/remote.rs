@@ -18,7 +18,7 @@ use super::{
 use crate::{
     auth::admin::AdminUser,
     error::{AppError, AppResult},
-    http_client::HttpResponse,
+    http_client::{HttpError, HttpResponse},
     services::emoji_packs,
     state::AppState,
     util::url::parse_http_url,
@@ -141,8 +141,46 @@ fn remote_failure(message: &str, cause: &str) -> AppError {
     AppError::InternalMessage(message.to_owned())
 }
 
+/// Why [`fetch_checked`] gave no usable response; each caller words it
+/// for its own route.
+#[derive(Debug)]
+pub(super) enum FetchFailure {
+    /// The guarded client refused or failed the fetch: the SSRF guard,
+    /// transport, or the size cap.
+    Transport(HttpError),
+    /// The peer answered with this status outside 2xx.
+    Status(u16),
+}
+
+impl FetchFailure {
+    /// The cause as the log words it.
+    fn cause(&self) -> String {
+        match self {
+            Self::Transport(err) => err.to_string(),
+            Self::Status(status) => format!("the peer answered {status}"),
+        }
+    }
+}
+
 /// Fetches `url` with the state's guarded client, reading at most
-/// `max_bytes`, and insists on a 2xx answer; every failure — transport,
+/// `max_bytes`, and insists on a 2xx answer.
+pub(super) async fn fetch_checked(
+    state: &AppState,
+    url: &str,
+    max_bytes: usize,
+) -> Result<HttpResponse, FetchFailure> {
+    let response = state
+        .http_client
+        .get_limited(url, &[], max_bytes)
+        .await
+        .map_err(FetchFailure::Transport)?;
+    if !(MIN_FETCH_STATUS..MAX_FETCH_STATUS).contains(&response.status) {
+        return Err(FetchFailure::Status(response.status));
+    }
+    Ok(response)
+}
+
+/// Fetches `url` through [`fetch_checked`]; every failure — transport,
 /// guard, size cap, status — arrives as the 500 that `message` words.
 pub(super) async fn fetch_remote(
     state: &AppState,
@@ -150,18 +188,9 @@ pub(super) async fn fetch_remote(
     max_bytes: usize,
     message: &str,
 ) -> AppResult<HttpResponse> {
-    let response = state
-        .http_client
-        .get_limited(url, &[], max_bytes)
+    fetch_checked(state, url, max_bytes)
         .await
-        .map_err(|err| remote_failure(message, &err.to_string()))?;
-    if !(MIN_FETCH_STATUS..MAX_FETCH_STATUS).contains(&response.status) {
-        return Err(remote_failure(
-            message,
-            &format!("the peer answered {}", response.status),
-        ));
-    }
-    Ok(response)
+        .map_err(|failure| remote_failure(message, &failure.cause()))
 }
 
 /// Fetches `url` under the listing cap ([`MAX_REMOTE_LIST_BYTES`]) and
