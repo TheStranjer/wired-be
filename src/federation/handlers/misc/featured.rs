@@ -1,14 +1,23 @@
 //! The `Add` and `Remove` routes: the featured-collection pins.
 //! [`handle_add`] and [`handle_remove`] fold one shared body,
 //! [`apply_featured_change`] — only a `target` equal to the actor's own
-//! `featured_url` and a stored status the actor authored can be pinned.
+//! `featured_url` and a status the actor authored can be pinned. An `Add`
+//! of a status this instance has not stored fetches it when it lives on
+//! the actor's own host; a `Remove` only looks it up.
 
 use futures::future::BoxFuture;
 use tracing::debug;
 
 use crate::{
-    federation::dispatch::{ActivityView, FederationError, Outcome},
-    models::{pinned_status, status, user::User},
+    federation::{
+        dispatch::{ActivityView, FederationError, Outcome},
+        fetch_object, json,
+    },
+    models::{
+        pinned_status,
+        status::{self, Status},
+        user::User,
+    },
     state::AppState,
 };
 
@@ -43,6 +52,42 @@ pub fn handle_remove(
     Box::pin(async move { apply_featured_change(state, view, signer, false).await })
 }
 
+/// Resolves the object of an `Add` or `Remove` that is not stored.
+///
+/// Only an `Add` fetches, and only an object on the signer's own host: the
+/// fetch is the status resolver's own (`resolve_status_as_actor`), which
+/// stores nothing the signer did not author. A `Remove` has nothing to
+/// take back that was never stored. `None` means there is nothing to pin.
+///
+/// # Errors
+///
+/// The resolver's [`FederationError`]: transient for a network or database
+/// failure that may pass on a retry, permanent for a document it refuses.
+async fn fetch_unstored(
+    state: &AppState,
+    uri: &str,
+    signer: &User,
+    pinning: bool,
+) -> Result<Option<Status>, FederationError> {
+    let own_host = json::http_host(uri).is_some_and(|host| {
+        json::http_host(&signer.ap_id).is_some_and(|signer_host| host == signer_host)
+    });
+    if !pinning || !own_host {
+        debug!(
+            uri,
+            pinning,
+            own_host,
+            "an Add or Remove of a status this instance does not store; ignoring"
+        );
+        return Ok(None);
+    }
+    let resolved = fetch_object::resolve_status_as_actor(state, uri, signer).await?;
+    if resolved.is_none() {
+        debug!(uri, "an Add of a status that resolved to nothing foldable");
+    }
+    Ok(resolved)
+}
+
 /// The shared body of [`handle_add`] and [`handle_remove`]: the featured
 /// collection's pins, folded for the signer alone.
 async fn apply_featured_change(
@@ -74,14 +119,13 @@ async fn apply_featured_change(
             "an Add or Remove whose object names no id",
         ));
     };
-    let stored = status::get_by_uri(&state.db, uri).await.map_err(|err| {
+    let mut stored = status::get_by_uri(&state.db, uri).await.map_err(|err| {
         FederationError::transient("could not fold the remote activity's featured status", &err)
     })?;
+    if stored.is_none() {
+        stored = fetch_unstored(&state, uri, &signer, pinning).await?;
+    }
     let Some(stored) = stored else {
-        debug!(
-            uri,
-            "an Add or Remove of a status this instance does not store; ignoring"
-        );
         return Ok(Outcome::Ignored(
             "an Add or Remove whose object is not a stored status",
         ));
@@ -285,14 +329,14 @@ mod tests {
                 "Add",
                 "add-6",
                 ALICE,
-                json!({"object": "https://peer.example/posts/never", "target": FEATURED}),
+                json!({"object": "https://elsewhere.example/posts/never", "target": FEATURED}),
             ),
             alice,
         )
         .await;
         assert!(
             ignored(unknown_status).contains("not a stored status"),
-            "the fetch ticket gives unknown statuses a home later"
+            "an unknown status on another host is never fetched"
         );
 
         let idless_object = handle_add(
