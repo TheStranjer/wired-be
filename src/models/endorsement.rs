@@ -25,7 +25,7 @@
 //! (see [`crate::models::follow::unfollow`]), and so does a block of the
 //! pair, in both directions ([`remove_between`]).
 
-use sqlx::{PgConnection, PgPool, Postgres, QueryBuilder};
+use sqlx::{Executor, PgConnection, PgPool, Postgres, QueryBuilder};
 use uuid::Uuid;
 
 use crate::{error::AppResult, models::user::User, pagination::PageParams, util::id::new_id};
@@ -110,11 +110,14 @@ pub async fn endorse(pool: &PgPool, user_id: Uuid, target_id: Uuid) -> AppResult
 ///
 /// Any database failure (connection, encoding) arrives as
 /// [`AppError::Database`](crate::error::AppError).
-pub async fn unendorse(pool: &PgPool, user_id: Uuid, target_id: Uuid) -> AppResult<()> {
+pub async fn unendorse<'e, E>(executor: E, user_id: Uuid, target_id: Uuid) -> AppResult<()>
+where
+    E: Executor<'e, Database = Postgres>,
+{
     sqlx::query(UNENDORSE_SQL)
         .bind(user_id)
         .bind(target_id)
-        .execute(pool)
+        .execute(executor)
         .await
         .map(drop)?;
     Ok(())
