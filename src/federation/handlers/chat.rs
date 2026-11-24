@@ -49,7 +49,7 @@
 //! [`crate::services::federation_out`]'s chat arms; nothing here sends
 //! anything anywhere.
 
-use chrono::{DateTime, TimeDelta, Utc};
+use chrono::{DateTime, Utc};
 use futures::future::BoxFuture;
 use serde_json::Value;
 use sqlx::PgConnection;
@@ -72,10 +72,7 @@ use crate::{
         user::{self, User},
     },
     state::AppState,
-    util::{
-        sanitize::{sanitize_html, strip_html},
-        time::parse_time,
-    },
+    util::sanitize::{sanitize_html, strip_html},
 };
 
 /// The object type both of this module's sub-registry entries claim.
@@ -85,12 +82,6 @@ const CHAT_MESSAGE_TYPE: &str = "ChatMessage";
 /// Pleroma's chat-arm validator list: the note family's `Link` entry is
 /// nobody's media.
 const ATTACHMENT_TYPES: [&str; 4] = ["Document", "Image", "Video", "Audio"];
-
-/// How far a delivered `published` may lead this clock before the fold stops
-/// trusting it — the same five minutes [`crate::federation::note_parser`]
-/// grants a note, so a peer's forward clock cannot push a message past the
-/// ones already in the conversation.
-const CLOCK_SKEW: TimeDelta = TimeDelta::minutes(5);
 
 /// The `mediaType` Pleroma's attachment validator defaults when a document
 /// declares none, and the fallback this fold stores beside it.
@@ -211,7 +202,7 @@ struct IncomingChat<'a> {
     /// The same text with its markup stripped — what the model's length
     /// backstop measures.
     raw_text: String,
-    /// The object's `published` time, clamped against [`CLOCK_SKEW`]; it
+    /// The object's `published` time, clamped against [`json::CLOCK_SKEW`]; it
     /// becomes the message row's creation time.
     published: DateTime<Utc>,
     /// The document's first attachment, when it carries chat media.
@@ -301,16 +292,11 @@ fn single_recipient(object: &Value) -> Option<String> {
 }
 
 /// The object's `published` instant: required (Pleroma's validator names it
-/// among the fields), parsed through [`parse_time`], and answered `now`
-/// whenever it leads the local clock past [`CLOCK_SKEW`] — a remote clock
-/// cannot move a message down somebody's chat list.
+/// among the fields), parsed by [`json::clamped_time`], and answered `now`
+/// whenever it leads the local clock past [`json::CLOCK_SKEW`] — a remote
+/// clock cannot move a message down somebody's chat list.
 fn published_time(object: &Value, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
-    let published = object
-        .get("published")
-        .and_then(Value::as_str)
-        .and_then(parse_time)?;
-    let ceiling = now.checked_add_signed(CLOCK_SKEW).unwrap_or(now);
-    Some(if published > ceiling { now } else { published })
+    json::clamped_time(object.get("published"), now)
 }
 
 /// The first `attachment` entry of the document, in Pleroma's
@@ -675,6 +661,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    use crate::util::time::parse_time;
 
     /// The actor every fixture here is delivered by.
     const BOB: &str = "https://remote.example/users/bob";

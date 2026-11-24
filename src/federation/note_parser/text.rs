@@ -6,7 +6,7 @@ use chrono::{DateTime, Utc};
 use serde_json::Value;
 
 use crate::{
-    federation::json::value_or_id,
+    federation::json::{clamped_time, value_or_id},
     util::{
         format::truncate_chars,
         sanitize::{escape_html, sanitize_html, strip_html},
@@ -15,8 +15,8 @@ use crate::{
 };
 
 use super::{
-    CLOCK_SKEW, DEFAULT_HTML_CONTENT_TYPE, MAX_CONTENT_CHARS, TYPE_ARTICLE, TYPE_AUDIO, TYPE_EVENT,
-    TYPE_IMAGE, TYPE_PAGE, TYPE_VIDEO,
+    DEFAULT_HTML_CONTENT_TYPE, MAX_CONTENT_CHARS, TYPE_ARTICLE, TYPE_AUDIO, TYPE_EVENT, TYPE_IMAGE,
+    TYPE_PAGE, TYPE_VIDEO,
     types::{NoteText, NoteTimes},
 };
 
@@ -102,13 +102,11 @@ fn article_header(title: Option<&str>, url: &str) -> String {
 }
 
 /// The timestamps: `published` clamped to `now` when it leads `now` by more
-/// than [`CLOCK_SKEW`] (a remote clock cannot push a post into the future),
-/// and `updated` kept as the edit time only when it postdates that.
+/// than [`CLOCK_SKEW`](crate::federation::json::CLOCK_SKEW) (a remote clock
+/// cannot push a post into the future), and `updated` kept as the edit time
+/// only when it postdates that.
 pub(super) fn parse_times(json: &Value, now: DateTime<Utc>) -> NoteTimes {
-    let ceiling = now.checked_add_signed(CLOCK_SKEW).unwrap_or(now);
-    let inserted_at = timestamp_field(json, "published")
-        .filter(|published| *published <= ceiling)
-        .unwrap_or(now);
+    let inserted_at = clamped_time(json.get("published"), now).unwrap_or(now);
     let edited_at = timestamp_field(json, "updated").filter(|updated| *updated > inserted_at);
     NoteTimes {
         inserted_at,
