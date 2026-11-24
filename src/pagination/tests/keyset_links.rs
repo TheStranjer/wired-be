@@ -45,6 +45,17 @@ fn min_id_orders_ascending() {
 }
 
 #[test]
+fn keyset_with_all_three_cursors_has_exact_sql() {
+    let query = format!("max_id={MAX_ID}&min_id={MIN_ID}&since_id={SINCE_ID}&limit=5");
+    assert_eq!(
+        keyset_sql(&query, "s.id"),
+        "SELECT id FROM statuses WHERE 1=1 AND s.id < $1 AND s.id > $2 AND s.id > $3 \
+             ORDER BY s.id ASC LIMIT $4",
+        "max, min and since conditions in order, ascending because min_id is present"
+    );
+}
+
+#[test]
 fn keyset_uses_the_given_id_column() {
     assert_eq!(
         keyset_sql(&format!("since_id={SINCE_ID}"), "s.id"),
