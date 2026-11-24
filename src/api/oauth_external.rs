@@ -34,11 +34,13 @@
 //!      with their own `redirect_uris`, and no consent screen is rendered
 //!      here; a provider that auto-approves (GitHub and GitLab do for an
 //!      already-authorized app) would otherwise hand any victim's code to an
-//!      attacker's redirect URI on one click. So for an untrusted app the
-//!      state row is deleted and the answer is a 302 to the app's
-//!      `redirect_uri` with `error=access_denied&error_description=consent_required`
-//!      (and the client's `state`); no authorization is created. This is
-//!      interim, until the frontend consent flow exists. For a trusted app
+//!      attacker's redirect URI on one click. So for an untrusted app no
+//!      code is minted: a one-time `confirm_token` and the linked user's id
+//!      are stored in the state row
+//!      ([`set_confirmation`](crate::models::oauth_login_state::set_confirmation))
+//!      and the browser is redirected 302 to
+//!      `{BASE_URL}/oauth/external/consent?state=…&confirm_token=…`, where
+//!      the frontend's consent screen takes over (5). For a trusted app
 //!      the readiness gate ([`crate::api::oauth`]'s `check_account_ready`,
 //!      the one the token endpoint applies) runs, and the answer is
 //!      the authorization code for the *stored* parameters: a
@@ -73,6 +75,21 @@
 //!    with the hourly `maintenance.tokens` sweep, and a missing, expired
 //!    or `pending`-less state is the 400 `{"error":"Invalid state"}` on
 //!    both halves.
+//! 5. The same screens for a frontend that renders them itself, all JSON
+//!    (the sibling `frontend` child): `GET /oauth/registration_details` with
+//!    `Accept: application/json` answers the pending account as
+//!    `{"nickname","email","name","provider"}`; `POST /oauth/register` with a
+//!    JSON body (`state`, `nickname`, `email`, optionally `password`) answers
+//!    200 `{"redirect_uri": …}` with the code, 200
+//!    `{"pending":"approval"|"confirmation"}`, or the refusal as
+//!    `POST /api/v1/accounts` words it (422, the registrations-closed 403).
+//!    `GET /oauth/external/consent?state=&confirm_token=` answers
+//!    `{"app":{"name","website"},"scopes":[…]}` and `POST
+//!    /oauth/external/consent` takes `{state, confirm_token, approve}` and
+//!    answers 200 `{"redirect_uri": …}` carrying the code, or
+//!    `error=access_denied` on a denial. The token is compared in constant
+//!    time and the state is deleted by the verdict; anything else is the
+//!    400 `Invalid state`.
 //!
 //! Every answer — JSON, redirect or page — carries `Cache-Control:
 //! no-store`, as the rest of `/oauth` does: a state and a code are
@@ -91,23 +108,26 @@
 use axum::{
     Json, Router,
     extract::{Path, State},
+    http::HeaderMap,
     response::{IntoResponse as _, Response},
     routing::{get, post},
 };
 
 use crate::{
-    api::oauth::authorize,
+    api::oauth::{authorize, json_media::wants_json},
     extract::{ApiBody, ApiParams},
     state::AppState,
 };
 
 use self::{
     form::RegisterForm,
+    frontend::{ConsentBody, ConsentQuery},
     registration::registered,
     state::{CallbackQuery, PrepareQuery, StateQuery, completed, details, prepared, redirected},
 };
 
 mod form;
+mod frontend;
 mod provider;
 mod registration;
 mod state;
@@ -138,6 +158,11 @@ const CALLBACK_SEGMENT: &str = "callback";
 const REGISTRATION_DETAILS: &str = "/oauth/registration_details";
 /// The form's submission endpoint: `/oauth/register`.
 const REGISTER_PATH: &str = "/oauth/register";
+/// Where a linked account of an untrusted application is sent for consent,
+/// and the route that answers there: `/oauth/external/consent`.
+const CONSENT_PATH: &str = "/oauth/external/consent";
+/// Bytes behind the one-time `confirm_token` of a consent redirect.
+const CONFIRM_TOKEN_BYTES: usize = 32;
 /// The error line the form is re-rendered with while `REGISTRATIONS_OPEN`
 /// is off, the wording this ticket pins. Pleroma gates the registration
 /// the same way; here the form carries no invite token, so a closed
@@ -162,18 +187,20 @@ const USERINFO_MAX_BYTES: usize = 1024 * 1024;
 /// beside [`crate::api::oauth::router`].
 ///
 /// It answers `/oauth/prepare_request`, `/oauth/registration_details`,
-/// `/oauth/register`, `/oauth/{provider}` and `/oauth/{provider}/callback`.
+/// `/oauth/register`, `/oauth/external/consent`, `/oauth/{provider}` and
+/// `/oauth/{provider}/callback`.
 ///
 /// The static `/oauth` paths — the sibling router's (`/oauth/token`,
 /// `/oauth/authorize`, `/oauth/revoke`) and this router's
-/// `/oauth/registration_details` and `/oauth/register` — win over the
-/// `{provider}` segment: a router tries statics first — so no provider may
-/// be named after one.
+/// `/oauth/registration_details`, `/oauth/register` and
+/// `/oauth/external/consent` — win over the `{provider}` segment: a router
+/// tries statics first — so no provider may be named after one.
 pub fn router() -> Router<AppState> {
     Router::new()
         .route(PREPARE_PATH, get(prepare_request))
         .route(REGISTRATION_DETAILS, get(registration_details))
         .route(REGISTER_PATH, post(register))
+        .route(CONSENT_PATH, get(consent).post(decide))
         .route(PROVIDER_PATH, get(request))
         .route(CALLBACK_PATH, get(callback))
 }
@@ -222,25 +249,55 @@ async fn callback(
 /// `GET /oauth/registration_details` — the registration form an unlinked
 /// provider account was handed: the state's `pending` account info
 /// prefilled, posting to `/oauth/register` with the state.
+/// `Accept: application/json` gets the account info as JSON instead.
 async fn registration_details(
     State(state): State<AppState>,
+    headers: HeaderMap,
     ApiParams(query): ApiParams<StateQuery>,
 ) -> Response {
-    let response = match details(&state, query.state.as_deref()).await {
-        Ok(reply) => reply.into_response(),
-        Err(err) => err.into_response(),
+    let response = if wants_json(&headers) {
+        frontend::json_response(frontend::details_json(&state, query.state.as_deref()).await)
+    } else {
+        match details(&state, query.state.as_deref()).await {
+            Ok(reply) => reply.into_response(),
+            Err(err) => err.into_response(),
+        }
     };
     authorize::no_store(response)
 }
 
 /// `POST /oauth/register` — the completed form: create the account, link
 /// the provider identity, and finish the authorization-code flow the state
-/// was prepared for.
-async fn register(State(state): State<AppState>, ApiBody(form): ApiBody<RegisterForm>) -> Response {
-    let response = match registered(&state, form).await {
-        Ok(reply) => reply.into_response(),
-        Err(err) => err.into_response(),
+/// was prepared for. A JSON body gets the outcome as JSON.
+async fn register(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    ApiBody(form): ApiBody<RegisterForm>,
+) -> Response {
+    let response = if frontend::is_json_body(&headers) {
+        frontend::json_response(frontend::registered_json(&state, form).await)
+    } else {
+        match registered(&state, form).await {
+            Ok(reply) => reply.into_response(),
+            Err(err) => err.into_response(),
+        }
     };
+    authorize::no_store(response)
+}
+
+/// `GET /oauth/external/consent` — the application and scopes a linked
+/// login of an untrusted application waits for consent on.
+async fn consent(
+    State(state): State<AppState>,
+    ApiParams(query): ApiParams<ConsentQuery>,
+) -> Response {
+    let response = frontend::json_response(frontend::consent_details(&state, query).await);
+    authorize::no_store(response)
+}
+
+/// `POST /oauth/external/consent` — the user's verdict on that login.
+async fn decide(State(state): State<AppState>, ApiBody(body): ApiBody<ConsentBody>) -> Response {
+    let response = frontend::json_response(frontend::consent_decided(&state, body).await);
     authorize::no_store(response)
 }
 

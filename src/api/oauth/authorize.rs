@@ -53,7 +53,7 @@ use serde_json::{Value, json};
 use sqlx::PgPool;
 use url::form_urlencoded;
 
-use super::{NO_STORE, mfa};
+use super::{NO_STORE, json_media::wants_json, mfa};
 use crate::{
     error::{AppError, AppResult},
     extract::{ApiBody, ApiParams},
@@ -85,8 +85,6 @@ pub(crate) const INVALID_SCOPE: &str = "Invalid scope";
 pub(crate) const OOB_REDIRECT_URI: &str = "urn:ietf:wg:oauth:2.0:oob";
 /// The `error` value of a denied authorization (RFC 6749 §4.1.2.1).
 pub(crate) const ACCESS_DENIED: &str = "access_denied";
-/// The `error_description` of a login refused for want of a consent step.
-pub(crate) const CONSENT_REQUIRED: &str = "consent_required";
 /// The path both halves are mounted on, and the one the frontend serves
 /// its consent screen at.
 const AUTHORIZE_PATH: &str = "/oauth/authorize";
@@ -130,7 +128,7 @@ async fn show(
     uri: Uri,
     ApiParams(query): ApiParams<AuthorizeQuery>,
 ) -> Response {
-    let response = if json::wants_json(&headers) {
+    let response = if wants_json(&headers) {
         json::describe(&state, &query).await
     } else {
         match redirect_to_frontend(&state, &query, &uri).await {
@@ -426,25 +424,7 @@ pub(crate) fn deliver_code(
 /// A redirect URI that cannot become a header value is a 400
 /// [`INVALID_REDIRECT_URI`].
 pub(crate) fn denied(delivery: &Delivery<'_>) -> AppResult<AuthorizeReply> {
-    denied_with(delivery, None)
-}
-
-/// [`denied`] with an `error_description` beside the `error`, for a refusal
-/// the client can act on: [`CONSENT_REQUIRED`] tells an untrusted app that
-/// the login needs a consent step this server cannot render yet.
-///
-/// # Errors
-///
-/// A redirect URI that cannot become a header value is a 400
-/// [`INVALID_REDIRECT_URI`].
-pub(crate) fn denied_with(
-    delivery: &Delivery<'_>,
-    description: Option<&str>,
-) -> AppResult<AuthorizeReply> {
     let mut params: Vec<(&str, &str)> = vec![("error", ACCESS_DENIED)];
-    if let Some(text) = description {
-        params.push(("error_description", text));
-    }
     if let Some(client_state) = delivery.state {
         params.push(("state", client_state));
     }

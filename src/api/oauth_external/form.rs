@@ -5,6 +5,8 @@
 //! resolves them. The routes that render and consume them are the sibling
 //! `registration` child's.
 
+use std::fmt;
+
 use serde::Deserialize;
 
 use crate::{
@@ -51,7 +53,7 @@ impl PendingRegistration {
 /// back to the provider's info the way Pleroma's
 /// `create_from_registration` reads the form above the stored
 /// registration, and an absent nickname fails validation like a blank one.
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 pub(super) struct RegisterForm {
     /// The state [`registration_details`] carried through the form.
     ///
@@ -70,6 +72,26 @@ pub(super) struct RegisterForm {
     /// Profile note as source text.
     #[serde(default)]
     pub(super) bio: Option<String>,
+    /// A password of the registrant's own choosing. Only the JSON
+    /// registration reads it; the HTML form has no such field and ignores
+    /// it. Never in `Debug` output.
+    #[serde(default)]
+    pub(super) password: Option<String>,
+}
+
+/// [`password`](RegisterForm::password) is secret material and renders as
+/// `<redacted>`; everything else shows.
+impl fmt::Debug for RegisterForm {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RegisterForm")
+            .field("state", &"<redacted>")
+            .field("nickname", &self.nickname)
+            .field("email", &self.email)
+            .field("name", &self.name)
+            .field("bio", &self.bio)
+            .field("password", &"<redacted>")
+            .finish()
+    }
 }
 
 /// The submission's fields, resolved against the provider's `pending`
@@ -117,15 +139,19 @@ impl Submitted {
         }
     }
 
-    /// The [`RegisterParams`] of a resolved submission: the password is a
-    /// fresh random token nobody will ever type (see
+    /// The [`RegisterParams`] of a resolved submission: the password is the
+    /// registrant's own when `chosen` carries one (the JSON registration),
+    /// otherwise a fresh random token nobody will ever type (see
     /// [`EXTERNAL_PASSWORD_BYTES`]), and no registration reason or invite
     /// belongs to an external signup.
-    pub(super) fn into_register_params(self) -> RegisterParams {
+    pub(super) fn into_register_params(self, chosen: Option<&str>) -> RegisterParams {
+        let password = chosen
+            .filter(|text| !text.is_empty())
+            .map_or_else(|| random_token(EXTERNAL_PASSWORD_BYTES), str::to_owned);
         RegisterParams {
             nickname: self.nickname,
             email: self.email,
-            password: random_token(EXTERNAL_PASSWORD_BYTES),
+            password,
             name: self.name,
             bio: self.bio,
             reason: None,
@@ -278,8 +304,8 @@ mod tests {
         };
         let form: RegisterForm =
             crate::extract::into_params(json!({"state": "s"})).expect("all optional");
-        let first = Submitted::of_form(&form, &pending).into_register_params();
-        let second = Submitted::of_form(&form, &pending).into_register_params();
+        let first = Submitted::of_form(&form, &pending).into_register_params(None);
+        let second = Submitted::of_form(&form, &pending).into_register_params(None);
         assert_eq!(first.password.len(), 86, "64 random bytes, base64url");
         assert_ne!(
             first.password, second.password,
@@ -303,5 +329,40 @@ mod tests {
             !first.provider_email_verified,
             "nothing was vouched for when the provider said no email"
         );
+    }
+
+    #[test]
+    fn a_chosen_password_replaces_the_random_one_unless_blank() {
+        let pending = PendingRegistration {
+            provider: "github".to_owned(),
+            uid: "4242".to_owned(),
+            nickname: Some("octocat".to_owned()),
+            email: None,
+            name: None,
+        };
+        let form: RegisterForm = crate::extract::into_params(json!({"state": "s"}))
+            .expect("the password is an optional field");
+        let chosen =
+            Submitted::of_form(&form, &pending).into_register_params(Some("my own secret"));
+        assert_eq!(chosen.password, "my own secret", "the registrant's own");
+        let blank = Submitted::of_form(&form, &pending).into_register_params(Some(""));
+        assert_eq!(blank.password.len(), 86, "a blank one is no choice at all");
+    }
+
+    #[test]
+    fn the_form_debug_output_hides_the_password_and_the_state() {
+        let form: RegisterForm = crate::extract::into_params(json!({
+            "state": "a-very-secret-state",
+            "nickname": "octocat",
+            "password": "a-very-secret-password",
+        }))
+        .expect("a submission");
+        let debug = format!("{form:?}");
+        assert!(
+            !debug.contains("a-very-secret-password"),
+            "no password: {debug}"
+        );
+        assert!(!debug.contains("a-very-secret-state"), "no state: {debug}");
+        assert!(debug.contains("octocat"), "the rest shows: {debug}");
     }
 }

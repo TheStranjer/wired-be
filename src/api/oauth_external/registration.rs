@@ -43,23 +43,58 @@ use super::{
 /// generation failure of the registration itself as [`AppError`].
 pub(super) async fn registered(state: &AppState, form: RegisterForm) -> AppResult<AuthorizeReply> {
     let (stored, pending, params) = registrable_state(state, form.state.as_deref()).await?;
-    if !state.config.registrations_open.get() {
-        return Ok(refused_form(
+    match create_account(state, &form, &stored, &pending, None).await? {
+        Created::Closed => Ok(refused_form(
             &form,
             &stored.state,
             REGISTRATIONS_CLOSED_FORM,
-        ));
+        )),
+        Created::Invalid(errors) => Ok(refused_form(
+            &form,
+            &stored.state,
+            &validation_line(&errors),
+        )),
+        Created::Done(user) => finish_registration(state, &user, &params).await,
     }
-    let account = Submitted::of_form(&form, &pending);
-    let user = match create_local_user(state, account.into_register_params(), None).await {
+}
+
+/// What creating the account of a submitted registration came to. The
+/// payloads are boxed so the variants stay the size of a pointer.
+#[derive(Debug)]
+pub(super) enum Created {
+    /// `REGISTRATIONS_OPEN` is off: nothing was written.
+    Closed,
+    /// Validation or an availability check refused the submission; nothing
+    /// was written.
+    Invalid(Box<FieldErrors>),
+    /// The account exists, the provider identity is linked and the state
+    /// row is spent.
+    Done(Box<User>),
+}
+
+/// The write both halves of the registration share: the `REGISTRATIONS_OPEN`
+/// gate, the account created through [`create_local_user`] from `form`
+/// resolved against `pending` (with `chosen` as its password, or a random
+/// one nobody can type), the identity link, and the burned state row.
+///
+/// # Errors
+///
+/// Any database or key generation failure of the registration itself as
+/// [`AppError`]; a refusal is [`Created::Closed`] or [`Created::Invalid`].
+pub(super) async fn create_account(
+    state: &AppState,
+    form: &RegisterForm,
+    stored: &OauthLoginState,
+    pending: &PendingRegistration,
+    chosen: Option<&str>,
+) -> AppResult<Created> {
+    if !state.config.registrations_open.get() {
+        return Ok(Created::Closed);
+    }
+    let account = Submitted::of_form(form, pending);
+    let user = match create_local_user(state, account.into_register_params(chosen), None).await {
         Ok(user) => user,
-        Err(RegisterError::Invalid(errors)) => {
-            return Ok(refused_form(
-                &form,
-                &stored.state,
-                &validation_line(&errors),
-            ));
-        }
+        Err(RegisterError::Invalid(errors)) => return Ok(Created::Invalid(Box::new(errors))),
         Err(RegisterError::Failed(err)) => return Err(err),
     };
     let linked = user_identity::link(&state.db, user.id, &pending.provider, &pending.uid).await?;
@@ -70,7 +105,7 @@ pub(super) async fn registered(state: &AppState, form: RegisterForm) -> AppResul
         provider = %pending.provider,
         "external registration linked a new account and finished the login"
     );
-    finish_registration(state, &user, &params).await
+    Ok(Created::Done(Box::new(user)))
 }
 
 /// What a finished external registration is answered with: the message

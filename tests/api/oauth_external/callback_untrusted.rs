@@ -1,21 +1,23 @@
-//! The callback of a linked account for an untrusted application: no code,
-//! an `access_denied` redirect saying consent is required, and a state that
-//! cannot be replayed afterwards.
+//! The callback of a linked account for an untrusted application: no code
+//! yet, a `confirm_token` stored beside the linked user in the state, and
+//! the browser sent to the consent screen carrying both.
 
 use axum::http::StatusCode;
+use serde_json::json;
 
 use super::provider::{LINKED_UID, PROVIDER, REDIRECT};
 use super::support::{
     assert_no_store, count_codes, count_states, error_text, fixture, link, location, prepare,
-    set_trusted,
+    query_param, set_trusted, stored_params,
 };
 use crate::common;
 
-/// A linked account on an untrusted app is refused: the app's redirect gets
-/// `error=access_denied&error_description=consent_required` and the client's
-/// state, no authorization row is created and the state row is gone.
+/// A linked account on an untrusted app is not granted a code: the browser
+/// is redirected to the consent screen with the state and a fresh
+/// `confirm_token`, no authorization row is created, and the state row now
+/// carries the token and the linked user.
 #[tokio::test]
-async fn an_untrusted_app_is_refused_a_code_for_a_linked_account() {
+async fn an_untrusted_app_is_sent_to_consent_for_a_linked_account() {
     let db = common::test_db().await;
     let pool = db.pool().clone();
     let site = fixture(pool.clone(), "nora", "read write").await;
@@ -30,24 +32,40 @@ async fn an_untrusted_app_is_refused_a_code_for_a_linked_account() {
     .send(&site.http)
     .await;
 
-    assert_eq!(response.status, StatusCode::FOUND, "the app is redirected");
+    assert_eq!(response.status, StatusCode::FOUND, "the browser moves on");
     assert_no_store(&response);
-    assert_eq!(
-        location(&response),
-        format!(
-            "{REDIRECT}?error=access_denied&error_description=consent_required&state=client-state"
-        ),
-        "the refusal names consent, with the client's state and no code"
+    let url = location(&response);
+    assert!(
+        url.contains("/oauth/external/consent?"),
+        "to the consent screen: {url}"
     );
+    assert!(
+        !url.starts_with(REDIRECT),
+        "not to the application's redirect URI: {url}"
+    );
+    assert_eq!(
+        query_param(&url, "state").as_deref(),
+        Some(state.as_str()),
+        "the state rides along"
+    );
+    let token = query_param(&url, "confirm_token").expect("a confirm_token on the redirect");
+    assert_eq!(token.len(), 43, "32 random bytes, base64url");
+
     assert_eq!(count_codes(&pool).await, 0, "no authorization was created");
-    assert_eq!(count_states(&pool).await, 0, "the state row was burned");
+    assert_eq!(count_states(&pool).await, 1, "the state waits for consent");
+    let (_, params) = stored_params(&pool, &state).await;
+    assert_eq!(
+        params["confirmation"],
+        json!({"token": token, "user_id": site.user.id}),
+        "the token and the linked user are parked in the state"
+    );
     site.provider.stop();
 }
 
-/// The refused state cannot be reused: a second callback on it is the 400
-/// `Invalid state`, and still no code exists.
+/// A second callback on the same state parks a fresh token: the first one
+/// stops opening the consent screen, and still no code exists.
 #[tokio::test]
-async fn a_refused_state_cannot_be_reused() {
+async fn a_second_callback_rotates_the_confirm_token() {
     let db = common::test_db().await;
     let pool = db.pool().clone();
     let site = fixture(pool.clone(), "owen", "read").await;
@@ -57,18 +75,23 @@ async fn a_refused_state_cannot_be_reused() {
     let path = format!("/oauth/{PROVIDER}/callback?code={LINKED_UID}&state={state}");
 
     let first = common::TestRequest::get(&path).send(&site.http).await;
-    assert_eq!(
-        first.status,
-        StatusCode::FOUND,
-        "the first callback bounces"
-    );
     let second = common::TestRequest::get(&path).send(&site.http).await;
+    assert_eq!(second.status, StatusCode::FOUND, "the replay redirects too");
+    let old = query_param(&location(&first), "confirm_token").expect("the first token");
+    let new = query_param(&location(&second), "confirm_token").expect("the second token");
+    assert_ne!(old, new, "each callback parks its own token");
+
+    let old_reply = common::TestRequest::get(&format!(
+        "/oauth/external/consent?state={state}&confirm_token={old}"
+    ))
+    .send(&site.http)
+    .await;
     assert_eq!(
-        second.status,
+        old_reply.status,
         StatusCode::BAD_REQUEST,
-        "the burned state is no state"
+        "the old token is dead"
     );
-    assert_eq!(error_text(&second), "Invalid state", "the usual refusal");
+    assert_eq!(error_text(&old_reply), "Invalid state", "the usual refusal");
     assert_eq!(count_codes(&pool).await, 0, "and no code was ever minted");
     site.provider.stop();
 }
