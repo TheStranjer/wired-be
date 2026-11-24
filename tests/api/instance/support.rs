@@ -14,7 +14,7 @@ pub(super) const BASE: &str = "https://test.example";
 /// The feature list Pleroma 2.10.2 advertises with its shipped defaults,
 /// spelled out here (as in `tests/nodeinfo.rs`) so the shared builder is
 /// checked against the ticket, not echoed by it.
-pub(super) const EXPECTED_FEATURES: [&str; 26] = [
+pub(super) const EXPECTED_FEATURES: [&str; 25] = [
     "pleroma_api",
     "mastodon_api",
     "mastodon_api_grouped_notifications",
@@ -37,7 +37,6 @@ pub(super) const EXPECTED_FEATURES: [&str; 26] = [
     "pleroma:pin_chats",
     "exposable_reactions",
     "profile_directory",
-    "pleroma:get:main/ostatus",
     "pleroma:group_actors",
     "pleroma:bookmark_folders",
     "pleroma:block_expiration",

@@ -1,23 +1,23 @@
 //! Remote interaction over HTTP (WBE-188): the `POST
 //! /api/v1/pleroma/remote_interaction` endpoint, the retired
 //! `/ostatus_subscribe` pair (WBE-741: answered by the fallback alone),
-//! `GET /authorize_interaction`'s frontend redirects and the
-//! `/main/ostatus` remote-subscribe pair (`src/api/remote_interaction.rs`).
+//! `GET /authorize_interaction`'s frontend redirects and the retired
+//! `/main/ostatus` pair, also answered by the fallback alone
+//! (`src/api/remote_interaction.rs`).
 //!
 //! The WebFinger half of the flow needs a live `https://{domain}` peer,
 //! so the HTTP success path is pinned by the module's own mock-server
 //! unit tests; what this suite pins over the real router is the
 //! parameter refusals (every case is network-free: an unresolvable
 //! profile is spelled with a single-label domain that the `WebFinger`
-//! client rejects before any request), the pages' HTML shape and
-//! escaping, and the redirects a locally stored actor, handle and status
-//! get.
+//! client rejects before any request), and the redirects a locally
+//! stored actor, handle and status get.
 
 #![cfg(test)]
 
 use axum::http::StatusCode;
 use serde_json::json;
-use wired_be::models::{follow, status::Visibility, user::User};
+use wired_be::models::{follow, status::Visibility};
 
 use crate::common;
 
@@ -286,110 +286,33 @@ async fn authorize_interaction_refuses_unresolvable_uris() {
     }
 }
 
-/// `GET /main/ostatus` renders the remote-subscribe form with both
-/// nested fields, the query pair escaped into them.
+/// `GET /main/ostatus` and `POST /main/ostatus` are not routed: the
+/// server-rendered remote-subscribe form is gone, and only the fallback
+/// answers both methods.
 #[tokio::test]
-async fn the_main_ostatus_form_escapes_its_fields() {
+async fn the_main_ostatus_pair_is_answered_by_the_fallback() {
     let db = common::test_db().await;
     let app = common::test_app(db.pool().clone());
 
-    let response = common::TestRequest::get(
-        "/main/ostatus?nickname=%3Ci%3Ealice&profile=%22evil%22%40remote.example",
-    )
-    .send(&app)
-    .await;
-
-    common::assert_answer(&response, StatusCode::OK, "the subscribe page");
-    assert_eq!(
-        response.header("content-type"),
-        Some("text/html; charset=utf-8"),
-        "the page is HTML"
-    );
-    let body = response.text();
-    assert!(
-        body.contains("action=\"/main/ostatus\""),
-        "the form posts back to the same route: {body}"
-    );
-    assert!(
-        body.contains("name=\"user[nickname]\" value=\"&lt;i&gt;alice\""),
-        "the local account renders escaped: {body}"
-    );
-    assert!(
-        body.contains("name=\"user[profile]\" value=\"&quot;evil&quot;@remote.example\""),
-        "the remote handle renders escaped: {body}"
-    );
-    assert!(
-        !body.contains("<i>alice"),
-        "no tag from the query survives: {body}"
-    );
-}
-
-/// `POST /main/ostatus` with a nickname that is no live local account —
-/// unknown, or the remote mirror this page may not act as — re-renders
-/// the form with `Could not find user`, both submitted values kept.
-#[tokio::test]
-async fn the_main_ostatus_post_refuses_a_missing_actor() {
-    let db = common::test_db().await;
-    let pool = db.pool().clone();
-    let _bob: User = common::create_remote_user(&pool, "bob", "remote.example").await;
-    let app = common::test_app(pool);
-
-    let unknown = common::TestRequest::post("/main/ostatus")
+    let get = common::TestRequest::get("/main/ostatus?nickname=alice&profile=bob%40remote.example")
+        .send(&app)
+        .await;
+    let post = common::TestRequest::post("/main/ostatus")
         .form(&[
-            ("user[nickname]", "nobody"),
-            ("user[profile]", UNRESOLVABLE),
+            ("user[nickname]", "alice"),
+            ("user[profile]", "bob@remote.example"),
         ])
         .send(&app)
         .await;
-    let mirror = common::TestRequest::post("/main/ostatus")
-        .form(&[
-            ("user[nickname]", "bob@remote.example"),
-            ("user[profile]", UNRESOLVABLE),
-        ])
-        .send(&app)
-        .await;
-    let empty = common::TestRequest::post("/main/ostatus").send(&app).await;
-    for response in [&unknown, &mirror, &empty] {
-        common::assert_answer(response, StatusCode::OK, "a refused subscribe");
-        let body = response.text();
-        assert!(
-            body.contains("<p class=\"error\">Could not find user</p>"),
-            "the form says who was missing: {body}"
+
+    for (response, who) in [(&get, "the retired form"), (&post, "the retired post")] {
+        common::assert_answer(response, StatusCode::NOT_FOUND, who);
+        assert_eq!(
+            response.header("x-wired-fallback"),
+            Some("1"),
+            "only the fallback answers the path"
         );
     }
-    assert!(
-        unknown.text().contains("value=\"nobody\""),
-        "the nickname is kept on the re-render: {}",
-        unknown.text()
-    );
-}
-
-/// `POST /main/ostatus` with a real local account but a profile that
-/// resolves to no subscribe answer re-renders the form with the
-/// catch-all error line (the handle grammar fails `WebFinger` before any
-/// request, so this stays network-free).
-#[tokio::test]
-async fn the_main_ostatus_post_refuses_an_unresolvable_profile() {
-    let db = common::test_db().await;
-    let pool = db.pool().clone();
-    let _alice: User = common::create_local_user(&pool, "alice").await;
-    let app = common::test_app(pool);
-
-    let response = common::TestRequest::post("/main/ostatus")
-        .form(&[("user[nickname]", "alice"), ("user[profile]", UNRESOLVABLE)])
-        .send(&app)
-        .await;
-
-    common::assert_answer(&response, StatusCode::OK, "the profile refusal");
-    let body = response.text();
-    assert!(
-        body.contains("<p class=\"error\">Something went wrong.</p>"),
-        "Pleroma's catch-all line: {body}"
-    );
-    assert!(
-        body.contains("value=\"alice\"") && body.contains(&format!("value=\"{UNRESOLVABLE}\"")),
-        "both values are kept on the re-render: {body}"
-    );
 }
 
 /// The `path` as a percent-encoded query value, so fixture URLs and

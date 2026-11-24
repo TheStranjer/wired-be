@@ -74,7 +74,7 @@ pub const POST_FORMATS: [&str; 3] = ["text/plain", "text/html", "text/markdown"]
 /// detection). The list describes the API dialect — which is what clients
 /// sniff — not which endpoint a given build has wired up yet, exactly as
 /// in Pleroma.
-const FEATURES: [&str; 26] = [
+const FEATURES: [&str; 25] = [
     "pleroma_api",
     "mastodon_api",
     "mastodon_api_grouped_notifications",
@@ -97,7 +97,6 @@ const FEATURES: [&str; 26] = [
     "pleroma:pin_chats",
     "exposable_reactions",
     "profile_directory",
-    "pleroma:get:main/ostatus",
     "pleroma:group_actors",
     "pleroma:bookmark_folders",
     "pleroma:block_expiration",
@@ -344,7 +343,6 @@ mod tests {
                 "pleroma:pin_chats",
                 "exposable_reactions",
                 "profile_directory",
-                "pleroma:get:main/ostatus",
                 "pleroma:group_actors",
                 "pleroma:bookmark_folders",
                 "pleroma:block_expiration",
