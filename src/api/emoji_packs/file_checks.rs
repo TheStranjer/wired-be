@@ -5,7 +5,9 @@
 use serde::Deserialize;
 use serde_json::Value;
 
-use super::{ACCEPTED_EMOJI_TYPES, MAX_EMOJI_FILE_BYTES, UNSUPPORTED_FILE_TYPE};
+use super::{
+    ACCEPTED_EMOJI_TYPES, MAX_EMOJI_FILE_BYTES, UNSUPPORTED_FILE_TYPE, pack_writes::fold_miss,
+};
 use crate::{
     error::{AppError, AppResult},
     extract::flex,
@@ -81,15 +83,6 @@ pub(super) struct Rename<'a> {
     pub(super) force: bool,
 }
 
-/// Whether `code` may be an emoji shortcode: a non-empty run of
-/// `[A-Za-z0-9_-]`, the pattern the ticket pins — the service's rule
-/// [`emoji_packs::shortcode_valid`], shared with the manifests
-/// [`import_packs`](emoji_packs::import_packs) and
-/// [`manifest_from_images`](super::install::manifest_from_images) write.
-pub(super) fn shortcode_valid(code: &str) -> bool {
-    emoji_packs::shortcode_valid(code)
-}
-
 /// The 400 the file routes owe a pack that is not there to write, the
 /// ticket pinning Pleroma's `"Pack <name> does not exist"` wording to the
 /// 400 status (the pack-write routes answer the same message as a 404,
@@ -103,10 +96,7 @@ fn file_pack_missing(name: &str) -> AppError {
 /// Folds a service refusal that means "there is no pack here to write"
 /// into [`file_pack_missing`]; every other failure arrives unchanged.
 fn file_write_miss(name: &str, err: AppError) -> AppError {
-    if matches!(err, AppError::NotFound | AppError::BadRequest(_)) {
-        return file_pack_missing(name);
-    }
-    err
+    fold_miss(err, || file_pack_missing(name))
 }
 
 /// Loads pack `name` for a file route, refusing with
@@ -166,10 +156,7 @@ pub(super) fn file_too_large() -> AppError {
 /// self-rename's `NotFound`) — into [`emoji_missing`]'s 400, Pleroma's
 /// answer through `get_filename`; every other failure arrives unchanged.
 pub(super) fn rename_miss(shortcode: &str, err: AppError) -> AppError {
-    if matches!(err, AppError::NotFound | AppError::BadRequest(_)) {
-        return emoji_missing(shortcode);
-    }
-    err
+    fold_miss(err, || emoji_missing(shortcode))
 }
 
 /// The media type of emoji file bytes, read from the bytes themselves —
@@ -233,12 +220,15 @@ mod tests {
     #[test]
     fn shortcodes_follow_the_pinned_pattern() {
         for code in ["cat", "a", "0", "dog_1", "well-known", "MiXeD42"] {
-            assert!(shortcode_valid(code), "{code} is a shortcode");
+            assert!(emoji_packs::shortcode_valid(code), "{code} is a shortcode");
         }
         for code in [
             "", " ", "cat dog", "cat.png", "a/b", ".hidden", "..", "cat!", "cat;rm", "é", "cat\n",
         ] {
-            assert!(!shortcode_valid(code), "{code} is not a shortcode");
+            assert!(
+                !emoji_packs::shortcode_valid(code),
+                "{code} is not a shortcode"
+            );
         }
     }
 

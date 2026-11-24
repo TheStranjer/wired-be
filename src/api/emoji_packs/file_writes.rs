@@ -9,15 +9,16 @@ use serde_json::Value;
 use tracing::debug;
 
 use super::{
-    AREA_EMOJI, CLASS_WRITE, FILE_FIELD, MAX_EMOJI_FILE_BYTES, MAX_FETCH_STATUS, MIN_FETCH_STATUS,
-    MISSING_FILE, RENAME_EMPTY, UNSUPPORTED_FILE_TYPE,
+    AREA_EMOJI, CLASS_WRITE, FILE_FIELD, MAX_EMOJI_FILE_BYTES, MISSING_FILE, RENAME_EMPTY,
+    UNSUPPORTED_FILE_TYPE,
     file_checks::{
         CreateFileParams, DeleteFileParams, Rename, UpdateFileParams, bad_file_name, bad_shortcode,
         detect_emoji_type, emoji_missing, file_too_large, load_for_file_write, rename_miss,
-        shortcode_in_use, shortcode_taken, shortcode_valid, target_filename,
+        shortcode_in_use, shortcode_taken, target_filename,
     },
     pack_writes::{resync, trimmed_name},
     params::PackParams,
+    remote::{FetchFailure, fetch_checked},
 };
 use crate::{
     auth::admin::AdminUser,
@@ -51,17 +52,14 @@ pub(super) fn fetch_refused(err: &HttpError) -> AppError {
 /// [`AppError::Unprocessable`] for a refused or failed fetch, a status
 /// outside 2xx, and bytes no accepted image type matches.
 async fn fetch_emoji_file(state: &AppState, url: &str) -> AppResult<(Bytes, &'static str)> {
-    let response = state
-        .http_client
-        .get_limited(url, &[], MAX_EMOJI_FILE_BYTES)
+    let response = fetch_checked(state, url, MAX_EMOJI_FILE_BYTES)
         .await
-        .map_err(|err| fetch_refused(&err))?;
-    if !(MIN_FETCH_STATUS..MAX_FETCH_STATUS).contains(&response.status) {
-        return Err(AppError::Unprocessable(format!(
-            "File URL answered {}",
-            response.status
-        )));
-    }
+        .map_err(|failure| match failure {
+            FetchFailure::Transport(err) => fetch_refused(&err),
+            FetchFailure::Status(status) => {
+                AppError::Unprocessable(format!("File URL answered {status}"))
+            }
+        })?;
     let content_type = detect_emoji_type(&response.body)?;
     Ok((response.body, content_type))
 }
@@ -161,7 +159,7 @@ pub(super) async fn create_file(
     let name = trimmed_name(fields.name.as_deref().or(params.name.as_deref()))?;
     let shortcode = fields.shortcode;
     let mut pack = load_for_file_write(&state, name).await?;
-    if !shortcode_valid(&shortcode) {
+    if !emoji_packs::shortcode_valid(&shortcode) {
         return Err(bad_shortcode(&shortcode));
     }
     if pack.files.contains_key(&shortcode) {
@@ -210,7 +208,7 @@ async fn apply_rename(
     let new_shortcode = rename.new_shortcode.unwrap_or(rename.shortcode);
     let same_shortcode = new_shortcode == rename.shortcode;
     if !same_shortcode {
-        if !shortcode_valid(new_shortcode) {
+        if !emoji_packs::shortcode_valid(new_shortcode) {
             return Err(bad_shortcode(new_shortcode));
         }
         if !rename.force && pack.files.contains_key(new_shortcode) {
