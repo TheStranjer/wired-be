@@ -1,4 +1,4 @@
-//! The static `GET /emoji/{pack}/{file}` route: pack images served from
+//! The static `GET /emoji/{pack}/{*file}` route: pack images served from
 //! the instance's own origin with the media safety headers.
 
 use axum::{
@@ -19,8 +19,9 @@ use crate::{
     util::headers::NOSNIFF,
 };
 
-/// `GET /emoji/{pack}/{file}` — one image file of a pack, served with the
-/// media safety headers. No authentication: the address is what
+/// `GET /emoji/{pack}/{*file}` — one image file of a pack (`file` may be a
+/// nested path like `sub/kitten.gif`), served with the media safety
+/// headers. No authentication: the address is what
 /// `custom_emojis.image_url` carries into client HTML.
 ///
 /// # Errors

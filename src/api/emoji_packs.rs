@@ -46,7 +46,7 @@
 //! share its files, 400 for a missing `name` parameter (Pleroma's `"pack
 //! name cannot be empty"`), which the writes share.
 //!
-//! [`files_router`] is the separate top-level `GET /emoji/{pack}/{file}`:
+//! [`files_router`] is the separate top-level `GET /emoji/{pack}/{*file}`:
 //! the address [`emoji_image_url`](crate::services::emoji_packs::emoji_image_url)
 //! stores in `custom_emojis.image_url`. Like [`crate::api::media_files`] it
 //! serves from the instance's own origin, so the type comes from the
@@ -258,8 +258,9 @@ pub fn router(config: &Config) -> Router<AppState> {
         )
 }
 
-/// The static `GET /emoji/{pack}/{file}` router, merged at the top level of
-/// [`crate::app`]: synced `custom_emojis.image_url` values point there.
+/// The static `GET /emoji/{pack}/{*file}` router, merged at the top level of
+/// [`crate::app`]: synced `custom_emojis.image_url` values point there. The
+/// wildcard captures nested names such as `sub/kitten.gif`.
 pub fn files_router() -> Router<AppState> {
-    Router::new().route("/emoji/{pack}/{file}", get(serve_emoji_file))
+    Router::new().route("/emoji/{pack}/{*file}", get(serve_emoji_file))
 }

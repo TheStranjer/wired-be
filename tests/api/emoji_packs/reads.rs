@@ -1,6 +1,6 @@
 //! The read routes: the pack listing and its pagination, the single-pack
 //! view, the zip archive download, the util emoji map, the static
-//! `GET /emoji/{pack}/{file}` route and the verbs the routes refuse.
+//! `GET /emoji/{pack}/{*file}` route and the verbs the routes refuse.
 
 use axum::http::StatusCode;
 use serde_json::{Value, json};
@@ -10,7 +10,9 @@ use wired_be::{
     services::emoji_packs,
 };
 
-use super::support::{PNG_BYTES, cats_pack, error_message, pack, pack_names, read_zip, seed_pack};
+use super::support::{
+    GIF_BYTES, PNG_BYTES, cats_pack, error_message, pack, pack_names, read_zip, seed_pack,
+};
 use crate::common;
 
 /// `GET /api/v1/pleroma/emoji/packs` lists every pack keyed by name with
@@ -370,8 +372,8 @@ async fn static_route_serves_only_pack_images() {
         .await;
     assert_eq!(
         nested.status,
-        StatusCode::NOT_FOUND,
-        "nested files are outside the one-segment route"
+        StatusCode::OK,
+        "nested pack files are served by the wildcard route"
     );
 
     for path in [
@@ -391,6 +393,45 @@ async fn static_route_serves_only_pack_images() {
             Some("application/json"),
             "misses answer as JSON errors, not as files: {path}"
         );
+    }
+}
+
+/// A pack whose `files` value lives in a subdirectory serves at the nested
+/// address `custom_emojis.image_url` stores, flat files still serve, and
+/// traversal, dot-segment and absent nested names answer 404.
+#[tokio::test]
+async fn static_route_serves_nested_pack_files() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let dir = tempfile::TempDir::new().unwrap();
+    let manifest = pack(
+        true,
+        &[("kitten", "sub/kitten.gif"), ("flat", "kitten.gif")],
+    );
+    seed_pack(dir.path(), "cats", &manifest).await;
+    std::fs::write(dir.path().join("cats/sub/kitten.gif"), GIF_BYTES).unwrap();
+    std::fs::write(dir.path().join("cats/sub/.hidden.png"), PNG_BYTES).unwrap();
+    std::fs::write(dir.path().join("cats/kitten.gif"), GIF_BYTES).unwrap();
+    let app = common::test_app_with_emoji_dir(pool, dir.path());
+
+    for path in ["/emoji/cats/sub/kitten.gif", "/emoji/cats/kitten.gif"] {
+        let response = common::TestRequest::get(path).send(&app).await;
+        assert_eq!(response.status, StatusCode::OK, "{path} serves");
+        assert_eq!(response.body.as_ref(), GIF_BYTES, "{path} byte for byte");
+        assert_eq!(
+            response.header("content-type"),
+            Some("image/gif"),
+            "{path} is typed by its extension"
+        );
+    }
+
+    for path in [
+        "/emoji/cats/sub/../pack.json",
+        "/emoji/cats/sub/.hidden.png",
+        "/emoji/cats/sub/missing.png",
+    ] {
+        let miss = common::TestRequest::get(path).send(&app).await;
+        assert_eq!(miss.status, StatusCode::NOT_FOUND, "{path} is a 404");
     }
 }
 
