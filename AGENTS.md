@@ -175,6 +175,10 @@ Older Axum examples, and much model training data, use v0.6/0.7 syntax. Check `C
 - Middleware (tracing, timeouts, CORS, body limits) comes from `tower`/`tower-http` layers via `.layer(...)`, not hand-rolled.
 - Test handlers without a network socket: build the router and call `tower::ServiceExt::oneshot` (see the tests in `src/main.rs`).
 
+### API only
+
+- The backend renders no HTML and serves no frontend. Browser-facing flows redirect to `FRONTEND_BASE_URL`; do not add `text/html` responses. `tests/api/route_inventory.rs` fails when a route without path parameters answers an `Accept: text/html` request with `text/html`.
+
 ### Errors, docs, misc
 
 - Return `Result`; don't panic in non-test code. Prefer `?` to `match`ing on errors only to re-wrap them.
