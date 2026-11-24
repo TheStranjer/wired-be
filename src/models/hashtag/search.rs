@@ -2,13 +2,13 @@
 //! search's hashtag arm ([`crate::api::search`]).
 //!
 //! [`search_prefix`] normalizes its needle with the module's
-//! `normalize_name` and escapes it for `ILIKE` with [`like_prefix`], so a
+//! `normalize_name` and escapes it for `ILIKE` with [`like::prefix`], so a
 //! search spells what the searcher typed — a prefix match on the stored,
 //! lowercase name, never a substring one.
 
 use sqlx::PgPool;
 
-use crate::error::AppResult;
+use crate::{error::AppResult, util::like};
 
 use super::{Hashtag, normalize_name};
 
@@ -40,27 +40,11 @@ pub async fn search_prefix(pool: &PgPool, needle: &str, limit: i64) -> AppResult
         return Ok(Vec::new());
     };
     let hashtags = sqlx::query_as::<_, Hashtag>(SEARCH_PREFIX_SQL)
-        .bind(like_prefix(&tag))
+        .bind(like::prefix(&tag))
         .bind(limit.max(0))
         .fetch_all(pool)
         .await?;
     Ok(hashtags)
-}
-
-/// The `ILIKE` prefix pattern of a normalized tag name: the metacharacters
-/// it may hold (`%`, `_`, and the escape character itself) are
-/// backslash-escaped so a search spells what was typed, and the trailing
-/// `%` makes it the prefix match [`search_prefix`] promises.
-fn like_prefix(needle: &str) -> String {
-    let mut pattern = String::with_capacity(needle.len() + 1);
-    for symbol in needle.chars() {
-        if matches!(symbol, '%' | '_' | '\\') {
-            pattern.push('\\');
-        }
-        pattern.push(symbol);
-    }
-    pattern.push('%');
-    pattern
 }
 
 #[cfg(test)]
@@ -156,18 +140,6 @@ mod tests {
             names(&search_prefix(&pool, "ru", 1).await.unwrap()),
             vec!["rust"],
             "the limit cuts the name-ordered page"
-        );
-    }
-
-    #[test]
-    fn the_prefix_pattern_escapes_the_like_metacharacters() {
-        assert_eq!(like_prefix("rust"), "rust%", "the plain case");
-        assert_eq!(like_prefix("50%"), r"50\%%", "a percent stays literal");
-        assert_eq!(like_prefix("a_b"), r"a\_b%", "an underscore stays literal");
-        assert_eq!(
-            like_prefix("a\\b"),
-            r"a\\b%",
-            "and so does the escape itself"
         );
     }
 }
