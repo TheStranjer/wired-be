@@ -26,7 +26,7 @@ use sqlx::{Executor, PgPool, Postgres};
 use uuid::Uuid;
 
 use crate::{
-    error::{AppError, AppResult},
+    error::AppResult,
     util::{
         id::new_id,
         token::{CREDENTIAL_BYTES, random_token},
@@ -45,8 +45,10 @@ const INSERT_SQL: &str =
 const SELECT_VALID_SQL: &str = "SELECT * FROM password_reset_tokens \
      WHERE token = $1 AND NOT used AND inserted_at > now() - $2::interval";
 
-/// [`mark_used`]: spend the token in the row.
-const MARK_USED_SQL: &str = "UPDATE password_reset_tokens SET used = true WHERE id = $1";
+/// [`mark_used`]: spend the token in the row, only while it is still
+/// unspent, so two concurrent spenders cannot both win.
+const MARK_USED_SQL: &str =
+    "UPDATE password_reset_tokens SET used = true WHERE id = $1 AND NOT used";
 
 /// [`delete_others`]: every token of the account except the one being
 /// spent, so a completed reset leaves exactly one (now-used) row behind.
@@ -152,6 +154,10 @@ pub async fn get_valid(
 
 /// Marks the token `id` used: the spend that closes a completed reset.
 ///
+/// The update is conditional (`AND NOT used`), so of two concurrent spends
+/// exactly one reports `true`; the loser reports `false` and the caller
+/// must treat the token as invalid.
+///
 /// Runs on the caller's executor (or any open transaction), so the reset
 /// endpoint can land the spend with the password write and the
 /// revocations.
@@ -159,11 +165,9 @@ pub async fn get_valid(
 /// # Errors
 ///
 /// Any database failure (connection, constraint) arrives as
-/// [`AppError::Database`](crate::error::AppError). Updating an id no
-/// token carries (one deleted under the caller's feet) is reported as
-/// [`AppError::Internal`]: the caller read the row moments ago, so a
-/// missed update is a broken expectation, not a client error.
-pub async fn mark_used<'e, E>(executor: E, id: Uuid) -> AppResult<()>
+/// [`AppError::Database`](crate::error::AppError). A token that is already
+/// spent, or that no longer exists, is not an error: it answers `false`.
+pub async fn mark_used<'e, E>(executor: E, id: Uuid) -> AppResult<bool>
 where
     E: Executor<'e, Database = Postgres>,
 {
@@ -171,12 +175,7 @@ where
         .bind(id)
         .execute(executor)
         .await?;
-    if outcome.rows_affected() == 0 {
-        return Err(AppError::Internal(
-            "reset token spend matched no row".to_owned(),
-        ));
-    }
-    Ok(())
+    Ok(outcome.rows_affected() > 0)
 }
 
 /// Deletes every reset token of the account `user_id` except the row
@@ -365,7 +364,10 @@ mod tests {
         let pool = db.pool().clone();
         let user_id = account(&pool, "spent").await;
         let spent = mint(&pool, user_id).await;
-        mark_used(&pool, spent.id).await.expect("the spend runs");
+        assert!(
+            mark_used(&pool, spent.id).await.expect("the spend runs"),
+            "the first spend wins"
+        );
         assert_eq!(
             get_valid(&pool, &spent.token, HOUR)
                 .await
@@ -400,23 +402,39 @@ mod tests {
         let pool = db.pool().clone();
         let user_id = account(&pool, "marker").await;
         let token = mint(&pool, user_id).await;
-        mark_used(&pool, token.id).await.expect("the spend runs");
+        assert!(
+            mark_used(&pool, token.id).await.expect("the spend runs"),
+            "the first spend lands"
+        );
         assert!(stored(&pool, token.id).await.used, "the row is spent");
-        mark_used(&pool, token.id)
-            .await
-            .expect("spending a spent token still hits the row");
     }
 
     #[tokio::test]
-    async fn mark_used_of_a_vanished_token_is_an_error() {
+    async fn mark_used_twice_answers_false_the_second_time() {
         let db = crate::test_db::test_db().await.expect("test database slot");
         let pool = db.pool().clone();
-        let err = mark_used(&pool, Uuid::now_v7())
-            .await
-            .expect_err("no token carries this id");
+        let user_id = account(&pool, "twice").await;
+        let token = mint(&pool, user_id).await;
         assert!(
-            matches!(err, AppError::Internal(_)),
-            "a missed update is the internal arm, got {err}"
+            mark_used(&pool, token.id).await.expect("the first spend"),
+            "the first spend wins"
+        );
+        assert!(
+            !mark_used(&pool, token.id).await.expect("the second spend"),
+            "the second spend of the same token loses"
+        );
+        assert!(stored(&pool, token.id).await.used, "the row stays spent");
+    }
+
+    #[tokio::test]
+    async fn mark_used_of_a_vanished_token_answers_false() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        assert!(
+            !mark_used(&pool, Uuid::now_v7())
+                .await
+                .expect("a missing row is not a database failure"),
+            "no token carries this id"
         );
     }
 
@@ -428,9 +446,12 @@ mod tests {
         let token = mint(&pool, user_id).await;
         let mut conn = pool.acquire().await.expect("a connection");
         let mut tx = conn.begin().await.expect("a transaction begins");
-        mark_used(&mut *tx, token.id)
-            .await
-            .expect("the spend runs on the transaction");
+        assert!(
+            mark_used(&mut *tx, token.id)
+                .await
+                .expect("the spend runs on the transaction"),
+            "the spend lands inside the transaction"
+        );
         tx.rollback().await.expect("the rollback runs");
         assert!(
             !stored(&pool, token.id).await.used,

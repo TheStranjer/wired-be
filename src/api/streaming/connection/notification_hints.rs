@@ -20,7 +20,7 @@ use crate::{
 /// socket's reader only: `None` — the drop signal — when the socket
 /// has no viewer, the row is not a live notification addressed to
 /// this reader (a foreign, unknown or dismissed row, or one whose
-/// actor is deactivated, all of which
+/// actor is deactivated, blocked or muted, all of which
 /// [`notification::get_visible`] answers `None` for), the actor left
 /// no user row, or any read or render fails.
 pub(super) async fn render_hinted_notification(

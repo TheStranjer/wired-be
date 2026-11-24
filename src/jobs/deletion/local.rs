@@ -11,7 +11,7 @@ use super::{parse_args, retry};
 use crate::{
     jobs::{AttemptInfo, HandlerFuture, JobError, backups::sweep_archive_file, scheduled_statuses},
     models::{
-        backup, bookmark, favourite, follow, job, list, media_attachment, notification,
+        backup, bookmark, chat, favourite, follow, job, list, media_attachment, notification,
         scheduled_status, status, user, web_push_subscription,
     },
     state::AppState,
@@ -71,6 +71,9 @@ async fn clear_data(state: &AppState, account: &user::User) -> Result<(), JobErr
     let statuses = status::soft_delete_all_for_user(db, id)
         .await
         .map_err(|err| retry(&err))?;
+    let chat_messages = chat::withdraw_all_from_sender(db, id)
+        .await
+        .map_err(|err| retry(&err))?;
     let follows = follow::delete_all_for_user_with_counts(db, id)
         .await
         .map_err(|err| retry(&err))?;
@@ -96,7 +99,7 @@ async fn clear_data(state: &AppState, account: &user::User) -> Result<(), JobErr
         .map_err(|err| retry(&err))?;
     debug!(
         account = %account.nickname,
-        statuses, follows, favourites, bookmarks, notifications, lists, media,
+        statuses, chat_messages, follows, favourites, bookmarks, notifications, lists, media,
         scheduled, backups, push_subscriptions,
         "account deletion cleared"
     );
@@ -155,9 +158,10 @@ mod tests {
 
     use super::super::test_support::{
         BATCH_OVERSHOOT, accepted_follow, app_state, available_jobs_keyed, broken_state,
-        count_where, follows, fresh_user, has_follow, likes, list_of, live_statuses, local_user,
-        locked_user, marks, media_row, notify, post, post_many, processed_backup,
-        push_subscription, run, scheduled_with_job, status_deleted_at, uploads_state,
+        count_where, follows, fresh_user, has_follow, is_blank_tombstone, likes, list_of,
+        listed_messages, live_statuses, local_user, locked_user, marks, media_row, notify, post,
+        post_many, processed_backup, push_subscription, run, scheduled_with_job, send_chat,
+        status_deleted_at, uploads_state,
     };
     use super::super::{KIND_DELETE, job_args};
     use super::*;
@@ -827,6 +831,53 @@ mod tests {
             count_where(&pool, "web_push_subscriptions", "user_id", bob.id).await,
             1,
             "bob's subscription stays"
+        );
+    }
+
+    /// The other participant of a chat no longer reads what the deleted
+    /// account sent: its messages are blank tombstones that drop off the
+    /// page, and the other participant's own messages stay. A second pass
+    /// changes nothing.
+    #[tokio::test]
+    async fn the_handler_withdraws_the_chat_messages_the_account_sent() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = local_user(&pool, "alice").await;
+        let bob = local_user(&pool, "bob").await;
+        let first = send_chat(&pool, &alice, &bob, "alice says one").await;
+        let second = send_chat(&pool, &alice, &bob, "alice says two").await;
+        let reply = send_chat(&pool, &bob, &alice, "bob answers").await;
+        let bobs_chat = first.chat_id;
+        assert_eq!(
+            listed_messages(&pool, bobs_chat).await.len(),
+            3,
+            "bob reads all three messages before the sweep"
+        );
+
+        let state = app_state(&pool);
+        run(&state, alice.id).await.expect("the delete job runs");
+
+        assert_eq!(
+            listed_messages(&pool, bobs_chat).await,
+            vec![reply.message_id],
+            "bob's page keeps only bob's own message"
+        );
+        for gone in [first.message_id, second.message_id] {
+            assert!(
+                is_blank_tombstone(&pool, gone).await,
+                "alice's message {gone} is a blank tombstone"
+            );
+        }
+        assert!(
+            !is_blank_tombstone(&pool, reply.message_id).await,
+            "bob's reply is not alice's to withdraw"
+        );
+
+        run(&state, alice.id).await.expect("the second pass runs");
+        assert_eq!(
+            listed_messages(&pool, bobs_chat).await,
+            vec![reply.message_id],
+            "the rerun changes nothing"
         );
     }
 

@@ -18,17 +18,22 @@ use axum::{
     response::{IntoResponse as _, Response},
 };
 use serde::{Deserialize, Serialize};
+use sqlx::PgPool;
 
 use super::{
     MISSING_TOKEN, NO_CACHE, NO_STORE,
-    params::{invalid_credentials, validate_app},
+    params::{ClientCredentials, invalid_credentials, validate_app},
 };
 use crate::{
     error::{AppError, AppResult},
     extract::ApiBody,
-    models::oauth_token,
+    models::{oauth_app::OauthApp, oauth_token, oauth_token::OauthToken},
     state::AppState,
 };
+
+/// The `token_type_hint` value (RFC 7009 §2.1) that makes the lookup try
+/// the refresh-token column before the access-token one.
+const REFRESH_TOKEN_HINT: &str = "refresh_token";
 
 /// `POST /oauth/revoke` — retire one of the application's access tokens
 /// (Pleroma's `token_revoke`, RFC 7009). No bearer authentication: the
@@ -68,14 +73,37 @@ async fn revoke_token(
     let Some(token) = params.token.as_deref() else {
         return Err(AppError::BadRequest(MISSING_TOKEN.to_owned()));
     };
-    let app = validate_app(state, headers, params.body_credentials()).await?;
-    if let Some((found, owner)) = oauth_token::get_with_app(&state.db, token).await? {
+    let app = validate_app(state, headers, params.client.pair()).await?;
+    let hint_is_refresh = params.token_type_hint.as_deref() == Some(REFRESH_TOKEN_HINT);
+    if let Some((found, owner)) = find_pair(&state.db, token, hint_is_refresh).await? {
         if owner.id != app.id {
             return Err(invalid_credentials());
         }
         oauth_token::delete_token(&state.db, found.id).await?;
     }
     Ok(Json(RevokeResponse))
+}
+
+/// Looks `token` up as an access token and as a refresh token (RFC 7009
+/// §2.1: both are revocable), returning the pair row with its issuing
+/// application. The `token_type_hint` only picks which column is tried
+/// first (`hint_is_refresh`); a miss in the hinted column falls through to
+/// the other one (§2.1: the hint is optional and may be wrong).
+async fn find_pair(
+    pool: &PgPool,
+    token: &str,
+    hint_is_refresh: bool,
+) -> AppResult<Option<(OauthToken, OauthApp)>> {
+    if hint_is_refresh {
+        if let Some(found) = oauth_token::get_by_refresh_token(pool, token).await? {
+            return Ok(Some(found));
+        }
+        return oauth_token::get_with_app(pool, token).await;
+    }
+    if let Some(found) = oauth_token::get_with_app(pool, token).await? {
+        return Ok(Some(found));
+    }
+    oauth_token::get_by_refresh_token(pool, token).await
 }
 
 /// The request parameters of `POST /oauth/revoke`: the access token to
@@ -90,32 +118,25 @@ pub(super) struct RevokeParams {
     /// [`MISSING_TOKEN`]. Renders as `<redacted>` in `Debug` output.
     #[serde(default)]
     token: Option<String>,
-    /// The public OAuth client id, when not presented through HTTP Basic.
+    /// RFC 7009's optional `token_type_hint`: `refresh_token` makes the
+    /// lookup try the refresh-token column first; any other value (or
+    /// none) tries the access token first. It never narrows the search.
     #[serde(default)]
-    client_id: Option<String>,
-    /// The OAuth client secret, when not presented through HTTP Basic.
-    /// Never in `Debug` output.
-    #[serde(default)]
-    client_secret: Option<String>,
+    token_type_hint: Option<String>,
+    /// The client credentials, when not presented through HTTP Basic.
+    #[serde(flatten)]
+    client: ClientCredentials,
 }
 
-/// [`token`](Self::token) and [`client_secret`](Self::client_secret) are
+/// [`token`](Self::token) and the [`client`](Self::client) secret are
 /// secret material and render as `<redacted>`; the client id shows.
 impl fmt::Debug for RevokeParams {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("RevokeParams")
             .field("token", &"<redacted>")
-            .field("client_id", &self.client_id)
-            .field("client_secret", &"<redacted>")
+            .field("token_type_hint", &self.token_type_hint)
+            .field("client", &self.client)
             .finish()
-    }
-}
-
-impl RevokeParams {
-    /// The `client_id`/`client_secret` body fields as a pair, `None`
-    /// unless both are present.
-    fn body_credentials(&self) -> Option<(&str, &str)> {
-        Some((self.client_id.as_deref()?, self.client_secret.as_deref()?))
     }
 }
 
@@ -170,28 +191,13 @@ mod tests {
     ) -> RevokeParams {
         RevokeParams {
             token: token.map(str::to_owned),
-            client_id: client_id.map(str::to_owned),
-            client_secret: secret.map(str::to_owned),
+            token_type_hint: None,
+            client: crate::extract::into_params(json!({
+                "client_id": client_id,
+                "client_secret": secret,
+            }))
+            .unwrap(),
         }
-    }
-
-    #[test]
-    fn revoke_body_credentials_need_both_fields() {
-        assert_eq!(
-            revoke_params(Some("tok"), None, None).body_credentials(),
-            None,
-            "nothing sent"
-        );
-        assert_eq!(
-            revoke_params(Some("tok"), Some("id"), None).body_credentials(),
-            None,
-            "an id without a secret"
-        );
-        assert_eq!(
-            revoke_params(Some("tok"), Some("id"), Some("secret")).body_credentials(),
-            Some(("id", "secret")),
-            "the pair completes"
-        );
     }
 
     #[test]
@@ -223,7 +229,11 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(full.token.as_deref(), Some("a-token"), "the token");
-        assert_eq!(full.client_id.as_deref(), Some("id"), "the client id");
+        assert_eq!(
+            full.client.pair(),
+            Some(("id", "secret")),
+            "the credentials"
+        );
         // A form body parses to the same string-shaped map (the form
         // keys themselves are covered by `crate::extract`'s tests).
         let form: RevokeParams = crate::extract::into_params(json!({
@@ -232,7 +242,18 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(form.token.as_deref(), Some("a-token"), "same token");
-        assert_eq!(form.client_secret, None, "an absent field stays absent");
+        assert_eq!(form.client.pair(), None, "an absent secret stays absent");
+
+        let from_json: RevokeParams =
+            serde_json::from_str(r#"{"token":"t","client_id":"id","client_secret":"s"}"#).unwrap();
+        assert_eq!(from_json.client.pair(), Some(("id", "s")), "a JSON body");
+        let from_form: RevokeParams = crate::extract::into_params(json!({
+            "token": "t",
+            "client_id": "id",
+            "client_secret": "s",
+        }))
+        .unwrap();
+        assert_eq!(from_form.client.pair(), Some(("id", "s")), "a form body");
     }
 
     #[test]

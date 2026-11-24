@@ -269,3 +269,55 @@ async fn peers_are_capped_at_one_thousand() {
         "the listing starts at the top"
     );
 }
+
+/// With `timelines_federated` restricted, the peer list is hidden from
+/// everyone — it is the anonymous-readable endpoint — and the instance
+/// documents advertise exactly the configured areas.
+#[tokio::test]
+async fn restricted_areas_hide_the_peers_and_are_advertised() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    mirror_remote(&pool, "remote.example").await;
+    let open = common::test_app(pool.clone());
+    let listed = common::TestRequest::get("/api/v1/instance/peers")
+        .send(&open)
+        .await;
+    assert_eq!(
+        listed.json_value(),
+        json!(["remote.example"]),
+        "the default config lists peers"
+    );
+
+    let app =
+        common::test_app_with_restricted_areas(pool, &["timelines_federated", "activities_local"]);
+    let hidden = common::TestRequest::get("/api/v1/instance/peers")
+        .send(&app)
+        .await;
+    assert_eq!(hidden.status, StatusCode::OK, "the endpoint still answers");
+    assert_eq!(hidden.json_value(), json!([]), "no peers are listed");
+
+    let expected = json!({
+        "timelines": { "local": false, "federated": true },
+        "profiles": { "local": false, "remote": false },
+        "activities": { "local": true, "remote": false },
+    });
+    for path in ["/api/v1/instance", "/api/v2/instance"] {
+        let response = common::TestRequest::get(path).send(&app).await;
+        assert_eq!(response.status, StatusCode::OK, "{path} is served");
+        assert_eq!(
+            response.json_value()["pleroma"]["metadata"]["restrict_unauthenticated"],
+            expected,
+            "{path} advertises the configured restrictions"
+        );
+    }
+
+    let other = common::test_app_with_restricted_areas(db.pool().clone(), &["profiles_local"]);
+    let still_listed = common::TestRequest::get("/api/v1/instance/peers")
+        .send(&other)
+        .await;
+    assert_eq!(
+        still_listed.json_value(),
+        json!(["remote.example"]),
+        "other restricted areas leave the peer list alone"
+    );
+}

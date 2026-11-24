@@ -95,7 +95,7 @@ impl PleromaMetadata {
             federation,
             fields_limits: FieldsLimits::pleroma_defaults(),
             post_formats: &POST_FORMATS,
-            restrict_unauthenticated: instance_meta::restrict_unauthenticated(),
+            restrict_unauthenticated: instance_meta::restrict_unauthenticated(config),
             markup: Markup::denying(),
         }
     }
@@ -246,7 +246,7 @@ mod tests {
         );
         assert_eq!(
             metadata["restrict_unauthenticated"],
-            instance_meta::restrict_unauthenticated(),
+            instance_meta::restrict_unauthenticated(&Config::for_tests()),
             "the shared access restrictions"
         );
         assert_eq!(

@@ -14,6 +14,7 @@ mod tests {
 
     use crate::http_client::test_support::*;
     use crate::http_client::*;
+    use crate::util::keys::FIXTURE_PRIVATE_PKCS1_PEM;
 
     #[tokio::test]
     async fn get_sends_the_configured_user_agent() {
@@ -168,7 +169,7 @@ mod tests {
     async fn post_bytes_is_blocked_by_the_guard_too() {
         let client = HttpClient::new(TEST_UA);
         let result = client
-            .post_bytes("http://127.0.0.1:9/ingest", &[], b"x".to_vec())
+            .post_bytes("http://127.0.0.1:9/ingest", &[], b"x".to_vec(), 1024)
             .await;
         assert!(
             matches!(result, Err(HttpError::Blocked(_))),
@@ -256,7 +257,7 @@ mod tests {
         let client = HttpClient::new_for_tests(TEST_UA);
 
         let response = client
-            .post_bytes(&url, &[("x-marker", "pong")], b"activity".to_vec())
+            .post_bytes(&url, &[("x-marker", "pong")], b"activity".to_vec(), 1024)
             .await
             .unwrap();
 
@@ -279,7 +280,7 @@ mod tests {
         let purge = Method::from_bytes(b"PURGE").unwrap();
 
         let response = client
-            .request(purge, &url, &[("x-marker", "yes")])
+            .request(purge, &url, &[("x-marker", "yes")], 1024)
             .await
             .unwrap();
 
@@ -300,11 +301,74 @@ mod tests {
                 Method::from_bytes(b"PURGE").unwrap(),
                 "http://127.0.0.1:9/purge",
                 &[],
+                1024,
             )
             .await;
         assert!(
             matches!(result, Err(HttpError::Blocked(_))),
             "a PURGE to loopback must be blocked like any other verb, got {result:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn post_bytes_caps_the_response_body() {
+        let listener = bind().await;
+        let url = url_for(&listener, "/answer");
+        let server = spawn_server(listener, Router::new().route("/answer", post(two_kib)));
+        let client = HttpClient::new_for_tests(TEST_UA);
+
+        let tight = client.post_bytes(&url, &[], b"x".to_vec(), 1024).await;
+        assert_eq!(
+            tight.unwrap_err(),
+            HttpError::TooLarge,
+            "a 2 KiB answer over a 1 KiB cap fails"
+        );
+
+        let roomy = client
+            .post_bytes(&url, &[], b"x".to_vec(), 4096)
+            .await
+            .unwrap();
+        assert_eq!(roomy.body.len(), 2048, "the same answer fits a 4 KiB cap");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn request_caps_the_response_body() {
+        let listener = bind().await;
+        let url = url_for(&listener, "/answer");
+        let server = spawn_server(listener, Router::new().route("/answer", any(two_kib)));
+        let client = HttpClient::new_for_tests(TEST_UA);
+        let purge = Method::from_bytes(b"PURGE").unwrap();
+
+        let tight = client.request(purge.clone(), &url, &[], 1024).await;
+        assert_eq!(
+            tight.unwrap_err(),
+            HttpError::TooLarge,
+            "a 2 KiB answer over a 1 KiB cap fails"
+        );
+
+        let roomy = client.request(purge, &url, &[], 4096).await.unwrap();
+        assert_eq!(roomy.body.len(), 2048, "the same answer fits a 4 KiB cap");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn signed_get_caps_the_response_body() {
+        let listener = bind().await;
+        let url = url_for(&listener, "/answer");
+        let server = spawn_server(listener, Router::new().route("/answer", get(two_kib)));
+        let client = HttpClient::new_for_tests(TEST_UA);
+
+        let tight = client
+            .signed_get(&url, TEST_KEY_ID, FIXTURE_PRIVATE_PKCS1_PEM, 1024)
+            .await;
+        assert_eq!(tight.unwrap_err(), HttpError::TooLarge, "over the cap");
+
+        let roomy = client
+            .signed_get(&url, TEST_KEY_ID, FIXTURE_PRIVATE_PKCS1_PEM, 4096)
+            .await
+            .unwrap();
+        assert_eq!(roomy.body.len(), 2048, "under the cap");
+        server.abort();
     }
 }

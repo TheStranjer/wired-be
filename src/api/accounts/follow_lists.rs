@@ -51,8 +51,7 @@ use crate::{
 /// scrobbles listing's constant, same rule).
 const NO_EXTRA_QUERY: [(String, String); 0] = [];
 
-/// The 403 body `GET /api/v1/accounts/{id}/statuses` answers an anonymous
-/// request while the instance keeps the account's profile area restricted
+/// The 403 body the account reads answer an anonymous request while the instance keeps the account's profile area restricted
 /// (Pleroma's `EnsureAuthenticatedPlug` wording, the one [`crate::auth`]
 /// renders for an app-only token).
 const USER_REQUIRED: &str = "This API requires an authenticated user";
@@ -90,8 +89,10 @@ const PROFILES_REMOTE: &str = "profiles_remote";
 /// the authenticated token lacks `read:accounts`;
 /// [`AppError::Unauthorized`] from the extractor for an invalid token;
 /// [`AppError::NotFound`] for a malformed, unknown or deactivated account
-/// id; [`AppError::BadRequest`] from [`PageParams`] for a malformed
-/// cursor. Any database failure arrives through `?` as
+/// id; [`AppError::Forbidden`] ("This API requires an authenticated user")
+/// from [`require_profile_read`] for an anonymous request while
+/// `RESTRICT_UNAUTHENTICATED` closes the account's profile half;
+/// [`AppError::BadRequest`] from [`PageParams`] for a malformed cursor. Any database failure arrives through `?` as
 /// [`AppError::Database`], and [`set_link_header`] reports a `Link` value
 /// that is not header-safe as [`AppError::Internal`].
 pub(super) async fn list_followers(
@@ -104,6 +105,7 @@ pub(super) async fn list_followers(
     auth.require_user_scope(READ_ACCOUNTS)?;
     let target = visible_account_or_404(&state, &id, auth.0.as_ref()).await?;
     let viewer = auth.0.as_ref();
+    require_profile_read(&state.config, viewer, &target)?;
     if target.hide_followers.get() && !viewer_is(viewer, &target) {
         return Ok(empty_page());
     }
@@ -132,6 +134,7 @@ pub(super) async fn list_following(
     auth.require_user_scope(READ_ACCOUNTS)?;
     let target = visible_account_or_404(&state, &id, auth.0.as_ref()).await?;
     let viewer = auth.0.as_ref();
+    require_profile_read(&state.config, viewer, &target)?;
     if target.hide_follows.get() && !viewer_is(viewer, &target) {
         return Ok(empty_page());
     }
@@ -139,7 +142,8 @@ pub(super) async fn list_following(
     page_response(&state, viewer, &entries, uri.path()).await
 }
 
-/// The `RESTRICT_UNAUTHENTICATED` gate of the account's status listing: an
+/// The `RESTRICT_UNAUTHENTICATED` gate of the account's reads (`show`,
+/// `lookup`, `followers`, `following` and the status listing): an
 /// authenticated request always passes — the restriction is about the
 /// anonymous reader, as Pleroma's `visible_for` is — while an anonymous one
 /// is the 403 [`USER_REQUIRED`] when this instance keeps the account's

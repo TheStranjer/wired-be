@@ -351,8 +351,8 @@ mod follow_requests;
 /// The `/health` endpoint and the `common` harness itself.
 mod health;
 
-/// The HTML helper pages (`/frontend_switcher` and the module's shared
-/// page builders).
+/// The HTML helper pages (the embed card, the player, the unsubscribe page
+/// and the module's shared page builders).
 mod html_pages;
 
 /// Remote-note ingestion over HTTP: fixture `Create` activities run through

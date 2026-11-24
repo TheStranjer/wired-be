@@ -507,8 +507,27 @@ async fn registrations_toggle_and_shared_metadata_follow_the_builders() {
     );
     assert_eq!(
         document["metadata"]["restrict_unauthenticated"],
-        instance_meta::restrict_unauthenticated(),
+        instance_meta::restrict_unauthenticated(&common::test_config()),
         "the shared access restrictions"
+    );
+}
+
+/// `RESTRICT_UNAUTHENTICATED` is what `/nodeinfo/2.1` advertises: exactly
+/// the configured areas are `true`.
+#[tokio::test]
+async fn restricted_areas_are_advertised_in_the_metadata() {
+    let db = common::test_db().await;
+    let config =
+        common::test_config_with_restricted_areas(&["timelines_federated", "activities_local"]);
+    let app = common::test_app_with_config(db.pool().clone(), config);
+    let document = get_document(&app, "/nodeinfo/2.1").await;
+    assert_eq!(
+        document["metadata"]["restrict_unauthenticated"],
+        json!({
+            "timelines": { "local": false, "federated": true },
+            "profiles": { "local": false, "remote": false },
+            "activities": { "local": true, "remote": false },
+        })
     );
 }
 

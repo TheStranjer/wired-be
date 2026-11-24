@@ -78,6 +78,12 @@ pub use ending::{fetch_ended_unnotified, mark_ended_notified, voter_ids};
 pub use reads::{for_statuses, get_by_id, get_for_status, options, options_for_statuses};
 pub use votes::{has_voted, voted_option_positions, votes_by_status};
 
+/// The `polls` columns [`Poll`] decodes, in the one spelling every statement
+/// that returns a poll row interpolates: a new column is added here (and to
+/// the struct) and nowhere else.
+pub(super) const POLL_COLUMNS: &str =
+    "id, status_id, expires_at, multiple, hide_totals, voters_count, votes_count, ended_notified";
+
 /// One row of `polls`: the poll a status carries, without its options or its
 /// voters.
 #[derive(Clone, Debug, PartialEq, Eq, sqlx::FromRow)]

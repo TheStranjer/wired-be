@@ -123,7 +123,7 @@ mod tests {
         let client = HttpClient::new_for_tests(TEST_UA);
 
         let response = client
-            .signed_get(&url, TEST_KEY_ID, FIXTURE_PRIVATE_PKCS1_PEM)
+            .signed_get(&url, TEST_KEY_ID, FIXTURE_PRIVATE_PKCS1_PEM, 4096)
             .await
             .unwrap()
             .error_for_status()
@@ -168,7 +168,7 @@ mod tests {
         let client = HttpClient::new_for_tests(TEST_UA);
 
         let response = client
-            .signed_get(&url, TEST_KEY_ID, FIXTURE_PRIVATE_PKCS1_PEM)
+            .signed_get(&url, TEST_KEY_ID, FIXTURE_PRIVATE_PKCS1_PEM, 4096)
             .await
             .unwrap();
         let seen: Value = response.json().unwrap();
@@ -228,6 +228,7 @@ mod tests {
                 "ftp://example.com/pub",
                 TEST_KEY_ID,
                 FIXTURE_PRIVATE_PKCS1_PEM,
+                4096,
             )
             .await;
         assert!(
@@ -235,7 +236,7 @@ mod tests {
             "a non-http(s) URL cannot be signed, got {bad_url:?}"
         );
         let junk_key = client
-            .signed_get("https://peer.invalid/actor", TEST_KEY_ID, "not a key")
+            .signed_get("https://peer.invalid/actor", TEST_KEY_ID, "not a key", 4096)
             .await;
         assert!(
             matches!(junk_key, Err(HttpError::Connect(_))),

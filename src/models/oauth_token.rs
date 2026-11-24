@@ -52,7 +52,7 @@ pub use deletes::{
 };
 pub use listing::{TokenWithAppName, list_for_user, list_valid_with_app_names};
 pub use tokens::{consume_refresh_token, create_token, get_by_id, get_valid_token};
-pub use with_app::get_with_app;
+pub use with_app::{get_by_refresh_token, get_with_app};
 
 /// How long past its `valid_until` a pair's refresh token stays redeemable.
 ///

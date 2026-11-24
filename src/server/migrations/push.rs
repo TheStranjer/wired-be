@@ -223,3 +223,32 @@ async fn instance_secrets_migration_creates_the_secrets_table() {
         "the name alone is the primary key {key}"
     );
 }
+
+/// The user-id index migration (WBE-512) creates the index behind
+/// `FOR_USER_SQL`'s `WHERE user_id = $1 ORDER BY id`, keyed on
+/// `(user_id, id)` so the per-notification fan-out lookup needs no
+/// sequential scan or sort.
+#[tokio::test]
+async fn web_push_subscriptions_user_id_index_serves_the_fan_out_lookup() {
+    let db = crate::test_db::test_db().await.expect("test database slot");
+    let pool = db.pool().clone();
+    let rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT tablename, indexdef
+           FROM pg_indexes
+          WHERE schemaname = 'public' AND indexname = 'web_push_subscriptions_user_id_idx'",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(rows.len(), 1, "the user-id index exists exactly once");
+    let (table, definition) = &rows[0];
+    assert_eq!(table, "web_push_subscriptions", "the index is on the table");
+    assert!(
+        definition.contains("(user_id, id)"),
+        "keyed on (user_id, id): {definition}"
+    );
+    assert!(
+        !definition.contains("UNIQUE"),
+        "not unique, a user has many devices: {definition}"
+    );
+}

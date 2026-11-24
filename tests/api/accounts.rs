@@ -18,6 +18,7 @@
 
 mod lookup;
 mod pending;
+mod restricted;
 mod show;
 mod support;
 mod verify_credentials;

@@ -213,7 +213,8 @@ async fn list(
 /// as one rendered entity.
 ///
 /// Pleroma's `show` asks only who owns the row; this keeps the listing's
-/// scope, so the dismissed and the deactivated-actor's row read as the 404
+/// scope, so the dismissed, the blocked, the muted and the
+/// deactivated-actor's row read as the 404
 /// the client already sees for an unknown id — and a malformed one, all
 /// indistinguishable.
 ///

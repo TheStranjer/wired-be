@@ -42,8 +42,8 @@ async fn runtime_config_rules_documents_and_announcements_reach_the_public_api()
 
 /// The `:instance` runtime override: rename the instance, and the change
 /// reads through `GET /api/v1/instance`, `/api/v2/instance` and `NodeInfo`;
-/// a restart-requiring `:media_proxy` write raises the per-request
-/// `need_reboot` flag on the answer.
+/// a `:media_proxy` write, which nothing reads at runtime, is refused with
+/// a 400 and never logged.
 async fn instance_override(world: &World) {
     let written = post_configs(
         &world.app,
@@ -84,8 +84,8 @@ async fn instance_override(world: &World) {
         "NodeInfo tells the same name"
     );
 
-    // A restart-requiring key reports its own need_reboot on the answer.
-    let reboot = post_configs(
+    // A key nothing reads at runtime is refused, not stored.
+    let refused = post_configs(
         &world.app,
         &world.admin,
         json!([{
@@ -95,22 +95,14 @@ async fn instance_override(world: &World) {
         }]),
     )
     .await;
-    common::assert_answer(&reboot, StatusCode::OK, "the :media_proxy write");
-    assert_eq!(
-        reboot.json_value()["need_reboot"],
-        json!(true),
-        "the proxy row needs a restart"
-    );
+    common::assert_answer(&refused, StatusCode::BAD_REQUEST, "the :media_proxy write");
 
-    // The override is logged once, naming the pair.
+    // The override is logged once, naming the pair; the refusal is not.
     assert_log(
         &world.app,
         &world.admin,
         "config_change",
-        &[
-            "@root changed config: :pleroma/:media_proxy".to_owned(),
-            "@root changed config: :pleroma/:instance".to_owned(),
-        ],
+        &["@root changed config: :pleroma/:instance".to_owned()],
     )
     .await;
 }
@@ -122,7 +114,7 @@ async fn descriptions_answer_the_whitelist(app: &Router, token: &str) {
     common::assert_answer(&response, StatusCode::OK, "the descriptions payload");
     let body = response.json_value();
     let entries = body.as_array().expect("the descriptions are an array");
-    assert_eq!(entries.len(), 8, "the whole whitelist is documented");
+    assert_eq!(entries.len(), 6, "the whole whitelist is documented");
     assert_eq!(
         entries[0]["key"],
         json!(":instance"),

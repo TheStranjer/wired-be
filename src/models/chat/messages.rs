@@ -117,6 +117,33 @@ where
     Ok(stamped.rows_affected() > 0)
 }
 
+/// The `UPDATE` behind [`withdraw_all_from_sender`]: the tombstone of
+/// [`SOFT_DELETE_MESSAGE_SQL`] for every live message one account sent.
+const WITHDRAW_ALL_FROM_SENDER_SQL: &str = "UPDATE chat_messages
+      SET content = '', raw_text = '', deleted_at = now()
+    WHERE sender_id = $1 AND deleted_at IS NULL";
+
+/// Turns every live message user `sender_id` sent into a tombstone, the chat
+/// step of the account-deletion jobs.
+///
+/// The user row is purged or kept, never deleted, so no foreign key removes
+/// the messages; without this the other participant keeps reading the text of
+/// everything the departed account said. Withdrawn messages are left as they
+/// are, which makes a rerun a no-op. Answers how many messages this call
+/// struck.
+///
+/// # Errors
+///
+/// Any database failure (connection, encoding) arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn withdraw_all_from_sender(pool: &PgPool, sender_id: Uuid) -> AppResult<u64> {
+    let stamped = sqlx::query(WITHDRAW_ALL_FROM_SENDER_SQL)
+        .bind(sender_id)
+        .execute(pool)
+        .await?;
+    Ok(stamped.rows_affected())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -304,6 +331,68 @@ mod tests {
         assert!(
             tombstone.content.is_empty() && tombstone.raw_text.is_empty(),
             "with its text cleared"
+        );
+    }
+
+    /// Reads whether message `id` is a tombstone and what text it still holds.
+    async fn stored(pool: &PgPool, id: Uuid) -> (bool, String, String) {
+        sqlx::query_as::<_, (bool, String, String)>(
+            "SELECT deleted_at IS NOT NULL, content, raw_text FROM chat_messages WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .expect("the fixture message reads")
+    }
+
+    #[tokio::test]
+    async fn withdrawing_all_from_a_sender_tombstones_only_their_messages() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = local(&pool, "alice").await;
+        let bob = local(&pool, "bob").await;
+        let (first, _, bobs_view) = send(&pool, &alice, &bob, "first from alice").await;
+        let (second, _, _) = send(&pool, &alice, &bob, "second from alice").await;
+        let (reply, _, _) = send(&pool, &bob, &alice, "bob answers").await;
+        let bobs_chat = bobs_view
+            .expect("bob is local, so he has a reference")
+            .chat_id;
+
+        assert_eq!(
+            withdraw_all_from_sender(&pool, alice.id).await.unwrap(),
+            2,
+            "both of alice's live messages are struck"
+        );
+        for id in [first.id, second.id] {
+            assert_eq!(
+                stored(&pool, id).await,
+                (true, String::new(), String::new()),
+                "alice's message {id} is a tombstone with its text cleared"
+            );
+        }
+        let (tombstoned, content, raw_text) = stored(&pool, reply.id).await;
+        assert!(!tombstoned, "bob's message is not alice's to withdraw");
+        assert_eq!(content, "<p>bob answers</p>", "and keeps its content");
+        assert_eq!(raw_text, "bob answers", "and its source text");
+        let bobs_page = messages_page(&pool, bobs_chat, page(ALL)).await.unwrap();
+        assert_eq!(
+            bobs_page
+                .iter()
+                .map(|reference| reference.message_id)
+                .collect::<Vec<Uuid>>(),
+            vec![reply.id],
+            "bob's page lists only his own message"
+        );
+
+        assert_eq!(
+            withdraw_all_from_sender(&pool, alice.id).await.unwrap(),
+            0,
+            "a second call finds nothing live"
+        );
+        assert_eq!(
+            withdraw_all_from_sender(&pool, new_id()).await.unwrap(),
+            0,
+            "a sender with no messages matches nothing"
         );
     }
 }

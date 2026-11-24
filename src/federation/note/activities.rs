@@ -31,11 +31,31 @@ use super::{
 /// writes for a document that declares no language. The collection
 /// documents in [`crate::federation::collections`] carry the same header.
 pub(crate) fn json_ld_context(config: &Config) -> Value {
+    json_ld_context_for(config, None)
+}
+
+/// The `@context` of a note written in `language`: [`json_ld_context`] with
+/// the language map naming that BCP 47 tag, as Pleroma's
+/// `make_json_ld_header` does for an object that has one. A `None` or empty
+/// tag falls back to the `und` map.
+pub(crate) fn json_ld_context_for(config: &Config, language: Option<&str>) -> Value {
+    let language = language
+        .filter(|tag| !tag.is_empty())
+        .unwrap_or(LANGUAGE_UNDETERMINED);
     json!([
         AS_VOCABULARY,
         format!("{}{LITEPUB_SCHEMA_PATH}", config.base_url),
-        { "@language": LANGUAGE_UNDETERMINED },
+        { "@language": language },
     ])
+}
+
+/// The `@context` an activity wrapping `note` carries: the note's own, so
+/// the two documents never disagree on the language, falling back to the
+/// plain [`json_ld_context`] for an object that has none.
+fn wrapped_context(note: &Value, config: &Config) -> Value {
+    note.get("@context")
+        .cloned()
+        .unwrap_or_else(|| json_ld_context(config))
 }
 
 /// The JSON-LD context document served at [`LITEPUB_SCHEMA_PATH`].
@@ -77,7 +97,7 @@ pub fn litepub_context_json() -> Value {
 #[must_use]
 pub fn create_activity_json(note: &Value, status: &Status, config: &Config) -> Value {
     json!({
-        "@context": json_ld_context(config),
+        "@context": wrapped_context(note, config),
         "id": format!("{}/activities/{}", config.base_url, status.id),
         "type": TYPE_CREATE,
         "actor": note.get("actor").cloned().unwrap_or(Value::Null),
@@ -108,7 +128,7 @@ pub fn create_activity_json(note: &Value, status: &Status, config: &Config) -> V
 #[must_use]
 pub fn update_activity_json(note: &Value, id: Uuid, config: &Config) -> Value {
     json!({
-        "@context": json_ld_context(config),
+        "@context": wrapped_context(note, config),
         "id": format!("{}/activities/{id}", config.base_url),
         "type": TYPE_UPDATE,
         "actor": note.get("actor").cloned().unwrap_or(Value::Null),
