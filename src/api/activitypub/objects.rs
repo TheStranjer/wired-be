@@ -31,8 +31,7 @@ use crate::{
 
 use super::ACTIVITY_JSON;
 use super::negotiation::{
-    document, document_response, frontend_redirect, notice_redirect, wants_activity_json,
-    wants_html, with_vary,
+    document, document_response, frontend_redirect, wants_activity_json, wants_html, with_vary,
 };
 
 /// `GET /objects/{uuid}/replies` — the replies collection of one local
@@ -61,7 +60,7 @@ async fn object_replies_answer(
 ) -> AppResult<Response> {
     if !wants_activity_json(headers) {
         if wants_html(headers) {
-            return frontend_redirect(&state.config.base_url, &format!("notice/{raw_id}"));
+            return frontend_redirect(&state.config, &format!("notice/{raw_id}"));
         }
         return Err(AppError::RouteNotFound);
     }
@@ -124,7 +123,7 @@ pub(super) async fn get_scoped_object(
 /// an `ActivityPub` media type is a federating client and gets the very
 /// document [`get_object`] serves; an `Accept` naming `text/html` (and no
 /// `ActivityPub` type) is a browser and gets the 302 to the same path on
-/// the frontend origin (see [`notice_redirect`]); anything else, the 404.
+/// the frontend origin (see [`frontend_redirect`]); anything else, the 404.
 pub(super) async fn get_notice(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -134,7 +133,7 @@ pub(super) async fn get_notice(
     let outcome = if wants_activity_json(&headers) {
         object_core(&state, &id, None, &headers, &uri).await
     } else if wants_html(&headers) {
-        notice_redirect(&state.config, &id)
+        frontend_redirect(&state.config, &format!("notice/{id}"))
     } else {
         Err(AppError::RouteNotFound)
     };
