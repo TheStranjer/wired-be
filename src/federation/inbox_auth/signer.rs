@@ -1,7 +1,7 @@
 //! Resolving a `keyId` to the signer: the actor lookup behind the
-//! extractor's step 4 — the mirror, the on-the-fly fetch, the standalone
+//! extractor's step 5 — the mirror, the on-the-fly fetch, the standalone
 //! key object's `owner`, the gone actor's self-`Delete` — plus the
-//! once-per-window key-refetch throttle its step 5 retries through.
+//! once-per-window key-refetch throttle its step 6 retries through.
 
 use std::{
     collections::BTreeMap,
@@ -29,7 +29,7 @@ use crate::{
 static KEY_REFETCH_STAMPS: Mutex<BTreeMap<String, Instant>> = Mutex::new(BTreeMap::new());
 
 /// Resolves the `keyId` to the actor whose key must verify the signature
-/// (step 4 of the [module docs](super)): the mirror of the fragment-stripped
+/// (step 5 of the [module docs](super)): the mirror of the fragment-stripped
 /// URL answers; a miss fetches that actor; a fetch that fails on a
 /// document that is not an actor retries the `keyId` itself as a key
 /// object, following its `owner`. A `410 Gone` for a self-`Delete` is
