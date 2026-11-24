@@ -49,12 +49,13 @@ use crate::federation::{
     mrf::{
         MrfContext, MrfPolicy, MrfResult, Transparency,
         simple::{
-            PUBLIC_ADDRESS, activity_host, activity_type, add_address, addresses_public,
-            followers_collection, has_attachments, is_note_activity, limit_document,
-            note_object_mut, remove_public, remove_reference, rewrite_each_document,
+            activity_host, activity_type, add_address, addresses_public, followers_collection,
+            has_attachments, is_note_activity, limit_document, note_object_mut, remove_public,
+            remove_reference, rewrite_each_document,
         },
         single_block,
     },
+    vocab::AS_PUBLIC,
 };
 
 /// The key of this policy's parameters inside the `mrf` instance setting,
@@ -260,7 +261,7 @@ fn move_public_to_cc(document: &mut Map<String, Value>, followers: &str) {
     remove_public(document, "to");
     add_address(document, "to", followers);
     remove_reference(document, "cc", followers);
-    add_address(document, "cc", PUBLIC_ADDRESS);
+    add_address(document, "cc", AS_PUBLIC);
 }
 
 /// `mrf_tag:sandbox`, on a `Create`: the note becomes followers-only —
@@ -294,7 +295,7 @@ mod tests {
     /// That actor's followers collection, the `/followers` convention.
     const FOLLOWERS: &str = "https://peer.example/users/alice/followers";
     /// The public address, full `ActivityStreams` spelling.
-    const PUBLIC: &str = PUBLIC_ADDRESS;
+    const PUBLIC: &str = AS_PUBLIC;
     /// A second recipient the fixtures keep in `cc`.
     const BOB: &str = "https://remote.example/users/bob";
     /// The note a fixture `Create` announces.

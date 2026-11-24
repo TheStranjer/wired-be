@@ -181,6 +181,18 @@ pub fn followers(ap_id: &str) -> String {
     format!("{ap_id}/followers")
 }
 
+/// The address naming `user`'s followers collection.
+///
+/// It is the stored `followers_url` (what the publisher expands, and what a
+/// peer's own documents name), with the [`followers`] construction behind a
+/// row that carries none.
+#[must_use]
+pub fn followers_address(user: &User) -> String {
+    user.followers_url
+        .clone()
+        .unwrap_or_else(|| followers(&user.ap_id))
+}
+
 /// The following collection of actor `ap_id`: `{ap_id}/following`.
 #[must_use]
 pub fn following(ap_id: &str) -> String {

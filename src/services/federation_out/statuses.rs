@@ -86,12 +86,13 @@ mod tests {
     use crate::{
         config::{Config, TEST_BASE_URL},
         federation::note,
+        federation::vocab::AS_PUBLIC,
         models::{
             status::{self, NewStatus, Visibility},
             user::{Flag, NewUser, User, insert},
         },
         services::federation_out::{
-            PUBLIC, after_status_deleted,
+            after_status_deleted,
             test_support::{
                 accepted_follow, app_state, delivered_inboxes, job_count, local, local_post,
                 publish_jobs, remote, remote_status, run_publishes, the_single_activity,
@@ -178,7 +179,7 @@ mod tests {
             "the activity id is the status' own — the address the C2S create promises"
         );
         assert_eq!(activity["actor"], alice.ap_id, "the author publishes");
-        assert_eq!(activity["to"], json!([PUBLIC]));
+        assert_eq!(activity["to"], json!([AS_PUBLIC]));
         assert_eq!(
             activity["cc"],
             json!([format!("{}/followers", alice.ap_id)]),
@@ -225,7 +226,7 @@ mod tests {
 
         let activity = the_single_activity(&pool).await;
         assert_eq!(activity["type"], "Create");
-        assert_eq!(activity["to"], json!([PUBLIC]));
+        assert_eq!(activity["to"], json!([AS_PUBLIC]));
         assert_eq!(
             activity["cc"],
             json!([format!("{}/followers", alice.ap_id), bob.ap_id]),
@@ -339,7 +340,7 @@ mod tests {
         );
         assert_eq!(
             activity["to"],
-            json!([PUBLIC]),
+            json!([AS_PUBLIC]),
             "the addressing is the status' own"
         );
         assert_eq!(

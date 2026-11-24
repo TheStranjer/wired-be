@@ -24,8 +24,9 @@ use serde_json::{Value, json};
 
 use crate::{
     config::Config,
-    federation::note::{
-        AS_VOCABULARY, LANGUAGE_UNDETERMINED, LITEPUB_SCHEMA_PATH, SECURITY_VOCABULARY,
+    federation::{
+        note::{LANGUAGE_UNDETERMINED, LITEPUB_SCHEMA_PATH, SECURITY_VOCABULARY},
+        vocab::AS_VOCABULARY,
     },
     models::user::{User, followers, following, inbox, outbox},
     util::time::mastodon_time,

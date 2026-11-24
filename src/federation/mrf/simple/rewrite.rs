@@ -7,10 +7,11 @@ use serde_json::{Map, Value};
 
 use crate::federation::{
     json,
-    note_parser::{OBJECT_TYPES, PUBLIC_RECIPIENTS},
+    note_parser::OBJECT_TYPES,
+    vocab::{AS_PUBLIC, value_is_public},
 };
 
-use super::{ACTOR_TYPES, ADDRESS_FIELDS, FOLLOWERS_SUFFIX, PUBLIC_ADDRESS, WRAPPING_TYPES};
+use super::{ACTOR_TYPES, ADDRESS_FIELDS, FOLLOWERS_SUFFIX, WRAPPING_TYPES};
 
 /// The first string of a document's `type`, which may itself be an array.
 pub(in crate::federation::mrf) fn activity_type(document: &Value) -> Option<String> {
@@ -153,7 +154,7 @@ pub(in crate::federation::mrf) fn unlist_document(document: &mut Map<String, Val
         return;
     }
     remove_public(document, "to");
-    add_address(document, "cc", PUBLIC_ADDRESS);
+    add_address(document, "cc", AS_PUBLIC);
 }
 
 /// Takes the public address out of a document's `to` and `cc` and puts the
@@ -181,7 +182,7 @@ pub(in crate::federation::mrf) fn addresses_public(
 ) -> bool {
     document
         .get(field)
-        .is_some_and(|value| json::as_array(value).iter().any(is_public_address))
+        .is_some_and(|value| json::as_array(value).iter().any(value_is_public))
 }
 
 /// Drops every spelling of the public address from `field`. A field given
@@ -196,7 +197,7 @@ pub(in crate::federation::mrf) fn remove_public(document: &mut Map<String, Value
         *value = Value::Array(json::as_array(value).to_vec());
     }
     if let Value::Array(entries) = value {
-        entries.retain(|entry| !is_public_address(entry));
+        entries.retain(|entry| !value_is_public(entry));
     }
 }
 
@@ -237,12 +238,6 @@ pub(in crate::federation::mrf) fn add_address(
     }
     entries.push(Value::String(address.to_owned()));
     let _previous = document.insert(field.to_owned(), Value::Array(entries));
-}
-
-/// Whether an addressing entry is the public address in any of the
-/// [`PUBLIC_RECIPIENTS`] spellings, reference-object form included.
-fn is_public_address(entry: &Value) -> bool {
-    json::value_or_id(entry).is_some_and(|address| PUBLIC_RECIPIENTS.contains(&address.as_str()))
 }
 
 #[cfg(test)]

@@ -85,14 +85,14 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::federation::mrf::{MrfConfig, simple::PUBLIC_ADDRESS};
+    use crate::federation::{mrf::MrfConfig, vocab::AS_PUBLIC};
 
     /// The author the fixtures post as.
     const ALICE: &str = "https://peer.example/users/alice";
     /// The note the fixture `Create` announces.
     const NOTE: &str = "https://peer.example/objects/1";
     /// The public address, full `ActivityStreams` spelling.
-    const PUBLIC: &str = PUBLIC_ADDRESS;
+    const PUBLIC: &str = AS_PUBLIC;
 
     /// The context of an empty run: nothing this policy reads.
     fn ctx() -> MrfContext {

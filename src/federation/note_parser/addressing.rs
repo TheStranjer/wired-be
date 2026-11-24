@@ -5,11 +5,12 @@
 use serde_json::Value;
 
 use crate::{
-    federation::json::{as_array, value_or_id},
+    federation::{
+        json::{as_array, value_or_id},
+        vocab::is_public_address,
+    },
     models::{status::Visibility, user::User},
 };
-
-use super::PUBLIC_RECIPIENTS;
 
 /// The visibility from `to` and `cc`: the public recipient in `to` is
 /// public, in `cc` alone unlisted, the author's followers collection (and
@@ -20,9 +21,9 @@ use super::PUBLIC_RECIPIENTS;
 pub(crate) fn parse_visibility(json: &Value, author: &User) -> Visibility {
     let to = recipients(json, "to");
     let cc = recipients(json, "cc");
-    if has_public(&to) {
+    if to.iter().any(|recipient| is_public_address(recipient)) {
         Visibility::Public
-    } else if has_public(&cc) {
+    } else if cc.iter().any(|recipient| is_public_address(recipient)) {
         Visibility::Unlisted
     } else if addresses_followers(&to, &cc, author.followers_url.as_deref()) {
         Visibility::Private
@@ -32,7 +33,7 @@ pub(crate) fn parse_visibility(json: &Value, author: &User) -> Visibility {
 }
 
 /// The actor ids a document addresses in `to` and `cc`: every recipient
-/// that is neither a [`PUBLIC_RECIPIENTS`] spelling nor `author`'s
+/// that is neither a [public spelling](is_public_address) nor `author`'s
 /// followers collection, each once, `to` first. Mastodon's
 /// `process_audience` and Pleroma's `to` check both grant a known local
 /// account named here access without a `Mention` tag; resolving which of
@@ -44,7 +45,7 @@ pub(crate) fn addressed_actor_ids(json: &Value, author: &User) -> Vec<String> {
         .into_iter()
         .chain(recipients(json, "cc"))
     {
-        let is_public = PUBLIC_RECIPIENTS.contains(&recipient.as_str());
+        let is_public = is_public_address(&recipient);
         let is_followers = followers_url == Some(recipient.as_str());
         if !is_public && !is_followers && !ids.contains(&recipient) {
             ids.push(recipient);
@@ -62,14 +63,6 @@ fn recipients(json: &Value, field: &str) -> Vec<String> {
         .iter()
         .filter_map(value_or_id)
         .collect()
-}
-
-/// True when any recipient is the public address, in any of its
-/// [`PUBLIC_RECIPIENTS`] spellings.
-fn has_public(recipients: &[String]) -> bool {
-    recipients
-        .iter()
-        .any(|recipient| PUBLIC_RECIPIENTS.contains(&recipient.as_str()))
 }
 
 /// True when either list names the author's followers collection.

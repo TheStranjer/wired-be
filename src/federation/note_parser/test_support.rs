@@ -20,7 +20,7 @@ pub(super) const AUTHOR_AP_ID: &str = "https://remote.example/users/bob";
 /// The fixture author's followers collection.
 pub(super) const FOLLOWERS: &str = "https://remote.example/users/bob/followers";
 /// The public recipient, full `ActivityStreams` spelling.
-pub(super) const PUBLIC: &str = "https://www.w3.org/ns/activitystreams#Public";
+pub(super) const PUBLIC: &str = crate::federation::vocab::AS_PUBLIC;
 
 /// The instant every parse is anchored at: 2024-03-01T00:00:00Z.
 pub(super) fn now() -> DateTime<Utc> {

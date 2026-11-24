@@ -68,7 +68,7 @@ fn collection(archive: &BackupArchive, name: &str) -> Vec<Value> {
     let doc = entry_json(archive, name);
     assert_eq!(
         doc.get("@context").and_then(Value::as_str),
-        Some(AS_CONTEXT),
+        Some(AS_VOCABULARY),
         "{name} declares the plain ActivityStreams context"
     );
     assert_eq!(

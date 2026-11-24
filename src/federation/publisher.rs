@@ -17,8 +17,8 @@
 //! - the addressing properties `to`, `cc`, `bto`, `bcc` and `audience`
 //!   carry the recipients, each in any of the JSON-LD shapes
 //!   [`json::references`](crate::federation::json::references) normalizes;
-//! - the public address (`https://www.w3.org/ns/activitystreams#Public` and
-//!   its two shorthands) is never itself a recipient — it says "anyone",
+//! - the public address ([`AS_PUBLIC`](crate::federation::vocab::AS_PUBLIC)
+//!   and its two shorthands) is never itself a recipient — it says "anyone",
 //!   and "anyone" is spelled out as the followers collection and the
 //!   directly addressed actors;
 //! - the actor's own followers-collection URL expands to the actor's

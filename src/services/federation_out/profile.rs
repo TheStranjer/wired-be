@@ -11,15 +11,15 @@ use std::collections::HashSet;
 use serde_json::{Value, json};
 use tracing::{debug, warn};
 
-use super::PUBLIC;
 use crate::{
     error::AppResult,
     federation::{
         activities::activity_id, actor::actor_json, delivery::best_inbox, note, publisher,
+        vocab::AS_PUBLIC,
     },
     models::{
         follow, relay,
-        user::{self, User},
+        user::{self, User, followers_address},
     },
     state::AppState,
     util::id::new_id,
@@ -69,7 +69,7 @@ fn update_document(state: &AppState, account: &User, followers_collection: &str)
         "type": "Update",
         "actor": account.ap_id,
         "object": actor_json(account, &state.config),
-        "to": [PUBLIC],
+        "to": [AS_PUBLIC],
         "cc": [followers_collection],
     })
 }
@@ -156,17 +156,14 @@ fn delete_document(state: &AppState, account: &User) -> Value {
         "{}/activities/delete-user-{}",
         state.config.base_url, account.id
     );
-    let followers = account
-        .followers_url
-        .clone()
-        .unwrap_or_else(|| format!("{}/followers", account.ap_id));
+    let followers = followers_address(account);
     json!({
         "@context": note::json_ld_context(&state.config),
         "id": id,
         "type": "Delete",
         "actor": account.ap_id,
         "object": account.ap_id,
-        "to": [PUBLIC],
+        "to": [AS_PUBLIC],
         "cc": [followers],
     })
 }
@@ -225,7 +222,7 @@ mod tests {
         assert_eq!(activity["type"], "Update");
         assert_eq!(activity["actor"], alice.ap_id);
         assert_eq!(activity["object"]["id"], alice.ap_id);
-        assert_eq!(activity["to"][0], PUBLIC);
+        assert_eq!(activity["to"][0], AS_PUBLIC);
         assert_eq!(activity["cc"][0], alice.followers_url.unwrap());
     }
 
@@ -260,7 +257,7 @@ mod tests {
         );
         assert_eq!(activity["actor"], alice.ap_id);
         assert_eq!(activity["object"], alice.ap_id);
-        assert_eq!(activity["to"][0], PUBLIC);
+        assert_eq!(activity["to"][0], AS_PUBLIC);
         assert_eq!(
             inboxes_of(args),
             vec!["https://remote.example/inbox".to_owned(); 2],

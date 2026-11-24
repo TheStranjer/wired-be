@@ -10,7 +10,7 @@ use uuid::Uuid;
 use super::ADDRESSING_FIELDS;
 use crate::{
     error::AppResult,
-    federation::{delivery::best_inbox, json, note_parser::PUBLIC_RECIPIENTS},
+    federation::{delivery::best_inbox, json, vocab::is_public_address},
     models::{
         follow,
         user::{INSTANCE_ACTOR_NICKNAME, User, get_by_ap_id},
@@ -40,7 +40,7 @@ pub(super) async fn expand_recipients(
 ) -> AppResult<Vec<String>> {
     let mut inboxes = Vec::new();
     for address in addresses {
-        if is_public(address) {
+        if is_public_address(address) {
             continue;
         }
         if actor.followers_url.as_deref() == Some(address.as_str()) {
@@ -97,7 +97,7 @@ pub(super) fn primary_public(activity: &Value) -> bool {
         .get("to")
         .map_or_else(Vec::new, json::references)
         .iter()
-        .any(|address| is_public(address))
+        .any(|address| is_public_address(address))
 }
 
 /// Whether relays carry activities of this `type`: the ones that spread a
@@ -111,18 +111,13 @@ pub(super) fn relay_type(activity: &Value) -> bool {
     )
 }
 
-/// Whether `address` is the public address in any of its three
-/// [`PUBLIC_RECIPIENTS`] spellings.
-fn is_public(address: &str) -> bool {
-    PUBLIC_RECIPIENTS.contains(&address)
-}
-
 #[cfg(test)]
 mod tests {
     use serde_json::json;
 
     use super::super::test_support::*;
     use super::*;
+    use crate::federation::vocab::PUBLIC_RECIPIENTS;
 
     /// All five addressing properties contribute recipients, in any
     /// JSON-LD shape.
@@ -156,10 +151,13 @@ mod tests {
     #[test]
     fn the_public_spellings_are_recognised() {
         for spelling in PUBLIC_RECIPIENTS {
-            assert!(is_public(spelling), "`{spelling}` is the public address");
+            assert!(
+                is_public_address(spelling),
+                "`{spelling}` is the public address"
+            );
         }
         assert!(
-            !is_public("https://peer.example/users/bob"),
+            !is_public_address("https://peer.example/users/bob"),
             "an actor id is nobody's public address"
         );
     }

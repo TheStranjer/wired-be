@@ -7,10 +7,10 @@
 //! row; the followers address and the publisher hand are the root's.
 
 use super::after_profile_updated;
-use super::{followers_address, load_user, queue_activity};
+use super::{load_user, queue_activity};
 use crate::{
     federation::activities::{TargetedActivityContext, move_json},
-    models::user::User,
+    models::user::{User, followers_address},
     state::AppState,
     util::id::new_id,
 };
