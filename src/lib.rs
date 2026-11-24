@@ -56,8 +56,7 @@ use crate::{
 /// Pleroma routes the reset request outside `/api`), and the `MongooseIM`
 /// auth endpoints plus `/manifest.json` ([`api::misc`]) — are merged at the
 /// top level, together with the HTML helper pages of
-/// [`api::html_pages`] (`/embed/{id}`,
-/// `/notice/{id}/embed_player` and `/mailer/unsubscribe/{token}`), the
+/// [`api::html_pages`] (`/mailer/unsubscribe/{token}`), the
 /// remote-interaction pages of [`api::remote_interaction`]
 /// (`/ostatus_subscribe`, `/authorize_interaction` and `/main/ostatus`)
 /// and the invite registration link of

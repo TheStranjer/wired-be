@@ -107,16 +107,6 @@ pub(super) const ROWS: &[RouteSpec] = &[
     },
     RouteSpec {
         method: "GET",
-        path: "/notice/:id/embed_player",
-        auth: AuthClass::Public,
-    },
-    RouteSpec {
-        method: "GET",
-        path: "/embed/:id",
-        auth: AuthClass::Public,
-    },
-    RouteSpec {
-        method: "GET",
         path: "/mailer/unsubscribe/:token",
         auth: AuthClass::Public,
     },

@@ -1,14 +1,10 @@
 //! Top-level HTML helper pages: the small standalone documents this
 //! server serves outside `/api`.
 //!
-//! This module ships all three of its pages: the embeddable status card,
-//! the media player for one attachment of a
-//! status (`GET /notice/{id}/embed_player`, Pleroma's `notice_player` in
-//! `lib/pleroma/web/o_status/o_status_controller.ex`) and the mailer
-//! unsubscribe page (`GET /mailer/unsubscribe/{token}`, Pleroma's
-//! `SubscriptionController` in
-//! `lib/pleroma/web/mailer/subscription_controller.ex`), all built from
-//! the same contract and out of the shared page helpers here.
+//! This module ships one page: the mailer unsubscribe page
+//! (`GET /mailer/unsubscribe/{token}`, Pleroma's `SubscriptionController`
+//! in `lib/pleroma/web/mailer/subscription_controller.ex`), built out of
+//! the shared page helpers here.
 //!
 //! The contract every response this module answers keeps:
 //!
@@ -17,22 +13,21 @@
 //!   [`escape_html`], so nothing a request or a config carries can open a
 //!   tag or an attribute.
 //! - `content-security-policy: default-src 'none'; style-src
-//!   'unsafe-inline'; img-src * data:; media-src *` — Pleroma's helper-page
-//!   CSP, spelled by `PAGE_CSP`: the pages load no scripts, no external
-//!   CSS and no fonts, only the one inline `PAGE_STYLE` sheet, images and
-//!   media.
-//! - `x-frame-options: DENY` on every page that is not made for embedding;
-//!   embed pages omit the header so they can be iframed (see `Framing`).
+//!   'unsafe-inline'`, spelled by `PAGE_CSP`: the pages load no scripts, no
+//!   external CSS, no fonts, no images and no media, only the one inline
+//!   `PAGE_STYLE` sheet.
+//! - `x-frame-options: DENY` on every page: no page here can be framed.
 //!
-//! Pleroma's `/frontend_switcher` pair is deliberately not served: Wired is
-//! API-only, so the path falls through to the app-wide fallback.
+//! Pleroma's `/frontend_switcher` pair, `/embed/{id}` card and
+//! `/notice/{id}/embed_player` player are deliberately not served: Wired
+//! is API-only, so those paths fall through to the app-wide fallback. A
+//! client that wants an embed renders its own from
+//! `GET /api/v1/statuses/{id}`.
 //!
-//! This module is a tree. `embed` holds the status card and the media
-//! elements the player shares, `player` the media player page and
-//! `unsubscribe` the mailer link and its HMAC tokens; this root keeps the
-//! router, the shared constants and header statics, `Framing` and the page
-//! helpers every child answers through. `test_support` holds the unit-test
-//! fixtures the children share.
+//! This module is a tree. `unsubscribe` holds the mailer link and its HMAC
+//! tokens; this root keeps the router, the shared constants and header
+//! statics and the page helpers every child answers through.
+//! `test_support` holds the unit-test fixtures the children share.
 
 use axum::{
     Router,
@@ -45,20 +40,17 @@ use sha2_011::Sha256;
 
 use crate::{state::AppState, util::sanitize::escape_html};
 
-use self::{embed::embed, player::embed_player, unsubscribe::unsubscribe};
+use self::unsubscribe::unsubscribe;
 
 pub use self::unsubscribe::{unsubscribe_token, unsubscribe_user_id};
 
-mod embed;
-mod player;
 #[cfg(test)]
 mod test_support;
 mod unsubscribe;
 
-/// The one CSP every page in this module sends, Pleroma's helper-page
-/// `@csp`: no scripts, inline CSS only, any image or media source.
-const PAGE_CSP: &str =
-    "default-src 'none'; style-src 'unsafe-inline'; img-src * data:; media-src *";
+/// The one CSP every page in this module sends: no scripts, inline CSS
+/// only, no images or media.
+const PAGE_CSP: &str = "default-src 'none'; style-src 'unsafe-inline'";
 /// The media type of every page: [`page`] renders full HTML documents.
 const PAGE_CONTENT_TYPE: &str = "text/html; charset=utf-8";
 /// The one inline stylesheet [`page`] embeds: [`PAGE_CSP`] allows no other
@@ -69,21 +61,8 @@ const PAGE_STYLE: &str = "body{margin:0;min-height:100vh;display:flex;\
     main{background:#fff;border-radius:8px;padding:2rem;max-width:30rem;\
     box-shadow:0 2px 10px rgba(40,36,45,0.12)}\
     h1{font-size:1.3rem;margin-top:0}";
-/// The `X-Frame-Options` header [`Framing::Deny`] puts up.
+/// The `X-Frame-Options` header [`secure`] puts up.
 static FRAME_OPTIONS_HEADER: HeaderName = HeaderName::from_static("x-frame-options");
-/// The path of the embed card, `{id}` the status's primary key.
-const EMBED_PATH: &str = "/embed/{id}";
-/// The title of the embed card page.
-const EMBED_TITLE: &str = "Status embed";
-/// The title and body of the one 404 page the embed route answers every
-/// refusal with: an unknown, deleted or unembeddable id is told no
-/// differently than a malformed one, so the page never leaks which it was.
-const NOT_FOUND_MESSAGE: &str = "Not found";
-/// The path of the player, `{id}` the status's primary key, the
-/// attachment to play named by the `url` query parameter.
-const PLAYER_PATH: &str = "/notice/{id}/embed_player";
-/// The title of the player page.
-const PLAYER_TITLE: &str = "Media player";
 /// The path of the mailer unsubscribe page, `{token}` the link token as
 /// [`unsubscribe_token`] mints it.
 const UNSUBSCRIBE_PATH: &str = "/mailer/unsubscribe/{token}";
@@ -99,26 +78,13 @@ const INVALID_TOKEN_MESSAGE: &str = "Invalid token";
 /// with a different message.
 type HmacSha256 = Hmac<Sha256>;
 
-/// Whether a page may be framed: [`Framing`] decides if [`secure`] adds
-/// `X-Frame-Options: DENY` or leaves the header off.
-#[derive(Debug, Clone, Copy)]
-enum Framing {
-    /// An embed page: no `X-Frame-Options`, so another site may iframe it.
-    Allow,
-    /// Every other page: `X-Frame-Options: DENY`, never framable.
-    Deny,
-}
-
 /// The HTML helper-pages router, merged at the root by [`crate::app`].
 ///
-/// Mounts `/embed/{id}`, `/notice/{id}/embed_player` and
-/// `/mailer/unsubscribe/{token}`. Do not call [`Router::fallback`] on
-/// it: unmatched paths must reach the app-wide fallback in [`crate::app`].
+/// Mounts `/mailer/unsubscribe/{token}`. Do not call
+/// [`Router::fallback`] on it: unmatched paths must reach the app-wide
+/// fallback in [`crate::app`].
 pub fn router() -> Router<AppState> {
-    Router::new()
-        .route(EMBED_PATH, get(embed))
-        .route(PLAYER_PATH, get(embed_player))
-        .route(UNSUBSCRIBE_PATH, get(unsubscribe))
+    Router::new().route(UNSUBSCRIBE_PATH, get(unsubscribe))
 }
 
 /// The full document of a page: the doctype, the escaped `title`, the one
@@ -144,40 +110,19 @@ fn message_body(message: &str) -> String {
 }
 
 /// A `status` response carrying [`page`]'s document for `title` and
-/// `body`, secured for `framing`: the one place a page becomes an answer.
-fn respond(status: StatusCode, title: &str, body: &str, framing: Framing) -> Response {
+/// `body`, secured by [`secure`]: the one place a page becomes an answer.
+fn protected_page(status: StatusCode, title: &str, body: &str) -> Response {
     let mut response = (status, page(title, body)).into_response();
-    secure(&mut response, framing);
+    secure(&mut response);
     response
 }
 
-/// [`respond`] for the pages that are not made for embedding: the
-/// [`Framing::Deny`] flavour.
-fn protected_page(status: StatusCode, title: &str, body: &str) -> Response {
-    respond(status, title, body, Framing::Deny)
-}
-
-/// A `status` response for the embed pages: `respond` with the
-/// `Framing::Allow` flavour.
-///
-/// The embed route and the player answer with it. It is public (where the
-/// rest of the shared helpers are module-internal) so framable pages
-/// built elsewhere can reuse it.
-#[must_use]
-pub fn embed_page(status: StatusCode, title: &str, body: &str) -> Response {
-    respond(status, title, body, Framing::Allow)
-}
-
-/// Puts the module headers on `response`: the HTML media type and
-/// [`PAGE_CSP`] always, `X-Frame-Options: DENY` only under
-/// [`Framing::Deny`] — embed pages must stay framable, so the header is
-/// left off entirely rather than sent with another value.
-fn secure(response: &mut Response, framing: Framing) {
+/// Puts the module headers on `response`: the HTML media type, [`PAGE_CSP`]
+/// and `X-Frame-Options: DENY`, so no page can be framed.
+fn secure(response: &mut Response) {
     put_header(response, header::CONTENT_TYPE, PAGE_CONTENT_TYPE);
     put_header(response, header::CONTENT_SECURITY_POLICY, PAGE_CSP);
-    if matches!(framing, Framing::Deny) {
-        put_header(response, FRAME_OPTIONS_HEADER.clone(), "DENY");
-    }
+    put_header(response, FRAME_OPTIONS_HEADER.clone(), "DENY");
 }
 
 /// Sets header `name` on `response` to the static value `value`, replacing
@@ -228,8 +173,7 @@ mod tests {
 
     #[test]
     fn secure_sets_the_module_headers_on_every_page() {
-        let mut denied = protected_page(StatusCode::OK, "t", "b");
-        secure(&mut denied, Framing::Deny);
+        let denied = protected_page(StatusCode::OK, "t", "b");
         let headers = headers_of(&denied);
         assert_eq!(
             headers[header::CONTENT_TYPE],
@@ -247,34 +191,11 @@ mod tests {
             "a protected page cannot be framed"
         );
         assert_eq!(denied.status(), StatusCode::OK, "secure keeps the status");
-
-        let mut allowed = embed_page(StatusCode::OK, "t", "b");
-        secure(&mut allowed, Framing::Allow);
-        let embed_headers = headers_of(&allowed);
-        assert_eq!(
-            embed_headers[header::CONTENT_SECURITY_POLICY],
-            PAGE_CSP,
-            "embed pages get the CSP too"
-        );
-        assert_eq!(
-            embed_headers[header::CONTENT_TYPE],
-            PAGE_CONTENT_TYPE,
-            "and the HTML media type"
-        );
-        assert!(
-            !embed_headers.contains_key(FRAME_OPTIONS_HEADER.clone()),
-            "embed pages omit X-Frame-Options so they can be iframed"
-        );
     }
 
     #[test]
-    fn respond_wraps_the_page_and_secures_it() {
-        let response = respond(
-            StatusCode::IM_A_TEAPOT,
-            "Teapot",
-            "<p>short</p>",
-            Framing::Deny,
-        );
+    fn protected_page_wraps_the_page_and_secures_it() {
+        let response = protected_page(StatusCode::IM_A_TEAPOT, "Teapot", "<p>short</p>");
         assert_eq!(
             response.status(),
             StatusCode::IM_A_TEAPOT,
