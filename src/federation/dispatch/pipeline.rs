@@ -15,9 +15,9 @@ use super::{
     types::{ActivityView, MrfFn},
 };
 use crate::{
-    federation::{json, mrf},
+    federation::{json, mrf, policy::host_refused},
     jobs::JobError,
-    models::{instance_policy_domain, user, user::User},
+    models::{user, user::User},
     state::AppState,
 };
 
@@ -120,8 +120,9 @@ async fn process(
     route(state, processed, signer, handlers).await
 }
 
-/// The instance-policy arm of the policy hooks: a signer host on the
-/// `reject` list. The inbox refuses these deliveries at the door; this is
+/// The instance-policy arm of the policy hooks: a signer host the instance
+/// refuses — the policy table or the MRF domain lists, as
+/// [`host_refused`] decides. The inbox refuses these deliveries at the door; this is
 /// the same check inside the queue, where the [MRF
 /// stage](mrf::filter_incoming) may have rewritten the actor.
 async fn policy_rejects(state: &AppState, view: &ActivityView) -> Result<bool, JobError> {
@@ -129,7 +130,7 @@ async fn policy_rejects(state: &AppState, view: &ActivityView) -> Result<bool, J
     let Some(host) = json::http_host(&view.actor) else {
         return Ok(false);
     };
-    instance_policy_domain::is_rejected(&state.db, &host)
+    host_refused(state, &host)
         .await
         .map_err(|err| JobError::Retry(format!("the instance policy read failed: {err}")))
 }
@@ -242,6 +243,67 @@ mod tests {
             seen("ok", "https://peer.example/activities/policy-1"),
             0,
             "the handler never saw it"
+        );
+    }
+
+    /// The accepting policy fake: the follow fixture `policy-2`, whatever
+    /// the view says.
+    fn accept_mrf(_state: AppState, _view: &ActivityView) -> BoxFuture<'static, MrfDecision> {
+        Box::pin(async { MrfDecision::Accept(follow_activity("policy-2")) })
+    }
+
+    /// A reject row for a parent domain reaches the actor's subdomain, and
+    /// so does the MRF `reject` list, which needs no table row.
+    #[tokio::test]
+    async fn the_policy_arm_covers_parent_domains_and_the_mrf_lists() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = signer(&pool).await;
+        let activity = follow_activity("policy-2");
+        let state = app_state(&pool);
+        let view = ActivityView::parse(&activity).expect("the fixture parses");
+
+        assert!(
+            !policy_rejects(&state, &view).await.unwrap(),
+            "no policy, no rejection"
+        );
+
+        let _policy = sqlx::query(
+            "INSERT INTO instance_policy_domains (domain, action, reason) \
+             VALUES ('example', 'reject', 'test')",
+        )
+        .execute(&pool)
+        .await
+        .expect("the policy row inserts");
+        assert!(
+            policy_rejects(&state, &view).await.unwrap(),
+            "the row for the parent domain covers `peer.example`"
+        );
+
+        let _cleared = sqlx::query("TRUNCATE instance_policy_domains")
+            .execute(&pool)
+            .await
+            .expect("the table clears");
+        crate::services::runtime_config::write(
+            &pool,
+            ":pleroma",
+            ":mrf",
+            &json!({"policies": ["simple"], "simple": {"reject": ["peer.example"]}}),
+        )
+        .await
+        .expect("the MRF entry is stored");
+        let outcome = dispatch_activity(
+            &app_state(&pool),
+            incoming_args(&activity, &alice),
+            &test_handlers(),
+            accept_mrf,
+        )
+        .await;
+        assert_eq!(outcome, Ok(()), "the rejection completes the job");
+        assert_eq!(
+            seen("ok", "https://peer.example/activities/policy-2"),
+            0,
+            "the MRF list refuses the actor even past an accepting filter"
         );
     }
 
