@@ -64,8 +64,25 @@ pub async fn resolve_status(
     state: &AppState,
     uri: &str,
 ) -> Result<Option<Status>, FederationError> {
+    resolve_status_at_depth(state, uri, 0).await
+}
+
+/// [`resolve_status`] for the thread backfill, at a known walk depth.
+///
+/// A fetched object is ingested at `backfill_depth` links above the reply
+/// that started the walk, so its own queued backfill carries the true depth
+/// (see [`ingest_note_at_depth`](ingest::ingest_note_at_depth)).
+///
+/// # Errors
+///
+/// The same [`FederationError`] arms as [`resolve_status`].
+pub async fn resolve_status_at_depth(
+    state: &AppState,
+    uri: &str,
+    backfill_depth: i64,
+) -> Result<Option<Status>, FederationError> {
     let budget = FetchBudget::new(state.config.fetch.limits.max_fetches_per_activity);
-    resolve_uri(state, uri, None, &budget).await
+    resolve_uri(state, uri, None, &budget, backfill_depth).await
 }
 
 /// [`resolve_status`] for the `Create` handler: the fetched object is
@@ -85,18 +102,20 @@ pub async fn resolve_status_as_actor(
     actor: &User,
 ) -> Result<Option<Status>, FederationError> {
     let budget = FetchBudget::new(state.config.fetch.limits.max_fetches_per_activity);
-    resolve_uri(state, uri, Some(actor), &budget).await
+    resolve_uri(state, uri, Some(actor), &budget, 0).await
 }
 
 /// The whole resolver: local mirror, containment-checked fetch, `Note`
 /// family check, authoring, ingest. `as_actor` selects whose post may be
 /// folded — the object's own author's mirror, or only the named
-/// [`User`]'s (see [`resolve_status_as_actor`]).
+/// [`User`]'s (see [`resolve_status_as_actor`]). `backfill_depth` is the
+/// depth the ingested row's backfill job is queued at.
 async fn resolve_uri(
     state: &AppState,
     uri: &str,
     as_actor: Option<&User>,
     budget: &FetchBudget,
+    backfill_depth: i64,
 ) -> Result<Option<Status>, FederationError> {
     let stored = status::get_by_uri(&state.db, uri)
         .await
@@ -168,7 +187,7 @@ async fn resolve_uri(
         mirror = get_or_fetch_actor(state, &attributed).await?;
         &mirror
     };
-    let outcome = ingest::ingest_note(state, author, &document).await?;
+    let outcome = ingest::ingest_note_at_depth(state, author, &document, backfill_depth).await?;
     Ok(match outcome {
         IngestOutcome::Created(row) | IngestOutcome::Existing(row) => Some(row),
         IngestOutcome::Ignored(reason) => {
