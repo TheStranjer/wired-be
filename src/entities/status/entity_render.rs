@@ -212,10 +212,14 @@ fn a_rendered_quote_lands_in_the_entity_and_the_pleroma_block() {
         quoted_id.to_string(),
         "the quoted target's id, hyphenated (decision 4)"
     );
-    assert_eq!(value["quote"], quote, "the batch's nested render");
     assert_eq!(
-        value["pleroma"]["quote"], value["quote"],
-        "and the pleroma mirror is the SAME object"
+        value["quote"],
+        json!({ "state": "accepted", "quoted_status": quote }),
+        "Mastodon's Quote entity wraps the batch's nested render"
+    );
+    assert_eq!(
+        value["pleroma"]["quote"], quote,
+        "and the pleroma block carries the bare status"
     );
     assert_eq!(
         value["pleroma"]["quote_visible"], true,
@@ -225,6 +229,65 @@ fn a_rendered_quote_lands_in_the_entity_and_the_pleroma_block() {
         value["pleroma"]["quotes_count"], 2,
         "the counter of quotes OF this row rides along, untouched"
     );
+}
+
+#[test]
+fn a_quote_hidden_from_the_viewer_is_unauthorized() {
+    let alice = base_user("alice");
+    let quoted_id = Uuid::parse_str("01955555-5555-7555-8555-555555555555").unwrap();
+    let mut row = base_row();
+    row.quote_of_id = Some(quoted_id);
+    let value = render(&row, &Parts::of(&alice).quoting_hidden(), None);
+    assert_eq!(
+        value["quote"],
+        json!({ "state": "unauthorized", "quoted_status": null }),
+        "a hidden quote names its state and withholds the status"
+    );
+    assert_eq!(value["quote_id"], quoted_id.to_string());
+    assert_eq!(value["pleroma"]["quote"], Value::Null);
+    assert_eq!(value["pleroma"]["quote_visible"], false);
+}
+
+#[test]
+fn a_quote_that_is_gone_is_deleted() {
+    let alice = base_user("alice");
+    let quoted_id = Uuid::parse_str("01955555-5555-7555-8555-555555555555").unwrap();
+    let mut row = base_row();
+    row.quote_of_id = Some(quoted_id);
+    for parts in [Parts::of(&alice).quoting_deleted(), Parts::of(&alice)] {
+        let value = render(&row, &parts, None);
+        assert_eq!(
+            value["quote"],
+            json!({ "state": "deleted", "quoted_status": null }),
+            "a quote the batch could not find (or never handed over) is deleted"
+        );
+        assert_eq!(value["quote_id"], quoted_id.to_string());
+        assert_eq!(value["pleroma"]["quote"], Value::Null);
+        assert_eq!(value["pleroma"]["quote_visible"], false);
+    }
+}
+
+#[test]
+fn a_nested_quote_carries_only_state_and_the_quoted_id() {
+    let alice = base_user("alice");
+    let quoted_id = Uuid::parse_str("01955555-5555-7555-8555-555555555555").unwrap();
+    let mut row = base_row();
+    row.quote_of_id = Some(quoted_id);
+    let value = render(&row, &Parts::of(&alice).quoting_linked(), None);
+    assert_eq!(
+        value["quote"],
+        json!({ "state": "accepted", "quoted_status_id": quoted_id.to_string() }),
+        "one level deep, as Pleroma renders a quote inside a quote"
+    );
+    assert_eq!(value["pleroma"]["quote"], Value::Null);
+    assert_eq!(value["pleroma"]["quote_visible"], false);
+}
+
+#[test]
+fn a_row_that_quotes_nothing_has_a_null_quote() {
+    let alice = base_user("alice");
+    let value = render(&base_row(), &Parts::of(&alice), None);
+    assert_eq!(value["quote"], Value::Null, "no quote_of_id, no quote");
 }
 
 #[test]

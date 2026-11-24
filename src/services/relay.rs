@@ -32,7 +32,7 @@
 //! `https://{host}/relay`; the fetched actor must be an `Application`,
 //! `Service` or `Person` — the kinds relays are served as.
 
-use serde_json::{Value, json};
+use serde_json::Value;
 use sqlx::PgPool;
 use tracing::debug;
 
@@ -40,7 +40,7 @@ use crate::{
     config::Config,
     error::{AppError, AppResult},
     federation::{
-        activities::{AnsweredActivity, follow_json, undo_json},
+        activities::{AnsweredActivity, FollowActivity, follow_json_to, undo_json},
         fetch_actor::get_or_fetch_by_ap_id,
         publisher::{self, PublishOpts},
     },
@@ -196,9 +196,9 @@ async fn withdraw_follow(
 }
 
 /// The `Follow` behind the instance actor's relay subscription: the
-/// document [`follow_json`] renders for the pair, with the row's stored
+/// document [`follow_json_to`] renders for the pair, under the row's stored
 /// activity id (decision 6 — the id the relay's `Accept` names back and
-/// the `Undo` embeds) and, per the ticket, `to` replaced by the relay's
+/// the `Undo` embeds) and, per the ticket, addressed to the relay's
 /// *inbox* — the endpoint that must receive it, which is also why
 /// [`send_to_relay`] names that inbox directly instead of letting the
 /// publisher resolve an actor address.
@@ -210,18 +210,13 @@ fn relay_follow_document(
     relay_inbox: &str,
 ) -> Option<Value> {
     let stored_id = row.ap_id.as_deref()?;
-    let mut document = follow_json(
-        config,
-        row.id,
-        &follower.ap_id,
-        &target.ap_id,
-        &row.inserted_at,
-    );
-    if let Some(fields) = document.as_object_mut() {
-        let _previous_id = fields.insert("id".to_owned(), json!(stored_id));
-        let _previous_to = fields.insert("to".to_owned(), json!([relay_inbox]));
-    }
-    Some(document)
+    let follow = FollowActivity {
+        id: stored_id,
+        follower_ap_id: &follower.ap_id,
+        target_ap_id: &target.ap_id,
+        published: &row.inserted_at,
+    };
+    Some(follow_json_to(config, &follow, &[relay_inbox]))
 }
 
 /// Hand one built handshake document to the publisher addressed to the
@@ -326,6 +321,51 @@ mod tests {
                 "`{bad}` names neither a URL nor a host"
             );
         }
+    }
+
+    /// The relay `Follow` carries the row's stored `ap_id` verbatim and is
+    /// addressed to the relay's inbox alone; an id-less row has no document.
+    #[tokio::test]
+    async fn the_relay_follow_carries_the_stored_id_and_the_relay_inbox() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let [follower, target] = ["instance", "relay"].map(|name| NewUser {
+            nickname: format!("{name}@doc.example"),
+            ap_id: format!("https://doc.example/{name}"),
+            domain: Some("doc.example".to_owned()),
+            actor_type: "Service".to_owned(),
+            ..NewUser::default()
+        });
+        let follower = insert(&pool, &follower).await.expect("follower inserts");
+        let target = insert(&pool, &target).await.expect("target inserts");
+        let stored = "https://doc.example/activities/stored-follow";
+        let relay_inbox = "https://doc.example/relay/inbox";
+        let now = chrono::Utc::now();
+        let mut row = Follow {
+            id: uuid::Uuid::nil(),
+            follower_id: follower.id,
+            followee_id: target.id,
+            state: follow::FollowState::Accepted,
+            ap_id: Some(stored.to_owned()),
+            show_reblogs: true,
+            notify: false,
+            inserted_at: now,
+            updated_at: now,
+        };
+        let config = Config::for_tests();
+
+        let document = relay_follow_document(&config, &row, &follower, &target, relay_inbox)
+            .expect("a row with an id has a document");
+        assert_eq!(document["id"], stored, "the stored ap_id, not a minted one");
+        assert_eq!(document["to"], serde_json::json!([relay_inbox]));
+        assert_eq!(document["actor"], follower.ap_id.as_str());
+        assert_eq!(document["object"], target.ap_id.as_str());
+
+        row.ap_id = None;
+        assert!(
+            relay_follow_document(&config, &row, &follower, &target, relay_inbox).is_none(),
+            "an id-less row has no document"
+        );
     }
 
     /// The type gate: the three kinds a relay is served as pass, the

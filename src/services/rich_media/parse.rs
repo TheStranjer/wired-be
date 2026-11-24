@@ -13,7 +13,10 @@ use scraper::{Html, Selector};
 use serde_json::{Map, Value};
 use url::Url;
 
-use super::{Card, MAX_CARD_DESCRIPTION, MAX_CARD_TITLE, RAW_META_PREFIXES};
+use super::{
+    Card, MAX_CARD_DESCRIPTION, MAX_CARD_TITLE, MAX_RAW_META_KEY, MAX_RAW_META_PAIRS,
+    MAX_RAW_META_VALUE, RAW_META_PREFIXES,
+};
 use crate::util::{format::truncate_chars, url::is_http_url};
 
 /// Parses one HTML page into the rich media [`Card`] it describes.
@@ -110,21 +113,31 @@ fn is_raw_meta(key: &str) -> bool {
         .any(|prefix| key.starts_with(prefix))
 }
 
-/// The raw Open Graph map: every meta pair whose key is an `og:` or
+/// The raw Open Graph map: the meta pairs whose key is an `og:` or
 /// `twitter:` property, keyed by the full property name, the first tag
-/// with a repeated key winning.
+/// with a repeated key winning. Keys longer than [`MAX_RAW_META_KEY`]
+/// characters are skipped, values are cut to [`MAX_RAW_META_VALUE`]
+/// characters, and the map stops growing at [`MAX_RAW_META_PAIRS`] keys.
 fn raw_meta_pairs(tags: &[(String, String)]) -> Map<String, Value> {
     let mut pairs = Map::new();
-    for (key, value) in tags.iter().filter(|(key, _value)| is_raw_meta(key)) {
+    for (key, value) in tags
+        .iter()
+        .filter(|(key, _value)| is_raw_meta(key) && key.chars().count() <= MAX_RAW_META_KEY)
+    {
+        if pairs.len() >= MAX_RAW_META_PAIRS {
+            break;
+        }
         let _entry: &mut Value = pairs
             .entry(key.clone())
-            .or_insert_with(|| Value::String(value.clone()));
+            .or_insert_with(|| Value::String(truncate_chars(value, MAX_RAW_META_VALUE)));
     }
     pairs
 }
 
 #[cfg(test)]
 mod tests {
+    use std::fmt::Write as _;
+
     use super::*;
 
     /// A full Open Graph page: every field comes from its `og:*` tag, and
@@ -306,6 +319,61 @@ mod tests {
             "d".repeat(MAX_CARD_DESCRIPTION),
             "description cut to 500"
         );
+    }
+
+    /// A page with 100 distinct `og:` tags keeps the first 32 in document order.
+    #[test]
+    fn caps_the_raw_pair_count() {
+        let metas = (0..100).fold(String::new(), |mut metas, n| {
+            write!(metas, r#"<meta property="og:x{n}" content="v{n}">"#)
+                .expect("writing to a String cannot fail");
+            metas
+        });
+        let html = format!(
+            r#"<html><head><meta property="og:title" content="T">{metas}</head><body></body></html>"#
+        );
+        let card = parse_card(&html, "https://example.com/").expect("a titled page parses");
+        assert_eq!(card.opengraph.len(), MAX_RAW_META_PAIRS, "capped at 32");
+        assert!(card.opengraph.contains_key("og:title"), "first tag kept");
+        assert!(card.opengraph.contains_key("og:x30"), "31st tag kept");
+        assert!(!card.opengraph.contains_key("og:x31"), "33rd tag dropped");
+        assert!(!card.opengraph.contains_key("og:x99"), "last tag dropped");
+    }
+
+    /// A raw value is cut to 1000 characters.
+    #[test]
+    fn truncates_raw_values() {
+        let long = "v".repeat(5000);
+        let html = format!(
+            r#"<html><head>
+                <meta property="og:title" content="T">
+                <meta property="og:long" content="{long}">
+            </head><body></body></html>"#
+        );
+        let card = parse_card(&html, "https://example.com/").expect("a titled page parses");
+        assert_eq!(
+            card.opengraph.get("og:long"),
+            Some(&Value::String("v".repeat(MAX_RAW_META_VALUE))),
+            "value cut to 1000 characters"
+        );
+    }
+
+    /// A key over 64 characters is skipped and does not use up a slot.
+    #[test]
+    fn skips_over_long_raw_keys() {
+        let long_key = format!("og:{}", "k".repeat(MAX_RAW_META_KEY));
+        let ok_key = format!("og:{}", "k".repeat(MAX_RAW_META_KEY - 3));
+        let html = format!(
+            r#"<html><head>
+                <meta property="og:title" content="T">
+                <meta property="{long_key}" content="x">
+                <meta property="{ok_key}" content="y">
+            </head><body></body></html>"#
+        );
+        let card = parse_card(&html, "https://example.com/").expect("a titled page parses");
+        assert!(!card.opengraph.contains_key(&long_key), "long key skipped");
+        assert!(card.opengraph.contains_key(&ok_key), "64-char key kept");
+        assert_eq!(card.opengraph.len(), 2, "title and the 64-char key");
     }
 
     /// Truncation counts characters, not bytes: a multibyte title is cut on

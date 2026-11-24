@@ -22,8 +22,9 @@
 //!   (decision 4), not Pleroma's deprecated CRC32 of the context.
 //! - Pleroma's `quote_url` is not emitted at all: the quoted target is
 //!   the top-level `quote_id` (its id, whatever the viewer may see of
-//!   it) and the rendered quote is the nested `quote` entity, mirrored
-//!   identically in the `pleroma` block with `quote_visible` beside it.
+//!   it) and the rendered quote is Mastodon's `quote` object, whose
+//!   bare status is mirrored in the `pleroma` block with `quote_visible`
+//!   beside it.
 //!
 //! Keys a later ticket fills in, each from exactly one more batched
 //! loader in [`crate::services::render_status`] (see its module docs):
@@ -90,10 +91,14 @@
 //! pair are filled by the quoting ticket, from the quoted originals the
 //! service batch-loads and the one batched
 //! [`filter_visible`](crate::models::status_visibility::filter_visible)
-//! read that decides which of them this viewer may see: a visible quote
-//! renders nested — one level deep, the quoted status's own quote never
-//! rendering — and the same object lands in `pleroma.quote` beside its
-//! `quote_visible` flag, false exactly when `quote` is `null`. `quote_id`
+//! read that decides which of them this viewer may see. `quote` is
+//! Mastodon 4.4's Quote entity: `{state, quoted_status}` with state
+//! `accepted` (the bare quoted status rides in `quoted_status`),
+//! `unauthorized` (hidden from this viewer) or `deleted` (gone), and
+//! `null` when the row quotes nothing. The quoted status renders one
+//! level deep: its own `quote` is only `{state, quoted_status_id}`.
+//! The bare quoted status also lands in `pleroma.quote` beside its
+//! `quote_visible` flag, false unless the state is `accepted`. `quote_id`
 //! names the quoted row either way.
 //!
 //! This module is a tree. [`StatusSource`] — the batch a render consumes —
@@ -121,7 +126,11 @@ mod entity_render;
 #[cfg(test)]
 mod test_support;
 
-pub use self::{entity::Status, pleroma::PleromaMetadata, source::StatusSource};
+pub use self::{
+    entity::{QuoteEntity, QuoteRef, Status, StatusQuote},
+    pleroma::PleromaMetadata,
+    source::{QuoteSlot, StatusSource},
+};
 
 /// The `{"text/plain": …}` map the `pleroma` block renders for
 /// [`content`](PleromaMetadata::content) and

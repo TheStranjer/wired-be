@@ -185,12 +185,10 @@ fn follow_announcement(
     }))
 }
 
-/// The `Follow` behind the relationship row `row`: [`follow_json`] with its
-/// `id` replaced by the stored string — the builder mints ids from a fresh
-/// uuid and the row's `ap_id` is its own (decision 6), so only the stored
-/// text names the activity the peer was sent and must hear withdrawn.
-/// `None` when the row carries no id at all (a mirrored follow, which this
-/// instance does not own).
+/// The `Follow` behind the relationship row `row`: [`follow_json`] under
+/// the row's stored `ap_id` (decision 6), the text that names the activity
+/// the peer was sent and must hear withdrawn. `None` when the row carries
+/// no id at all (a mirrored follow, which this instance does not own).
 fn follow_document(
     state: &AppState,
     row: &Follow,
@@ -198,17 +196,13 @@ fn follow_document(
     target: &User,
 ) -> Option<Value> {
     let stored_id = row.ap_id.as_deref()?;
-    let mut document = follow_json(
+    Some(follow_json(
         &state.config,
-        row.id,
+        stored_id,
         &follower.ap_id,
         &target.ap_id,
         &row.inserted_at,
-    );
-    if let Some(fields) = document.as_object_mut() {
-        let _previous = fields.insert("id".to_owned(), json!(stored_id));
-    }
-    Some(document)
+    ))
 }
 
 #[cfg(test)]

@@ -246,8 +246,20 @@ fn relation_json(state: &AppState, resolved: &LocalActivity) -> AppResult<Value>
             };
             Ok(emoji_react_json(&context))
         }
-        LocalActivityKind::Follow => Ok(follow_json(config, id, actor, object, published)),
-        LocalActivityKind::Block => Ok(block_json(config, id, actor, object, published)),
+        LocalActivityKind::Follow => Ok(follow_json(
+            config,
+            &activity_id(config, id),
+            actor,
+            object,
+            published,
+        )),
+        LocalActivityKind::Block => Ok(block_json(
+            config,
+            &activity_id(config, id),
+            actor,
+            object,
+            published,
+        )),
         LocalActivityKind::Create | LocalActivityKind::Announce => Err(AppError::RouteNotFound),
     }
 }

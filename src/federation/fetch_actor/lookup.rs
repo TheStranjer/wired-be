@@ -18,10 +18,12 @@ use crate::{
     util::url::{is_local_url, parse_http_url},
 };
 
-use super::{FetchError, REFRESH_AFTER, error::server_error, fetch::fetch_and_store};
+use super::{
+    FetchError, REFRESH_AFTER, error::server_error, fetch::fetch_and_store, handle::Naming,
+};
 
 pub use by_acct::get_or_fetch_by_acct;
-pub use by_ap_id::get_or_fetch_by_ap_id;
+pub use by_ap_id::{get_or_fetch_by_ap_id, get_or_fetch_by_fingered_ap_id};
 
 pub(in crate::federation::fetch_actor) use by_acct::dev_webfinger_base;
 
@@ -44,7 +46,7 @@ pub async fn refresh_user(state: &AppState, user: &User) -> Result<User, FetchEr
             .map_err(|err| server_error(&err))?
             .ok_or(FetchError::NotFound);
     }
-    fetch_and_store(state, &user.ap_id).await
+    fetch_and_store(state, &user.ap_id, Naming::Confirm).await
 }
 
 /// Whether `stamp` falls inside the [`REFRESH_AFTER`] window; a mirror

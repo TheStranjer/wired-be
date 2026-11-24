@@ -140,7 +140,7 @@ async fn the_admin_view_nests_a_quote_the_public_view_hides() {
         "the id names the quote either way"
     );
     assert_eq!(
-        answer["quote"]["id"],
+        answer["quote"]["quoted_status"]["id"],
         secret.id.to_string(),
         "and the admin view renders the private quote itself"
     );
@@ -150,7 +150,7 @@ async fn the_admin_view_nests_a_quote_the_public_view_hides() {
     common::assert_answer(&client, StatusCode::OK, "the anonymous client read");
     assert_eq!(
         client.json_value()["quote"],
-        Value::Null,
+        json!({ "state": "unauthorized", "quoted_status": null }),
         "the anonymous client view keeps the same quote hidden"
     );
 }

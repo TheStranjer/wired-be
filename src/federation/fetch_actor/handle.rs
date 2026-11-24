@@ -23,6 +23,19 @@ use crate::{
 
 use super::lookup::dev_webfinger_base;
 
+/// Who settles a fetched actor's nickname before the mirror write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Naming {
+    /// The fetch asks `WebFinger` itself, through [`confirm_nickname`]: the
+    /// actor was reached by id, so no answer about its handle is at hand.
+    Confirm,
+    /// The caller just took the actor id from a `WebFinger` answer and
+    /// settles the handle from that answer itself, so a second lookup
+    /// would only repeat the question: [`keep_stored_nickname`] runs
+    /// instead.
+    Caller,
+}
+
 /// What asking `WebFinger` about an actor's derived handle came to.
 #[derive(Debug, PartialEq, Eq)]
 enum Verdict {
@@ -62,13 +75,19 @@ pub(super) async fn confirm_nickname(
     match ask_webfinger(state, &new_user.nickname, &new_user.ap_id).await {
         Verdict::Confirmed(handle) => new_user.nickname = handle,
         Verdict::Refuted => {}
-        Verdict::Unavailable => {
-            if let Some(row) = stored
-                && same_local_part(&row.nickname, &new_user.nickname)
-            {
-                new_user.nickname.clone_from(&row.nickname);
-            }
-        }
+        Verdict::Unavailable => keep_stored_nickname(stored, new_user),
+    }
+}
+
+/// Settles `new_user.nickname` without asking `WebFinger`: a stored
+/// nickname whose local part is the actor's `preferredUsername` is kept
+/// (a split-domain handle survives the refetch), and otherwise the
+/// parser's derived nickname stands.
+pub(super) fn keep_stored_nickname(stored: Option<&User>, new_user: &mut NewRemoteUser) {
+    if let Some(row) = stored
+        && same_local_part(&row.nickname, &new_user.nickname)
+    {
+        new_user.nickname.clone_from(&row.nickname);
     }
 }
 
@@ -152,7 +171,7 @@ mod tests {
     use super::*;
     use crate::{
         federation::{
-            fetch_actor::{get_or_fetch_by_ap_id, test_support::*},
+            fetch_actor::{get_or_fetch_by_ap_id, get_or_fetch_by_fingered_ap_id, test_support::*},
             remote_actor::{parse_actor, upsert_remote_user},
         },
         models::user::{get_by_nickname, set_nickname},
@@ -375,6 +394,123 @@ mod tests {
             0,
             "the derived nickname was already stored, so no lookup went out"
         );
+    }
+
+    /// Serves the self-identifying alice actor on `listener`, and a
+    /// `WebFinger` path that counts each lookup into `lookups` and answers
+    /// 404.
+    fn serve_counting(
+        listener: TcpListener,
+        base: &str,
+        lookups: &Arc<AtomicUsize>,
+    ) -> tokio::task::JoinHandle<()> {
+        spawn(
+            listener,
+            Router::new()
+                .route("/.well-known/webfinger", get(counting_not_found))
+                .with_state(Arc::clone(lookups))
+                .merge(
+                    Router::new()
+                        .route("/users/alice", get(self_actor))
+                        .with_state(peer_at(base)),
+                ),
+        )
+    }
+
+    #[tokio::test]
+    async fn a_fingered_fetch_asks_webfinger_nothing_more() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let listener = bind().await;
+        let base = origin(&listener);
+        let ap_id = format!("{base}/users/alice");
+        let lookups = Arc::new(AtomicUsize::new(0));
+        let server = serve_counting(listener, &base, &lookups);
+        let state = test_state(pool);
+
+        let user = get_or_fetch_by_fingered_ap_id(&state, &ap_id)
+            .await
+            .unwrap();
+
+        server.abort();
+        assert_eq!(
+            user.nickname,
+            format!("alice@{}", authority_of(&base)),
+            "the derived nickname, for the caller to settle"
+        );
+        assert_eq!(
+            lookups.load(Ordering::SeqCst),
+            0,
+            "the caller's own answer was the one WebFinger lookup"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_fingered_refresh_keeps_the_stored_split_nickname() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let listener = bind().await;
+        let base = origin(&listener);
+        let ap_id = format!("{base}/users/alice");
+        let mirrored = upsert_remote_user(&pool, parse_actor(&actor_document(&ap_id)).unwrap())
+            .await
+            .unwrap();
+        let _renamed = set_nickname(&pool, mirrored.id, "alice@split.example")
+            .await
+            .unwrap()
+            .expect("the split nickname is free");
+        make_stale(&pool, &ap_id).await;
+        let lookups = Arc::new(AtomicUsize::new(0));
+        let server = serve_counting(listener, &base, &lookups);
+        let state = test_state(pool);
+
+        let refreshed = get_or_fetch_by_fingered_ap_id(&state, &ap_id)
+            .await
+            .unwrap();
+
+        server.abort();
+        assert_eq!(refreshed.id, mirrored.id, "the same row");
+        assert!(
+            refreshed.last_fetched_at >= mirrored.last_fetched_at,
+            "the stale (back-dated) mirror was refetched"
+        );
+        assert_eq!(
+            refreshed.nickname, "alice@split.example",
+            "the stored split handle survives the refetch"
+        );
+        assert_eq!(lookups.load(Ordering::SeqCst), 0, "and no lookup went out");
+    }
+
+    #[tokio::test]
+    async fn a_fingered_refresh_drops_a_stored_nickname_of_another_local_part() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let listener = bind().await;
+        let base = origin(&listener);
+        let ap_id = format!("{base}/users/alice");
+        let mirrored = upsert_remote_user(&pool, parse_actor(&actor_document(&ap_id)).unwrap())
+            .await
+            .unwrap();
+        let _renamed = set_nickname(&pool, mirrored.id, "bob@split.example")
+            .await
+            .unwrap()
+            .expect("the other nickname is free");
+        make_stale(&pool, &ap_id).await;
+        let lookups = Arc::new(AtomicUsize::new(0));
+        let server = serve_counting(listener, &base, &lookups);
+        let state = test_state(pool);
+
+        let refreshed = get_or_fetch_by_fingered_ap_id(&state, &ap_id)
+            .await
+            .unwrap();
+
+        server.abort();
+        assert_eq!(
+            refreshed.nickname,
+            format!("alice@{}", authority_of(&base)),
+            "a handle naming another local part is not this actor's"
+        );
+        assert_eq!(lookups.load(Ordering::SeqCst), 0, "no lookup went out");
     }
 
     #[test]

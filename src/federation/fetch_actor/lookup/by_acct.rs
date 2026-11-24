@@ -14,7 +14,7 @@ use crate::{
     state::AppState,
 };
 
-use super::get_or_fetch_by_ap_id;
+use super::get_or_fetch_by_fingered_ap_id;
 
 /// Looks an account up by `acct` handle, resolving it through `WebFinger`
 /// and fetching the actor when this instance does not know it yet.
@@ -24,7 +24,8 @@ use super::get_or_fetch_by_ap_id;
 /// answers straight from the database, case-insensitively, with a handle
 /// carrying this instance's own domain folded to the bare local nickname
 /// (see [`get_by_acct`]). Otherwise the [`WebFinger`] resolver finds the
-/// actor URL and [`get_or_fetch_by_ap_id`] mirrors it. The fetched actor
+/// actor URL and [`get_or_fetch_by_fingered_ap_id`] mirrors it, without a
+/// second `WebFinger` lookup of its own. The fetched actor
 /// must then vouch for the handle: its `preferredUsername@host` has to
 /// equal `acct` case-insensitively (the Mastodon round trip), or the
 /// `WebFinger` subject has to name `acct` while the fetched actor is the
@@ -37,7 +38,7 @@ use super::get_or_fetch_by_ap_id;
 ///
 /// [`FetchError::Webfinger`] when the handle cannot be resolved,
 /// [`FetchError::AcctMismatch`] when the resolved actor denies it, and
-/// otherwise whatever [`get_or_fetch_by_ap_id`] reports.
+/// otherwise whatever [`get_or_fetch_by_fingered_ap_id`] reports.
 pub async fn get_or_fetch_by_acct(state: &AppState, acct: &str) -> Result<User, FetchError> {
     get_or_fetch_by_acct_with_base(state, acct, None).await
 }
@@ -67,7 +68,7 @@ async fn get_or_fetch_by_acct_with_base(
     let dev_base = dev_webfinger_base(&state.config, acct);
     let base = webfinger_base.or(dev_base.as_deref());
     let resolved = resolve_acct_with_base(&state.http_client, acct, base).await?;
-    let user = get_or_fetch_by_ap_id(state, &resolved.actor).await?;
+    let user = get_or_fetch_by_fingered_ap_id(state, &resolved.actor).await?;
     if acct_matches(&user.nickname, acct) {
         return Ok(user);
     }

@@ -4,7 +4,7 @@ Rules for anyone (human or AI) changing this codebase.
 
 ## The gate, and what you do before it
 
-`scripts/ci.sh` runs every check: a tracked-file length gate, `cargo fmt --check`, Clippy, the whole test suite, and rustdoc with warnings denied. It takes 10–20 minutes. It keeps going after a failure, so one run reports everything that's broken, and it exits 0 only when all checks pass. `.github/workflows/ci.yml` runs this same script. To add a check, add it to the script, not the workflow.
+`scripts/ci.sh` runs every check: a tracked-file length gate, a duplicate migration version gate, `cargo fmt --check`, Clippy, the whole test suite, and rustdoc with warnings denied. It takes 10–20 minutes. It keeps going after a failure, so one run reports everything that's broken, and it exits 0 only when all checks pass. `.github/workflows/ci.yml` runs this same script. To add a check, add it to the script, not the workflow.
 
 **The gate runs at the end, and not by you.** The harness runs it after you finish (CI runs it again on the push). A change is only done when that run is green, but **you never compile, test or lint the code yourself**: no `scripts/ci.sh`, no `cargo check`, `cargo build`, `cargo test`, `cargo clippy` or `cargo doc`, filtered or not. Every worktree on this machine shares one build directory and one build lock, so each of those runs stalls every other agent; the gate does all of it anyway.
 
@@ -27,7 +27,8 @@ You may run only the commands in the allowlist below, from the repository root. 
 |---|---|
 | Format | `cargo fmt`, `cargo fmt --check` |
 | Dependencies | `cargo add <crate>` |
-| Migrations | `sqlx migrate add <name>` |
+| Migrations | `sqlx migrate add <name>`, the only way to create one (see "Database and configuration") |
+| Move and delete files | `mv`, `rm`, `git mv`, `git rm`, inside the repository |
 | Read files (if no tool exists) | `ls`, `cat`, `head`, `tail` (never `-f`), `diff`, `find` (read-only), `grep`/`rg` |
 | Git, read-only | `git status`, `git diff`, `git log`, `git show`, `git branch` |
 | Git, write | `git switch -c <branch>`, `git add <paths>`, `git commit` |
@@ -39,7 +40,7 @@ Everything else is forbidden. The gate (`scripts/ci.sh`) and every command that 
 - **Sleeping and polling**: `sleep`, `timeout`, `watch`, `tail -f`, `while`/`until`/`for` loops that re-check a condition, and any retry loop. Never wait for time to pass.
 - **Background or long-lived processes**: `&`, `nohup`, `disown`, `setsid`, `screen`, `tmux`, `cargo run`, `cargo watch`, starting the server, starting PostgreSQL, `docker`, `systemctl`. Every command runs in the foreground, once, and finishes by itself. Test the app with `tower::ServiceExt::oneshot`, not a running server.
 - **Network and system changes**: `curl`, `wget`, `ssh`, `sudo`, `apt`, `pacman`, `pip`, `npm`, `rustup`, `cargo install`, editing anything outside the repository.
-- **Destructive or history-rewriting commands**: `rm` in any form, `cargo clean`, `git push`, `git reset --hard`, `git checkout -- <path>`, `git clean`, `git stash`, `git rebase`, `git commit --amend`, `--force`, `--no-verify`, `sqlx database drop`, `psql` with anything but a `SELECT`.
+- **Destructive or history-rewriting commands**: `cargo clean`, `git push`, `git reset --hard`, `git checkout -- <path>`, `git clean`, `git stash`, `git rebase`, `git commit --amend`, `--force`, `--no-verify`, `sqlx database drop`, `psql` with anything but a `SELECT`.
 - **Escape hatches**: `eval`, `bash -c`, `sh -c`, `xargs` into other commands, `python`/`perl`/`node` one-liners, and `sed -i`/`awk` to edit files. Edit files with the editing tool.
 
 ### Running commands
@@ -86,6 +87,7 @@ Everything else is forbidden. The gate (`scripts/ci.sh`) and every command that 
 
 - PostgreSQL is the only database. Use `sqlx` with its Postgres driver; don't add other database backends or ORMs.
 - Schema changes go in `sqlx` migrations under `migrations/` (`sqlx migrate add <name>`), never ad-hoc SQL run by hand.
+- Never write a migration's version by hand. `sqlx migrate add` stamps it from the clock, so migrations written on different branches practically never collide; a hand-picked round number like `20261123150000` can, and two migrations with one version break every database setup once both land. If `sqlx` is not found, stop and report it instead of making up a version. The gate fails when two migrations share a version.
 - Configuration comes only from environment variables, parsed in `src/config.rs`. To add a setting: add it to `Config`, give it a test, and document it in `.env.example` and the `README.md` table.
 - This repo will be public. Never commit secrets, real credentials, or `.env`. Don't log or `Debug`-print secrets (see the redacting `Debug` impl on `Config`).
 - Tests must not mutate the process environment. Pass values in through `Config::from_lookup` instead.

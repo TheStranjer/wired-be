@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # scripts/ci.sh — run every linter and test in one command: a tracked-file
-# length gate, rustfmt, Clippy, the test suite, and rustdoc. These are the same checks
+# length gate, a duplicate-migration-version gate, rustfmt, Clippy, the test
+# suite, and rustdoc. These are the same checks
 # .github/workflows/ci.yml runs on every push (it calls this script), so a
 # clean run here is a green pipeline there.
 #
@@ -132,6 +133,28 @@ check_file_lengths() {
   return 1
 }
 
+# check_migration_versions — no two files under migrations/ may share a
+# version (the digits before the first underscore). sqlx records each
+# version once, so a duplicate fails every database setup with a
+# `_sqlx_migrations_pkey` violation. Each branch is clean on its own; the
+# collision appears once two branches that hand-picked the same version
+# both land, so this check names the files instead of leaving the test
+# suite to fail in every database-backed test.
+check_migration_versions() {
+  local duplicates
+  duplicates=$(git ls-files -- 'migrations/*.sql' | sed -E 's#^migrations/([0-9]+)_.*#\1#' |
+    sort | uniq -d)
+  [[ -z "$duplicates" ]] && return 0
+
+  local version
+  while IFS= read -r version; do
+    printf 'migration version %s is used by:\n' "$version"
+    git ls-files -- "migrations/${version}_*" | sed 's/^/  /'
+  done <<< "$duplicates"
+  printf 'keep one per version and move the rest to fresh versions from `sqlx migrate add`\n'
+  return 1
+}
+
 # check_formatting — rustfmt in check mode, naming each misformatted file
 # rather than printing its diff.
 check_formatting() {
@@ -198,6 +221,7 @@ without_lint_boilerplate() {
 }
 
 step 'file length' check_file_lengths
+step 'migration versions' check_migration_versions
 step 'rustfmt' check_formatting
 step 'Clippy' without_lint_boilerplate \
   cargo clippy --quiet --locked --keep-going --all-targets --all-features

@@ -71,7 +71,8 @@ pub use contexts::{
 };
 pub use interactions::{announce_json, emoji_react_json, like_json, undo_json};
 pub use relations::{
-    accept_json, add_json, block_json, flag_json, follow_json, move_json, reject_json, remove_json,
+    FollowActivity, accept_json, add_json, block_json, flag_json, follow_json, follow_json_to,
+    move_json, reject_json, remove_json,
 };
 
 /// The `ActivityStreams` public addressing collection: the `cc` entry of a
