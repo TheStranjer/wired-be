@@ -9,8 +9,8 @@
 //! ([`timeline_response`], with the `Link` header and the filter-parameter
 //! readers the timeline routes and the account status listing share), the
 //! two account-lifecycle writes the two admin surfaces share
-//! ([`start_deletion`] and [`approve_account`]), and more as later tickets
-//! need it.
+//! ([`start_deletion`] and [`approve_account`]), the logged activation write
+//! beside them ([`set_activation`]), and more as later tickets need it.
 
 use std::{collections::HashSet, hash::Hash};
 
@@ -48,10 +48,12 @@ use crate::{
 
 mod account_page;
 mod accounts;
+mod activation;
 mod visible;
 
 pub use account_page::{AccountPageEntry, account_page, empty_account_page};
 pub use accounts::{accounts_with_relationships, expand_accounts};
+pub use activation::set_activation;
 pub use visible::{keyed_json, render_visible};
 
 /// The `RESTRICT_UNAUTHENTICATED` area that closes anonymous reads of a

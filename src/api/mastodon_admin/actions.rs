@@ -16,13 +16,14 @@ use super::{
     reads::named_account,
 };
 use crate::{
+    api::helpers,
     auth::admin::AdminUser,
     error::{AppError, AppResult},
     extract::ApiBody,
     models::{
         moderation_log,
         report::{self, ReportState},
-        user::{User, admin},
+        user::User,
     },
     services::report_moderation::set_report_state,
     state::AppState,
@@ -107,12 +108,11 @@ async fn apply_action(
     action: AccountAction,
 ) -> AppResult<()> {
     if action.deactivates() {
-        let moved = admin::set_active(&state.db, account.id, false)
+        let moved = helpers::set_activation(state, actor, slice::from_ref(account), false)
             .await?
+            .pop()
             .ok_or(AppError::NotFound)?;
-        let logged = moderation_log::deactivate(&state.db, actor, slice::from_ref(&moved)).await?;
         debug!(
-            log = %logged.id,
             account = %moved.id,
             "admin action deactivated an account"
         );
