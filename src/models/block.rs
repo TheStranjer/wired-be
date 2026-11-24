@@ -49,6 +49,7 @@
 //! own `blocker_id` and `blocked_id` names.
 
 use chrono::{DateTime, Utc};
+use sqlx::{Postgres, QueryBuilder};
 use uuid::Uuid;
 
 use crate::models::user::User;
@@ -67,6 +68,22 @@ pub use write::{block, unblock};
 /// wording this ticket pins for the endpoint (Pleroma's changeset refuses the
 /// self relationship for every edge type the same way).
 const SELF_BLOCK: &str = "Can not block yourself";
+
+/// Appends ` AND NOT EXISTS (...)` hiding every row whose author is one of
+/// `author_exprs` (SQL expressions, never client input) when `viewer_id`
+/// blocks that author; binds `viewer_id` once.
+pub(crate) fn push_not_blocked(
+    builder: &mut QueryBuilder<Postgres>,
+    viewer_id: Uuid,
+    author_exprs: &[&str],
+) {
+    let _open: &mut _ = builder
+        .push(" AND NOT EXISTS (SELECT 1 FROM blocks b WHERE b.blocker_id = ")
+        .push_bind(viewer_id)
+        .push(" AND b.blocked_id IN (")
+        .push(author_exprs.join(", "))
+        .push("))");
+}
 
 /// One row of `blocks`: the `blocker_id` account blocks the `blocked_id`
 /// one, plus the `ActivityPub` id of the `Block` activity behind it.
@@ -110,4 +127,23 @@ struct BlockUserRow {
     /// The blocked account, decoded from the join's unaliased `u.*`.
     #[sqlx(flatten)]
     user: User,
+}
+
+#[cfg(test)]
+mod push_tests {
+    use super::*;
+
+    /// `push_not_blocked` lists every expression and binds the viewer once.
+    #[test]
+    fn push_not_blocked_lists_the_authors_and_binds_the_viewer_once() {
+        let mut builder = QueryBuilder::<Postgres>::new("SELECT 1");
+        push_not_blocked(&mut builder, Uuid::nil(), &["u.id", "x.author"]);
+        let sql = builder.sql().as_str().to_owned();
+        assert!(
+            sql.contains("b.blocked_id IN (u.id, x.author)"),
+            "every expression is in the list: {sql}"
+        );
+        assert!(sql.contains("$1"), "the viewer is bound: {sql}");
+        assert!(!sql.contains("$2"), "and nothing else is: {sql}");
+    }
 }

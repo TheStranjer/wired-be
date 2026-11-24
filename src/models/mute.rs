@@ -46,6 +46,7 @@
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
+use sqlx::{Postgres, QueryBuilder};
 use uuid::Uuid;
 
 use crate::models::user::User;
@@ -66,6 +67,28 @@ pub use self::{
 /// wording this ticket pins for the endpoint (Pleroma's changeset refuses the
 /// self relationship for every edge type the same way).
 const SELF_MUTE: &str = "Can not mute yourself";
+
+/// The live-mute test over a `mutes` row aliased `m`: an indefinite mute
+/// counts, a mute at or past its expiry does not.
+pub(crate) const LIVE_MUTE_M: &str = "(m.expires_at IS NULL OR m.expires_at > now())";
+
+/// Appends ` AND NOT EXISTS (...)` hiding every row whose author is one of
+/// `author_exprs` (SQL expressions, never client input) when `viewer_id`
+/// still mutes that author ([`LIVE_MUTE_M`]); binds `viewer_id` once.
+pub(crate) fn push_not_muted(
+    builder: &mut QueryBuilder<Postgres>,
+    viewer_id: Uuid,
+    author_exprs: &[&str],
+) {
+    let _open: &mut _ = builder
+        .push(" AND NOT EXISTS (SELECT 1 FROM mutes m WHERE m.muter_id = ")
+        .push_bind(viewer_id)
+        .push(" AND m.muted_id IN (")
+        .push(author_exprs.join(", "))
+        .push(") AND ")
+        .push(LIVE_MUTE_M)
+        .push(")");
+}
 
 /// One row of `mutes`: the `muter_id` account hides the `muted_id` one, with
 /// the two Mastodon options the write was given.
@@ -172,4 +195,28 @@ fn into_entry(row: MuteUserRow) -> (Mute, User) {
         inserted_at: row.mute_inserted_at,
     };
     (mute, row.user)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `push_not_muted` emits the live-mute test, one `IN` list over every
+    /// expression, and binds the viewer exactly once.
+    #[test]
+    fn push_not_muted_tests_expiry_and_binds_the_viewer_once() {
+        let mut builder = QueryBuilder::<Postgres>::new("SELECT 1");
+        push_not_muted(&mut builder, Uuid::nil(), &["s.user_id", "x.author"]);
+        let sql = builder.sql().as_str().to_owned();
+        assert!(
+            sql.contains("expires_at"),
+            "the live-mute test is there: {sql}"
+        );
+        assert!(
+            sql.contains("m.muted_id IN (s.user_id, x.author)"),
+            "every expression is in the list: {sql}"
+        );
+        assert!(sql.contains("$1"), "the viewer is bound: {sql}");
+        assert!(!sql.contains("$2"), "and nothing else is: {sql}");
+    }
 }
