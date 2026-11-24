@@ -45,7 +45,11 @@ use sqlx::{PgPool, Postgres, QueryBuilder};
 
 use crate::{
     error::AppResult,
-    models::user::{NOT_INSTANCE_ACTOR_U, User},
+    models::{
+        block::push_not_blocked,
+        mute::push_not_muted,
+        user::{NOT_INSTANCE_ACTOR_U, User},
+    },
 };
 
 /// The knobs of one [`search_accounts`] call: the page and the two flags
@@ -228,18 +232,12 @@ fn push_exclusions(builder: &mut QueryBuilder<Postgres>, viewer: Option<&User>, 
             .push(")");
         return;
     }
-    let _viewer_blocks: &mut _ = builder
-        .push(" AND NOT EXISTS (SELECT 1 FROM blocks b2 WHERE b2.blocker_id = ")
-        .push_bind(viewer_id)
-        .push(" AND b2.blocked_id = u.id)");
+    push_not_blocked(builder, viewer_id, &["u.id"]);
     let _blocked_domain: &mut _ = builder
         .push(" AND NOT EXISTS (SELECT 1 FROM user_domain_blocks udb WHERE udb.user_id = ")
         .push_bind(viewer_id)
         .push(" AND udb.domain = u.domain)");
-    let _viewer_mutes: &mut _ = builder
-        .push(" AND NOT EXISTS (SELECT 1 FROM mutes m WHERE m.muter_id = ")
-        .push_bind(viewer_id)
-        .push(" AND m.muted_id = u.id AND (m.expires_at IS NULL OR m.expires_at > now()))");
+    push_not_muted(builder, viewer_id, &["u.id"]);
 }
 
 /// Appends the `ORDER BY` of the ticket's ranking: exact nickname match,

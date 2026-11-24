@@ -26,8 +26,8 @@ const EXCLUDE_BLOCKED_SQL: &str = " AND NOT EXISTS (SELECT 1 FROM blocks b \
      WHERE b.blocker_id = c.user_id AND b.blocked_id = c.recipient_id)";
 
 /// What the list hides unless `with_muted`: a chat whose counterpart the owner
-/// has a live mute on, the same live-mute test as `MUTE_LIVE_ARMS` in
-/// `status_search.rs` (no expiry, or one still ahead).
+/// has a live mute on, the same live-mute test as `LIVE_MUTE_M` in
+/// `models/mute.rs` (no expiry, or one still ahead).
 const EXCLUDE_MUTED_SQL: &str = " AND NOT EXISTS (SELECT 1 FROM mutes m \
      WHERE m.muter_id = c.user_id AND m.muted_id = c.recipient_id \
      AND (m.expires_at IS NULL OR m.expires_at > now()))";

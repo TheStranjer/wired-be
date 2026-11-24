@@ -5,9 +5,9 @@
 use sqlx::{Postgres, QueryBuilder};
 use uuid::Uuid;
 
-use crate::models::user::User;
+use crate::models::{block::push_not_blocked, mute::push_not_muted, user::User};
 
-use super::{ACCEPTED_FOLLOW_STATE, MUTE_LIVE_ARMS, REBLOG_AUTHOR_SQL, ReplyVisibility};
+use super::{ACCEPTED_FOLLOW_STATE, REBLOG_AUTHOR_SQL, ReplyVisibility};
 
 /// Appends the `reply_visibility` group for `visibility`, judged by the
 /// reply's stored target (`in_reply_to_account_id`) and @-mentions;
@@ -117,27 +117,14 @@ pub(super) fn push_mute_exclusions(builder: &mut QueryBuilder<Postgres>, viewer:
 /// The block arm: neither the row's author nor the author of the original
 /// it reblogs may be an account the viewer blocks.
 fn push_author_edge_exclusion(builder: &mut QueryBuilder<Postgres>, viewer_id: Uuid) {
-    let _blocked: &mut _ = builder
-        .push(" AND NOT EXISTS (SELECT 1 FROM blocks b WHERE b.blocker_id = ")
-        .push_bind(viewer_id)
-        .push(" AND (b.blocked_id = s.user_id OR b.blocked_id = ")
-        .push(REBLOG_AUTHOR_SQL)
-        .push("))");
+    push_not_blocked(builder, viewer_id, &["s.user_id", REBLOG_AUTHOR_SQL]);
 }
 
 /// The mute arm, [`push_author_edge_exclusion`]'s shape with the
-/// live-mutes test ([`MUTE_LIVE_ARMS`]) on: an expired mute hides nothing,
-/// the same way it counts for nothing in every other read of
-/// [`crate::models::mute`].
+/// live-mutes test on: an expired mute hides nothing, the same way it counts
+/// for nothing in every other read of [`crate::models::mute`].
 fn push_muted_edge_exclusion(builder: &mut QueryBuilder<Postgres>, viewer_id: Uuid) {
-    let _muted: &mut _ = builder
-        .push(" AND NOT EXISTS (SELECT 1 FROM mutes m WHERE m.muter_id = ")
-        .push_bind(viewer_id)
-        .push(" AND (m.muted_id = s.user_id OR m.muted_id = ")
-        .push(REBLOG_AUTHOR_SQL)
-        .push(")")
-        .push(MUTE_LIVE_ARMS)
-        .push(")");
+    push_not_muted(builder, viewer_id, &["s.user_id", REBLOG_AUTHOR_SQL]);
 }
 
 #[cfg(test)]
