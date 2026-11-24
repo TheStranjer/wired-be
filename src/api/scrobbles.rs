@@ -63,10 +63,17 @@ use crate::{
     oauth::scopes::WRITE,
     pagination::{PageParams, link_header, set_link_header},
     state::AppState,
+    util::url::is_http_url,
 };
 
 /// The longest title the endpoint accepts (the ticket's 255).
 const MAX_TITLE_CHARS: usize = 255;
+/// The longest artist or album the endpoint accepts.
+const MAX_TEXT_CHARS: usize = 255;
+/// The longest external link the endpoint accepts.
+const MAX_LINK_CHARS: usize = 2048;
+/// 422 body for an external link that is too long or not an `http(s)` URL.
+const LINK_INVALID: &str = "externalLink: is invalid";
 /// 422 body for an absent or blank title, in Pleroma's changeset wording
 /// (`"title: can't be blank"`, the `validate_required` message its
 /// `ApiSpec`-style errors are reported with).
@@ -231,13 +238,53 @@ impl ScrobbleParams {
     fn into_new_scrobble(self) -> AppResult<NewScrobble> {
         Ok(NewScrobble {
             title: validate_title(self.title)?,
-            artist: self.artist,
-            album: self.album,
+            artist: validate_optional_text("artist", self.artist, MAX_TEXT_CHARS)?,
+            album: validate_optional_text("album", self.album, MAX_TEXT_CHARS)?,
             length: self.length,
-            external_link: self.external_link.or(self.external_link_camel),
+            external_link: validate_link(self.external_link.or(self.external_link_camel))?,
             visibility: validate_visibility(self.visibility)?,
         })
     }
+}
+
+/// An optional free-text field, checked: blank or absent is `None`, longer
+/// than `max` characters is 422 `"<field>: is too long (maximum is <max>
+/// characters)"`; a kept value is stored verbatim.
+///
+/// # Errors
+///
+/// [`AppError::Unprocessable`] as described above.
+fn validate_optional_text(
+    field: &str,
+    value: Option<String>,
+    max: usize,
+) -> AppResult<Option<String>> {
+    let Some(text) = value.filter(|text| !text.trim().is_empty()) else {
+        return Ok(None);
+    };
+    if text.chars().count() > max {
+        return Err(AppError::Unprocessable(format!(
+            "{field}: is too long (maximum is {max} characters)"
+        )));
+    }
+    Ok(Some(text))
+}
+
+/// The external link, checked: blank or absent is `None`; otherwise at most
+/// [`MAX_LINK_CHARS`] characters and an absolute `http(s)` URL, else 422
+/// [`LINK_INVALID`]. A kept link is stored verbatim.
+///
+/// # Errors
+///
+/// [`AppError::Unprocessable`] as described above.
+fn validate_link(link: Option<String>) -> AppResult<Option<String>> {
+    let Some(text) = link.filter(|text| !text.trim().is_empty()) else {
+        return Ok(None);
+    };
+    if text.chars().count() > MAX_LINK_CHARS || !is_http_url(&text) {
+        return Err(AppError::Unprocessable(LINK_INVALID.to_owned()));
+    }
+    Ok(Some(text))
 }
 
 /// The title, checked: absent or blank is 422 [`TITLE_BLANK`], longer than
@@ -468,6 +515,92 @@ mod tests {
             both.external_link.as_deref(),
             Some("https://example.test/snake"),
             "and `external_link` wins, as in Pleroma's `put_new`"
+        );
+    }
+
+    #[test]
+    fn artist_and_album_are_capped_at_the_maximum_length() {
+        for field in ["artist", "album"] {
+            let edge = "x".repeat(MAX_TEXT_CHARS);
+            let new = new_scrobble(json!({"title": "x", field: edge.as_str()}))
+                .unwrap_or_else(|err| panic!("255 characters of {field} fit: {err}"));
+            let kept = if field == "artist" {
+                new.artist
+            } else {
+                new.album
+            };
+            assert_eq!(kept.as_deref(), Some(edge.as_str()), "{field} is verbatim");
+
+            assert_eq!(
+                rejection(json!({"title": "x", field: "x".repeat(MAX_TEXT_CHARS + 1)})),
+                format!("{field}: is too long (maximum is 255 characters)"),
+                "256 characters of {field} do not"
+            );
+        }
+    }
+
+    #[test]
+    fn a_blank_artist_or_album_becomes_none() {
+        let new = new_scrobble(json!({"title": "x", "artist": "  ", "album": ""}))
+            .expect("blank metadata validates");
+        assert!(new.artist.is_none(), "a blank artist is NULL");
+        assert!(new.album.is_none(), "a blank album is NULL");
+    }
+
+    #[test]
+    fn a_non_http_link_is_rejected() {
+        for link in [
+            "javascript:alert(1)",
+            "data:text/html,x",
+            "ftp://music.example/t/1",
+            "music.example/t/1",
+            "not a url",
+        ] {
+            for key in ["externalLink", "external_link"] {
+                assert_eq!(
+                    rejection(json!({"title": "x", key: link})),
+                    LINK_INVALID,
+                    "`{link}` under `{key}` is no http(s) link"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_http_link_passes_and_a_blank_one_becomes_none() {
+        for link in ["https://music.example/t/1", "http://music.example/t/1"] {
+            let new = new_scrobble(json!({"title": "x", "externalLink": link}))
+                .unwrap_or_else(|err| panic!("`{link}` is valid: {err}"));
+            assert_eq!(new.external_link.as_deref(), Some(link), "kept verbatim");
+        }
+        for blank in [json!(""), json!("   "), json!(null)] {
+            let new = new_scrobble(json!({"title": "x", "externalLink": blank}))
+                .expect("a blank link validates");
+            assert!(new.external_link.is_none(), "`{blank}` is NULL");
+        }
+    }
+
+    #[test]
+    fn a_link_longer_than_the_maximum_is_rejected() {
+        let prefix = "https://music.example/";
+        let edge = format!("{prefix}{}", "a".repeat(MAX_LINK_CHARS - prefix.len()));
+        assert_eq!(
+            edge.chars().count(),
+            MAX_LINK_CHARS,
+            "the fixture is at the cap"
+        );
+        let new = new_scrobble(json!({"title": "x", "externalLink": edge.as_str()}))
+            .expect("2048 characters fit");
+        assert_eq!(
+            new.external_link.as_deref(),
+            Some(edge.as_str()),
+            "verbatim"
+        );
+
+        assert_eq!(
+            rejection(json!({"title": "x", "externalLink": format!("{edge}a")})),
+            LINK_INVALID,
+            "2049 do not"
         );
     }
 
