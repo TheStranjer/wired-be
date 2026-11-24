@@ -88,6 +88,7 @@ use crate::{
     models::{follow, suggestion, user, user::User},
     oauth::scopes::{READ, READ_ACCOUNTS, READ_FOLLOWS, WRITE_ACCOUNTS},
     pagination::{MAX_LIMIT, PageParams},
+    services::account_emojis::AccountEmojis,
     state::AppState,
 };
 
@@ -209,7 +210,9 @@ async fn directory(
         local_only = filters.local_only,
         "directory listed"
     );
-    Ok(Json(render_accounts(&state, viewer.as_ref(), &accounts)))
+    Ok(Json(
+        render_accounts(&state, viewer.as_ref(), &accounts).await?,
+    ))
 }
 
 /// `GET /api/v1/suggestions` — the staff pool as the caller sees it, in the
@@ -227,7 +230,7 @@ async fn suggestions(
     uri: Uri,
 ) -> AppResult<Json<Vec<Account>>> {
     let pool = suggested_pool(&state, &auth, uri.query()).await?;
-    Ok(Json(render_accounts(&state, Some(&auth.0), &pool)))
+    Ok(Json(render_accounts(&state, Some(&auth.0), &pool).await?))
 }
 
 /// `GET /api/v2/suggestions` — the same pool, each entry wrapped in its
@@ -242,12 +245,17 @@ async fn suggestions_v2(
     uri: Uri,
 ) -> AppResult<Json<Vec<SuggestedAccount>>> {
     let pool = suggested_pool(&state, &auth, uri.query()).await?;
+    let emojis = AccountEmojis::load_all(&state.db, &pool).await?;
     let accounts = pool
         .iter()
         .map(|account| SuggestedAccount {
             source: SOURCE_STAFF,
             sources: [SOURCE_STAFF],
-            account: Account::from_user_for(Some(&auth.0), account, &state.config, None),
+            account: emojis.fill(
+                Account::from_user_for(Some(&auth.0), account, &state.config, None),
+                account,
+                &state.config,
+            ),
         })
         .collect();
     Ok(Json(accounts))
@@ -377,7 +385,7 @@ async fn familiar_entry(
     };
     Ok(FamiliarFollowers {
         id: target.id.to_string(),
-        accounts: render_accounts(state, Some(viewer), &followers),
+        accounts: render_accounts(state, Some(viewer), &followers).await?,
     })
 }
 
@@ -413,7 +421,9 @@ async fn birthdays(
         day,
         "birthdays listed"
     );
-    Ok(Json(render_accounts(&state, Some(&auth.0), &accounts)))
+    Ok(Json(
+        render_accounts(&state, Some(&auth.0), &accounts).await?,
+    ))
 }
 
 /// The `month`/`day` a birthday listing answers for, read from `query` over
@@ -494,12 +504,25 @@ impl DirectoryFilters {
 ///
 /// `pleroma.relationship` stays the empty object Pleroma renders for a
 /// viewer with no relationship loaded: none of these listings is a
-/// relationship endpoint, so none runs the batch loader for it.
-fn render_accounts(state: &AppState, viewer: AccountViewer<'_>, users: &[User]) -> Vec<Account> {
-    users
+/// relationship endpoint, so none runs the batch loader for it. The
+/// profile emojis of the whole page are one [`AccountEmojis`] load.
+///
+/// # Errors
+///
+/// Any database failure arrives as [`AppError::Database`].
+async fn render_accounts(
+    state: &AppState,
+    viewer: AccountViewer<'_>,
+    users: &[User],
+) -> AppResult<Vec<Account>> {
+    let emojis = AccountEmojis::load_all(&state.db, users).await?;
+    Ok(users
         .iter()
-        .map(|found| Account::from_user_for(viewer, found, &state.config, None))
-        .collect()
+        .map(|found| {
+            let account = Account::from_user_for(viewer, found, &state.config, None);
+            emojis.fill(account, found, &state.config)
+        })
+        .collect())
 }
 
 #[cfg(test)]

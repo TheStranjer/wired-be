@@ -4,19 +4,14 @@
 use serde_json::Value;
 
 use crate::{
-    federation::json::{as_array, first_string, value_or_id},
+    federation::{
+        emoji_tag::parse_emoji_tag,
+        json::{as_array, value_or_id},
+    },
     models::{hashtag::normalize_name, user::User},
-    util::{emoji, url::is_http_url},
 };
 
-/// The longest emoji shortcode kept, in bytes (the name is ASCII once it
-/// validates); Mastodon allows 2048 federated, a picker has no use for that.
-const MAX_SHORTCODE_BYTES: usize = 128;
-
-use super::{
-    MAX_TAGS,
-    types::{RemoteEmoji, TagSets},
-};
+use super::{MAX_TAGS, types::TagSets};
 
 /// The first `tag` entry of each kind, [`MAX_TAGS`] entries examined at
 /// most; unknown tag types and non-object entries are ignored (Pleroma's
@@ -34,7 +29,9 @@ pub(super) fn parse_tags(json: &Value, author: &User) -> TagSets {
                 .mention_hrefs
                 .extend(entry.get("href").and_then(value_or_id)),
             Some("Hashtag") => sets.hashtags.extend(parse_hashtag(entry)),
-            Some("Emoji") => sets.emojis.extend(parse_emoji(entry, author)),
+            Some("Emoji") => sets
+                .emojis
+                .extend(parse_emoji_tag(entry, author.domain.as_deref())),
             Some(_) | None => {}
         }
     }
@@ -48,36 +45,15 @@ fn parse_hashtag(entry: &Value) -> Option<String> {
     normalize_name(entry.get("name").and_then(Value::as_str)?)
 }
 
-/// One `Emoji` tag: the colon-stripped `name` and the first `http(s)` url
-/// under `icon`, in the author's domain (Pleroma's `fix_emoji` reads the
-/// same fields). A tag with neither is skipped, and so is one whose name is
-/// no shortcode (`[A-Za-z0-9_+-]+`, a superset of Pleroma's matcher) or is
-/// over [`MAX_SHORTCODE_BYTES`] long.
-fn parse_emoji(entry: &Value, author: &User) -> Option<RemoteEmoji> {
-    let trimmed = entry.get("name").and_then(Value::as_str)?.trim_matches(':');
-    if trimmed.len() > MAX_SHORTCODE_BYTES || emoji::shortcode(&format!(":{trimmed}:")).is_none() {
-        return None;
-    }
-    let shortcode = trimmed.to_owned();
-    let url = entry
-        .get("icon")
-        .map_or_default(as_array)
-        .iter()
-        .filter_map(first_string)
-        .find(|candidate| is_http_url(candidate))?;
-    Some(RemoteEmoji {
-        shortcode,
-        url,
-        domain: author.domain.clone(),
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::federation::note_parser::test_support::*;
+    use crate::federation::{
+        emoji_tag::MAX_SHORTCODE_BYTES,
+        note_parser::{RemoteEmoji, test_support::*},
+    };
 
     #[test]
     fn the_mastodon_note_splits_its_tags() {

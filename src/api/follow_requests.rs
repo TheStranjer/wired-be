@@ -62,7 +62,7 @@ use crate::{
     pagination::{
         ACCOUNT_LIST_MAX_LIMIT, NO_EXTRA_QUERY, PageParams, keyset_link, set_link_header,
     },
-    services::{federation_out, notify},
+    services::{account_emojis::AccountEmojis, federation_out, notify},
     state::AppState,
     util::id::parse_id,
 };
@@ -121,9 +121,14 @@ async fn list_follow_requests(
     // embedded relationship here (`embed_relationships` is not set), so the
     // entries keep the empty `pleroma.relationship` object.
     let viewer: AccountViewer<'_> = Some(&auth.0);
+    let users: Vec<_> = entries.iter().map(|entry| &entry.user).collect();
+    let emojis = AccountEmojis::load(&state.db, &users).await?;
     let accounts = entries
         .iter()
-        .map(|entry| Account::from_user_for(viewer, &entry.user, &state.config, None))
+        .map(|entry| {
+            let account = Account::from_user_for(viewer, &entry.user, &state.config, None);
+            emojis.fill(account, &entry.user, &state.config)
+        })
         .collect();
     Ok((headers, Json(accounts)))
 }

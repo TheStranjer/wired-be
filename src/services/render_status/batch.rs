@@ -27,6 +27,7 @@ use crate::{
         status::Status as StatusRow,
         user::User,
     },
+    services::account_emojis::AccountEmojis,
     state::AppState,
 };
 
@@ -62,6 +63,13 @@ pub(super) struct Batch<'a> {
     ///
     /// [`custom_emoji::get_by_shortcodes`]: crate::models::custom_emoji::get_by_shortcodes
     emojis: HashMap<Uuid, Vec<EmojiRow>>,
+    /// The custom emojis the page's accounts use in their profiles, for the
+    /// embedded `account` of every rendered status — one
+    /// [`custom_emoji::get_by_shortcodes`] read per distinct account domain,
+    /// none when no profile text holds a shortcode.
+    ///
+    /// [`custom_emoji::get_by_shortcodes`]: crate::models::custom_emoji::get_by_shortcodes
+    account_emojis: AccountEmojis,
     /// The reblogged originals, keyed by id.
     originals: HashMap<Uuid, StatusRow>,
     /// The page's quoted originals, keyed by id — the module-docs step 2
@@ -192,6 +200,8 @@ impl<'a> Batch<'a> {
         let users = load_users(pool, &ids.accounts).await?;
         let shown = rendered_rows(rows, &originals, &quoted, &visible_quotes);
         let emojis = load_row_emojis(pool, &shown, &users, &poll_options).await?;
+        let authors: Vec<&User> = users.values().collect();
+        let account_emojis = AccountEmojis::load(pool, &authors).await?;
         debug!(
             rows = shown.len(),
             with_emojis = emojis.len(),
@@ -202,6 +212,7 @@ impl<'a> Batch<'a> {
             viewer,
             users,
             emojis,
+            account_emojis,
             originals,
             quoted,
             visible_quotes,
@@ -382,12 +393,16 @@ impl<'a> Batch<'a> {
                     .is_none_or(|parent| self.visible_parents.contains(&parent)),
             ),
         };
-        Some(Status::from_source(
+        let mut entity = Status::from_source(
             source,
             self.viewer,
             self.relationships.as_ref(),
             self.config,
-        ))
+        );
+        entity.account = self
+            .account_emojis
+            .fill(entity.account, author, self.config);
+        Some(entity)
     }
 
     /// The [`Poll`] entity of `row`: `None` when the batch's poll read

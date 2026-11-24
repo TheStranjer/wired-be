@@ -11,7 +11,10 @@ use crate::{
         hashtag, status::Status as StatusRow, status_search, status_visibility, user::User,
         user_search,
     },
-    services::render_status::{ViewerMode, render_statuses},
+    services::{
+        account_emojis::AccountEmojis,
+        render_status::{ViewerMode, render_statuses},
+    },
     state::AppState,
 };
 
@@ -144,23 +147,30 @@ pub(super) async fn account_rows(
 /// endpoints, so `pleroma.relationship` stays the empty object), with the
 /// account the request resolved riding first — and left out of `rows` when
 /// the fetch answered a row that is in the page after all, so one account is
-/// never listed twice.
-pub(super) fn account_entities(
+/// never listed twice. Every entity carries the custom emojis its profile
+/// uses, loaded once for the whole page.
+///
+/// # Errors
+///
+/// Any database failure arrives through `?` as
+/// [`AppError::Database`](crate::error::AppError).
+pub(super) async fn account_entities(
     state: &AppState,
     viewer: Option<&User>,
     rows: &[User],
     resolved: Option<&User>,
-) -> Vec<Account> {
-    let mut accounts: Vec<Account> = rows
+) -> AppResult<Vec<Account>> {
+    let listed: Vec<&User> = rows
         .iter()
         .filter(|row| resolved.is_none_or(|found| row.id != found.id))
-        .map(|found| Account::from_user_for(viewer, found, &state.config, None))
         .collect();
-    if let Some(found) = resolved {
-        accounts.insert(
-            0,
-            Account::from_user_for(viewer, found, &state.config, None),
-        );
-    }
-    accounts
+    let page: Vec<&User> = resolved.into_iter().chain(listed).collect();
+    let emojis = AccountEmojis::load(&state.db, &page).await?;
+    Ok(page
+        .into_iter()
+        .map(|found| {
+            let account = Account::from_user_for(viewer, found, &state.config, None);
+            emojis.fill(account, found, &state.config)
+        })
+        .collect())
 }

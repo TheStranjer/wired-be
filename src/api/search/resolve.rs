@@ -271,7 +271,9 @@ mod tests {
         assert_eq!(stored.id, account.id, "the answer is the stored row");
 
         let follower_id = follower.id.to_string();
-        let listed = account_entities(&state, Some(&viewer), &[follower], Some(&account));
+        let listed = account_entities(&state, Some(&viewer), &[follower], Some(&account))
+            .await
+            .expect("the entities render");
         let ids: Vec<String> = listed.iter().map(|entry| entry.id.clone()).collect();
         assert_eq!(
             ids,

@@ -4,9 +4,13 @@ use serde_json::{Value, json};
 
 use super::*;
 use crate::{
-    federation::remote_actor::{
-        MAX_ALIASES, MAX_FIELD_NAME_CHARS, MAX_FIELD_VALUE_CHARS, MAX_REMOTE_FIELDS,
-        test_support::{MASTODON, PLEROMA, fixture, remove},
+    federation::{
+        note_parser::RemoteEmoji,
+        remote_actor::{
+            MAX_ALIASES, MAX_FIELD_NAME_CHARS, MAX_FIELD_VALUE_CHARS, MAX_REMOTE_EMOJIS,
+            MAX_REMOTE_FIELDS,
+            test_support::{MASTODON, PLEROMA, fixture, remove},
+        },
     },
     util::time::parse_time,
 };
@@ -645,4 +649,94 @@ fn an_over_long_username_is_rejected_and_the_cap_itself_accepted() {
     );
     document["preferredUsername"] = json!("a".repeat(MAX_USERNAME_CHARS));
     assert!(parse_actor(&document).is_ok(), "2048 characters pass");
+}
+
+#[test]
+fn emoji_tags_of_both_server_shapes_are_parsed_and_malformed_ones_skipped() {
+    let mut document = fixture(MASTODON);
+    document["tag"] = json!([
+        {
+            "id": "https://mastodon.example/emojis/1",
+            "type": "Emoji",
+            "name": ":mastofox:",
+            "updated": "2024-01-01T00:00:00Z",
+            "icon": {
+                "type": "Image",
+                "mediaType": "image/png",
+                "url": "https://mastodon.example/system/emoji/mastofox.png"
+            }
+        },
+        {
+            "id": "https://mastodon.example/emojis/misskeycat",
+            "type": "Emoji",
+            "name": "misskeycat",
+            "icon": {"type": "Image", "url": "https://mastodon.example/files/misskeycat.webp"}
+        },
+        {"type": "Emoji", "name": ":no icon:", "icon": {"url": "https://mastodon.example/x.png"}},
+        {"type": "Emoji", "name": ":noicon:"},
+        {"type": "Emoji", "icon": {"url": "https://mastodon.example/y.png"}},
+        {"type": "Hashtag", "name": "#rust"},
+        "stray"
+    ]);
+    let parsed = parse_actor(&document).unwrap();
+    assert_eq!(
+        parsed.emojis,
+        [
+            RemoteEmoji {
+                shortcode: "mastofox".to_owned(),
+                url: "https://mastodon.example/system/emoji/mastofox.png".to_owned(),
+                domain: Some("mastodon.example".to_owned()),
+            },
+            RemoteEmoji {
+                shortcode: "misskeycat".to_owned(),
+                url: "https://mastodon.example/files/misskeycat.webp".to_owned(),
+                domain: Some("mastodon.example".to_owned()),
+            },
+        ],
+        "both shapes parse, colons stripped, filed under the actor's host; \
+         the malformed and non-emoji entries are skipped"
+    );
+}
+
+#[test]
+fn an_actor_without_emoji_tags_has_no_emojis() {
+    let mut document = fixture(MASTODON);
+    assert!(
+        parse_actor(&document).unwrap().emojis.is_empty(),
+        "an empty tag array"
+    );
+    remove(&mut document, "tag");
+    assert!(
+        parse_actor(&document).unwrap().emojis.is_empty(),
+        "no tag key"
+    );
+}
+
+#[test]
+fn a_single_object_tag_is_read_as_a_one_entry_list() {
+    let mut document = fixture(MASTODON);
+    document["tag"] = json!({
+        "type": "Emoji",
+        "name": ":solo:",
+        "icon": {"url": "https://mastodon.example/solo.png"}
+    });
+    let parsed = parse_actor(&document).unwrap();
+    assert_eq!(parsed.emojis.len(), 1, "one object is a one-entry list");
+}
+
+#[test]
+fn only_the_first_hundred_tags_are_examined_for_emojis() {
+    let mut document = fixture(MASTODON);
+    let tags: Vec<Value> = (0..120)
+        .map(|n| {
+            json!({
+                "type": "Emoji",
+                "name": format!(":e{n}:"),
+                "icon": {"url": format!("https://mastodon.example/e{n}.png")}
+            })
+        })
+        .collect();
+    document["tag"] = json!(tags);
+    let parsed = parse_actor(&document).unwrap();
+    assert_eq!(parsed.emojis.len(), MAX_REMOTE_EMOJIS, "the cap");
 }

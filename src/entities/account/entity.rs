@@ -16,6 +16,7 @@ use serde_json::Value;
 use crate::{config::Config, models::user::User};
 
 use super::{AccountSource, Field, JsonBool, MuteExpiresAt, PleromaMetadata};
+use crate::entities::custom_emoji::CustomEmoji;
 
 /// The Mastodon `Account` entity (core fields).
 ///
@@ -77,9 +78,11 @@ pub struct Account {
     pub statuses_count: i32,
     /// Date of the newest status as `YYYY-MM-DD`, or `null`.
     pub last_status_at: Option<String>,
-    /// Custom emojis used in the profile; always the empty array until
-    /// the emoji ticket fills it.
-    pub emojis: Vec<Value>,
+    /// The custom emojis the display name, note and profile fields use, as
+    /// [`CustomEmoji`] entities. The pure renders leave it `[]`;
+    /// [`Account::with_emojis`] fills it from the rows the caller batch-loaded
+    /// (see `services::account_emojis`).
+    pub emojis: Vec<CustomEmoji>,
     /// Profile metadata, in storage order.
     pub fields: Vec<Field>,
     /// The account this one moved to; `null` until the render resolves

@@ -90,6 +90,7 @@ use crate::{
     },
     oauth::scopes::{READ_LISTS, WRITE_LISTS},
     pagination::{MAX_LIMIT, OrdinalPageParams, link_for_page, set_link_header},
+    services::account_emojis::AccountEmojis,
     state::AppState,
     util::id::parse_id,
 };
@@ -319,9 +320,14 @@ async fn list_list_accounts(
     let mut headers = HeaderMap::new();
     set_link_header(&mut headers, link.as_deref())?;
     let viewer: AccountViewer<'_> = Some(&auth.0);
+    let users: Vec<_> = entries.iter().map(|entry| &entry.user).collect();
+    let emojis = AccountEmojis::load(&state.db, &users).await?;
     let accounts = entries
         .iter()
-        .map(|entry| Account::from_user_for(viewer, &entry.user, &state.config, None))
+        .map(|entry| {
+            let account = Account::from_user_for(viewer, &entry.user, &state.config, None);
+            emojis.fill(account, &entry.user, &state.config)
+        })
         .collect();
     Ok((headers, Json(accounts)))
 }

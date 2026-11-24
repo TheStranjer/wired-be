@@ -63,6 +63,7 @@ pub mod authorized_fetch;
 pub mod collections;
 pub mod delivery;
 pub mod dispatch;
+pub mod emoji_tag;
 pub mod fetch_actor;
 pub mod fetch_object;
 pub mod handlers;

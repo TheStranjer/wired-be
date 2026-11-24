@@ -27,7 +27,11 @@ use super::{
     },
     pleroma::pleroma_metadata,
 };
-use crate::{config::Config, entities::relationship::RelationshipMap, models::user::User};
+use crate::{
+    config::Config,
+    entities::{custom_emoji::CustomEmoji, relationship::RelationshipMap},
+    models::{custom_emoji::CustomEmoji as EmojiRow, user::User},
+};
 
 impl Account {
     /// Renders `user` as an `Account` of the instance described by
@@ -156,6 +160,20 @@ impl Account {
     #[must_use]
     pub fn with_moved(mut self, target: &User, config: &Config) -> Self {
         self.moved = serde_json::to_value(Self::from_user(target, config)).ok();
+        self
+    }
+
+    /// Fills [`emojis`](Self::emojis) from the rows `emojis`, in order.
+    ///
+    /// Each row becomes one [`CustomEmoji`] entity. Which rows an account uses is the caller's batch read (the
+    /// `services::account_emojis` loader): the pure renders leave the key
+    /// `[]`, so an unfilled render is simply an account that uses none.
+    #[must_use]
+    pub fn with_emojis(mut self, emojis: &[EmojiRow], config: &Config) -> Self {
+        self.emojis = emojis
+            .iter()
+            .map(|row| CustomEmoji::from_model(row, config))
+            .collect();
         self
     }
 
@@ -433,5 +451,57 @@ mod tests {
             timed["mute_expires_at"], "2024-01-31T12:34:56.789Z",
             "a timed mute sends the expiry in the Mastodon format"
         );
+    }
+
+    /// A remote account's `:blob:` renders as a `CustomEmoji` entity.
+    ///
+    /// A local account renders its local `:wiredcat:` the same way.
+    #[test]
+    fn with_emojis_renders_the_rows_as_custom_emoji_entities() {
+        let config = Config::for_tests();
+        let mut bob = base_user("bob@remote.example", "https://remote.example/users/bob");
+        bob.domain = Some("remote.example".to_owned());
+        bob.name = "Bob :blob:".to_owned();
+        let remote_emoji = emoji_row("blob", Some("remote.example"));
+
+        let value = serde_json::to_value(
+            Account::from_user(&bob, &config).with_emojis(&[remote_emoji], &config),
+        )
+        .unwrap();
+        assert_eq!(
+            value["emojis"],
+            json!([{
+                "shortcode": "blob",
+                "url": format!("{BASE}/emoji/cats/blob.gif"),
+                "static_url": format!("{BASE}/emoji/cats/blob.png"),
+                "visible_in_picker": true,
+                "category": "cats",
+                "tags": [],
+            }]),
+            "the remote account lists the emoji its name uses"
+        );
+        assert_eq!(
+            json_keys(&value),
+            EXPECTED_KEYS,
+            "filling the slot leaves the key set alone"
+        );
+
+        let mut wanda = base_user("wanda", &format!("{BASE}/users/wanda"));
+        wanda.local = Flag::new(true);
+        wanda.name = "Wanda :wiredcat:".to_owned();
+        let cat = emoji_row("wiredcat", None);
+        let own = serde_json::to_value(
+            Account::for_owner(&wanda, &config, 0).with_emojis(&[cat], &config),
+        )
+        .unwrap();
+        assert_eq!(
+            own["emojis"][0]["shortcode"], "wiredcat",
+            "a local account lists its local emoji, owner view included"
+        );
+
+        let none =
+            serde_json::to_value(Account::from_user(&bob, &config).with_emojis(&[], &config))
+                .unwrap();
+        assert_eq!(none["emojis"], json!([]), "no rows, no emojis");
     }
 }

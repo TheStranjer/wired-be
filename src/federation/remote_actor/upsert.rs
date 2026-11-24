@@ -6,7 +6,7 @@ use sqlx::PgPool;
 use super::{ActorError, NewRemoteUser};
 use crate::{
     federation::json::http_host,
-    models::{instance, user::User},
+    models::{custom_emoji, instance, user::User},
     util::id::new_id,
 };
 
@@ -96,6 +96,10 @@ const RELEASE_KEY_ID_SQL: &str =
 /// [`ActorError::NicknameConflict`]. When two actor ids of one origin claim
 /// one handle, the document fetched last holds it.
 ///
+/// Once the row is committed, each of [`emojis`](NewRemoteUser::emojis) is
+/// written with [`custom_emoji::upsert_remote`] under the actor's domain,
+/// so every fetch, refresh and `Update` keeps the profile's emoji current.
+///
 /// After the row is stored, [`instance::touch`] records first sight of the
 /// host of [`ap_id`](NewRemoteUser::ap_id) (or notes that a known host was
 /// seen again): mirroring a remote user is what makes its instance exist in
@@ -162,6 +166,10 @@ pub async fn upsert_remote_user(pool: &PgPool, new: NewRemoteUser) -> Result<Use
         .fetch_one(&mut *tx)
         .await?;
     tx.commit().await?;
+    for emoji in &new.emojis {
+        custom_emoji::upsert_remote(pool, &emoji.shortcode, emoji.domain.as_deref(), &emoji.url)
+            .await?;
+    }
     // First sight of the mirrored user touches its instance; an `ap_id`
     // [`http_host`] cannot read names no host, and the record is skipped
     // (see the function docs).
@@ -621,5 +629,69 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(rows, 0, "and the instance record was skipped");
+    }
+
+    /// A fetched actor's `Emoji` tags land in `custom_emojis`.
+    ///
+    /// They are filed under the actor's domain, and a refresh rewrites a
+    /// moved image instead of adding a row.
+    #[tokio::test]
+    async fn an_upsert_stores_the_actors_emoji_under_its_domain() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let mut document = fixture(MASTODON);
+        document["tag"] = json!([
+            {
+                "type": "Emoji",
+                "name": ":mastofox:",
+                "icon": {"type": "Image", "url": "https://mastodon.example/emoji/mastofox.png"}
+            },
+            {
+                "type": "Emoji",
+                "name": ":blob-cat:",
+                "icon": {"type": "Image", "url": "https://mastodon.example/emoji/blob-cat.png"}
+            },
+        ]);
+        let _first = upsert_remote_user(&pool, parse_actor(&document).unwrap())
+            .await
+            .unwrap();
+
+        let codes = ["mastofox".to_owned(), "blob-cat".to_owned()];
+        let rows = custom_emoji::get_by_shortcodes(&pool, &codes, Some("mastodon.example"))
+            .await
+            .unwrap();
+        let stored: Vec<(&str, &str)> = rows
+            .iter()
+            .map(|row| (row.shortcode.as_str(), row.image_url.as_str()))
+            .collect();
+        assert_eq!(
+            stored,
+            [
+                ("blob-cat", "https://mastodon.example/emoji/blob-cat.png"),
+                ("mastofox", "https://mastodon.example/emoji/mastofox.png"),
+            ],
+            "both emojis exist under the actor's domain"
+        );
+        let local = custom_emoji::get_by_shortcodes(&pool, &codes, None)
+            .await
+            .unwrap();
+        assert!(local.is_empty(), "and none leaked into the local set");
+
+        document["tag"][0]["icon"]["url"] = json!("https://mastodon.example/emoji/new.png");
+        let _second = upsert_remote_user(&pool, parse_actor(&document).unwrap())
+            .await
+            .unwrap();
+        let refreshed = custom_emoji::get_by_shortcodes(&pool, &codes, Some("mastodon.example"))
+            .await
+            .unwrap();
+        assert_eq!(refreshed.len(), 2, "a refresh adds no row");
+        let fox = refreshed
+            .iter()
+            .find(|row| row.shortcode == "mastofox")
+            .expect("the fox is still stored");
+        assert_eq!(
+            fox.image_url, "https://mastodon.example/emoji/new.png",
+            "the refresh rewrote the moved image"
+        );
     }
 }

@@ -9,7 +9,8 @@ use super::{
     NewRemoteUser,
     fields::{
         bool_field, optional_http_url, parse_accepts_chat_messages, parse_also_known_as,
-        parse_fields, parse_media_url, parse_published, required_http_url, string_field,
+        parse_emojis, parse_fields, parse_media_url, parse_published, required_http_url,
+        string_field,
     },
     truncate_chars,
 };
@@ -48,6 +49,7 @@ pub fn parse_actor(json: &Value) -> Result<NewRemoteUser, ActorError> {
     let summary = string_field(json, "summary");
     let summary = truncate_chars(&summary, MAX_REMOTE_BIO_CHARS);
     let name = string_field(json, "name");
+    let emojis = parse_emojis(json, &domain);
     Ok(NewRemoteUser {
         nickname: format!("{username}@{domain}"),
         ap_id,
@@ -66,6 +68,7 @@ pub fn parse_actor(json: &Value) -> Result<NewRemoteUser, ActorError> {
         locked: bool_field(json, "manuallyApprovesFollowers"),
         discoverable: bool_field(json, "discoverable"),
         fields: parse_fields(json),
+        emojis,
         inbox,
         shared_inbox: json
             .get("endpoints")

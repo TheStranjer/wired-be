@@ -97,7 +97,10 @@ use crate::{
     },
     oauth::scopes::{FOLLOW, READ_FAVOURITES, READ_FOLLOWS, WRITE_FOLLOWS},
     pagination::{NO_EXTRA_QUERY, PageParams, keyset_link, set_link_header},
-    services::render_status::{ViewerMode, render_statuses},
+    services::{
+        account_emojis::AccountEmojis,
+        render_status::{ViewerMode, render_statuses},
+    },
     state::AppState,
 };
 
@@ -316,9 +319,14 @@ async fn outgoing(
     // delegates to the account view's `index.json` with no relationships
     // preloaded: the entries keep the empty `pleroma.relationship` object.
     let viewer: AccountViewer<'_> = Some(&auth.0);
+    let users: Vec<_> = entries.iter().map(|entry| &entry.user).collect();
+    let emojis = AccountEmojis::load(&state.db, &users).await?;
     let accounts = entries
         .iter()
-        .map(|entry| Account::from_user_for(viewer, &entry.user, &state.config, None))
+        .map(|entry| {
+            let account = Account::from_user_for(viewer, &entry.user, &state.config, None);
+            emojis.fill(account, &entry.user, &state.config)
+        })
         .collect();
     Ok((headers, Json(accounts)))
 }

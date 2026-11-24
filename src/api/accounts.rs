@@ -49,6 +49,7 @@ use crate::{
     error::AppResult,
     extract::multipart::upload_body_limit,
     models::user::{DEFAULT_ACTOR_TYPE, User},
+    services::account_emojis::AccountEmojis,
     state::AppState,
 };
 
@@ -200,6 +201,8 @@ async fn render_account(
 ) -> AppResult<Account> {
     let relationships = preload_relationship(state, viewer, found).await?;
     let account = Account::from_user_for(viewer, found, &state.config, relationships.as_ref());
+    let emojis = AccountEmojis::load_one(&state.db, found).await?;
+    let account = emojis.fill(account, found, &state.config);
     with_moved(state, account, found).await
 }
 

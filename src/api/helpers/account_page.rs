@@ -20,6 +20,7 @@ use crate::{
     error::AppResult,
     models::user::User,
     pagination::{NO_EXTRA_QUERY, keyset_link, set_link_header},
+    services::account_emojis::AccountEmojis,
     state::AppState,
 };
 
@@ -76,12 +77,14 @@ pub async fn account_page<T: AccountPageEntry + Sync>(
     );
     let mut headers = HeaderMap::new();
     set_link_header(&mut headers, link.as_deref())?;
+    let users: Vec<&User> = entries.iter().map(T::user).collect();
+    let emojis = AccountEmojis::load(&state.db, &users).await?;
     let accounts = entries
         .iter()
         .map(|entry| {
             let account =
                 Account::from_user_for(viewer, entry.user(), &state.config, relationships.as_ref());
-            entry.decorate(account)
+            entry.decorate(emojis.fill(account, entry.user(), &state.config))
         })
         .collect();
     Ok((headers, Json(accounts)))

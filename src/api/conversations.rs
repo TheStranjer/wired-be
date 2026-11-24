@@ -96,7 +96,10 @@ use crate::{
     },
     oauth::scopes::{READ_STATUSES, WRITE_CONVERSATIONS},
     pagination::{NO_EXTRA_QUERY, PageParams, keyset_link, link_for_page, set_link_header},
-    services::render_status::{ViewerMode, render_statuses},
+    services::{
+        account_emojis::AccountEmojis,
+        render_status::{ViewerMode, render_statuses},
+    },
     state::AppState,
     util::id::parse_id,
 };
@@ -513,6 +516,8 @@ pub(crate) async fn conversation_entities(
     let account_ids = distinct(lists.values().flatten().copied());
     let (users, relationships) =
         accounts_with_relationships(state, Some(viewer), &account_ids).await?;
+    let participants: Vec<&User> = users.values().collect();
+    let emojis = AccountEmojis::load(&state.db, &participants).await?;
     let last_status_ids = distinct(rows.iter().filter_map(|row| row.last_status_id));
     let last_statuses = visible_statuses(state, Some(viewer), &last_status_ids).await?;
     let entities = rows
@@ -524,12 +529,13 @@ pub(crate) async fn conversation_entities(
                 .iter()
                 .filter_map(|id| users.get(id))
                 .map(|account| {
-                    Account::from_user_for(
+                    let entity = Account::from_user_for(
                         Some(viewer),
                         account,
                         &state.config,
                         relationships.as_ref(),
-                    )
+                    );
+                    emojis.fill(entity, account, &state.config)
                 })
                 .collect();
             let last_status = row
