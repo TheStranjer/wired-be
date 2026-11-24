@@ -11,6 +11,7 @@ use crate::{
     config::Config,
     models::chat::{self, ChatMessageReference},
     state::AppState,
+    util::id::local_object_uuid,
 };
 
 /// Announce the chat message the admin API just withdrew from both sides.
@@ -72,33 +73,38 @@ pub async fn after_chat_message_deleted_by_admin(
 }
 
 /// Whether `ap_id` names an object this instance minted: the
-/// `{BASE_URL}/objects/` prefix every locally owned document carries
+/// `{BASE_URL}/objects/{uuid}` shape every locally owned document carries
 /// (decision 6). Any other id is a remote mirror's own object.
 fn is_local_object_id(config: &Config, ap_id: &str) -> bool {
-    ap_id.starts_with(&format!("{}/objects/", config.base_url))
+    local_object_uuid(&config.base_url, ap_id).is_some()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// The local-origin gate is exactly the `{BASE_URL}/objects/` prefix:
+    /// The local-origin gate is exactly the `{BASE_URL}/objects/{uuid}` shape:
     /// another instance's id is nobody's withdrawal to announce, and neither
     /// is this instance's own activity namespace.
     #[test]
     fn only_this_instances_object_ids_are_local_origin() {
         let config = Config::for_tests();
+        let id = "0190a0b0-0000-7000-8000-000000000001";
         assert!(is_local_object_id(
             &config,
-            "https://test.example/objects/chat-1"
+            &format!("https://test.example/objects/{id}")
         ));
         assert!(
-            !is_local_object_id(&config, "https://remote.example/objects/chat-1"),
+            !is_local_object_id(&config, &format!("https://remote.example/objects/{id}")),
             "a remote object id is the remote's own to withdraw"
         );
         assert!(
-            !is_local_object_id(&config, "https://test.example/activities/chat-1"),
+            !is_local_object_id(&config, &format!("https://test.example/activities/{id}")),
             "the objects prefix is the whole test"
+        );
+        assert!(
+            !is_local_object_id(&config, "https://test.example/objects/chat-1"),
+            "a local object id's tail is a uuid"
         );
     }
 }

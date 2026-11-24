@@ -17,6 +17,7 @@ use crate::{
         user::User,
     },
     state::AppState,
+    util::id::OBJECTS_PATH,
 };
 
 /// The parts one federated answer document of a remote poll is built from:
@@ -55,7 +56,7 @@ struct Ballot<'a> {
 fn answer_document(state: &AppState, ballot: &Ballot<'_>, option: &PollOption) -> Value {
     let name = format!("vote-{}-{}", ballot.poll_id, option.position);
     let object = json!({
-        "id": format!("{}/objects/{name}", state.config.base_url),
+        "id": format!("{}{OBJECTS_PATH}{name}", state.config.base_url),
         "type": "Note",
         "attributedTo": ballot.voter_ap_id,
         "inReplyTo": ballot.question_uri,

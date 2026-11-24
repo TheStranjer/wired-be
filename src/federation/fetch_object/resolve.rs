@@ -3,7 +3,6 @@
 
 use serde_json::Value;
 use tracing::debug;
-use uuid::Uuid;
 
 use super::{FetchBudget, FetchError, fetch::fetch_contained};
 use crate::{
@@ -20,7 +19,10 @@ use crate::{
     },
     services::ingest::{self, IngestOutcome},
     state::AppState,
-    util::url::{host_with_port, parse_http_url},
+    util::{
+        id::{object_ap_id, parse_id},
+        url::{host_with_port, parse_http_url},
+    },
 };
 
 /// Human-facing url path segment of a local status (see
@@ -28,8 +30,6 @@ use crate::{
 /// `/notice/{uuid}` resolves against the `/objects/{uuid}` the row is
 /// stored under.
 const NOTICE_PATH: &str = "/notice/";
-/// Object id path segment [`resolve_status`] also matches locally.
-const OBJECTS_PATH: &str = "/objects/";
 
 /// Resolves `uri` to a stored status, fetching the remote object when this
 /// instance does not have one.
@@ -196,10 +196,7 @@ fn local_object_uri(config: &Config, uri: &str) -> Option<String> {
     let rest = uri
         .strip_prefix(&config.base_url)?
         .strip_prefix(NOTICE_PATH)?;
-    if Uuid::parse_str(rest).is_err() {
-        return None;
-    }
-    Some(format!("{}{OBJECTS_PATH}{rest}", config.base_url))
+    Some(object_ap_id(&config.base_url, parse_id(rest)?))
 }
 
 /// Whether a fetched document is of the `Note` family the status handlers

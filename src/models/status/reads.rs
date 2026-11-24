@@ -7,7 +7,7 @@
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use crate::error::AppResult;
+use crate::{error::AppResult, util::id::object_ap_id};
 
 use super::{NewStatus, Status};
 
@@ -128,7 +128,7 @@ pub async fn get_many(pool: &PgPool, ids: &[Uuid]) -> AppResult<Vec<Status>> {
 pub(super) fn object_uri(base_url: &str, new_status: &NewStatus, id: Uuid) -> Option<String> {
     new_status
         .local
-        .then(|| format!("{base_url}/objects/{id}"))
+        .then(|| object_ap_id(base_url, id))
         .or_else(|| new_status.uri.clone())
 }
 
