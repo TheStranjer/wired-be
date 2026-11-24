@@ -7,9 +7,12 @@ use url::Url;
 use super::{FetchBudget, FetchError};
 use crate::{
     config::Config,
-    federation::fetch_actor::{
-        Signer, ensure_not_redirected, ensure_same_host, fetch_document, fetch_signer,
-        names_served_url,
+    federation::{
+        fetch_actor::{
+            Signer, ensure_not_redirected, ensure_same_host, fetch_document, fetch_signer,
+            names_served_url,
+        },
+        mrf,
     },
     http_client::{HttpClient, user_agent},
     state::AppState,
@@ -58,6 +61,7 @@ pub(super) async fn fetch_contained(
     url: &str,
     budget: &FetchBudget,
 ) -> Result<Value, FetchError> {
+    refuse(state, url).await?;
     let http = object_client(&state.config);
     let signer = fetch_signer(state).await?;
     let (document, served) = fetch_bounded(&http, url, signer.as_ref(), budget).await?;
@@ -73,7 +77,10 @@ pub(super) async fn fetch_contained(
     }
     // Same origin but a different id than the URL that served it: follow
     // the claim exactly once, without a redirect, and accept only a
-    // document that names itself.
+    // document that names itself. The claim is checked against the MRF
+    // lists like the URL was (it shares the URL's authority, so this only
+    // matters for a list that tells ports apart, but costs nothing).
+    refuse(state, claimed).await?;
     let (refetched, refetched_from) =
         fetch_bounded(&http, claimed, signer.as_ref(), budget).await?;
     ensure_not_redirected(claimed, &refetched_from)?;
@@ -84,6 +91,17 @@ pub(super) async fn fetch_contained(
         )));
     }
     Ok(refetched)
+}
+
+/// Refuses to dereference `url` when the MRF policy rejects its host.
+///
+/// The refusal is a [`FetchError::Invalid`], a permanent failure to the
+/// callers: nothing is sent to a domain the instance federates with no
+/// one at.
+async fn refuse(state: &AppState, url: &str) -> Result<(), FetchError> {
+    mrf::refuse_rejected(state, url)
+        .await
+        .map_err(FetchError::Invalid)
 }
 
 /// One budgeted document `GET`: spends a dereference and runs the shared

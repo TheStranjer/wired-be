@@ -344,3 +344,37 @@ async fn an_author_on_the_object_origin_still_resolves() {
     );
     server.abort();
 }
+
+/// `resolve_status` of an object on a host the `simple` policy refuses is
+/// a permanent failure, with no request sent: neither the `reject` list
+/// naming it nor an allowlist omitting it is bypassed by a status lookup.
+#[tokio::test]
+async fn a_status_of_a_rejected_host_is_permanent_and_not_fetched() {
+    for lists in [
+        json!({"reject": ["127.0.0.1"]}),
+        json!({"accept": ["friend.example"]}),
+    ] {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        set_simple_lists(&pool, &lists).await;
+        let state = test_state(pool);
+        let listener = bind().await;
+        let base = origin(&listener);
+        let peer = peer_at(&base);
+        let server = spawn(listener, peer_app(peer.clone()));
+
+        let answer = resolve_status(&state, &object_url(&base, "one")).await;
+
+        assert!(
+            matches!(&answer, Err(FederationError::Permanent(detail)) if detail.contains("127.0.0.1")),
+            "the refusal is permanent ({lists}): {:?}",
+            answer.as_ref().err()
+        );
+        assert_eq!(
+            peer.hits.load(Ordering::SeqCst),
+            0,
+            "nothing was sent to the refused host ({lists})"
+        );
+        server.abort();
+    }
+}

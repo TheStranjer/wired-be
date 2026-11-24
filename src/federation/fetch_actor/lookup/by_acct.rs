@@ -7,6 +7,7 @@ use crate::{
     config::Config,
     federation::{
         fetch_actor::{FetchError, error::server_error},
+        mrf,
         remote_actor::ActorError,
         webfinger_client::{Resolved, resolve_acct_with_base, strip_finger_prefixes},
     },
@@ -63,6 +64,11 @@ async fn get_or_fetch_by_acct_with_base(
         .map_err(|err| server_error(&err))?
     {
         return Ok(stored);
+    }
+    if let Some((_, domain)) = strip_finger_prefixes(acct).rsplit_once('@') {
+        mrf::refuse_rejected(state, &format!("https://{domain}"))
+            .await
+            .map_err(FetchError::Invalid)?;
     }
     let dev_base = dev_webfinger_base(&state.config, acct);
     let base = webfinger_base.or(dev_base.as_deref());
@@ -126,7 +132,7 @@ mod tests {
     use std::sync::{Arc, atomic::Ordering};
 
     use axum::{Router, routing::get};
-    use serde_json::json;
+    use serde_json::{Value, json};
 
     use super::*;
     use crate::{
@@ -318,6 +324,86 @@ mod tests {
                 .is_none(),
             "the claimed handle was never stored"
         );
+    }
+
+    /// Counts the `WebFinger` query and answers 404.
+    async fn counted_not_found(
+        axum::extract::State(hits): axum::extract::State<Arc<std::sync::atomic::AtomicUsize>>,
+    ) -> axum::http::StatusCode {
+        let _previous = hits.fetch_add(1, Ordering::SeqCst);
+        axum::http::StatusCode::NOT_FOUND
+    }
+
+    /// Fingers `alice@{mock authority}` with the `simple` policy configured
+    /// by `lists` (no MRF entry for `None`): the lookup's error and how
+    /// many `WebFinger` queries the mock saw.
+    async fn finger_under(lists: Option<&Value>) -> (FetchError, usize) {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        if let Some(lists) = lists {
+            write_simple_lists(&pool, lists).await;
+        }
+        let listener = bind().await;
+        let base = origin(&listener);
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let server = spawn(
+            listener,
+            Router::new()
+                .route("/.well-known/webfinger", get(counted_not_found))
+                .with_state(Arc::clone(&hits)),
+        );
+        let state = test_state(pool);
+        let acct = format!("alice@{}", authority_of(&base));
+
+        let error = get_or_fetch_by_acct_with_base(&state, &acct, Some(&base))
+            .await
+            .unwrap_err();
+
+        server.abort();
+        (error, hits.load(Ordering::SeqCst))
+    }
+
+    /// Stores the runtime MRF entry enabling `simple` with `lists`.
+    async fn write_simple_lists(pool: &sqlx::PgPool, lists: &Value) {
+        crate::services::runtime_config::write(
+            pool,
+            ":pleroma",
+            ":mrf",
+            &json!({"policies": ["simple"], "simple": lists}),
+        )
+        .await
+        .expect("the mrf entry writes");
+    }
+
+    /// A handle on a domain the `simple` policy refuses — by its `reject`
+    /// list or by an allowlist that omits it — is not fingered at all.
+    #[tokio::test]
+    async fn a_handle_of_a_rejected_domain_is_not_fingered() {
+        for lists in [
+            json!({"reject": ["127.0.0.1"]}),
+            json!({"accept": ["friend.example"]}),
+        ] {
+            let (error, hits) = finger_under(Some(&lists)).await;
+
+            assert!(
+                matches!(&error, FetchError::Invalid(detail) if detail.contains("127.0.0.1")),
+                "the refusal names the host ({lists}): {error:?}"
+            );
+            assert_eq!(hits, 0, "no WebFinger query left ({lists})");
+        }
+    }
+
+    /// With no MRF entry the same handle is fingered: the mock's 404 is
+    /// the answer, and its counter proves the query was sent.
+    #[tokio::test]
+    async fn a_handle_with_no_mrf_entry_is_fingered() {
+        let (error, hits) = finger_under(None).await;
+
+        assert!(
+            matches!(error, FetchError::Webfinger(_)),
+            "the resolver ran and its 404 answers: {error:?}"
+        );
+        assert!(hits > 0, "the query reached the mock");
     }
 
     #[tokio::test]
