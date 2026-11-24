@@ -5,8 +5,8 @@ use super::*;
 
 /// Asserts that publishing `row` drops it and writes no status for `author`.
 async fn assert_dropped_unpublished(pool: &PgPool, author: &User, row: &ScheduledStatus) {
-    let outcome = publish_one(&app_state(pool), row).await;
-    assert_eq!(outcome, Ok(()), "a barred author's schedule is dropped");
+    let outcome = publish_one(&app_state(pool), row.id).await;
+    assert_eq!(outcome, Ok(true), "a barred author's schedule is dropped");
     assert!(
         fetched(pool, row.id).await.is_none(),
         "the schedule is gone"

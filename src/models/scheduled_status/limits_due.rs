@@ -41,6 +41,13 @@ const FETCH_DUE_SQL: &str = "SELECT * FROM scheduled_statuses
    ORDER BY scheduled_at, id
       LIMIT $2";
 
+/// [`fetch_due_ids`]: [`FETCH_DUE_SQL`]'s ordering and bound, ids only — the
+/// sweep claims each row itself, so it needs no payload from this read.
+const FETCH_DUE_IDS_SQL: &str = "SELECT id FROM scheduled_statuses
+      WHERE scheduled_at <= $1
+   ORDER BY scheduled_at, id
+      LIMIT $2";
+
 /// [`reserved_media_ids`]: the submitted ids, keeping submission order, that
 /// some pending row names inside its `params -> 'media_ids'` array. The
 /// containment test is against a one-element array of the id's text, the
@@ -189,6 +196,26 @@ pub async fn fetch_due(
         .fetch_all(pool)
         .await?;
     Ok(due)
+}
+
+/// The ids of the schedules due at or before `now`, oldest first, at most
+/// `limit` of them — [`fetch_due`] without the rows.
+///
+/// Nothing is locked: the sweep takes each id through
+/// [`lock_due`](super::lock_due) and publishes it like the per-row job does,
+/// so a row another runner holds simply comes back from the claim as `None`.
+///
+/// # Errors
+///
+/// Any database failure (connection, decoding) arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn fetch_due_ids(pool: &PgPool, now: DateTime<Utc>, limit: i64) -> AppResult<Vec<Uuid>> {
+    let ids = sqlx::query_scalar::<_, Uuid>(FETCH_DUE_IDS_SQL)
+        .bind(now)
+        .bind(limit)
+        .fetch_all(pool)
+        .await?;
+    Ok(ids)
 }
 
 /// Which of `ids` some pending schedule already reserves — the media gate a
@@ -405,6 +432,47 @@ mod tests {
         assert!(
             before_time.is_empty(),
             "an instant before everything is due sweeps nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_due_ids_returns_the_due_ids_oldest_first() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = user(&pool, "alice").await;
+        let now = Utc::now().trunc_subsecs(6);
+        let hour = ChronoDuration::hours(1);
+        let late = schedule(&pool, &alice, now + hour, json!({ "status": "late" })).await;
+        let middle = schedule(&pool, &alice, now - hour, json!({ "status": "middle" })).await;
+        let due_now = schedule(&pool, &alice, now, json!({ "status": "now" })).await;
+        let oldest = schedule(&pool, &alice, now - hour * 2, json!({ "status": "old" })).await;
+
+        let ids = fetch_due_ids(&pool, now, 10)
+            .await
+            .expect("the id sweep runs");
+        assert_eq!(
+            ids,
+            vec![oldest.id, middle.id, due_now.id],
+            "due ids only, oldest first, the exactly-due row included"
+        );
+        let page = fetch_due_ids(&pool, now, 2)
+            .await
+            .expect("the limited id sweep runs");
+        assert_eq!(
+            page,
+            vec![oldest.id, middle.id],
+            "the limit takes the oldest"
+        );
+        assert!(
+            fetch_due_ids(&pool, now - hour * 3, 10)
+                .await
+                .expect("the early id sweep runs")
+                .is_empty(),
+            "nothing is due before everything"
+        );
+        assert!(
+            !ids.contains(&late.id),
+            "a future row is not in the due ids"
         );
     }
 
