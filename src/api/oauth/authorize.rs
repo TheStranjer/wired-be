@@ -45,7 +45,7 @@ use axum::{
         HeaderMap, HeaderValue, StatusCode, Uri,
         header::{CACHE_CONTROL, LOCATION},
     },
-    response::{Html, IntoResponse, Response},
+    response::{IntoResponse, Response},
     routing::get,
 };
 use serde::Deserialize;
@@ -272,8 +272,6 @@ pub(crate) enum AuthorizeReply {
     /// 200 `{"code": …}` JSON: the code of an out-of-band client, which
     /// cannot be redirected.
     Code(String),
-    /// 200 page: the external-login registration form or message.
-    Page(String),
 }
 
 impl IntoResponse for AuthorizeReply {
@@ -281,7 +279,6 @@ impl IntoResponse for AuthorizeReply {
         match self {
             Self::Found(location) => (StatusCode::FOUND, [(LOCATION, location)]).into_response(),
             Self::Code(code) => Json(json!({ "code": code })).into_response(),
-            Self::Page(page) => Html(page).into_response(),
         }
     }
 }

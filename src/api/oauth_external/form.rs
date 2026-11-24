@@ -48,16 +48,14 @@ impl PendingRegistration {
     }
 }
 
-/// The `POST /oauth/register` form. The state rides hidden; every field
+/// The `POST /oauth/register` body. The state rides along; every field
 /// the flow keeps is optional at the shape level — blank submissions fall
 /// back to the provider's info the way Pleroma's
 /// `create_from_registration` reads the form above the stored
 /// registration, and an absent nickname fails validation like a blank one.
 #[derive(Deserialize)]
 pub(super) struct RegisterForm {
-    /// The state [`registration_details`] carried through the form.
-    ///
-    /// [`registration_details`]: super::registration_details
+    /// The state the callback redirected the frontend with.
     #[serde(default)]
     pub(super) state: Option<String>,
     /// Desired handle.
@@ -72,9 +70,8 @@ pub(super) struct RegisterForm {
     /// Profile note as source text.
     #[serde(default)]
     pub(super) bio: Option<String>,
-    /// A password of the registrant's own choosing. Only the JSON
-    /// registration reads it; the HTML form has no such field and ignores
-    /// it. Never in `Debug` output.
+    /// A password of the registrant's own choosing; absent, a random one
+    /// nobody can type is set. Never in `Debug` output.
     #[serde(default)]
     pub(super) password: Option<String>,
 }

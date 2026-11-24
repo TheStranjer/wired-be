@@ -1,8 +1,9 @@
 //! Integration tests for the external OAuth login endpoints: `GET
 //! /oauth/prepare_request`, `GET /oauth/{provider}`, `GET
-//! /oauth/{provider}/callback` and the registration form that picks up an
-//! unlinked account — `GET /oauth/registration_details` and `POST
-//! /oauth/register` (`docs/ARCHITECTURE.md` decision 13).
+//! /oauth/{provider}/callback` and the JSON registration endpoints behind
+//! the frontend's screens — `GET /oauth/registration_details` and `POST
+//! /oauth/register` (`docs/ARCHITECTURE.md` decision 13). The callback hands
+//! the browser to `https://fe.example`, the fixture's `FRONTEND_BASE_URL`.
 //!
 //! A mock provider runs on a loopback port — its authorize route answers
 //! 500, because the flow must only *redirect* a browser there and never
@@ -24,9 +25,9 @@
 //! redirect; `callback` walks the callback's successes and
 //! `callback_refusals` its failures and edges; `callback_untrusted` the
 //! hand-off to consent; `registration` and `registration_modes` cover the
-//! hand-off form and the registration modes that replace its code with a
-//! message page; and `json_registration`, `json_registration_modes` and
-//! `json_consent` the same screens as JSON endpoints for a frontend.
+//! registration routes answering JSON only and the modes around them; and
+//! `json_registration`, `json_registration_modes` and `json_consent` the
+//! registration and consent screens' JSON endpoints in detail.
 
 #![cfg(test)]
 
@@ -51,9 +52,9 @@ mod json_registration_modes;
 mod prepare;
 /// The flow's consts and the mock provider on its own loopback port.
 mod provider;
-/// The registration form and the hand-off that creates the user.
+/// The registration routes: JSON only, bad states, the next callback.
 mod registration;
-/// Closed, approval-required and activation-required registrations.
+/// Registration under activation-required and for an out-of-band client.
 mod registration_modes;
 /// Shared fixtures and helpers every submodule of this area draws on.
 mod support;
