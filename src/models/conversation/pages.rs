@@ -7,7 +7,11 @@
 use sqlx::{PgPool, Postgres, QueryBuilder};
 use uuid::Uuid;
 
-use crate::{error::AppResult, models::status::Status, pagination::PageParams};
+use crate::{
+    error::AppResult,
+    models::status::Status,
+    pagination::{PageParams, keyset_page},
+};
 
 use super::Participation;
 
@@ -74,12 +78,7 @@ pub async fn page_for_user(
             .push_bind(recipients.to_vec())
             .push(RECIPIENTS_FILTER_TAIL_SQL);
     }
-    page.apply_keyset(&mut builder, "p.id");
-    let rows = builder
-        .build_query_as::<Participation>()
-        .fetch_all(pool)
-        .await?;
-    let mut rows = page.finish(rows);
+    let mut rows: Vec<Participation> = keyset_page(pool, builder, "p.id", &page).await?;
     sort_by_activity(&mut rows);
     Ok(rows)
 }
@@ -121,9 +120,7 @@ pub async fn page_direct_statuses(
     let _thread: &mut _ = builder
         .push_bind(conversation_id)
         .push(" AND s.visibility = 'direct' AND s.deleted_at IS NULL");
-    page.apply_keyset(&mut builder, "s.id");
-    let rows = builder.build_query_as::<Status>().fetch_all(pool).await?;
-    Ok(page.finish(rows))
+    keyset_page(pool, builder, "s.id", &page).await
 }
 
 #[cfg(test)]
