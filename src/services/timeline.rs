@@ -99,11 +99,6 @@ const REBLOG_AUTHOR_SQL: &str = "(SELECT su.user_id FROM statuses su WHERE su.id
 const TAG_JOIN_SQL: &str = "SELECT 1 FROM status_hashtags sh \
      JOIN hashtags h ON h.id = sh.hashtag_id WHERE sh.status_id = s.id";
 
-/// The live-mute arms, the same test every mute read in this repository
-/// applies: an indefinite mute counts, a mute at or past its expiry does
-/// not (see [`crate::models::mute`]).
-const MUTE_LIVE_ARMS: &str = " AND (m.expires_at IS NULL OR m.expires_at > now())";
-
 /// The accepted-follow arms shared by the [`TimelineSource::Home`] predicate
 /// and the [`ReplyVisibility::Following`] filter.
 const ACCEPTED_FOLLOW_STATE: &str = " AND f.state = 'accepted'";
