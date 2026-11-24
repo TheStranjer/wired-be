@@ -23,6 +23,7 @@ use crate::{
         status::{self, Status},
         user::{self, User},
     },
+    util::emoji::is_shortcode_char,
 };
 
 use super::{NoteContext, PollData, PollOptionData};
@@ -191,7 +192,7 @@ fn used_shortcodes(status: &Status) -> Vec<String> {
 }
 
 /// Every `:shortcode:` reference in `text`: a colon, one or more
-/// `[A-Za-z0-9_]`, a colon — the shape [`crate::util::emoji::shortcode`]
+/// `[A-Za-z0-9_+-]`, a colon — the shape [`crate::util::emoji::shortcode`]
 /// recognises, scanned out of running prose. A colon after an incomplete
 /// candidate starts a new one (so `:a::b:` names both), and a candidate
 /// that never closes is dropped.
@@ -208,7 +209,7 @@ fn shortcodes_in(text: &str) -> Vec<String> {
                 }
                 candidate = Some(String::new());
             }
-            other if other.is_ascii_alphanumeric() || other == '_' => {
+            other if is_shortcode_char(other) => {
                 if let Some(code) = candidate.as_mut() {
                     code.push(other);
                 }

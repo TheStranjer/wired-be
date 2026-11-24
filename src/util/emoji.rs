@@ -26,7 +26,7 @@ pub enum Emoji<'a> {
     /// the variant holds the client's own text.
     Unicode(&'a str),
     /// A `:shortcode:` reference to a custom emoji; the variant holds the
-    /// bare `shortcode`, i.e. the `[A-Za-z0-9_]+` between the colons.
+    /// bare `shortcode`, i.e. the `[A-Za-z0-9_+-]+` between the colons.
     Custom(&'a str),
 }
 
@@ -34,7 +34,7 @@ impl<'a> Emoji<'a> {
     /// Classifies `text` as a reaction emoji, `None` for anything else.
     ///
     /// The two accepted spellings are [`Emoji::Custom`] for `:shortcode:`
-    /// text whose shortcode is non-empty and only of `[A-Za-z0-9_]` —
+    /// text whose shortcode is non-empty and only of `[A-Za-z0-9_+-]` —
     /// Pleroma's `maybe_quote` shape — and [`Emoji::Unicode`] for exactly one
     /// emoji grapheme cluster ([`is_single_emoji`]). Everything else — the
     /// empty string, a word, two emojis, one emoji glued to a letter, `::` —
@@ -52,18 +52,22 @@ impl<'a> Emoji<'a> {
 }
 
 /// The shortcode of `:shortcode:` text, `None` when `text` is not that
-/// shape: colons at both ends and at least one `[A-Za-z0-9_]` between them.
+/// shape: colons at both ends and at least one `[A-Za-z0-9_+-]` between them.
 ///
-/// The inner text may not hold another colon, so `:a::b:` is not one
-/// shortcode and neither is a colon-wrapped string with anything else added.
+/// The set is a superset of Pleroma's own matcher (`[A-Za-z0-9_-]+`), so
+/// pack names like `blob-cat` and `blobfox+1` work. The inner text may not
+/// hold another colon, so `:a::b:` is not one shortcode and neither is a
+/// colon-wrapped string with anything else added.
 #[must_use]
 pub fn shortcode(text: &str) -> Option<&str> {
     let inner = text.strip_prefix(':')?.strip_suffix(':')?;
-    (!inner.is_empty()
-        && inner
-            .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_'))
-    .then_some(inner)
+    (!inner.is_empty() && inner.chars().all(is_shortcode_char)).then_some(inner)
+}
+
+/// Whether `ch` may appear between the colons of a shortcode.
+#[must_use]
+pub const fn is_shortcode_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '+')
 }
 
 /// Whether `text` is exactly one grapheme cluster that is an emoji.
@@ -178,6 +182,9 @@ mod tests {
             (":Cat99:", "Cat99"),
             (":_:", "_"),
             (":2hu:", "2hu"),
+            (":blob-cat:", "blob-cat"),
+            (":blobfox+1:", "blobfox+1"),
+            (":a-b_c:", "a-b_c"),
         ] {
             assert_eq!(classified(text), format!("custom {code}"), "{text}");
         }
@@ -185,9 +192,7 @@ mod tests {
 
     #[test]
     fn a_non_shortcode_spelling_is_rejected() {
-        for text in [
-            ":", "::", ":a b:", ":a-b:", ":a.b:", ":é:", ":a::b:", "cat", ":x",
-        ] {
+        for text in [":", "::", ":a b:", ":a.b:", ":é:", ":a::b:", "cat", ":x"] {
             assert_eq!(classified(text), "nothing", "{text} is no emoji");
         }
     }
@@ -198,7 +203,17 @@ mod tests {
         assert_eq!(shortcode(":"), None, "a lone colon is empty inside");
         assert_eq!(shortcode("::"), None, "so is nothing between colons");
         assert_eq!(shortcode("cat"), None, "colons are required");
-        assert_eq!(shortcode(":a;b:"), None, "and only word characters ride");
+        assert_eq!(
+            shortcode(":a;b:"),
+            None,
+            "and only shortcode characters ride"
+        );
+        assert_eq!(
+            shortcode(":a b:"),
+            None,
+            "a space is no shortcode character"
+        );
+        assert_eq!(shortcode(":a:b:"), None, "a colon inside is refused");
     }
 
     #[test]

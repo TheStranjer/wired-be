@@ -165,6 +165,36 @@ async fn a_custom_reaction_carries_its_shortcode_and_image() {
 }
 
 #[tokio::test]
+async fn a_dashed_or_plus_shortcode_is_a_custom_reaction() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let app = common::test_app(pool.clone());
+    let (alice, token) = reader_and_writer(&pool, "alice").await;
+    let status_id = public_post(&pool, "bob").await;
+    emoji(&pool, "blob-cat").await;
+    emoji(&pool, "blobfox+1").await;
+
+    for name in [":blob-cat:", ":blobfox+1:"] {
+        react_ok(&app, &token, &status_id, name).await;
+    }
+    let status_text = status_id.to_string();
+    let mut rows = stored(&pool).await;
+    rows.sort();
+    assert_eq!(
+        rows,
+        vec![
+            (
+                alice.id.to_string(),
+                status_text.clone(),
+                ":blob-cat:".to_owned()
+            ),
+            (alice.id.to_string(), status_text, ":blobfox+1:".to_owned()),
+        ],
+        "both spellings are stored with their colons"
+    );
+}
+
+#[tokio::test]
 async fn an_emoji_that_is_not_one_emoji_is_refused() {
     let db = common::test_db().await;
     let pool = db.pool().clone();

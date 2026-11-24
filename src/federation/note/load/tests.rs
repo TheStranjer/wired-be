@@ -31,6 +31,11 @@ fn shortcode_scan_reads_complete_references_only() {
         vec!["a".to_owned(), "b".to_owned()],
         "adjacent references split on the second colon"
     );
+    assert_eq!(
+        shortcodes_in("x :blob-cat: :blobfox+1:"),
+        vec!["blob-cat".to_owned(), "blobfox+1".to_owned()],
+        "dashes and pluses belong to a shortcode"
+    );
     assert!(shortcodes_in("no codes here").is_empty(), "no colons");
     assert!(
         shortcodes_in(":unclosed").is_empty(),
