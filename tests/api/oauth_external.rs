@@ -36,6 +36,8 @@ mod callback;
 mod callback_mfa;
 /// The callback's refusals, the provider-call failures and the route edges.
 mod callback_refusals;
+/// The callback of a linked account for an untrusted application: refused.
+mod callback_untrusted;
 /// `GET /oauth/prepare_request` and the provider redirect it feeds.
 mod prepare;
 /// The flow's consts and the mock provider on its own loopback port.
