@@ -26,8 +26,8 @@ pub enum List {
     FollowersOnly,
     /// `media_removal`: strip the attachments of matching hosts' notes.
     MediaRemoval,
-    /// `media_nsfw`: mark matching hosts' notes that have attachments
-    /// sensitive.
+    /// `media_nsfw`: mark all of matching hosts' notes sensitive, with or
+    /// without attachments.
     MediaNsfw,
     /// `report_removal`: refuse `Flag` activities from matching hosts.
     ReportRemoval,
