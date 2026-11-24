@@ -4,8 +4,8 @@
 use super::*;
 use crate::services::config_registry::types::ValueKind;
 
-/// The registry holds exactly the ticket's eight `:pleroma` keys, in
-/// order, and each one resolves through [`find`].
+/// The registry holds exactly the six `:pleroma` keys a runtime consumer
+/// reads, in order, and each one resolves through [`find`].
 #[test]
 fn the_registry_carries_the_whitelisted_keys() {
     let keys: Vec<&str> = entries().iter().map(|entry| entry.key).collect();
@@ -18,11 +18,10 @@ fn the_registry_carries_the_whitelisted_keys() {
             KEY_MRF_KEYWORD,
             KEY_MRF_HELLTHREAD,
             KEY_MRF_OBJECT_AGE,
-            KEY_MEDIA_PROXY,
-            KEY_RESTRICT_UNAUTHENTICATED,
         ],
-        "the ticket's whitelist, in the GET order"
+        "the whitelist, in the GET order"
     );
+    assert_eq!(entries().len(), 6, "six whitelisted entries");
     assert!(
         entries().iter().all(|entry| entry.group == GROUP_PLEROMA),
         "every entry lives in :pleroma"
@@ -34,10 +33,24 @@ fn the_registry_carries_the_whitelisted_keys() {
 }
 
 /// `find` refuses everything the whitelist does not carry, and the
-/// refusal is what the API answers 400 for.
+/// refusal is what the API answers 400 for — including the two keys
+/// nothing reads at runtime.
 #[test]
 fn unregistered_pairs_find_nothing() {
     assert!(find(GROUP_PLEROMA, ":feeds").is_none(), "not whitelisted");
+    assert!(
+        find(GROUP_PLEROMA, ":restrict_unauthenticated").is_none(),
+        "no runtime consumer reads the restriction set"
+    );
+    assert!(
+        find(GROUP_PLEROMA, ":media_proxy").is_none(),
+        "no runtime consumer reads the media proxy shape"
+    );
+    assert!(
+        !requires_restart(GROUP_PLEROMA, ":media_proxy")
+            && !requires_restart(GROUP_PLEROMA, ":restrict_unauthenticated"),
+        "a refused pair restarts nothing"
+    );
     assert!(
         find(":wired", KEY_INSTANCE).is_none(),
         "wrong group is no pair"
@@ -53,8 +66,7 @@ fn unregistered_pairs_find_nothing() {
 }
 
 /// `:instance` and `:mrf` are subkey-whitelisted; the whole-value
-/// entries are bare, and only the two entries no runtime consumer
-/// reads are flagged for a restart.
+/// entries are bare, and no entry is flagged for a restart.
 #[test]
 fn subkeys_and_restart_flags_follow_the_ticket() {
     let instance = find(GROUP_PLEROMA, KEY_INSTANCE).expect("registered");
@@ -89,16 +101,8 @@ fn subkeys_and_restart_flags_follow_the_ticket() {
         );
     }
     assert!(
-        requires_restart(GROUP_PLEROMA, KEY_MEDIA_PROXY),
-        "the media proxy shape is read at boot"
-    );
-    assert!(
-        requires_restart(GROUP_PLEROMA, KEY_RESTRICT_UNAUTHENTICATED),
-        "and the restriction set is read from the environment"
-    );
-    assert!(
-        !requires_restart(GROUP_PLEROMA, KEY_INSTANCE) && !requires_restart(GROUP_PLEROMA, KEY_MRF),
-        "the wired consumers need no restart"
+        entries().iter().all(|entry| !entry.requires_restart),
+        "every wired consumer takes effect without a restart"
     );
 }
 
@@ -137,8 +141,7 @@ fn instance_keys() -> &'static [&'static str] {
 }
 
 /// The `:mrf` fallback is the `MRF_POLICIES` list; the bare entries
-/// fall back to the empty object, and the two derived ones mirror
-/// their env settings.
+/// fall back to the empty object.
 #[test]
 fn the_other_defaults_follow_their_environment() {
     let mut config = Config::for_tests();
@@ -152,29 +155,6 @@ fn the_other_defaults_follow_their_environment() {
         empty_defaults(&config),
         json!({}),
         "a bare entry defaults to nothing configured"
-    );
-    config.media_proxy.enabled = true;
-    config.media_proxy.blacklist = vec!["evil.example".to_owned()];
-    let Value::Object(proxy) = media_proxy_defaults(&config) else {
-        panic!("the media proxy defaults are a keyword object");
-    };
-    assert_eq!(proxy["enabled"], json!(true));
-    assert_eq!(proxy["blacklist"], json!(["evil.example"]));
-    assert!(
-        !proxy.contains_key("secret"),
-        "the signing secret is never part of the store"
-    );
-    config.restrict_unauthenticated = std::iter::once("timelines_local".to_owned()).collect();
-    let restricted = restrict_unauthenticated_defaults(&config);
-    assert_eq!(
-        restricted["timelines"]["local"],
-        json!(true),
-        "the flat name regroups under its half"
-    );
-    assert_eq!(
-        restricted["timelines"]["federated"],
-        json!(false),
-        "and the siblings stay open"
     );
 }
 
@@ -216,10 +196,12 @@ fn descriptions_document_every_whitelisted_key() {
             KEY_MRF_KEYWORD,
             KEY_MRF_HELLTHREAD,
             KEY_MRF_OBJECT_AGE,
-            KEY_MEDIA_PROXY,
-            KEY_RESTRICT_UNAUTHENTICATED,
         ],
-        "the ticket's order, the ticket's eight keys"
+        "the whitelist's order, its six keys"
+    );
+    assert!(
+        !keys.contains(&":media_proxy") && !keys.contains(&":restrict_unauthenticated"),
+        "the two unread keys are not documented"
     );
 }
 
@@ -305,35 +287,6 @@ fn children_follow_the_subkeys_and_the_policies() {
     assert!(
         suggestions.contains(&json!("simple")) && suggestions.contains(&json!("keyword")),
         "the wired policy names are offered as examples"
-    );
-}
-
-/// The nested `:map` documentation survives to the payload:
-/// `:restrict_unauthenticated` groups its halves, and each half
-/// nests its own booleans.
-#[test]
-fn nested_maps_carry_their_own_children() {
-    let rendered = serde_json::to_value(descriptions()).expect("the payload serializes");
-    let Value::Array(objects) = &rendered else {
-        panic!("the payload is an array");
-    };
-    let restricted = &objects[7];
-    assert_eq!(restricted["key"], json!(KEY_RESTRICT_UNAUTHENTICATED));
-    assert_eq!(restricted["type"], json!("group"));
-    let Value::Array(halves) = &restricted["children"] else {
-        panic!("the halves are an array");
-    };
-    assert_eq!(halves.len(), 3, "timelines, profiles, activities");
-    assert_eq!(halves[0]["key"], json!("timelines"));
-    assert_eq!(halves[0]["type"], json!("map"), "a map of booleans");
-    let Value::Array(fields) = &halves[0]["children"] else {
-        panic!("the map nests its fields");
-    };
-    assert_eq!(fields.len(), 3, "local, federated and remote");
-    assert_eq!(fields[0]["type"], json!("boolean"));
-    assert!(
-        halves[1].get("children").is_some() && halves[2].get("children").is_some(),
-        "every documented container renders its children"
     );
 }
 
