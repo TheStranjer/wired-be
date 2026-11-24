@@ -10,8 +10,11 @@
 //! completes with it; [`get_valid`] reads it back until it expires, and
 //! the endpoints [`delete`] it the moment the second factor passes.
 //!
-//! `token` is secret material: the manual [`Debug`] impl below redacts
-//! it, so it can never reach a log line.
+//! The raw token is never stored: the table keeps only its SHA-256 digest
+//! ([`token_digest`]). [`create`] hands the raw text back once, in an
+//! [`IssuedMfaToken`], for the login response; [`get_valid`] digests the
+//! submitted text before it looks. The manual [`Debug`] impls below redact
+//! both, so neither can reach a log line.
 
 use std::{fmt, time::Duration};
 
@@ -23,7 +26,7 @@ use crate::{
     error::AppResult,
     util::{
         id::new_id,
-        token::{CREDENTIAL_BYTES, random_token},
+        token::{CREDENTIAL_BYTES, random_token, token_digest},
     },
 };
 
@@ -46,9 +49,10 @@ pub const MAX_MFA_ATTEMPTS: i32 = 5;
 pub struct MfaToken {
     /// `UUIDv7` primary key, minted by [`create`] (decision 4).
     pub id: Uuid,
-    /// The challenge token a client exchanges for a token pair. Never in
-    /// `Debug` output.
-    pub token: String,
+    /// The SHA-256 digest ([`token_digest`]) of the challenge token a
+    /// client exchanges for a token pair. Never in `Debug` output; the
+    /// token itself is never stored.
+    pub token_digest: String,
     /// The account that must prove its second factor.
     pub user_id: Uuid,
     /// The pending authorization carrying the grant's parameters, when
@@ -64,13 +68,13 @@ pub struct MfaToken {
     pub failed_attempts: i32,
 }
 
-/// [`token`](Self::token) is secret material and renders as
-/// `<redacted>`; everything else shows.
+/// [`token_digest`](Self::token_digest) renders as `<redacted>`;
+/// everything else shows.
 impl fmt::Debug for MfaToken {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("MfaToken")
             .field("id", &self.id)
-            .field("token", &"<redacted>")
+            .field("token_digest", &"<redacted>")
             .field("user_id", &self.user_id)
             .field("authorization_id", &self.authorization_id)
             .field("valid_until", &self.valid_until)
@@ -80,23 +84,42 @@ impl fmt::Debug for MfaToken {
     }
 }
 
-/// The `INSERT` behind [`create`]: the token is minted by the caller of
-/// the statement, the expiry is computed from the bound lifetime by the
-/// database clock, and `RETURNING *` brings back the row with its
-/// timestamp.
+/// A freshly minted challenge: the stored row and the raw token, which
+/// exists only here and goes into the login response once.
+pub struct IssuedMfaToken {
+    /// The stored row; it holds only the digest of [`token`](Self::token).
+    pub row: MfaToken,
+    /// The raw challenge token; redacted from `Debug`.
+    pub token: String,
+}
+
+/// [`token`](IssuedMfaToken::token) renders as `<redacted>`.
+impl fmt::Debug for IssuedMfaToken {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("IssuedMfaToken")
+            .field("row", &self.row)
+            .field("token", &"<redacted>")
+            .finish()
+    }
+}
+
+/// The `INSERT` behind [`create`]: the token digest is computed by the
+/// caller of the statement, the expiry is computed from the bound
+/// lifetime by the database clock, and `RETURNING *` brings back the row
+/// with its timestamp.
 const INSERT_SQL: &str = "INSERT INTO mfa_tokens (
-     id, token, user_id, authorization_id, valid_until
+     id, token_digest, user_id, authorization_id, valid_until
 ) VALUES ($1, $2, $3, $4, now() + $5) RETURNING *";
 
 /// Creates a five-minute challenge for `user_id` and returns the stored
-/// row.
+/// row with the raw token.
 ///
 /// The id is a fresh `UUIDv7` (decision 4) and the token a 43-character
 /// random credential (Pleroma's `Token.Utils.generate_token`, the shape
-/// every OAuth credential here carries). `authorization_id` links the
-/// pending authorization whose parameters the finished challenge
-/// grants; `None` links nothing. The token column is unique, so a minted
-/// collision is rejected.
+/// every OAuth credential here carries); only its digest is stored.
+/// `authorization_id` links the pending authorization whose parameters
+/// the finished challenge grants; `None` links nothing. The digest column
+/// is unique, so a minted collision is rejected.
 ///
 /// # Errors
 ///
@@ -106,19 +129,21 @@ pub async fn create(
     pool: &PgPool,
     user_id: Uuid,
     authorization_id: Option<Uuid>,
-) -> AppResult<MfaToken> {
-    let token = sqlx::query_as::<_, MfaToken>(INSERT_SQL)
+) -> AppResult<IssuedMfaToken> {
+    let token = random_token(CREDENTIAL_BYTES);
+    let row = sqlx::query_as::<_, MfaToken>(INSERT_SQL)
         .bind(new_id())
-        .bind(random_token(CREDENTIAL_BYTES))
+        .bind(token_digest(&token))
         .bind(user_id)
         .bind(authorization_id)
         .bind(MFA_TOKEN_TTL)
         .fetch_one(pool)
         .await?;
-    Ok(token)
+    Ok(IssuedMfaToken { row, token })
 }
 
-/// Fetches the challenge `token` while it is still valid.
+/// Fetches the challenge whose raw `token` is given (looked up by its
+/// digest) while it is still valid.
 ///
 /// `None` for an unknown token, for one at or past `valid_until` and for
 /// one that has taken [`MAX_MFA_ATTEMPTS`] wrong codes, the cases the
@@ -131,9 +156,9 @@ pub async fn create(
 pub async fn get_valid(pool: &PgPool, token: &str) -> AppResult<Option<MfaToken>> {
     let found = sqlx::query_as::<_, MfaToken>(
         "SELECT * FROM mfa_tokens
-         WHERE token = $1 AND valid_until > now() AND failed_attempts < $2",
+         WHERE token_digest = $1 AND valid_until > now() AND failed_attempts < $2",
     )
-    .bind(token)
+    .bind(token_digest(token))
     .bind(MAX_MFA_ATTEMPTS)
     .fetch_optional(pool)
     .await?;
@@ -236,12 +261,16 @@ mod tests {
         let authorization = oauth_token::create_authorization(&pool, alice.id, app.id, "read", "")
             .await
             .unwrap();
-        let token = create(&pool, alice.id, Some(authorization.id))
+        let issued = create(&pool, alice.id, Some(authorization.id))
             .await
             .unwrap();
+        let IssuedMfaToken {
+            row: token,
+            token: raw,
+        } = issued;
 
         assert!(token.id.get_version_num() == 7, "id is a UUIDv7");
-        assert_eq!(token.token.len(), 43, "the 43-char credential shape");
+        assert_eq!(raw.len(), 43, "the 43-char credential shape");
         assert_eq!(token.user_id, alice.id, "the account round trips");
         assert_eq!(
             token.authorization_id,
@@ -258,15 +287,59 @@ mod tests {
         );
         assert!(token.inserted_at <= token.valid_until, "timestamps agree");
 
-        let found = get_valid(&pool, &token.token)
+        let found = get_valid(&pool, &raw)
             .await
             .unwrap()
             .expect("a fresh challenge is valid");
         assert_eq!(found.id, token.id, "found by its text");
-        assert_eq!(found.token, token.token, "the secret round trips");
+        assert_eq!(
+            found.token_digest, token.token_digest,
+            "the stored digest round trips"
+        );
 
         let unlinked = create(&pool, alice.id, None).await.unwrap();
-        assert!(unlinked.authorization_id.is_none(), "NULL links nothing");
+        assert!(
+            unlinked.row.authorization_id.is_none(),
+            "NULL links nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_stored_token_is_the_digest_not_the_secret() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let gina = insert_user(&pool, "gina").await;
+        let issued = create(&pool, gina.id, None).await.unwrap();
+        let (stored_text,): (String,) =
+            sqlx::query_as("SELECT token_digest FROM mfa_tokens WHERE id = $1")
+                .bind(issued.row.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_ne!(stored_text, issued.token, "the secret is not stored");
+        assert_eq!(
+            stored_text,
+            token_digest(&issued.token),
+            "the digest of the secret is"
+        );
+        assert_eq!(issued.row.token_digest, stored_text, "the row agrees");
+        assert!(
+            get_valid(&pool, &stored_text).await.unwrap().is_none(),
+            "the stored digest is not itself a usable token"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_valid_finds_the_row_by_its_raw_token() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let hank = insert_user(&pool, "hank").await;
+        let issued = create(&pool, hank.id, None).await.unwrap();
+        let found = get_valid(&pool, &issued.token)
+            .await
+            .unwrap()
+            .expect("the raw token finds the challenge");
+        assert_eq!(found.id, issued.row.id, "the same row comes back");
     }
 
     #[tokio::test]
@@ -279,7 +352,7 @@ mod tests {
             get_valid(&pool, "no-such-token").await.unwrap().is_none(),
             "an unknown token finds nothing"
         );
-        expire(&pool, token.id).await;
+        expire(&pool, token.row.id).await;
         assert!(
             get_valid(&pool, &token.token).await.unwrap().is_none(),
             "a challenge past valid_until is refused"
@@ -294,13 +367,13 @@ mod tests {
         let token = create(&pool, frank.id, None).await.unwrap();
         let other = create(&pool, frank.id, None).await.unwrap();
         assert_eq!(
-            token.failed_attempts, 0,
+            token.row.failed_attempts, 0,
             "a fresh challenge has no failures"
         );
 
         for expected in 1..MAX_MFA_ATTEMPTS {
             assert_eq!(
-                record_failure(&pool, token.id).await.unwrap(),
+                record_failure(&pool, token.row.id).await.unwrap(),
                 expected,
                 "each failure bumps the count"
             );
@@ -311,7 +384,7 @@ mod tests {
             assert_eq!(found.failed_attempts, expected, "the count is stored");
         }
         assert_eq!(
-            record_failure(&pool, token.id).await.unwrap(),
+            record_failure(&pool, token.row.id).await.unwrap(),
             MAX_MFA_ATTEMPTS,
             "the last allowed failure reaches the cap"
         );
@@ -336,8 +409,8 @@ mod tests {
         let pool = db.pool().clone();
         let carol = insert_user(&pool, "carol").await;
         let token = create(&pool, carol.id, None).await.unwrap();
-        delete(&pool, token.id).await.unwrap();
-        assert_eq!(token_rows(&pool, token.id).await, 0, "the row is gone");
+        delete(&pool, token.row.id).await.unwrap();
+        assert_eq!(token_rows(&pool, token.row.id).await, 0, "the row is gone");
         assert!(
             get_valid(&pool, &token.token).await.unwrap().is_none(),
             "and it no longer validates"
@@ -357,8 +430,9 @@ mod tests {
             .unwrap();
         let linked = create(&pool, dave.id, Some(authorization.id))
             .await
-            .unwrap();
-        let own_account = create(&pool, dave.id, None).await.unwrap();
+            .unwrap()
+            .row;
+        let own_account = create(&pool, dave.id, None).await.unwrap().row;
 
         let outcome = sqlx::query("DELETE FROM oauth_authorizations WHERE id = $1")
             .bind(authorization.id)
@@ -390,12 +464,21 @@ mod tests {
         let db = crate::test_db::test_db().await.expect("test database slot");
         let pool = db.pool().clone();
         let erin = insert_user(&pool, "erin").await;
-        let token = create(&pool, erin.id, None).await.unwrap();
-        let debug = format!("{token:?}");
-        assert!(!debug.contains(&token.token), "the token must not leak");
+        let issued = create(&pool, erin.id, None).await.unwrap();
+        let debug = format!("{issued:?}");
+        assert!(!debug.contains(&issued.token), "the token must not leak");
+        assert!(
+            !debug.contains(&issued.row.token_digest),
+            "the digest must not leak"
+        );
         assert!(
             debug.contains(r#"token: "<redacted>""#),
             "the redaction marker names the field: {debug}"
+        );
+        let row_debug = format!("{:?}", issued.row);
+        assert!(
+            row_debug.contains(r#"token_digest: "<redacted>""#),
+            "the row redacts its digest: {row_debug}"
         );
         assert!(debug.contains(&erin.id.to_string()), "the rest shows");
     }

@@ -145,11 +145,13 @@ async fn stored_challenge(
     pool: &PgPool,
     token: &str,
 ) -> Option<(Uuid, Option<Uuid>, DateTime<Utc>)> {
-    sqlx::query_as("SELECT id, authorization_id, valid_until FROM mfa_tokens WHERE token = $1")
-        .bind(token)
-        .fetch_optional(pool)
-        .await
-        .expect("the challenge lookup reaches the database")
+    sqlx::query_as(
+        "SELECT id, authorization_id, valid_until FROM mfa_tokens WHERE token_digest = $1",
+    )
+    .bind(wired_be::util::token::token_digest(token))
+    .fetch_optional(pool)
+    .await
+    .expect("the challenge lookup reaches the database")
 }
 
 /// Asserts the stored challenge of `token` belongs to `user`, links a

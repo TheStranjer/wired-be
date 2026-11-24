@@ -80,7 +80,12 @@ async fn the_reset_token_endpoint_issues_a_spendable_link() {
     );
     let stored = stored_tokens(&seeded.pool, &plain(&seeded.pool).await).await;
     assert_eq!(stored.len(), 1, "the mint landed in the table");
-    assert_eq!(stored[0].token, secret, "and is the answered token");
+    assert_eq!(
+        stored[0].token_digest,
+        wired_be::util::token::token_digest(secret),
+        "and holds the digest of the answered token"
+    );
+    assert_ne!(stored[0].token_digest, secret, "never the token itself");
 
     for segment in ["nobody", "faraway@remote.example"] {
         let missing = TestRequest::get(&issued_reset(segment))

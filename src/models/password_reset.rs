@@ -15,8 +15,11 @@
 //! the token with [`mark_used`] and deletes the account's other tokens with
 //! [`delete_others`].
 //!
-//! `token` is secret material until the email is delivered: the manual
-//! [`Debug`](PasswordResetToken) impl below redacts it, so it can never
+//! The raw token is never stored: the table keeps only its SHA-256 digest
+//! ([`token_digest`]), so a leaked row is no credential. [`create_for_user`]
+//! hands the raw text back once, in an [`IssuedReset`], for the mailer;
+//! [`get_valid`] digests the submitted text before it looks. The manual
+//! [`Debug`](PasswordResetToken) impls below redact both, so neither can
 //! reach a log line.
 
 use std::{fmt, time::Duration};
@@ -29,21 +32,22 @@ use crate::{
     error::AppResult,
     util::{
         id::new_id,
-        token::{CREDENTIAL_BYTES, random_token},
+        token::{CREDENTIAL_BYTES, random_token, token_digest},
     },
 };
 
-/// [`create_for_user`]: the minted id and random secret against the two
-/// columns an insert supplies; `used` and `inserted_at` come from the
-/// column defaults and `RETURNING *` brings the row back stamped.
+/// [`create_for_user`]: the minted id and the digest of the random secret
+/// against the two columns an insert supplies; `used` and `inserted_at`
+/// come from the column defaults and `RETURNING *` brings the row back
+/// stamped.
 const INSERT_SQL: &str =
-    "INSERT INTO password_reset_tokens (id, token, user_id) VALUES ($1, $2, $3) RETURNING *";
+    "INSERT INTO password_reset_tokens (id, token_digest, user_id) VALUES ($1, $2, $3) RETURNING *";
 
-/// [`get_valid`]: the one lookup the reset flow runs — the exact,
-/// case-sensitive token text is the unique key, and only an unused row
-/// whose issue time is inside the bound interval is a hit.
+/// [`get_valid`]: the one lookup the reset flow runs — the digest of the
+/// exact, case-sensitive token text is the unique key, and only an unused
+/// row whose issue time is inside the bound interval is a hit.
 const SELECT_VALID_SQL: &str = "SELECT * FROM password_reset_tokens \
-     WHERE token = $1 AND NOT used AND inserted_at > now() - $2::interval";
+     WHERE token_digest = $1 AND NOT used AND inserted_at > now() - $2::interval";
 
 /// [`mark_used`]: spend the token in the row, only while it is still
 /// unspent, so two concurrent spenders cannot both win.
@@ -59,9 +63,10 @@ const DELETE_OTHERS_SQL: &str = "DELETE FROM password_reset_tokens WHERE user_id
 pub struct PasswordResetToken {
     /// `UUIDv7` primary key, minted by [`create_for_user`] (decision 4).
     pub id: Uuid,
-    /// The secret text carried in the reset link; unique, and redacted
-    /// from `Debug` output.
-    pub token: String,
+    /// The SHA-256 digest ([`token_digest`]) of the secret text carried in
+    /// the reset link; unique, and redacted from `Debug` output. The
+    /// secret itself is never stored.
+    pub token_digest: String,
     /// The account this token can reset (foreign key, deletes with it).
     pub user_id: Uuid,
     /// Whether the token has been spent; a used token never resets again.
@@ -70,16 +75,37 @@ pub struct PasswordResetToken {
     pub inserted_at: DateTime<Utc>,
 }
 
-/// [`token`](Self::token) is secret material and renders as `<redacted>`;
+/// [`token_digest`](Self::token_digest) renders as `<redacted>`;
 /// everything else shows.
 impl fmt::Debug for PasswordResetToken {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("PasswordResetToken")
             .field("id", &self.id)
-            .field("token", &"<redacted>")
+            .field("token_digest", &"<redacted>")
             .field("user_id", &self.user_id)
             .field("used", &self.used)
             .field("inserted_at", &self.inserted_at)
+            .finish()
+    }
+}
+
+/// A freshly minted reset: the stored row and the raw secret, which
+/// exists only here and is handed to the mailer (or the admin's one-time
+/// link) once.
+#[derive(Clone, PartialEq, Eq)]
+pub struct IssuedReset {
+    /// The stored row; it holds only the digest of [`token`](Self::token).
+    pub row: PasswordResetToken,
+    /// The raw secret text for the reset link; redacted from `Debug`.
+    pub token: String,
+}
+
+/// [`token`](IssuedReset::token) renders as `<redacted>`.
+impl fmt::Debug for IssuedReset {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("IssuedReset")
+            .field("row", &self.row)
+            .field("token", &"<redacted>")
             .finish()
     }
 }
@@ -102,9 +128,12 @@ impl PasswordResetToken {
     }
 }
 
-/// Mints a reset token for the account `user_id` and returns the stored
-/// row. Nothing is sent here — the endpoint hands the token's link to the
-/// mailer (see [`crate::mailer::templates::password_reset`]).
+/// Mints a reset token for `user_id`; returns the row and the raw secret.
+///
+/// Only the secret's digest is stored; the raw text lives in the returned
+/// [`IssuedReset`] alone. Nothing is sent here — the endpoint hands the
+/// token's link to the mailer (see
+/// [`crate::mailer::templates::password_reset`]).
 ///
 /// # Errors
 ///
@@ -112,18 +141,19 @@ impl PasswordResetToken {
 /// [`AppError::Database`](crate::error::AppError). The random token
 /// colliding with a stored one is a database failure too — vanishingly
 /// unlikely for 32 CSPRNG bytes, and the account can request again.
-pub async fn create_for_user(pool: &PgPool, user_id: Uuid) -> AppResult<PasswordResetToken> {
+pub async fn create_for_user(pool: &PgPool, user_id: Uuid) -> AppResult<IssuedReset> {
+    let token = random_token(CREDENTIAL_BYTES);
     let row = sqlx::query_as::<_, PasswordResetToken>(INSERT_SQL)
         .bind(new_id())
-        .bind(random_token(CREDENTIAL_BYTES))
+        .bind(token_digest(&token))
         .bind(user_id)
         .fetch_one(pool)
         .await?;
-    Ok(row)
+    Ok(IssuedReset { row, token })
 }
 
-/// Fetches the still-valid (unused, unexpired) token whose text is exactly
-/// `token`, `None` when no row matches.
+/// Fetches the still-valid (unused, unexpired) token whose raw text is
+/// exactly `token` (looked up by its digest), `None` when no row matches.
 ///
 /// Unknown, spent or lapsed tokens are deliberately not told apart, the way
 /// Pleroma's `reset` renders one `invalid_token.html` for all three.
@@ -145,7 +175,7 @@ pub async fn get_valid(
         // large for the interval type is a window that never closes.
         .unwrap_or(chrono::Duration::MAX);
     let row = sqlx::query_as::<_, PasswordResetToken>(SELECT_VALID_SQL)
-        .bind(token)
+        .bind(token_digest(token))
         .bind(validity)
         .fetch_optional(pool)
         .await?;
@@ -219,7 +249,7 @@ mod tests {
     fn token_aged(seconds: i64) -> PasswordResetToken {
         PasswordResetToken {
             id: Uuid::now_v7(),
-            token: "secret-text".to_owned(),
+            token_digest: "secret-text".to_owned(),
             user_id: Uuid::now_v7(),
             used: false,
             inserted_at: Utc::now() - ChronoDuration::seconds(seconds),
@@ -227,7 +257,7 @@ mod tests {
     }
 
     /// A fresh slot row for the given account, minted through the model.
-    async fn mint(pool: &PgPool, user_id: Uuid) -> PasswordResetToken {
+    async fn mint(pool: &PgPool, user_id: Uuid) -> IssuedReset {
         create_for_user(pool, user_id)
             .await
             .expect("the insert runs")
@@ -276,7 +306,7 @@ mod tests {
         let now = Utc::now();
         let make = |age_secs| PasswordResetToken {
             id: Uuid::now_v7(),
-            token: "s".to_owned(),
+            token_digest: "s".to_owned(),
             user_id: Uuid::now_v7(),
             used: false,
             inserted_at: now - ChronoDuration::seconds(age_secs),
@@ -307,6 +337,23 @@ mod tests {
             "the token must not leak into Debug output"
         );
         assert!(
+            debug.contains(r#"token_digest: "<redacted>""#),
+            "the redaction marker names the field"
+        );
+    }
+
+    #[test]
+    fn issued_debug_redacts_the_raw_token() {
+        let issued = IssuedReset {
+            row: token_aged(0),
+            token: "raw-secret-text".to_owned(),
+        };
+        let debug = format!("{issued:?}");
+        assert!(
+            !debug.contains("raw-secret-text"),
+            "the raw token must not leak into Debug output"
+        );
+        assert!(
             debug.contains(r#"token: "<redacted>""#),
             "the redaction marker names the field"
         );
@@ -318,14 +365,14 @@ mod tests {
         let pool = db.pool().clone();
         let user_id = account(&pool, "minter").await;
         let first = mint(&pool, user_id).await;
-        assert_ne!(first.id, Uuid::nil(), "the id is minted");
+        assert_ne!(first.row.id, Uuid::nil(), "the id is minted");
         assert_eq!(
             first.token.len(),
             43,
             "32 bytes are 43 base64url characters"
         );
-        assert_eq!(first.user_id, user_id, "the token names its account");
-        assert!(!first.used, "a fresh token is unused");
+        assert_eq!(first.row.user_id, user_id, "the token names its account");
+        assert!(!first.row.used, "a fresh token is unused");
         assert!(
             first
                 .token
@@ -338,6 +385,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_stored_token_is_the_digest_not_the_secret() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let user_id = account(&pool, "digested").await;
+        let issued = mint(&pool, user_id).await;
+        let stored_text: String =
+            sqlx::query_scalar("SELECT token_digest FROM password_reset_tokens WHERE id = $1")
+                .bind(issued.row.id)
+                .fetch_one(&pool)
+                .await
+                .expect("the stored column reads");
+        assert_ne!(stored_text, issued.token, "the secret is not stored");
+        assert_eq!(
+            stored_text,
+            token_digest(&issued.token),
+            "the digest of the secret is"
+        );
+        assert_eq!(issued.row.token_digest, stored_text, "the row agrees");
+        assert_eq!(
+            get_valid(&pool, &stored_text, HOUR)
+                .await
+                .expect("the lookup runs"),
+            None,
+            "the stored digest is not itself a usable token"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_valid_finds_the_row_by_its_raw_token() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let user_id = account(&pool, "rawlookup").await;
+        let issued = mint(&pool, user_id).await;
+        let found = get_valid(&pool, &issued.token, HOUR)
+            .await
+            .expect("the lookup runs");
+        assert_eq!(found.as_ref(), Some(&issued.row), "the raw token finds it");
+    }
+
+    #[tokio::test]
     async fn get_valid_answers_only_the_named_unused_token() {
         let db = crate::test_db::test_db().await.expect("test database slot");
         let pool = db.pool().clone();
@@ -346,7 +433,7 @@ mod tests {
         let fetched = get_valid(&pool, &token.token, HOUR)
             .await
             .expect("the lookup runs");
-        assert_eq!(fetched.as_ref(), Some(&token), "a fresh token is valid");
+        assert_eq!(fetched.as_ref(), Some(&token.row), "a fresh token is valid");
         assert_eq!(
             get_valid(&pool, "never-minted-text", HOUR)
                 .await
@@ -365,7 +452,9 @@ mod tests {
         let user_id = account(&pool, "spent").await;
         let spent = mint(&pool, user_id).await;
         assert!(
-            mark_used(&pool, spent.id).await.expect("the spend runs"),
+            mark_used(&pool, spent.row.id)
+                .await
+                .expect("the spend runs"),
             "the first spend wins"
         );
         assert_eq!(
@@ -375,10 +464,13 @@ mod tests {
             None,
             "a used token is not valid"
         );
-        assert!(stored(&pool, spent.id).await.used, "and the flag says so");
+        assert!(
+            stored(&pool, spent.row.id).await.used,
+            "and the flag says so"
+        );
 
         let lapsed = mint(&pool, user_id).await;
-        age_token(&pool, lapsed.id, 7_200).await;
+        age_token(&pool, lapsed.row.id, 7_200).await;
         assert_eq!(
             get_valid(&pool, &lapsed.token, HOUR)
                 .await
@@ -391,7 +483,7 @@ mod tests {
                 .await
                 .expect("the lookup runs")
                 .as_ref(),
-            Some(&stored(&pool, lapsed.id).await),
+            Some(&stored(&pool, lapsed.row.id).await),
             "the same token is still valid inside a 24-hour window"
         );
     }
@@ -401,7 +493,7 @@ mod tests {
         let db = crate::test_db::test_db().await.expect("test database slot");
         let pool = db.pool().clone();
         let user_id = account(&pool, "marker").await;
-        let token = mint(&pool, user_id).await;
+        let token = mint(&pool, user_id).await.row;
         assert!(
             mark_used(&pool, token.id).await.expect("the spend runs"),
             "the first spend lands"
@@ -414,7 +506,7 @@ mod tests {
         let db = crate::test_db::test_db().await.expect("test database slot");
         let pool = db.pool().clone();
         let user_id = account(&pool, "twice").await;
-        let token = mint(&pool, user_id).await;
+        let token = mint(&pool, user_id).await.row;
         assert!(
             mark_used(&pool, token.id).await.expect("the first spend"),
             "the first spend wins"
@@ -443,7 +535,7 @@ mod tests {
         let db = crate::test_db::test_db().await.expect("test database slot");
         let pool = db.pool().clone();
         let user_id = account(&pool, "txn").await;
-        let token = mint(&pool, user_id).await;
+        let token = mint(&pool, user_id).await.row;
         let mut conn = pool.acquire().await.expect("a connection");
         let mut tx = conn.begin().await.expect("a transaction begins");
         assert!(
@@ -465,7 +557,7 @@ mod tests {
         let pool = db.pool().clone();
         let user_id = account(&pool, "cleaner").await;
         let other_user = account(&pool, "untouched").await;
-        let kept = mint(&pool, user_id).await;
+        let kept = mint(&pool, user_id).await.row;
         let doomed = mint(&pool, user_id).await;
         let foreign = mint(&pool, other_user).await;
 
@@ -485,7 +577,7 @@ mod tests {
                 .await
                 .expect("the lookup runs")
                 .as_ref(),
-            Some(&foreign),
+            Some(&foreign.row),
             "another account's token is untouched"
         );
         assert_eq!(
@@ -502,7 +594,7 @@ mod tests {
         let db = crate::test_db::test_db().await.expect("test database slot");
         let pool = db.pool().clone();
         let user_id = account(&pool, "doomed").await;
-        let token = mint(&pool, user_id).await;
+        let token = mint(&pool, user_id).await.row;
         let deleted = sqlx::query("DELETE FROM users WHERE id = $1")
             .bind(user_id)
             .execute(&pool)
