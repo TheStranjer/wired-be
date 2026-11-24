@@ -259,7 +259,7 @@ async fn load_note_context_loads_media_and_the_expired_poll() {
         document["attachment"],
         json!([
             {"type": "Image", "mediaType": "image/png", "url": format!("{BASE}/media/loading/cat.png"),
-             "name": "a cat", "blurhash": null},
+             "name": "a cat"},
         ]),
         "the media as an Image attachment"
     );

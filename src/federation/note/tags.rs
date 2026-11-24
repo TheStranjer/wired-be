@@ -2,7 +2,7 @@
 //! mentions and used custom emojis, the `attachment` array of media objects,
 //! and the poll fields that turn a `Note` into a `Question`.
 
-use serde_json::{Value, json};
+use serde_json::{Map, Number, Value, json};
 
 use crate::{
     models::{
@@ -95,19 +95,48 @@ pub(super) fn attachments_json(attachments: &[MediaAttachment]) -> Vec<Value> {
 }
 
 /// One media row as its attachment object.
+///
+/// `focalPoint` (`[x, y]`, Mastodon's `-1..1` convention) and `width` /
+/// `height` appear only when the row stores them; `blurhash` only when set.
 pub(crate) fn attachment_json(media: &MediaAttachment) -> Value {
     let class = if media.content_type.starts_with("image/") {
         TYPE_IMAGE
     } else {
         TYPE_DOCUMENT
     };
-    json!({
-        "type": class,
-        "mediaType": &media.content_type,
-        "url": &media.url,
-        "name": media.description.clone().unwrap_or_default(),
-        "blurhash": &media.blurhash,
-    })
+    let mut fields = Map::new();
+    let mut put = |key: &str, value: Value| {
+        let _previous = fields.insert(key.to_owned(), value);
+    };
+    put("type", json!(class));
+    put("mediaType", json!(&media.content_type));
+    put("url", json!(&media.url));
+    put("name", json!(media.description.clone().unwrap_or_default()));
+    if let Some(blurhash) = &media.blurhash {
+        put("blurhash", json!(blurhash));
+    }
+    if let Some(point) = focal_point(media) {
+        put("focalPoint", point);
+    }
+    if let (Some(width), Some(height)) = (media.width, media.height) {
+        put("width", json!(width));
+        put("height", json!(height));
+    }
+    Value::Object(fields)
+}
+
+/// The `[x, y]` focal point of `media`, when both axes are stored and finite.
+fn focal_point(media: &MediaAttachment) -> Option<Value> {
+    let x = axis_number(media.focus_x?)?;
+    let y = axis_number(media.focus_y?)?;
+    Some(Value::Array(vec![x, y]))
+}
+
+/// One focal axis as a JSON number at its shortest `f32` decimal form, so a
+/// stored `0.3` federates as `0.3`, not `0.30000001192092896`.
+fn axis_number(axis: f32) -> Option<Value> {
+    let decimal = format!("{axis}").parse::<f64>().ok()?;
+    Number::from_f64(decimal).map(Value::Number)
 }
 
 /// The poll fields of a `Question`: the choices under `oneOf` (single
@@ -230,9 +259,65 @@ mod tests {
                 {"type": "Image", "mediaType": "image/png", "url": format!("{BASE}/media/cat.png"),
                  "name": "a cat", "blurhash": "UBLHZ;9a"},
                 {"type": "Document", "mediaType": "application/pdf", "url": format!("{BASE}/media/report.pdf"),
-                 "name": "", "blurhash": null},
+                 "name": ""},
             ]),
-            "image/* classifies as Image, the rest as Document"
+            "image/* classifies as Image, the rest as Document; a null blurhash is omitted"
+        );
+    }
+
+    #[test]
+    fn an_image_with_focus_and_dimensions_renders_them() {
+        let mut photo = fixture_media(&format!("{BASE}/media/photo.jpg"), "image/jpeg");
+        photo.focus_x = Some(0.3);
+        photo.focus_y = Some(0.6);
+        photo.width = Some(400);
+        photo.height = Some(300);
+        let rendered = attachment_json(&photo);
+        assert_eq!(rendered["focalPoint"], json!([0.3, 0.6]), "the focal point");
+        assert_eq!(rendered["width"], 400, "the original width");
+        assert_eq!(rendered["height"], 300, "the original height");
+        assert_eq!(
+            rendered["focalPoint"].to_string(),
+            "[0.3,0.6]",
+            "shortest decimal form, not the widened f32"
+        );
+    }
+
+    #[test]
+    fn missing_focus_or_dimensions_are_omitted() {
+        let mut photo = fixture_media(&format!("{BASE}/media/photo.jpg"), "image/jpeg");
+        photo.width = Some(400);
+        photo.height = Some(300);
+        let rendered = attachment_json(&photo);
+        assert!(rendered.get("focalPoint").is_none(), "no focus, no key");
+        let mut half = fixture_media(&format!("{BASE}/media/half.jpg"), "image/jpeg");
+        half.focus_x = Some(0.5);
+        half.width = Some(400);
+        let partial = attachment_json(&half);
+        assert!(partial.get("focalPoint").is_none(), "one axis is no point");
+        assert!(partial.get("width").is_none(), "width alone is dropped");
+        assert!(partial.get("height").is_none(), "no height stored");
+    }
+
+    #[test]
+    fn an_audio_file_has_no_dimensions() {
+        let audio = fixture_media(&format!("{BASE}/media/song.mp3"), "audio/mpeg");
+        let rendered = attachment_json(&audio);
+        assert_eq!(rendered["type"], "Document", "audio is a Document");
+        for key in ["width", "height", "focalPoint", "blurhash"] {
+            assert!(rendered.get(key).is_none(), "{key} is omitted");
+        }
+    }
+
+    #[test]
+    fn negative_focus_keeps_the_mastodon_convention() {
+        let mut photo = fixture_media(&format!("{BASE}/media/photo.jpg"), "image/jpeg");
+        photo.focus_x = Some(0.5);
+        photo.focus_y = Some(-0.25);
+        assert_eq!(
+            attachment_json(&photo)["focalPoint"],
+            json!([0.5, -0.25]),
+            "a negative y survives"
         );
     }
 

@@ -320,7 +320,6 @@ async fn a_message_with_media_publishes_the_first_attachment() {
             "mediaType": "image/png",
             "url": "https://test.example/media/cat.png",
             "name": "a cat",
-            "blurhash": Value::Null,
         })),
     );
     assert_eq!(activity, expected, "the whole delivery JSON, media and all");
