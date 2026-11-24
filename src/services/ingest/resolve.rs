@@ -197,8 +197,10 @@ async fn fetch_mention(state: &AppState, href: String) -> Option<User> {
 /// Step 6: upsert the `Emoji` tags the post announces, each under the
 /// announcing author's domain — the same row shape the emoji endpoints
 /// serve through `GET /api/v1/custom_emojis`, and idempotent, so a
-/// redelivered Create rewrites the same images it wrote the first time.
-pub(super) async fn upsert_emojis(
+/// redelivered Create rewrites the same images it wrote the first time. The
+/// edit fold of an `Update` calls it too, so an emoji first used in an edit
+/// is stored.
+pub(crate) async fn upsert_emojis(
     state: &AppState,
     emojis: &[RemoteEmoji],
 ) -> Result<(), FederationError> {

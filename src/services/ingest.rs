@@ -139,11 +139,11 @@ pub mod write;
 mod test_support;
 
 pub(crate) use self::{
-    resolve::{merge_accounts, resolve_local_audience, resolve_mentions},
+    resolve::{merge_accounts, resolve_local_audience, resolve_mentions, upsert_emojis},
     write::{insert_media, insert_poll},
 };
 use self::{
-    resolve::{resolve_quote, resolve_reply, upsert_emojis},
+    resolve::{resolve_quote, resolve_reply},
     write::{build_new_status, write_ingested},
 };
 
