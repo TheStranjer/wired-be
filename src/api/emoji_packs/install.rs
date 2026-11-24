@@ -21,7 +21,6 @@ use super::{
     },
 };
 use crate::{
-    api::instance::sha256_hex_bytes,
     auth::admin::AdminUser,
     error::{AppError, AppResult},
     extract::{
@@ -30,6 +29,7 @@ use crate::{
     },
     services::emoji_packs,
     state::AppState,
+    util::token::sha256_hex_bytes,
 };
 
 /// Where the archive of `request`'s remote pack comes from, Pleroma's

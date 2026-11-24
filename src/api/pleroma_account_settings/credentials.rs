@@ -13,7 +13,6 @@ use super::{
     PASSWORD_TOO_SHORT, error_body, password_accepted, success_body,
 };
 use crate::{
-    api::instance::sha256_hex,
     auth::AuthUser,
     error::AppResult,
     extract::ApiBody,
@@ -24,7 +23,7 @@ use crate::{
     },
     oauth::scopes::WRITE_ACCOUNTS,
     state::AppState,
-    util::password::hash_password,
+    util::{password::hash_password, token::sha256_hex},
 };
 
 /// The parameters of `POST /api/pleroma/change_password`.
