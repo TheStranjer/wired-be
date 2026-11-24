@@ -24,6 +24,9 @@ use serde_json::{Value, json};
 
 use crate::{
     config::Config,
+    federation::note::{
+        AS_VOCABULARY, LANGUAGE_UNDETERMINED, LITEPUB_SCHEMA_PATH, SECURITY_VOCABULARY,
+    },
     models::user::{User, followers, following, inbox, outbox},
     util::time::mastodon_time,
 };
@@ -68,7 +71,7 @@ pub fn actor_json(user: &User, config: &Config) -> Value {
 fn actor_fields(user: &User, config: &Config) -> Vec<(&'static str, Value)> {
     let ap_id = user.ap_id.as_str();
     let mut fields = vec![
-        ("@context", json_ld_context()),
+        ("@context", json_ld_context(config)),
         ("id", json!(ap_id)),
         ("type", json!(user.actor_type)),
         ("preferredUsername", json!(user.nickname)),
@@ -105,48 +108,16 @@ fn actor_fields(user: &User, config: &Config) -> Vec<(&'static str, Value)> {
 }
 
 /// The `@context` of an actor document: the `ActivityStreams` and
-/// `security` vocabularies plus the inline term definitions Pleroma ships
-/// in `priv/static/schemas/litepub-0.1.jsonld` (the schema its 2.10
-/// documents reference), extended with the `movedTo` alias of a moved
-/// actor.
-fn json_ld_context() -> Value {
+/// `security` vocabularies, this instance's single served term map
+/// ([`litepub_context_json`](crate::federation::note::litepub_context_json)
+/// at [`LITEPUB_SCHEMA_PATH`]) and the `und` language map — the schema
+/// Pleroma's 2.10 actor documents reference too.
+fn json_ld_context(config: &Config) -> Value {
     json!([
-        "https://www.w3.org/ns/activitystreams",
-        "https://w3id.org/security/v1",
-        {
-            "as": "https://www.w3.org/ns/activitystreams#",
-            "fedibird": "http://fedibird.com/ns#",
-            "litepub": "http://litepub.social/ns#",
-            "ostatus": "http://ostatus.org#",
-            "schema": "http://schema.org#",
-            "sm": "http://smithereen.software/ns#",
-            "toot": "http://joinmastodon.org/ns#",
-            "vcard": "http://www.w3.org/2006/vcard/ns#",
-            "alsoKnownAs": {"@id": "as:alsoKnownAs", "@type": "@id"},
-            "capabilities": "litepub:capabilities",
-            "ChatMessage": "litepub:ChatMessage",
-            "conversation": {"@id": "ostatus:conversation", "@type": "@id"},
-            "directMessage": "litepub:directMessage",
-            "discoverable": "toot:discoverable",
-            "Emoji": "toot:Emoji",
-            "EmojiReact": "litepub:EmojiReact",
-            "formerRepresentations": "litepub:formerRepresentations",
-            "Hashtag": "as:Hashtag",
-            "invisible": "litepub:invisible",
-            "listMessage": {"@id": "litepub:listMessage", "@type": "@id"},
-            "manuallyApprovesFollowers": "as:manuallyApprovesFollowers",
-            "movedTo": {"@id": "as:movedTo", "@type": "@id"},
-            "nonAnonymous": "sm:nonAnonymous",
-            "oauthRegistrationEndpoint": {
-                "@id": "litepub:oauthRegistrationEndpoint",
-                "@type": "@id"
-            },
-            "PropertyValue": "schema:PropertyValue",
-            "quoteUri": "fedibird:quoteUri",
-            "quoteUrl": "as:quoteUrl",
-            "sensitive": "as:sensitive",
-            "value": "schema:value",
-        }
+        AS_VOCABULARY,
+        SECURITY_VOCABULARY,
+        format!("{}{LITEPUB_SCHEMA_PATH}", config.base_url),
+        { "@language": LANGUAGE_UNDETERMINED },
     ])
 }
 
@@ -219,6 +190,7 @@ mod tests {
 
     use super::*;
     use crate::{
+        federation::note::{litepub_context_json, test_support::undefined_terms},
         models::user::{DEFAULT_SCOPE, Flag},
         util::time::parse_time,
     };
@@ -412,20 +384,24 @@ mod tests {
     }
 
     #[test]
-    fn the_context_is_the_activitypub_one_pleroma_emits() {
+    fn the_context_references_the_one_served_litepub_schema() {
         let document = render(&local_alice());
-        let terms = document["@context"].as_array().unwrap();
         assert_eq!(
-            terms[0],
-            json!("https://www.w3.org/ns/activitystreams"),
-            "the ActivityStreams vocabulary comes first"
+            document["@context"],
+            json!([
+                "https://www.w3.org/ns/activitystreams",
+                "https://w3id.org/security/v1",
+                "https://test.example/schemas/litepub-0.1.jsonld",
+                {"@language": "und"},
+            ]),
+            "vocabulary, security, the served schema, the language map"
         );
-        assert_eq!(
-            terms[1],
-            json!("https://w3id.org/security/v1"),
-            "then the security vocabulary that defines publicKey"
-        );
-        let aliases = terms[2].as_object().unwrap();
+    }
+
+    #[test]
+    fn the_served_schema_defines_the_actor_terms() {
+        let schema = litepub_context_json();
+        let aliases = schema["@context"].as_object().unwrap();
         assert_eq!(
             aliases["manuallyApprovesFollowers"], "as:manuallyApprovesFollowers",
             "manuallyApprovesFollowers is an ActivityStreams alias"
@@ -453,6 +429,20 @@ mod tests {
         assert_eq!(
             aliases["PropertyValue"], "schema:PropertyValue",
             "attachments need the schema term"
+        );
+    }
+
+    #[test]
+    fn every_term_the_actor_document_emits_is_defined_in_the_served_schema() {
+        let mut alice = local_alice();
+        alice.avatar_url = Some(format!("{BASE}/avatar.png"));
+        alice.banner_url = Some(format!("{BASE}/banner.png"));
+        alice.moved_to_ap_id = Some("https://other.example/users/alice".to_owned());
+        alice.fields = json!([{"name": "site", "value": "https://alice.example"}]);
+        assert_eq!(
+            undefined_terms(&render(&alice)),
+            Vec::<String>::new(),
+            "no actor key is left undefined"
         );
     }
 

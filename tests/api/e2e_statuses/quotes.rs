@@ -58,21 +58,27 @@ async fn a_quote_create_nests_its_original_and_counts_it_once() {
         "a quote is an ordinary post about another one"
     );
     assert_eq!(
-        quote["quote"]["id"], original["id"],
+        quote["quote"]["state"],
+        json!("accepted"),
+        "Mastodon's Quote entity reports the poster may see it"
+    );
+    let nested = &quote["quote"]["quoted_status"];
+    assert_eq!(
+        nested["id"], original["id"],
         "the create nests the quoted original for the poster"
     );
     assert_eq!(
-        quote["quote"]["content"],
+        nested["content"],
         json!("<p>the quoted word</p>"),
         "the nested entity speaks as the original"
     );
     assert_eq!(
-        quote["quote"]["account"]["acct"],
+        nested["account"]["acct"],
         json!("author"),
         "the original's author rides the nest"
     );
     assert_eq!(
-        quote["quote"]["quote"],
+        nested["quote"],
         Value::Null,
         "one level deep: the original quotes nothing"
     );
@@ -94,11 +100,11 @@ async fn a_quote_create_nests_its_original_and_counts_it_once() {
 /// `public` quote (rule 3 — only the blocked account loses even this),
 /// while the nested `quote` follows the *original's* audience: the author
 /// and the accepted follower read the `private` original back inside it
-/// (rule 5), every other admitted viewer reads `quote: null` — the very
-/// answer of a row that quotes nothing, no id or text leaking — while the
+/// (rule 5), every other admitted viewer reads `quote.state:
+/// unauthorized` with no id or text leaking — while the
 /// entity keeps the quoting contract: top-level `quote_id` names the
-/// original to every viewer, `pleroma.quote` mirrors the nested render and
-/// `pleroma.quote_visible` is false exactly when it is null, and `pleroma`
+/// original to every viewer, `pleroma.quote` mirrors the bare quoted
+/// status and `pleroma.quote_visible` is false exactly when it is null, and `pleroma`
 /// carries no `quote_id` or `quote_url` key at all (a recorded decision).
 #[tokio::test]
 async fn a_quote_shows_its_original_only_to_viewers_that_reach_it() {
@@ -119,14 +125,14 @@ async fn a_quote_shows_its_original_only_to_viewers_that_reach_it() {
         let sees = matches!(who, "author" | "follower");
         if sees {
             assert_eq!(
-                entity["quote"]["id"], original["id"],
+                entity["quote"]["quoted_status"]["id"], original["id"],
                 "{who}: the reachable original nests"
             );
         } else {
             assert_eq!(
                 entity["quote"],
-                Value::Null,
-                "{who}: the hidden original answers like no quote at all"
+                json!({ "state": "unauthorized", "quoted_status": null }),
+                "{who}: the hidden original is unauthorized, no id or text leaking"
             );
         }
         assert_eq!(
@@ -139,7 +145,7 @@ async fn a_quote_shows_its_original_only_to_viewers_that_reach_it() {
             "{who}: quote_visible is false exactly when the quote is null"
         );
         assert_eq!(
-            entity["pleroma"]["quote"], entity["quote"],
+            entity["pleroma"]["quote"], entity["quote"]["quoted_status"],
             "{who}: the pleroma block mirrors the nested render"
         );
         for key in ["quote_id", "quote_url"] {

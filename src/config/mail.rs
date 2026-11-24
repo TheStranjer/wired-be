@@ -8,7 +8,7 @@ use super::{
     defaults::{DEFAULT_MAIL_FROM_USER, DEFAULT_SMTP_PORT},
     error::ConfigError,
     integrations::SmtpTls,
-    parse::number,
+    parse::{number, trimmed},
     vars::{
         MAIL_FROM_VAR, SMTP_HOST_VAR, SMTP_PASSWORD_VAR, SMTP_PORT_VAR, SMTP_TLS_VAR,
         SMTP_USERNAME_VAR,
@@ -51,19 +51,12 @@ pub(crate) fn mailer_settings<F>(lookup: &F, domain: &str) -> Result<MailerSetti
 where
     F: Fn(&str) -> Option<String>,
 {
-    let smtp_host = lookup(SMTP_HOST_VAR)
-        .map(|host| host.trim().to_owned())
-        .filter(|host| !host.is_empty());
+    let smtp_host = trimmed(lookup, SMTP_HOST_VAR);
     let smtp_port = smtp_port(lookup)?;
-    let smtp_username = lookup(SMTP_USERNAME_VAR)
-        .map(|name| name.trim().to_owned())
-        .filter(|name| !name.is_empty());
+    let smtp_username = trimmed(lookup, SMTP_USERNAME_VAR);
     let smtp_password = lookup(SMTP_PASSWORD_VAR).filter(|secret| !secret.is_empty());
     let smtp_tls = smtp_tls(lookup)?;
-    let mail_from = lookup(MAIL_FROM_VAR)
-        .map(|from| from.trim().to_owned())
-        .filter(|from| !from.is_empty())
-        .unwrap_or_else(|| default_mail_from(domain));
+    let mail_from = trimmed(lookup, MAIL_FROM_VAR).unwrap_or_else(|| default_mail_from(domain));
     Ok(MailerSettings {
         host: smtp_host,
         port: smtp_port,

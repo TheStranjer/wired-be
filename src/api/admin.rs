@@ -46,8 +46,7 @@
 //! `GET /restart` pair, WBE-206 and WBE-207) joins as the
 //! [`config`] submodule, the registration invites (`users/invite_token`,
 //! `users/invites`, `users/revoke_invite`, `users/email_invite`, WBE-199)
-//! as the [`invites`] submodule — whose [`registration_router`]
-//! additionally rides on [`crate::app`] at the root — the webhook
+//! as the [`invites`] submodule, the webhook
 //! maintenance API (`/webhooks` and its `{id}` actions, WBE-209) as the
 //! [`webhooks`] submodule, the admin's view of the accounts table
 //! (`GET /users` and `GET /users/{nickname}`, WBE-195) as the [`users`]
@@ -84,7 +83,6 @@
 //! [`AdminUser::require`]: crate::auth::admin::AdminUser::require
 //! [`StaffUser`]: crate::auth::admin::StaffUser
 //! [`StaffUser::require`]: crate::auth::admin::StaffUser::require
-//! [`registration_router`]: invites::registration_router
 
 use std::collections::HashMap;
 

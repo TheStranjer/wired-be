@@ -2,7 +2,7 @@
 //! `Accept: application/json` describing the request, and `POST` with a
 //! trusted app's bearer token approving or denying it — the successes,
 //! the 400/401/403 refusals, the out-of-band answer, the code's redemption
-//! at `POST /oauth/token` and the unchanged browser page.
+//! at `POST /oauth/token` and the browser redirect that stays apart.
 
 use axum::{Router, http::StatusCode};
 use serde_json::{Value, json};
@@ -151,9 +151,10 @@ async fn json_get_refuses_bad_requests() {
     );
 }
 
-/// A browser `GET` (no JSON `Accept`) still renders the HTML page.
+/// A browser `GET` (no JSON `Accept`) is redirected to the frontend, not
+/// answered with the JSON description or a page.
 #[tokio::test]
-async fn browser_get_still_renders_the_page() {
+async fn browser_get_is_redirected_not_described() {
     let db = common::test_db().await;
     let pool = db.pool().clone();
     let app = register_app(&pool, "Third Party", REDIRECT, "read").await;
@@ -166,14 +167,13 @@ async fn browser_get_still_renders_the_page() {
         .header("accept", "text/html,application/xhtml+xml,*/*;q=0.8")
         .send(&http)
         .await;
-    assert_eq!(response.status, StatusCode::OK, "the page");
+    assert_eq!(response.status, StatusCode::FOUND, "the redirect");
     assert!(
         response
-            .header("content-type")
-            .is_some_and(|value| value.starts_with("text/html")),
-        "as HTML"
+            .header("location")
+            .is_some_and(|value| value.contains("/oauth/authorize?")),
+        "to the frontend's consent screen"
     );
-    assert!(response.text().contains("<form"), "with the consent form");
 }
 
 /// Approval by a trusted app's token yields a redirect carrying `code` and

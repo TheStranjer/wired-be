@@ -218,20 +218,7 @@ fn capped(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        config::TEST_BASE_URL,
-        models::user::{NewUser, User, insert, local_ap_id},
-    };
-
-    /// Inserts a local user named `nickname`.
-    async fn user(pool: &PgPool, nickname: &str) -> User {
-        insert(
-            pool,
-            &NewUser::local(nickname, &local_ap_id(TEST_BASE_URL, nickname)),
-        )
-        .await
-        .expect("the local fixture inserts")
-    }
+    use crate::{models::user::User, test_fixtures::local_user as user};
 
     /// The timelines of `rows`, in order — what a read test compares against.
     fn timelines(rows: &[Marker]) -> Vec<&str> {

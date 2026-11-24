@@ -1,8 +1,7 @@
 //! The unit-test fixtures the remote-interaction children share: the
 //! `WebFinger` documents the mock peers answer with, the loopback server
 //! that serves them, the subscribe lookup driven against it, the test
-//! state whose client may reach loopback, the stored local actor and the
-//! response reader. Test-only.
+//! state whose client may reach loopback and the response reader. Test-only.
 
 use axum::{
     Router,
@@ -14,12 +13,7 @@ use axum::{
 use sqlx::PgPool;
 use tokio::{net::TcpListener, task::JoinHandle};
 
-use crate::{
-    config::{Config, TEST_BASE_URL},
-    http_client::HttpClient,
-    models::user::{NewUser, User, insert, local_ap_id},
-    state::AppState,
-};
+use crate::{config::Config, http_client::HttpClient, state::AppState};
 
 use super::interaction::subscribe_url_for;
 
@@ -138,16 +132,6 @@ pub(super) fn client_state() -> AppState {
         .connect_lazy("postgres://localhost/unused")
         .unwrap();
     test_state(&pool)
-}
-
-/// The local `alice` whose actor id is [`AP_ID`], inserted straight.
-pub(super) async fn local_alice(pool: &PgPool) -> User {
-    insert(
-        pool,
-        &NewUser::local("alice", &local_ap_id(TEST_BASE_URL, "alice")),
-    )
-    .await
-    .expect("the fixture local user inserts")
 }
 
 /// The full text of a response body.

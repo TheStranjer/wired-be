@@ -253,6 +253,14 @@ pub(super) async fn sweeps_for(pool: &PgPool, account: &User) -> Vec<Value> {
         .collect()
 }
 
+/// How many rows the job table holds, whatever their queue or kind.
+pub(super) async fn job_count(pool: &PgPool) -> i64 {
+    sqlx::query_scalar::<_, i64>("SELECT count(*) FROM jobs")
+        .fetch_one(pool)
+        .await
+        .expect("the job count reads back")
+}
+
 /// The letters the mailer queue holds, in the order they were posted.
 pub(super) async fn letters(pool: &PgPool) -> Vec<Value> {
     jobs_of(pool, "mailer", "mailer.send").await

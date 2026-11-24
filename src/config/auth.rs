@@ -14,7 +14,7 @@ use super::{
     error::ConfigError,
     federation_types::Toggle,
     integrations::OauthProvider,
-    parse::{boolean, number},
+    parse::{boolean, number, trimmed},
     vars::{
         ACCOUNTS_EMAIL_OPTIONAL_VAR, ALLOW_ACCOUNT_DELETION_VAR, MIN_PASSWORD_LENGTH_VAR,
         OAUTH_PROVIDERS_VAR, OAUTH_TOKEN_TTL_SECS_VAR, PASSWORD_RESET_TTL_SECS_VAR,
@@ -30,9 +30,7 @@ pub(crate) fn secret_key_base<F>(lookup: &F) -> Option<String>
 where
     F: Fn(&str) -> Option<String>,
 {
-    lookup(SECRET_KEY_BASE_VAR)
-        .map(|secret| secret.trim().to_owned())
-        .filter(|secret| !secret.is_empty())
+    trimmed(lookup, SECRET_KEY_BASE_VAR)
 }
 
 /// What [`auth_settings`] reads: the six settings that gate
@@ -220,6 +218,24 @@ mod tests {
         assert_eq!(
             custom.password_reset_ttl_secs, 7_200,
             "custom PASSWORD_RESET_TTL_SECS is honored"
+        );
+    }
+
+    #[test]
+    fn ttl_accessors_return_the_configured_seconds_as_durations() {
+        let config = config_with(&[
+            (OAUTH_TOKEN_TTL_SECS_VAR, "600"),
+            (PASSWORD_RESET_TTL_SECS_VAR, "1200"),
+        ]);
+        assert_eq!(
+            config.oauth_token_ttl().as_secs(),
+            600,
+            "the token lifetime"
+        );
+        assert_eq!(
+            config.password_reset_ttl().as_secs(),
+            1_200,
+            "the reset-token lifetime"
         );
     }
 

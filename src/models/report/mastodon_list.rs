@@ -5,7 +5,10 @@
 use sqlx::{PgPool, Postgres, QueryBuilder};
 use uuid::Uuid;
 
-use crate::{error::AppResult, pagination::PageParams};
+use crate::{
+    error::AppResult,
+    pagination::{PageParams, keyset_page},
+};
 
 use super::Report;
 
@@ -64,9 +67,7 @@ pub async fn mastodon_list(
 ) -> AppResult<Vec<Report>> {
     let mut builder = QueryBuilder::<Postgres>::new(MASTODON_SELECT_SQL);
     push_mastodon_filters(&mut builder, params);
-    page.apply_keyset(&mut builder, "id");
-    let rows = builder.build_query_as::<Report>().fetch_all(pool).await?;
-    Ok(page.finish(rows))
+    keyset_page(pool, builder, "id", &page).await
 }
 
 /// Appends [`mastodon_list`]'s `WHERE` clause to the always-true predicate

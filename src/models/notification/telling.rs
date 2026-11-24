@@ -1,8 +1,8 @@
 //! The full five-part key of one telling: [`Telling`], the live-row
 //! probe ([`already_told`]) and its withdrawal twin
-//! ([`delete_telling`]) — the pair that names the voted status and the
-//! reaction emoji the three-part reads ([`already_notified`](super::already_notified) and
-//! [`delete_matching`](super::delete_matching)) stop short of.
+//! ([`delete_telling`]) — the one dedupe query and the one withdrawal
+//! query of the notification model, naming the status and the reaction
+//! emoji alongside the recipient, actor and type.
 
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -12,12 +12,11 @@ use crate::error::AppResult;
 /// The full key of one telling: who was told, who caused it, of what, and
 /// about which status and emoji.
 ///
-/// [`already_told`] and [`delete_telling`] take this — the five-part form
-/// of the key [`already_notified`](super::already_notified) and [`delete_matching`](super::delete_matching) use, which
-/// cannot name what those two stop short of: the status that keeps two
-/// ballots of one voter apart, and the emoji that keeps two reactions to
-/// one status apart. A `None` field matches by `IS NOT DISTINCT FROM`, so
-/// it names exactly the rows that store none.
+/// [`already_told`] and [`delete_telling`] take this: the status keeps two
+/// ballots of one voter apart, and the emoji keeps two reactions to one
+/// status apart. A `None` field matches by `IS NOT DISTINCT FROM`, so it
+/// names exactly the rows that store none — a follow is
+/// `status_id: None, emoji: None`.
 #[derive(Clone, Debug)]
 pub struct Telling<'a> {
     /// The recipient account.
@@ -32,9 +31,8 @@ pub struct Telling<'a> {
     pub emoji: Option<&'a str>,
 }
 
-/// The live-row probe shared by [`already_told`] and its status-less twin
-/// [`already_notified`](super::already_notified)]: whether the recipient holds an undismissed
-/// notification under this key.
+/// The live-row probe behind [`already_told`]: whether the recipient holds
+/// an undismissed notification under this key.
 const ALREADY_TOLD_SQL: &str = "SELECT EXISTS (SELECT 1 FROM notifications \
           WHERE user_id = $1 AND from_account_id = $2 AND type = $3 \
             AND status_id IS NOT DISTINCT FROM $4 \
@@ -46,10 +44,11 @@ const ALREADY_TOLD_SQL: &str = "SELECT EXISTS (SELECT 1 FROM notifications \
 ///
 /// The deduplication the repeat-prone tellings owe — the poll ballot whose
 /// endpoint could re-fire, the reaction a client may `PUT` again on an
-/// idempotent write — on the full key, so a second reaction with another
-/// emoji is a fresh fact and not a duplicate. A dismissed row does not
-/// count, exactly as in [`already_notified`](super::already_notified): the recipient cleared that
-/// telling, so a fresh event may tell again.
+/// idempotent write, the second `POST …/follow` of an open pair (Pleroma's
+/// `recently_followed` skip) — on the full key, so a second reaction with
+/// another emoji is a fresh fact and not a duplicate. A dismissed row does
+/// not count: the recipient cleared that telling, so a fresh event may
+/// tell again.
 ///
 /// # Errors
 ///
@@ -69,10 +68,12 @@ pub async fn already_told(pool: &PgPool, telling: &Telling<'_>) -> AppResult<boo
 /// Removes every notification matching every part of `telling`, returning
 /// how many rows went.
 ///
-/// The withdrawal [`delete_matching`](super::delete_matching) is when the telling carries an
-/// emoji: retiring one reaction's notification leaves another emoji's
-/// group on the same status alone. Dismissed rows go like live ones, for
-/// the same reason [`delete_matching`](super::delete_matching) gives.
+/// The withdrawal of a telling: the undo of a favourite or a reblog takes
+/// back the telling it caused, the grant of a follow request takes back
+/// the `follow_request` row, and retiring one reaction's notification
+/// leaves another emoji's on the same status alone. `None` parts name the
+/// rows that store none — never everything. Dismissed rows go like live
+/// ones: a withdrawal retires the telling whatever its state.
 ///
 /// # Errors
 ///
@@ -99,9 +100,9 @@ mod tests {
     use super::*;
 
     use crate::models::notification::{
-        NewNotification, Notification, TYPE_EMOJI_REACTION, TYPE_FOLLOW, TYPE_POLL, TYPE_STATUS,
-        create, dismiss, get,
-        test_support::{note, trio},
+        NewNotification, Notification, TYPE_EMOJI_REACTION, TYPE_FAVOURITE, TYPE_FOLLOW,
+        TYPE_FOLLOW_REQUEST, TYPE_POLL, TYPE_STATUS, create, dismiss, get,
+        test_support::{note, solo, trio},
     };
 
     /// A [`Telling`] over the full key.
@@ -302,7 +303,7 @@ mod tests {
             )
             .await
             .expect("the probe reads"),
-            "a cleared telling lets a fresh event through, as already_notified does"
+            "a cleared telling lets a fresh event through"
         );
     }
 
@@ -375,5 +376,111 @@ mod tests {
         .await
         .expect("the rerun runs");
         assert_eq!(repeat, 0, "a withdrawn telling withdraws nothing twice");
+    }
+
+    #[tokio::test]
+    async fn a_follow_dedupe_answers_only_live_tellings_of_one_actor_and_type() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool();
+        let (recipient, actor, _) = trio(pool).await;
+        let other = solo(pool, "dup-other").await;
+        let follow = telling(recipient, actor, TYPE_FOLLOW, None, None);
+        assert!(
+            !already_told(pool, &follow).await.expect("the read runs"),
+            "a fresh recipient has been told nothing"
+        );
+
+        // A row of another type from the same actor is not the follow.
+        let _favourite = note(pool, recipient, actor, TYPE_FAVOURITE, None).await;
+        assert!(
+            !already_told(pool, &follow).await.expect("the read runs"),
+            "a different type does not answer for the follow"
+        );
+
+        let row = note(pool, recipient, actor, TYPE_FOLLOW, None).await;
+        assert!(
+            already_told(pool, &follow).await.expect("the read runs"),
+            "the live telling counts"
+        );
+        assert!(
+            !already_told(pool, &telling(recipient, other.id, TYPE_FOLLOW, None, None))
+                .await
+                .expect("the read runs"),
+            "one actor's telling does not speak for another's"
+        );
+
+        let _dismissed = dismiss(pool, recipient, row.id)
+            .await
+            .expect("the dismissal runs");
+        assert!(
+            !already_told(pool, &follow)
+                .await
+                .expect("the repeat read runs"),
+            "a dismissed row does not hold the next telling back"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_telling_without_a_status_takes_only_the_status_less_rows() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool();
+        let (recipient, actor, status_id) = trio(pool).await;
+        let carol = solo(pool, "matching-carol").await;
+        let favourite = note(pool, recipient, actor, TYPE_FAVOURITE, Some(status_id)).await;
+        let foreign = note(pool, carol.id, actor, TYPE_FAVOURITE, Some(status_id)).await;
+        let request = note(pool, recipient, actor, TYPE_FOLLOW_REQUEST, None).await;
+        let request_with_status =
+            note(pool, recipient, actor, TYPE_FOLLOW_REQUEST, Some(status_id)).await;
+
+        let gone = delete_telling(
+            pool,
+            &telling(recipient, actor, TYPE_FAVOURITE, Some(status_id), None),
+        )
+        .await
+        .expect("the withdrawal runs");
+        assert_eq!(gone, 1, "exactly the recipient's own telling went");
+        assert!(
+            get(pool, recipient, favourite.id)
+                .await
+                .expect("the read runs")
+                .is_none(),
+            "and it reads as nothing"
+        );
+        assert!(
+            get(pool, carol.id, foreign.id)
+                .await
+                .expect("the read runs")
+                .is_some(),
+            "the same telling of another recipient stays"
+        );
+        assert!(
+            get(pool, recipient, request.id)
+                .await
+                .expect("the read runs")
+                .is_some(),
+            "a status-less row is not this status's telling"
+        );
+
+        let went = delete_telling(
+            pool,
+            &telling(recipient, actor, TYPE_FOLLOW_REQUEST, None, None),
+        )
+        .await
+        .expect("the request withdrawal runs");
+        assert_eq!(went, 1, "the `None` status matches the status-less row");
+        assert!(
+            get(pool, recipient, request.id)
+                .await
+                .expect("the read runs")
+                .is_none(),
+            "the status-less request is the row that went"
+        );
+        assert!(
+            get(pool, recipient, request_with_status.id)
+                .await
+                .expect("the read runs")
+                .is_some(),
+            "and the `None` matched NULL only, never a row that names a status"
+        );
     }
 }

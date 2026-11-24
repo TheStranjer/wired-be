@@ -227,8 +227,8 @@ mod tests {
         let open = describe_chain(&chain, &Transparency::open());
         assert_eq!(
             open.policies,
-            vec!["SimplePolicy".to_owned()],
-            "with transparency on the chain's names are published"
+            vec!["SimplePolicy".to_owned(), "HashtagPolicy".to_owned()],
+            "with transparency on the chain's names are published, the always-on policy last"
         );
         assert_eq!(
             open.descriptions["mrf_simple"]["reject"],

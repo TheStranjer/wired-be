@@ -9,18 +9,19 @@ use axum::{Json, extract::State};
 use serde::Deserialize;
 use serde_json::Value;
 use tracing::debug;
-use url::{Url, form_urlencoded};
+use url::form_urlencoded;
 
 use super::{
-    AREA_EMOJI, CLASS_READ, COULD_NOT_FETCH, INVALID_URL, MAX_FETCH_STATUS, MAX_REMOTE_LIST_BYTES,
+    AREA_EMOJI, CLASS_WRITE, COULD_NOT_FETCH, INVALID_URL, MAX_FETCH_STATUS, MAX_REMOTE_LIST_BYTES,
     MIN_FETCH_STATUS, NAME_EMPTY, REMOTE_PACK_PATH, REMOTE_PACKS_PATH, params::PackParams,
 };
 use crate::{
     auth::admin::AdminUser,
     error::{AppError, AppResult},
-    http_client::HttpResponse,
+    http_client::{HttpError, HttpResponse},
     services::emoji_packs,
     state::AppState,
+    util::url::parse_http_url,
 };
 
 /// The `url`, `name` and optional `as` body of `POST /packs/download`:
@@ -121,10 +122,7 @@ pub(super) fn instance_api_url(
     path: &str,
     query: &[(&str, &str)],
 ) -> AppResult<String> {
-    let parsed = Url::parse(base.trim()).map_err(|_err| bad_url())?;
-    if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
-        return Err(bad_url());
-    }
+    let parsed = parse_http_url(base.trim()).ok_or_else(bad_url)?;
     let mut target = parsed.join(path).map_err(|_err| bad_url())?;
     let query_text = form_urlencoded::Serializer::new(String::new())
         .extend_pairs(query.iter().copied())
@@ -143,8 +141,46 @@ fn remote_failure(message: &str, cause: &str) -> AppError {
     AppError::InternalMessage(message.to_owned())
 }
 
+/// Why [`fetch_checked`] gave no usable response; each caller words it
+/// for its own route.
+#[derive(Debug)]
+pub(super) enum FetchFailure {
+    /// The guarded client refused or failed the fetch: the SSRF guard,
+    /// transport, or the size cap.
+    Transport(HttpError),
+    /// The peer answered with this status outside 2xx.
+    Status(u16),
+}
+
+impl FetchFailure {
+    /// The cause as the log words it.
+    fn cause(&self) -> String {
+        match self {
+            Self::Transport(err) => err.to_string(),
+            Self::Status(status) => format!("the peer answered {status}"),
+        }
+    }
+}
+
 /// Fetches `url` with the state's guarded client, reading at most
-/// `max_bytes`, and insists on a 2xx answer; every failure — transport,
+/// `max_bytes`, and insists on a 2xx answer.
+pub(super) async fn fetch_checked(
+    state: &AppState,
+    url: &str,
+    max_bytes: usize,
+) -> Result<HttpResponse, FetchFailure> {
+    let response = state
+        .http_client
+        .get_limited(url, &[], max_bytes)
+        .await
+        .map_err(FetchFailure::Transport)?;
+    if !(MIN_FETCH_STATUS..MAX_FETCH_STATUS).contains(&response.status) {
+        return Err(FetchFailure::Status(response.status));
+    }
+    Ok(response)
+}
+
+/// Fetches `url` through [`fetch_checked`]; every failure — transport,
 /// guard, size cap, status — arrives as the 500 that `message` words.
 pub(super) async fn fetch_remote(
     state: &AppState,
@@ -152,18 +188,9 @@ pub(super) async fn fetch_remote(
     max_bytes: usize,
     message: &str,
 ) -> AppResult<HttpResponse> {
-    let response = state
-        .http_client
-        .get_limited(url, &[], max_bytes)
+    fetch_checked(state, url, max_bytes)
         .await
-        .map_err(|err| remote_failure(message, &err.to_string()))?;
-    if !(MIN_FETCH_STATUS..MAX_FETCH_STATUS).contains(&response.status) {
-        return Err(remote_failure(
-            message,
-            &format!("the peer answered {}", response.status),
-        ));
-    }
-    Ok(response)
+        .map_err(|failure| remote_failure(message, &failure.cause()))
 }
 
 /// Fetches `url` under the listing cap ([`MAX_REMOTE_LIST_BYTES`]) and
@@ -205,13 +232,12 @@ pub(super) async fn fetch_pack_listing(
 /// relayed as it answered. A `url` that is no http(s) address is the
 /// 400; a remote that is down, answers a non-2xx or talks non-JSON is
 /// the 500 `{"error":"Could not fetch the pack list"}`. An admin with
-/// `admin:read` (the ticket's grant for the GETs; Pleroma itself asks
-/// `admin:write`).
+/// `admin:write` (as Pleroma demands; `admin:read` is refused).
 ///
 /// # Errors
 ///
 /// [`AppError::Unauthorized`] / [`AppError::Forbidden`] from [`AdminUser`]
-/// and its `admin:read` gate; [`AppError::BadRequest`] for a `url` no
+/// and its `admin:write` gate; [`AppError::BadRequest`] for a `url` no
 /// client may call ([`INVALID_URL`]); [`AppError::InternalMessage`] for
 /// every remote failure; other read failures arrive unchanged.
 pub(super) async fn remote(
@@ -219,7 +245,7 @@ pub(super) async fn remote(
     admin: AdminUser,
     params: PackParams,
 ) -> AppResult<Json<Value>> {
-    admin.require(CLASS_READ, AREA_EMOJI)?;
+    admin.require(CLASS_WRITE, AREA_EMOJI)?;
     let page = params.page.to_string();
     let page_size = params.page_size.to_string();
     let url = instance_api_url(

@@ -5,15 +5,19 @@ use serde::Serialize;
 
 use crate::{
     config::{Config, Toggle},
+    default_assets,
     entities::account::Account,
     models::{instance_rule::InstanceRule, user::User},
+    services::instance_meta::{
+        AVATAR_UPLOAD_LIMIT, BACKGROUND_UPLOAD_LIMIT, BANNER_UPLOAD_LIMIT,
+        MAX_POLL_EXPIRATION_SECS, MAX_POLL_OPTION_CHARS, MIN_POLL_EXPIRATION_SECS, PollLimits,
+    },
 };
 
 use super::{
-    AVATAR_UPLOAD_LIMIT, BACKGROUND_UPLOAD_LIMIT, BANNER_UPLOAD_LIMIT, CHARACTERS_RESERVED_PER_URL,
-    DESCRIPTION_LIMIT, IMAGE_MATRIX_LIMIT, InstanceStats, MAX_FEATURED_TAGS,
-    MAX_POLL_EXPIRATION_SECS, MAX_POLL_OPTION_CHARS, MIN_POLL_EXPIRATION_SECS,
-    SUPPORTED_MIME_TYPES, THUMBNAIL_PATH, VIDEO_FRAME_RATE_LIMIT, VIDEO_MATRIX_LIMIT,
+    CHARACTERS_RESERVED_PER_URL, DESCRIPTION_LIMIT, IMAGE_MATRIX_LIMIT, InstanceStats,
+    MAX_FEATURED_TAGS, SUPPORTED_MIME_TYPES, THUMBNAIL_PATH, VIDEO_FRAME_RATE_LIMIT,
+    VIDEO_MATRIX_LIMIT,
     handlers::{streaming_api_url, version_string},
     pleroma::PleromaBlock,
 };
@@ -63,7 +67,7 @@ pub(super) struct Instance {
     /// Attachment limit per status (`MAX_MEDIA_ATTACHMENTS`).
     max_media_attachments: usize,
     /// The poll limits this instance enforces (Pleroma's extra block,
-    /// beside [`Configuration`]'s Mastodon-shaped one).
+    /// beside [`Configuration`]'s Mastodon-shaped one), shared with `NodeInfo`.
     poll_limits: PollLimits,
     /// Bytes one uploaded file may hold (`UPLOAD_LIMIT_BYTES`).
     upload_limit: usize,
@@ -107,7 +111,7 @@ impl Instance {
                 streaming_api: streaming_api_url(config),
             },
             stats: *stats,
-            thumbnail: format!("{}{THUMBNAIL_PATH}", config.frontend_base_url),
+            thumbnail: default_assets::url(config, THUMBNAIL_PATH),
             languages: config.instance_languages.clone(),
             registrations: config.registrations_open,
             approval_required: config.registrations_approval_required.get(),
@@ -157,34 +161,6 @@ impl Rule {
             id: rule.id.to_string(),
             text: rule.text.clone(),
             hint: rule.hint.clone(),
-        }
-    }
-}
-
-/// The top-level `poll_limits` block (Pleroma's extra key, beside
-/// [`PollsConfiguration`]'s Mastodon-shaped one); its keys keep Pleroma's
-/// `snake_case` config names.
-#[derive(Debug, Serialize)]
-struct PollLimits {
-    /// Options one poll may offer (`MAX_POLL_OPTIONS`).
-    max_options: usize,
-    /// Characters one option may hold.
-    max_option_chars: usize,
-    /// Shortest poll duration, in seconds.
-    min_expiration: usize,
-    /// Longest poll duration, in seconds.
-    max_expiration: usize,
-}
-
-impl PollLimits {
-    /// The limits this instance enforces: its configured option count
-    /// with Pleroma's shipped values around it.
-    const fn for_config(config: &Config) -> Self {
-        Self {
-            max_options: config.max_poll_options,
-            max_option_chars: MAX_POLL_OPTION_CHARS,
-            min_expiration: MIN_POLL_EXPIRATION_SECS,
-            max_expiration: MAX_POLL_EXPIRATION_SECS,
         }
     }
 }
@@ -275,7 +251,7 @@ impl MediaAttachmentsConfiguration {
 }
 
 /// The `configuration.polls` group — the same four limits as
-/// [`PollLimits`], under Mastodon's own key names.
+/// [`PollLimits`](crate::services::instance_meta::PollLimits), under Mastodon's own key names.
 #[derive(Debug, Serialize)]
 pub(super) struct PollsConfiguration {
     /// Options one poll may offer (`MAX_POLL_OPTIONS`).

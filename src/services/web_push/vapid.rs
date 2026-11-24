@@ -10,11 +10,11 @@ use p256::{
     pkcs8::DecodePrivateKey as _,
 };
 use serde_json::json;
-use url::Url;
 
 use crate::{
     config::Config,
     error::{AppError, AppResult},
+    util::url::parse_http_url,
 };
 
 /// The `TTL` header every push message carries: four weeks, Pleroma's
@@ -82,30 +82,13 @@ pub fn vapid_headers(
 /// [`AppError::Unprocessable`] for an unparsable URL, a non-`http(s)`
 /// scheme or a missing host.
 fn endpoint_origin(endpoint: &str) -> AppResult<String> {
-    let parsed = Url::parse(endpoint)
-        .map_err(|err| AppError::Unprocessable(format!("the push endpoint is not a URL: {err}")))?;
-    let host = parsed
-        .host_str()
-        .filter(|_| matches!(parsed.scheme(), "http" | "https"))
+    parse_http_url(endpoint)
+        .map(|url| url.origin().ascii_serialization())
         .ok_or_else(|| {
             AppError::Unprocessable(
                 "the push endpoint is not an http(s) URL with a host".to_owned(),
             )
-        })?;
-    let port = match parsed.port() {
-        Some(port) if !is_default_port(parsed.scheme(), port) => format!(":{port}"),
-        _ => String::new(),
-    };
-    Ok(format!("{}://{host}{port}", parsed.scheme()))
-}
-
-/// Whether `port` is `scheme`'s default — the port an origin spells without
-/// it. `Url::port_or_known_default` cannot answer this (it returns the
-/// *explicit* port whenever one is present), so the two schemes
-/// [`endpoint_origin`] accepts carry the comparison directly.
-#[must_use]
-fn is_default_port(scheme: &str, port: u16) -> bool {
-    matches!((scheme, port), ("http", 80) | ("https", 443))
+        })
 }
 
 /// The VAPID `sub` this instance signs with (RFC 8292 §2.1: a `mailto:` or
@@ -225,6 +208,25 @@ mod tests {
         assert!(
             endpoint_origin("not a url").is_err(),
             "junk is refused before anything is signed"
+        );
+    }
+
+    /// A default port is dropped from the origin, a non-default one kept.
+    #[test]
+    fn endpoint_origin_drops_default_ports_and_keeps_others() {
+        assert_eq!(
+            endpoint_origin("https://push.example:443/x")
+                .as_deref()
+                .ok(),
+            Some("https://push.example"),
+        );
+        assert_eq!(
+            endpoint_origin("http://p.example:8080/x").as_deref().ok(),
+            Some("http://p.example:8080"),
+        );
+        assert_eq!(
+            endpoint_origin("http://p.example:80/x").as_deref().ok(),
+            Some("http://p.example"),
         );
     }
 

@@ -169,21 +169,9 @@ pub async fn page_for_user(
 mod tests {
     use super::*;
     use crate::{
-        config::TEST_BASE_URL,
-        error::AppError,
-        models::user::{NewUser, User, insert as insert_user, local_ap_id},
-        pagination::MAX_LIMIT,
+        error::AppError, models::user::User, pagination::MAX_LIMIT,
+        test_fixtures::local_user as user,
     };
-
-    /// Inserts a local user named `nickname`.
-    async fn user(pool: &PgPool, nickname: &str) -> User {
-        insert_user(
-            pool,
-            &NewUser::local(nickname, &local_ap_id(TEST_BASE_URL, nickname)),
-        )
-        .await
-        .expect("the local fixture inserts")
-    }
 
     /// A scrobble of `title`, the column defaults otherwise.
     fn titled(title: &str) -> NewScrobble {

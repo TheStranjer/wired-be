@@ -43,7 +43,9 @@
 //!    [`get_or_fetch_by_ap_id`] under `MENTION_LOOKUP_TIMEOUT`, at most
 //!    `MAX_MENTION_LOOKUPS` of them per status, and whatever stays
 //!    unresolved — a dead peer, an elapsed timeout, a mention past the
-//!    cap — is dropped rather than refused;
+//!    cap — is dropped rather than refused. The local accounts named in
+//!    `to`/`cc` join them as silent mentions (stored rows only, never
+//!    fetched), so an untagged direct post still reaches its recipient;
 //! 6. remote emojis upsert `custom_emojis` under the author's domain —
 //!    only once the unsolicited gate has let the post through, and only
 //!    the image URL of an emoji already stored, so a moderator's flags
@@ -91,7 +93,7 @@
 //! inbound edit handler calls are re-exported here, so an outside path
 //! stays `crate::services::ingest::…`.
 
-use std::{fmt, time::Duration};
+use std::time::Duration;
 
 use chrono::Utc;
 use serde_json::{Value, json};
@@ -125,7 +127,7 @@ pub mod write;
 mod test_support;
 
 pub(crate) use self::{
-    resolve::resolve_mentions,
+    resolve::{merge_accounts, resolve_local_audience, resolve_mentions},
     write::{insert_media, insert_poll},
 };
 use self::{
@@ -236,6 +238,10 @@ pub async fn ingest_note_delivered(
     let reply = resolve_reply(state, &parsed).await?;
     let quote_of_id = resolve_quote(state, parsed.quote_uri.as_deref()).await?;
     let mut mentioned = resolve_mentions(state, &parsed.mention_hrefs).await?;
+    merge_accounts(
+        &mut mentioned,
+        resolve_local_audience(state, &parsed.audience).await?,
+    );
     if let Some(owner) = owner
         && parsed.status.visibility == Visibility::Direct
         && owner.local.get()
@@ -298,7 +304,7 @@ async fn seen_before(
 ) -> Result<Option<IngestOutcome>, FederationError> {
     let stored = status::get_by_uri(&state.db, uri)
         .await
-        .map_err(|err| transient("the status uri read", &err))?;
+        .map_err(|err| FederationError::transient("the status uri read failed", &err))?;
     Ok(stored.map(|row| {
         if row.deleted_at.is_some() {
             IngestOutcome::Ignored("tombstoned")
@@ -339,7 +345,7 @@ async fn drops_unsolicited(
     }
     let solicited = follow::has_local_followers(&state.db, author.id)
         .await
-        .map_err(|err| transient("the follower gate read", &err))?;
+        .map_err(|err| FederationError::transient("the follower gate read failed", &err))?;
     Ok(!solicited)
 }
 
@@ -348,12 +354,6 @@ async fn drops_unsolicited(
 /// a number nobody can vote into being true.
 fn whole(count: i64) -> i32 {
     i32::try_from(count).unwrap_or(i32::MAX)
-}
-
-/// Shapes a database failure into the retryable arm of the dispatcher's
-/// error vocabulary, naming the read or write that failed.
-fn transient<E: fmt::Display>(what: &str, err: &E) -> FederationError {
-    FederationError::Transient(format!("{what} failed: {err}"))
 }
 
 #[cfg(test)]

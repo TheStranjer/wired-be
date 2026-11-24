@@ -26,6 +26,7 @@ use base64::{
     engine::general_purpose::{GeneralPurpose, NO_PAD},
 };
 use pbkdf2::{pbkdf2_hmac, sha2::Sha512};
+use subtle::ConstantTimeEq as _;
 
 use crate::error::{AppError, AppResult};
 
@@ -133,7 +134,7 @@ fn verify_pbkdf2_sha512(plain: &str, hash: &str) -> bool {
     }
     let mut derived = [0_u8; PBKDF2_KEY_LEN];
     pbkdf2_hmac::<Sha512>(plain.as_bytes(), &salt, iterations, &mut derived);
-    constant_time_eq(&derived, &expected)
+    derived.as_slice().ct_eq(expected.as_slice()).into()
 }
 
 /// Decode Comeonin's adapted base64; `None` for any invalid spelling.
@@ -141,16 +142,6 @@ fn verify_pbkdf2_sha512(plain: &str, hash: &str) -> bool {
 fn decode_comeonin_b64(text: &str) -> Option<Vec<u8>> {
     let alphabet = Alphabet::new(COMEONIN_B64_ALPHABET).ok()?;
     GeneralPurpose::new(&alphabet, NO_PAD).decode(text).ok()
-}
-
-/// Length-sensitive, byte-content-independent equality of two digests.
-#[must_use]
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    let mut difference = a.len() ^ b.len();
-    for (x, y) in a.iter().zip(b) {
-        difference |= usize::from(x ^ y);
-    }
-    difference == 0
 }
 
 #[cfg(test)]
@@ -296,10 +287,17 @@ mod tests {
     }
 
     #[test]
-    fn constant_time_eq_matches_equality() {
-        assert!(constant_time_eq(b"abc", b"abc"), "equal");
-        assert!(!constant_time_eq(b"abc", b"abd"), "one byte off");
-        assert!(!constant_time_eq(b"abc", b"ab"), "length differs");
-        assert!(constant_time_eq(b"", b""), "both empty");
+    fn a_digest_of_a_different_length_never_verifies() {
+        let alphabet = Alphabet::new(COMEONIN_B64_ALPHABET).unwrap();
+        let encoder = GeneralPurpose::new(&alphabet, NO_PAD);
+        let salt = encoder.encode([1_u8; 16]);
+        for len in [0_usize, 1, PBKDF2_KEY_LEN - 1, PBKDF2_KEY_LEN + 1] {
+            let digest = encoder.encode(vec![0_u8; len]);
+            let hash = format!("{PBKDF2_SHA512_PREFIX}1000${salt}${digest}");
+            assert!(
+                !verify_password(PASSWORD, &hash),
+                "a {len}-byte digest must not verify"
+            );
+        }
     }
 }

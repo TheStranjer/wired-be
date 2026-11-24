@@ -82,37 +82,37 @@ async fn the_domain_blocks_endpoint_maps_the_simple_lists_to_severities() {
         json!([
             {
                 "domain": "blocked.example",
-                "digest": wired_be::api::instance::sha256_hex("blocked.example"),
+                "digest": wired_be::util::token::sha256_hex("blocked.example"),
                 "severity": "suspend",
                 "comment": "coordinated abuse",
             },
             {
                 "domain": "*.worse.example",
-                "digest": wired_be::api::instance::sha256_hex("*.worse.example"),
+                "digest": wired_be::util::token::sha256_hex("*.worse.example"),
                 "severity": "suspend",
                 "comment": "",
             },
             {
                 "domain": "noisy.example",
-                "digest": wired_be::api::instance::sha256_hex("noisy.example"),
+                "digest": wired_be::util::token::sha256_hex("noisy.example"),
                 "severity": "silence",
                 "comment": "",
             },
             {
                 "domain": "press.example",
-                "digest": wired_be::api::instance::sha256_hex("press.example"),
+                "digest": wired_be::util::token::sha256_hex("press.example"),
                 "severity": "silence",
                 "comment": "",
             },
             {
                 "domain": "leech.example",
-                "digest": wired_be::api::instance::sha256_hex("leech.example"),
+                "digest": wired_be::util::token::sha256_hex("leech.example"),
                 "severity": "silence",
                 "comment": "",
             },
             {
                 "domain": "lewd.example",
-                "digest": wired_be::api::instance::sha256_hex("lewd.example"),
+                "digest": wired_be::util::token::sha256_hex("lewd.example"),
                 "severity": "silence",
                 "comment": "no nsfw",
             },

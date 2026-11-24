@@ -28,7 +28,7 @@ async fn remote_relays_the_packs_listing_of_an_instance() {
     let pool = db.pool().clone();
     let dir = tempfile::TempDir::new().unwrap();
     let app = common::test_app_with_emoji_dir(pool.clone(), dir.path());
-    let token = admin_token(&pool, "remotereader", "admin:read").await;
+    let token = admin_token(&pool, "remotereader", "admin:write").await;
 
     let listing = json!({
         "count": 1,
@@ -72,7 +72,7 @@ async fn remote_refuses_bad_urls_and_broken_remotes() {
     let pool = db.pool().clone();
     let dir = tempfile::TempDir::new().unwrap();
     let app = common::test_app_with_emoji_dir(pool.clone(), dir.path());
-    let token = admin_token(&pool, "remotescreener", "admin:read").await;
+    let token = admin_token(&pool, "remotescreener", "admin:write").await;
 
     for query in [
         "",

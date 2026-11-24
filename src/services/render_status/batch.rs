@@ -5,7 +5,6 @@
 use std::collections::{HashMap, HashSet};
 
 use chrono::{DateTime, Utc};
-use serde_json::Value;
 use tracing::debug;
 use uuid::Uuid;
 
@@ -14,8 +13,8 @@ use crate::{
     entities::{
         account::JsonBool,
         poll::Poll as PollEntity,
-        relationship::RelationshipMap,
-        status::{Status, StatusSource},
+        relationship::{Relationship, RelationshipMap},
+        status::{QuoteSlot, Status, StatusSource},
     },
     error::AppResult,
     models::{
@@ -35,11 +34,9 @@ use super::{
     loaders::{
         load_bookmarks, load_direct_participations, load_favourites, load_media, load_mentions,
         load_pins, load_quotes, load_reactions, load_reblogs, load_statuses_by_id, load_tags,
-        load_thread_mutes, load_users,
+        load_thread_mutes, load_users, load_visible_parents,
     },
-    loaders_polls_cards::{
-        load_cards, load_poll_options, load_poll_votes, load_polls, load_relationships,
-    },
+    loaders_polls_cards::{load_cards, load_poll_options, load_poll_votes, load_polls},
     page_ids::{PageIds, distinct},
 };
 
@@ -69,6 +66,14 @@ pub(super) struct Batch<'a> {
     /// with `pleroma.quote_visible` false while `quote_id` still names
     /// it.
     visible_quotes: HashSet<Uuid>,
+    /// Which of the statuses the page (and its nested rows) reply to this
+    /// viewer may see — one
+    /// [`filter_visible`](crate::models::status_visibility::filter_visible)
+    /// over the loaded parents, run once per page and skipped when nothing on it is
+    /// a reply. A parent outside this set (hidden, or gone) makes its
+    /// replies render `pleroma.parent_visible` false; a root post has no
+    /// parent and renders it true.
+    visible_parents: HashSet<Uuid>,
     /// Media attachments, keyed by status, in position order.
     media: HashMap<Uuid, Vec<AttachmentRow>>,
     /// Mentions, keyed by status, in mention order.
@@ -165,6 +170,7 @@ impl<'a> Batch<'a> {
         let quote_ids = distinct(rows.iter().copied().filter_map(|row| row.quote_of_id));
         let (quoted, visible_quotes) = load_quotes(pool, &quote_ids, mode).await?;
         let ids = PageIds::of(rows, &originals, &quoted);
+        let visible_parents = load_visible_parents(pool, &ids.parents, mode).await?;
         let polls = load_polls(pool, &ids.rendered).await?;
         let poll_options = load_poll_options(pool, &ids.rendered).await?;
         let poll_votes = load_poll_votes(pool, &ids.rendered, viewer).await?;
@@ -181,6 +187,7 @@ impl<'a> Batch<'a> {
             originals,
             quoted,
             visible_quotes,
+            visible_parents,
             media: load_media(pool, &ids.rendered).await?,
             mentions: load_mentions(pool, &ids.rendered).await?,
             tags: load_tags(pool, &ids.rendered).await?,
@@ -194,7 +201,7 @@ impl<'a> Batch<'a> {
             polls,
             poll_options,
             poll_votes,
-            relationships: load_relationships(pool, viewer, &ids.authors).await?,
+            relationships: Relationship::load_map(pool, viewer, &ids.authors).await?,
             cards: load_cards(pool, &ids.rendered).await?,
         })
     }
@@ -233,24 +240,45 @@ impl<'a> Batch<'a> {
         Some(Box::new(self.render_entity(original, None, quote)?))
     }
 
-    /// The nested render of the original `row` quotes: `Some` JSON when
+    /// What `row`'s quote resolves to, `None` when it quotes nothing.
+    /// [`QuoteSlot::Visible`] carries the nested render when
     /// [`row.quote_of_id`](StatusRow::quote_of_id) names a row the batch
     /// loaded (live: [`status::get_many`] answers tombstones not at all),
     /// the visibility read admitted to [`Batch::visible_quotes`], and the
     /// maps can render (an author the batch knows). That render is one
     /// level deep — Pleroma's `show_quote: false` on the quote's own
-    /// rendering — so the quoted row comes back with its OWN quote
-    /// forced to `None`, whatever it quoted. `None` — which the entity
-    /// renders as `quote: null` with `pleroma.quote_visible` false while
-    /// `quote_id` still names the target — when the id names nothing
-    /// this viewer may see.
-    fn render_quote(&self, row: &StatusRow) -> Option<Value> {
-        let quoted = self.quoted.get(&row.quote_of_id?)?;
+    /// rendering — so the quoted row carries only a
+    /// [`Batch::linked_quote`] reference to whatever it quotes.
+    /// [`QuoteSlot::Hidden`] is a loaded row the viewer may not see and
+    /// [`QuoteSlot::Deleted`] an id naming nothing the batch found;
+    /// the entity renders them `unauthorized` and `deleted` with
+    /// `pleroma.quote_visible` false while `quote_id` still names the
+    /// target.
+    fn render_quote(&self, row: &StatusRow) -> Option<QuoteSlot> {
+        let quoted = self.quoted.get(&row.quote_of_id?);
+        let Some(quoted) = quoted else {
+            return Some(QuoteSlot::Deleted);
+        };
         if !self.visible_quotes.contains(&quoted.id) {
-            return None;
+            return Some(QuoteSlot::Hidden);
         }
-        let entity = self.render_entity(quoted, None, None)?;
-        serde_json::to_value(entity).ok()
+        let rendered = self
+            .render_entity(quoted, None, self.linked_quote(quoted))
+            .and_then(|entity| serde_json::to_value(entity).ok());
+        Some(rendered.map_or(QuoteSlot::Deleted, QuoteSlot::Visible))
+    }
+
+    /// The reference a quoted status carries to its own quote, `None`
+    /// when it quotes nothing. Only the page rows' quote targets are
+    /// loaded, so a target the batch has not seen reads as visible.
+    fn linked_quote(&self, quoted: &StatusRow) -> Option<QuoteSlot> {
+        let target = quoted.quote_of_id?;
+        let hidden = self.quoted.contains_key(&target) && !self.visible_quotes.contains(&target);
+        Some(if hidden {
+            QuoteSlot::LinkedHidden
+        } else {
+            QuoteSlot::Linked
+        })
     }
 
     /// Renders one `row` from the loaded maps, attaching `reblog` as its
@@ -286,15 +314,20 @@ impl<'a> Batch<'a> {
     /// carries the original's poll. The `card` is the cards map read at
     /// the row's *own* id — `status_cards` keys on the row, so a reblog
     /// row renders its own id's card and the nested original its own. The
-    /// `quote` is the batch's serialized nested quote render —
-    /// `pleroma.quote` mirrors it and `pleroma.quote_visible` is its
-    /// presence, which is why the three can never disagree, while
-    /// `quote_id` names the target whatever the render answered.
+    /// `quote` is the batch's [`Batch::render_quote`] slot —
+    /// `pleroma.quote` mirrors a visible one's render and
+    /// `pleroma.quote_visible` is its presence, which is why the three
+    /// can never disagree, while `quote_id` names the target whatever
+    /// the slot answered. The
+    /// `pleroma.parent_visible` flag is `true` for a row that replies to
+    /// nothing and otherwise membership of the parent's id in the page's
+    /// visible-parents set — the viewer's access to the parent, which the
+    /// page filter on the rendered row says nothing about.
     fn render_entity(
         &self,
         row: &StatusRow,
         reblog: Option<Box<Status>>,
-        quote: Option<Value>,
+        quote: Option<QuoteSlot>,
     ) -> Option<Status> {
         let author = self.users.get(&row.user_id)?;
         let subject_id = row.reblog_of_id.unwrap_or(row.id);
@@ -325,6 +358,10 @@ impl<'a> Batch<'a> {
             quote,
             reblog,
             poll: self.render_poll(row),
+            parent_visible: JsonBool(
+                row.in_reply_to_id
+                    .is_none_or(|parent| self.visible_parents.contains(&parent)),
+            ),
         };
         Some(Status::from_source(
             source,

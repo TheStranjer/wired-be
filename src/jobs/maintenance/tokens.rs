@@ -9,10 +9,10 @@
 
 use serde_json::Value;
 use sqlx::{PgPool, query};
-use tracing::info;
 
+use super::run_sweep;
 use crate::{
-    jobs::{AttemptInfo, HandlerFuture, JobError},
+    jobs::{AttemptInfo, HandlerFuture},
     models::oauth_token::REFRESH_GRACE,
     state::AppState,
 };
@@ -141,19 +141,11 @@ async fn sweep_tokens(state: &AppState) -> Result<u64, sqlx::Error> {
 /// their ten minutes. Every row they match is one no read path accepts any
 /// more, so the sweep only reclaims storage.
 ///
-/// A failed pass is a [`JobError::Retry`], and the scheduler enqueues the
+/// A failed pass is a [`JobError::Retry`](crate::jobs::JobError::Retry), and the scheduler enqueues the
 /// next hour regardless, so the same sweep runs again shortly; a pass lost
 /// to a database outage costs nothing but the storage.
 pub fn handle_tokens(state: AppState, _attempt: AttemptInfo, _args: Value) -> HandlerFuture {
-    Box::pin(async move {
-        match sweep_tokens(&state).await {
-            Ok(deleted) => {
-                info!(deleted, "expired tokens deleted");
-                Ok(())
-            }
-            Err(err) => Err(JobError::Retry(format!("token sweep failed: {err}"))),
-        }
-    })
+    Box::pin(async move { run_sweep("expired tokens deleted", sweep_tokens(&state)).await })
 }
 
 #[cfg(test)]

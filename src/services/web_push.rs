@@ -30,10 +30,12 @@
 //! [`crate::models::follow`]), and what the JSON payload says
 //! ([`payload_json`]) — are pure here, so the job is thin glue. Like
 //! Pleroma the payload is the Mastodon-shaped JSON document
-//! (`access_token`, `notification_id`, `title`, `body`, …); the ticket
+//! (`notification_id`, `title`, `body`, …); the ticket
 //! fixes its content: the title is `<actor display name> <verb>` and the
 //! body the status's plain text, empty when the recipient set
-//! `hide_notification_contents`.
+//! `hide_notification_contents`. Unlike Pleroma it carries no
+//! `access_token`: the token table keeps only digests, so the raw bearer
+//! credential is not recoverable once issued.
 //!
 //! The sender is a tree: `crypto` holds the content coding and its header
 //! constants, `decrypt` the receiver's half that exists for tests and

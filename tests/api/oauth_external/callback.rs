@@ -1,6 +1,6 @@
 //! The callback's successes: the linked user logged in with a
 //! single-use code on the app's redirect, the echo of exactly what the
-//! client sent, the out-of-band code page, and the unlinked account
+//! client sent, the out-of-band code, and the unlinked account
 //! handed to the registration form under `pending`.
 
 use axum::http::StatusCode;
@@ -112,10 +112,11 @@ async fn the_callback_echoes_only_what_the_client_sent() {
     site.provider.stop();
 }
 
-/// An app registered with the out-of-band redirect URI gets the code page
-/// instead of a redirect, exactly as `POST /oauth/authorize` answers it.
+/// An app registered with the out-of-band redirect URI gets the code as
+/// JSON instead of a redirect, exactly as the frontend's approval answers
+/// it.
 #[tokio::test]
-async fn the_callback_answers_the_out_of_band_code_page() {
+async fn the_callback_answers_the_out_of_band_code() {
     let db = common::test_db().await;
     let pool = db.pool().clone();
     let site = fixture(pool.clone(), "ivan", "read").await;
@@ -131,25 +132,25 @@ async fn the_callback_answers_the_out_of_band_code_page() {
     assert_eq!(
         response.status,
         StatusCode::OK,
-        "a page, not a redirect: {}",
+        "an answer, not a redirect: {}",
         response.text()
     );
     assert_eq!(
         response.header("content-type"),
-        Some("text/html; charset=utf-8"),
-        "and it is HTML"
+        Some("application/json"),
+        "and it is JSON"
     );
     assert_no_store(&response);
     assert!(response.header("location").is_none(), "no redirect target");
 
-    let page = response.text();
     let code: String = sqlx::query_scalar("SELECT token FROM oauth_authorizations")
         .fetch_one(&pool)
         .await
         .expect("the code was minted for the out-of-band client");
-    assert!(
-        page.contains(code.as_str()),
-        "the page shows the code the client will read off it: {page}"
+    assert_eq!(
+        response.json_value(),
+        json!({ "code": code }),
+        "the body carries the code the client will redeem"
     );
     let stored: oauth_token::OauthAuthorization =
         sqlx::query_as("SELECT * FROM oauth_authorizations")

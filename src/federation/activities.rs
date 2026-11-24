@@ -57,7 +57,7 @@
 
 use uuid::Uuid;
 
-use crate::config::Config;
+use crate::{config::Config, util::id::activity_ap_id};
 
 mod contexts;
 mod interactions;
@@ -71,7 +71,8 @@ pub use contexts::{
 };
 pub use interactions::{announce_json, emoji_react_json, like_json, undo_json};
 pub use relations::{
-    accept_json, add_json, block_json, flag_json, follow_json, move_json, reject_json, remove_json,
+    accept_json, add_json, block_json, flag_json, follow_json, follow_json_to, move_json,
+    reject_json, remove_json,
 };
 
 /// The `ActivityStreams` public addressing collection: the `cc` entry of a
@@ -120,7 +121,7 @@ const TYPE_IMAGE: &str = "Image";
 /// itself, so the document carries the id the table keeps.
 #[must_use]
 pub fn activity_id(config: &Config, id: Uuid) -> String {
-    format!("{}/activities/{id}", config.base_url)
+    activity_ap_id(&config.base_url, id)
 }
 
 #[cfg(test)]

@@ -20,6 +20,10 @@ use crate::{
     util::time::mastodon_time,
 };
 
+/// Most response-body bytes read from a webhook endpoint: only the status
+/// matters, so 64 KiB is ample.
+const WEBHOOK_RESPONSE_BYTES: usize = 64 * 1024;
+
 /// The [`JobRegistry`](crate::jobs::JobRegistry) handler for [`KIND_DELIVER`].
 pub fn handle_deliver(state: AppState, _attempt: AttemptInfo, args: Value) -> HandlerFuture {
     Box::pin(async move { deliver(&state, &parse_args(&args)?).await })
@@ -88,7 +92,12 @@ async fn post_event(state: &AppState, hook: &Webhook, args: &DeliverArgs) -> Res
     ];
     let answer = state
         .http_client
-        .post_bytes(&hook.url, &headers, body.into_bytes())
+        .post_bytes(
+            &hook.url,
+            &headers,
+            body.into_bytes(),
+            WEBHOOK_RESPONSE_BYTES,
+        )
         .await;
     match answer {
         Ok(response) => {

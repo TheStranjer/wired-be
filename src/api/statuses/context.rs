@@ -36,7 +36,7 @@ use tracing::debug;
 use uuid::Uuid;
 
 use crate::{
-    api::helpers::status_for_viewer_or_404,
+    api::helpers::{retain_open_to_viewer, status_for_viewer_or_404},
     auth::MaybeAuthUser,
     entities::{account::JsonBool, status::Status},
     error::AppResult,
@@ -137,7 +137,8 @@ async fn visible_ancestors(
     status_id: Uuid,
 ) -> AppResult<Vec<StatusRow>> {
     let chain = status::ancestor_chain(&state.db, status_id, MAX_CONTEXT_DEPTH).await?;
-    status_visibility::filter_visible(&state.db, chain, viewer).await
+    let visible = status_visibility::filter_visible(&state.db, chain, viewer).await?;
+    retain_open_to_viewer(state, viewer, visible).await
 }
 
 /// The descendants array's rows: the raw tree below `status_id` (id order),
@@ -166,6 +167,7 @@ async fn visible_descendants(
     )
     .await?;
     let visible = status_visibility::filter_visible(&state.db, tree, viewer).await?;
+    let visible = retain_open_to_viewer(state, viewer, visible).await?;
     let Some(viewer) = viewer else {
         return Ok(visible);
     };

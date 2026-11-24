@@ -53,8 +53,8 @@ pub enum Suggestion {
 ///
 /// The data is Pleroma's docs metadata (`config/description.exs` and the
 /// policies' knowledge docs) carried here as registry data. A documented
-/// container nests its own subkeys in [`children`] — Pleroma's
-/// two-level `:map` entries, e.g. `:restrict_unauthenticated`.
+/// container may nest its own subkeys in [`children`]; no registered entry
+/// does today.
 ///
 /// [`children`]: ChildDescription::children
 #[derive(Debug, Serialize)]
@@ -133,9 +133,9 @@ pub struct RegistryEntry {
     /// The whitelist's subkeys for this entry; empty means the whole
     /// value is one unit (Pleroma's bare `:mrf_simple`-style entries).
     pub subkeys: &'static [&'static str],
-    /// Whether a change only takes effect after a restart: `true` for the
-    /// entries no runtime consumer reads yet, and what the admin API's
-    /// `need_reboot` flag is computed from.
+    /// Whether a change only takes effect after a restart, what the admin
+    /// API's `need_reboot` flag is computed from. `false` for every entry
+    /// today: an entry nothing reads at runtime is not whitelisted at all.
     pub requires_restart: bool,
     /// The entry's environment-derived default, read off [`Config`].
     pub defaults: fn(&Config) -> Value,
@@ -169,22 +169,5 @@ pub(super) const fn hinted(
         description,
         suggestions,
         children: &[],
-    }
-}
-
-/// A nested container description: the `:map` children of
-/// [`RESTRICT_UNAUTHENTICATED_CHILDREN`].
-pub(super) const fn nested(
-    key: &'static str,
-    kind: ValueKind,
-    description: &'static str,
-    children: &'static [ChildDescription],
-) -> ChildDescription {
-    ChildDescription {
-        key,
-        kind,
-        description,
-        suggestions: &[],
-        children,
     }
 }

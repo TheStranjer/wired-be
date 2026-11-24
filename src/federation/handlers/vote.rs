@@ -46,9 +46,9 @@
 //! The other halves of a federated poll are elsewhere by the ticket's own
 //! hand: this instance's own votes travelling out as answer activities is the
 //! outbound poll ticket, and the `Update` of a remote `Question`'s totals is
-//! the note-update ticket. Nothing here sends anything anywhere.
-
-use std::fmt;
+//! the note-update ticket. The one thing sent from here is the debounced
+//! `Update` of the local `Question`'s new tally
+//! ([`after_local_poll_changed`]).
 
 use chrono::Utc;
 use futures::future::BoxFuture;
@@ -68,6 +68,7 @@ use crate::{
         status_visibility,
         user::User,
     },
+    services::federation_out::after_local_poll_changed,
     state::AppState,
 };
 
@@ -271,13 +272,13 @@ async fn question_of(
 ) -> Result<Option<Question>, FederationError> {
     let stored = status::get_by_uri(&state.db, question_uri)
         .await
-        .map_err(|err| transient("the question read", &err))?;
+        .map_err(|err| FederationError::transient("the question read failed", &err))?;
     let Some(posted) = stored.filter(|row| row.local && row.deleted_at.is_none()) else {
         return Ok(None);
     };
     let stand = poll::get_for_status(&state.db, posted.id)
         .await
-        .map_err(|err| transient("the poll read", &err))?;
+        .map_err(|err| FederationError::transient("the poll read failed", &err))?;
     Ok(stand.map(|stand| Question { posted, stand }))
 }
 
@@ -300,7 +301,7 @@ async fn gate(
 ) -> Result<Decision, FederationError> {
     if !status_visibility::can_view(&state.db, &question.posted, Some(voter))
         .await
-        .map_err(|err| transient("the visibility read", &err))?
+        .map_err(|err| FederationError::transient("the visibility read failed", &err))?
     {
         return Ok(Decision::Refuse(
             "the question is not visible to the account that answered it",
@@ -315,13 +316,13 @@ async fn gate(
     if !question.stand.multiple
         && poll::has_voted(&state.db, question.stand.id, voter.id)
             .await
-            .map_err(|err| transient("the voter's marks read", &err))?
+            .map_err(|err| FederationError::transient("the voter's marks read failed", &err))?
     {
         return Ok(Decision::Refuse("the voter has already voted on this poll"));
     }
     let options = poll::options(&state.db, question.stand.id)
         .await
-        .map_err(|err| transient("the options read", &err))?;
+        .map_err(|err| FederationError::transient("the options read failed", &err))?;
     Ok(options
         .into_iter()
         .find(|opt| opt.title == option)
@@ -363,9 +364,11 @@ async fn mark(
     }
     let updated = poll::get_by_id(&state.db, stand.id)
         .await
-        .map_err(|err| transient("the poll read", &err))?;
+        .map_err(|err| FederationError::transient("the poll read failed", &err))?;
     if let Some(updated) = updated {
         after_vote_cast(state, &updated, voter, &[option.id]).await;
+        // the tally moved on a poll this instance owns: tell its audience
+        after_local_poll_changed(state, &question.posted).await;
     }
     debug!(
         poll = %stand.id,
@@ -386,11 +389,6 @@ fn cast_failure(err: &AppError, poll_id: uuid::Uuid) -> FederationError {
         ));
     }
     FederationError::Transient(format!("the ballot write failed: {err}"))
-}
-
-/// The dispatcher's vocabulary for a database failure the retry may outlive.
-fn transient<E: fmt::Display>(what: &str, err: &E) -> FederationError {
-    FederationError::Transient(format!("{what} failed: {err}"))
 }
 
 #[cfg(test)]

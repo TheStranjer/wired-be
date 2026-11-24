@@ -12,7 +12,7 @@ use super::*;
 use crate::{
     config::Config,
     jobs::{
-        QUEUE_BACKGROUND,
+        JobError, QUEUE_BACKGROUND,
         maintenance::test_support::{
             DAY, FIRST_ATTEMPT, HOURLY, app_state, broken_state, row_exists, state_with_config,
             user,
@@ -101,7 +101,7 @@ async fn authorization_row(
 /// `secs` seconds from now, returning its id.
 async fn mfa_token_expiring_in(pool: &PgPool, owner: &User, secs: i64) -> Uuid {
     let id = Uuid::now_v7();
-    let sql = "INSERT INTO mfa_tokens (id, token, user_id, authorization_id, valid_until)
+    let sql = "INSERT INTO mfa_tokens (id, token_digest, user_id, authorization_id, valid_until)
                    VALUES ($1, $2, $3, NULL, now() + make_interval(secs => $4))";
     let written = query(sql)
         .bind(id)
@@ -119,7 +119,7 @@ async fn mfa_token_expiring_in(pool: &PgPool, owner: &User, secs: i64) -> Uuid {
 /// in the past and spent when `used`, returning its id.
 async fn password_reset_row(pool: &PgPool, owner: &User, age_secs: i64, used: bool) -> Uuid {
     let id = Uuid::now_v7();
-    let sql = "INSERT INTO password_reset_tokens (id, token, user_id, used, inserted_at)
+    let sql = "INSERT INTO password_reset_tokens (id, token_digest, user_id, used, inserted_at)
                    VALUES ($1, $2, $3, $4, now() - make_interval(secs => $5))";
     let written = query(sql)
         .bind(id)
@@ -294,7 +294,7 @@ async fn an_unreachable_database_retries_the_token_sweep() {
 
     match outcome {
         Err(JobError::Retry(detail)) => assert!(
-            detail.starts_with("token sweep failed"),
+            detail.starts_with("expired tokens deleted failed"),
             "the retry states what failed: {detail}"
         ),
         Ok(()) => panic!("a closed pool must not read as a successful sweep"),

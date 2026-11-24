@@ -10,8 +10,7 @@ use axum::{
 use url::form_urlencoded;
 
 use super::{
-    AUTHENTICATION_REQUIRED, TIMELINES_FEDERATED, TIMELINES_LOCAL, parse_instance,
-    parse_public_reply_visibility,
+    AUTHENTICATION_REQUIRED, parse_instance, parse_public_reply_visibility, timeline_area,
 };
 use crate::{
     api::helpers::{is_true, push_visibility, timeline_response},
@@ -76,7 +75,7 @@ struct PublicParams {
     /// `local`: keep only statuses this instance authored.
     ///
     /// It is also the parameter that picks which [`Config::restricts`] area
-    /// gates an anonymous read (see [`TIMELINES_LOCAL`]).
+    /// gates an anonymous read (see [`timeline_area`]).
     local: Flag,
     /// `remote`: keep only statuses mirrored from other instances.
     remote: Flag,
@@ -147,12 +146,7 @@ impl PublicParams {
         if authenticated {
             return Ok(());
         }
-        let area = if self.local.get() {
-            TIMELINES_LOCAL
-        } else {
-            TIMELINES_FEDERATED
-        };
-        if config.restricts(area) {
+        if config.restricts(timeline_area(self.local.get())) {
             return Err(AppError::Forbidden(AUTHENTICATION_REQUIRED.to_owned()));
         }
         Ok(())
@@ -183,6 +177,7 @@ impl PublicParams {
 
 #[cfg(test)]
 mod tests {
+    use super::super::{TIMELINES_FEDERATED, TIMELINES_LOCAL};
     use super::*;
 
     /// The parsed public-page query as [`PublicParams`].

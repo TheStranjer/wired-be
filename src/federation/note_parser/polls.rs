@@ -7,14 +7,16 @@ use serde_json::Value;
 use crate::federation::json::as_array;
 
 use super::{
-    MAX_POLL_OPTIONS, MIN_POLL_OPTIONS, ParseError, TYPE_QUESTION,
+    MAX_POLL_OPTIONS, ParseError, TYPE_QUESTION,
     text::timestamp_field,
     types::{ParsedPoll, ParsedPollOption},
 };
 
 /// The poll of a `Question` — `oneOf` for a single-choice, `anyOf` for a
 /// multi-choice — or `None` for every other type, whose option lists (if
-/// any) are ignored. An invalid `Question` list fails [`ParseError::InvalidPoll`].
+/// any) are ignored. A `Question` with no usable option fails
+/// [`ParseError::InvalidPoll`]; one with more than `MAX_POLL_OPTIONS` keeps
+/// the first `MAX_POLL_OPTIONS`, in order.
 pub(super) fn parse_poll(json: &Value, kind: &str) -> Result<Option<ParsedPoll>, ParseError> {
     if kind != TYPE_QUESTION {
         return Ok(None);
@@ -28,13 +30,14 @@ pub(super) fn parse_poll(json: &Value, kind: &str) -> Result<Option<ParsedPoll>,
             ));
         }
     };
-    let options: Vec<ParsedPollOption> = as_array(entries).iter().filter_map(poll_option).collect();
-    if options.len() < MIN_POLL_OPTIONS || options.len() > MAX_POLL_OPTIONS {
-        return Err(ParseError::InvalidPoll(format!(
-            "the question carries {} options, {MIN_POLL_OPTIONS} to {MAX_POLL_OPTIONS} are required",
-            options.len()
-        )));
+    let mut options: Vec<ParsedPollOption> =
+        as_array(entries).iter().filter_map(poll_option).collect();
+    if options.is_empty() {
+        return Err(ParseError::InvalidPoll(
+            "the question carries no usable option".to_owned(),
+        ));
     }
+    options.truncate(MAX_POLL_OPTIONS);
     Ok(Some(ParsedPoll {
         options,
         multiple,
@@ -133,20 +136,25 @@ mod tests {
         document
     }
 
-    #[test]
-    fn questions_need_two_to_twenty_options() {
-        let one = json!([{"name": "only"}]);
-        let twenty_one = json!(
-            (0..21)
+    /// A JSON option list of `count` named options, `o0`, `o1`, ….
+    fn named_options(count: usize) -> Value {
+        json!(
+            (0..count)
                 .map(|n| json!({"name": format!("o{n}")}))
                 .collect::<Vec<Value>>()
-        );
+        )
+    }
+
+    #[test]
+    fn questions_without_a_usable_option_fail() {
         for (name, document) in [
             ("no option list at all", minimal_note_with_question_type()),
-            ("one option", question_with("oneOf", one)),
-            ("twenty-one options", question_with("oneOf", twenty_one)),
             ("an empty list", question_with("anyOf", json!([]))),
             ("a null list", question_with("anyOf", Value::Null)),
+            (
+                "only nameless or empty-named entries",
+                question_with("oneOf", json!([{"type": "Note"}, {"name": ""}])),
+            ),
         ] {
             let error = parse_note(&document, &author(), now()).unwrap_err();
             assert!(
@@ -154,15 +162,40 @@ mod tests {
                 "{name}: a bad question fails InvalidPoll, got {error}"
             );
         }
-        let two = json!([{"name": "a"}, {"name": "b"}]);
-        let ok = parse(&question_with("anyOf", two));
+    }
+
+    #[test]
+    fn a_single_option_question_parses() {
+        let poll = parse(&question_with("oneOf", json!([{"name": "only"}])))
+            .poll
+            .expect("one option is accepted");
+        assert_eq!(poll.options.len(), 1, "the lone option is kept");
+        assert_eq!(poll.options[0].title, "only", "with its title");
+    }
+
+    #[test]
+    fn a_question_past_the_cap_is_truncated_in_order() {
+        let over = MAX_POLL_OPTIONS + 10;
+        let poll = parse(&question_with("oneOf", named_options(over)))
+            .poll
+            .expect("an oversized poll still parses");
+        let titles: Vec<String> = poll.options.iter().map(|o| o.title.clone()).collect();
+        let expected: Vec<String> = (0..MAX_POLL_OPTIONS).map(|n| format!("o{n}")).collect();
+        assert_eq!(titles, expected, "the first options are kept, in order");
+    }
+
+    #[test]
+    fn twenty_five_options_all_survive_under_the_cap() {
+        let poll = parse(&question_with("anyOf", named_options(25)))
+            .poll
+            .expect("25 options parse");
+        let expected = 25.min(MAX_POLL_OPTIONS);
+        assert_eq!(poll.options.len(), expected, "up to the cap are kept");
+        assert_eq!(poll.options[0].title, "o0", "starting from the first");
         assert_eq!(
-            ok.poll
-                .expect("two options is the minimum, accepted")
-                .options
-                .len(),
-            2,
-            "exactly two options parses"
+            poll.options[expected - 1].title,
+            format!("o{}", expected - 1),
+            "in document order"
         );
     }
 

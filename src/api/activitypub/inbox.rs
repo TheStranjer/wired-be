@@ -104,7 +104,7 @@ async fn inbox_owner_id(state: &AppState, nickname: Option<&str>) -> AppResult<O
     };
     let owner = get_by_nickname(&state.db, name)
         .await?
-        .filter(|user| user.local.get() && user.is_active.get())
+        .filter(user::User::is_local_active)
         .ok_or(AppError::RouteNotFound)?;
     Ok(Some(owner.id))
 }

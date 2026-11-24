@@ -17,7 +17,7 @@ use crate::{
     entities::{
         account::JsonBool,
         poll::Poll,
-        status::{Status, StatusSource},
+        status::{QuoteSlot, Status, StatusSource},
     },
     models::{
         emoji_reaction::ReactionSummary as SummaryRow, hashtag::Hashtag, link_card::LinkCard,
@@ -68,10 +68,13 @@ pub(in crate::entities::status) struct Parts<'a> {
     /// field carries (what the polls batch's three reads would hand the
     /// renderer, already built).
     poll: Option<Poll>,
-    /// The rendered quote, in the serialized shape the quoting
-    /// ticket's batch hands the entity; `None` renders the quote
-    /// null.
-    quote: Option<Value>,
+    /// What the quoting ticket's batch found behind the row's quote;
+    /// `None` is a row that quotes nothing.
+    quote: Option<QuoteSlot>,
+    /// Whether the viewer may see the replied-to status, in the same
+    /// [`JsonBool`] wrapper the source field carries; `true` unless the
+    /// test hides the parent.
+    parent_visible: JsonBool,
 }
 
 impl<'a> Parts<'a> {
@@ -93,6 +96,17 @@ impl<'a> Parts<'a> {
             muted: JsonBool(false),
             poll: None,
             quote: None,
+            parent_visible: JsonBool(true),
+        }
+    }
+
+    /// Sets [`parent_visible`](Self::parent_visible) to `false`: the
+    /// batch's parent-visibility read did not admit the replied-to
+    /// status, so the viewer cannot see it.
+    pub(in crate::entities::status) fn parent_hidden(self) -> Self {
+        Self {
+            parent_visible: JsonBool(false),
+            ..self
         }
     }
 
@@ -233,7 +247,33 @@ impl<'a> Parts<'a> {
     /// viewer may see.
     pub(in crate::entities::status) fn quoting(self, quote: Value) -> Self {
         Self {
-            quote: Some(quote),
+            quote: Some(QuoteSlot::Visible(quote)),
+            ..self
+        }
+    }
+
+    /// Sets [`quote`](Self::quote) to a quoted row the viewer may not
+    /// see, as the batch's visibility read leaves it.
+    pub(in crate::entities::status) fn quoting_hidden(self) -> Self {
+        Self {
+            quote: Some(QuoteSlot::Hidden),
+            ..self
+        }
+    }
+
+    /// Sets [`quote`](Self::quote) to a quoted row the batch found gone.
+    pub(in crate::entities::status) fn quoting_deleted(self) -> Self {
+        Self {
+            quote: Some(QuoteSlot::Deleted),
+            ..self
+        }
+    }
+
+    /// Sets [`quote`](Self::quote) to the nested reference a quoted
+    /// status carries to its own quote.
+    pub(in crate::entities::status) fn quoting_linked(self) -> Self {
+        Self {
+            quote: Some(QuoteSlot::Linked),
             ..self
         }
     }
@@ -266,6 +306,7 @@ pub(in crate::entities::status) fn render(
         quote: parts.quote.clone(),
         reblog: reblog.map(Box::new),
         poll: parts.poll.clone(),
+        parent_visible: parts.parent_visible.clone(),
     };
     serde_json::to_value(Status::from_source(source, None, None, &config)).unwrap()
 }
@@ -294,6 +335,7 @@ pub(in crate::entities::status) fn render_nested(row: &StatusRow, author: &User)
             quote: None,
             reblog: None,
             poll: None,
+            parent_visible: JsonBool(true),
         },
         None,
         None,

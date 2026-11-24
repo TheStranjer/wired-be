@@ -64,7 +64,7 @@ use crate::{
     error::{AppError, AppResult},
     models::{hashtag, hashtag_follow},
     oauth::scopes::{READ, READ_FOLLOWS, WRITE_FOLLOWS},
-    pagination::{MAX_LIMIT, OrdinalPageParams, link_header, set_link_header},
+    pagination::{MAX_LIMIT, OrdinalPageParams, link_for_page, set_link_header},
     state::AppState,
 };
 
@@ -76,9 +76,6 @@ const HISTORY_DAYS: u64 = 7;
 const TAG_NOT_FOUND: &str = "Hashtag not found";
 /// 422 body for a path segment that normalizes to no usable tag name.
 const INVALID_HASHTAG: &str = "Invalid hashtag";
-/// The `Link` header's query parameters carry nothing but the cursor: the
-/// followed-tags page has no filter to repeat on either link.
-const NO_EXTRA_QUERY: [(String, String); 0] = [];
 
 /// The `/api/v1/tags`, `/api/v1/followed_tags` and `/api/v1/trends` router,
 /// merged into [`crate::api::v1`].
@@ -215,7 +212,9 @@ async fn list_followed_tags(
         user = %auth.0.id,
         "followed tags listed"
     );
-    let link = page_link(&state.config.base_url, uri.path(), &entries);
+    // The cursors key on the follow ordinal ([`hashtag_follow::Entry::position`]),
+    // not on the tags' ids.
+    let link = link_for_page(&state.config.base_url, uri.path(), &entries, |e| e.position);
     let mut headers = HeaderMap::new();
     set_link_header(&mut headers, link.as_deref())?;
     let mut tags = Vec::with_capacity(entries.len());
@@ -318,16 +317,6 @@ fn week(today: NaiveDate, counts: &[(NaiveDate, i64, i64)]) -> Vec<TagHistory> {
             )
         })
         .collect()
-}
-
-/// The `Link` header value for a fetched followed-tags page: Pleroma's
-/// `add_link_headers` over the first (newest) and last (oldest) entry's
-/// [`hashtag_follow::Entry::position`] — the cursors key on the follow
-/// ordinal, not on the tags' ids — and `None` for an empty page.
-fn page_link(base_url: &str, path: &str, entries: &[hashtag_follow::Entry]) -> Option<String> {
-    let newest = entries.first()?.position.to_string();
-    let oldest = entries.last()?.position.to_string();
-    link_header(base_url, path, &NO_EXTRA_QUERY, &newest, &oldest)
 }
 
 #[cfg(test)]

@@ -17,7 +17,7 @@ use super::{
     Card, MAX_CARD_DESCRIPTION, MAX_CARD_TITLE, MAX_RAW_META_KEY, MAX_RAW_META_PAIRS,
     MAX_RAW_META_VALUE, RAW_META_PREFIXES,
 };
-use crate::util::format::truncate_chars;
+use crate::util::{format::truncate_chars, url::is_http_url};
 
 /// Parses one HTML page into the rich media [`Card`] it describes.
 ///
@@ -102,7 +102,8 @@ fn resolve_image(base: Option<&Url>, raw: &str) -> Option<String> {
         Some(url) => url.join(raw).ok()?,
         None => Url::parse(raw).ok()?,
     };
-    matches!(resolved.scheme(), "http" | "https").then(|| resolved.to_string())
+    let text = resolved.to_string();
+    is_http_url(&text).then_some(text)
 }
 
 /// Whether a meta key belongs in [`Card`]'s raw Open Graph map.

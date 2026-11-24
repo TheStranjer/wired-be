@@ -6,7 +6,7 @@
 //! 6, the fire-and-forget publisher, the row readers — stand in the module
 //! root.
 
-use serde_json::{Value, json};
+use serde_json::Value;
 use tracing::{debug, warn};
 
 use super::load_user;
@@ -71,11 +71,10 @@ pub async fn after_block_changed(state: &AppState, block: &Block, undo: bool) {
 
 /// The `Block` (or the `Undo` wrapping it) for the row `block`.
 ///
-/// The `Block` half is [`block_json`] with its `id` replaced by the stored
-/// string — the builders mint ids from a fresh uuid and the row's `ap_id`
-/// is its own (decision 6), so only the stored text keeps a peer's
-/// `Undo`-lookup pointed at the activity it already holds. `None` when the
-/// row carries no id to stand behind the document.
+/// The `Block` half is [`block_json`] under the row's stored `ap_id`
+/// (decision 6), which keeps a peer's `Undo`-lookup pointed at the activity
+/// it already holds. `None` when the row carries no id to stand behind the
+/// document.
 fn block_document(
     state: &AppState,
     block: &Block,
@@ -84,16 +83,13 @@ fn block_document(
     undo: bool,
 ) -> Option<Value> {
     let stored_id = block.ap_id.as_deref()?;
-    let mut document = block_json(
+    let document = block_json(
         &state.config,
-        block.id,
+        stored_id,
         &blocker.ap_id,
         &target.ap_id,
         &block.inserted_at,
     );
-    if let Some(fields) = document.as_object_mut() {
-        let _previous = fields.insert("id".to_owned(), json!(stored_id));
-    }
     if undo {
         let now = chrono::Utc::now();
         let to = [target.ap_id.as_str()];
@@ -119,6 +115,7 @@ mod tests {
 
     use crate::{
         config::{Config, TEST_BASE_URL},
+        federation::activities::activity_id,
         models::block,
         services::federation_out::test_support::{
             app_state, job_count, local, publish_jobs, remote,
@@ -239,18 +236,14 @@ mod tests {
     }
 
     /// `published` on the block document is the row's own moment; on the
-    /// undo too, and the shape matches the activity builders' golden
-    /// (the id swapped for the stored one).
+    /// undo too, and the document carries the id it was given.
     #[test]
     fn the_block_document_carries_the_row_clock_and_stored_id() {
         let config = Config::for_tests();
         let published = Utc::now();
-        let document = block_json(&config, new_id(), "alice-ap", "bob-ap", &published);
+        let stored = activity_id(&config, new_id());
+        let document = block_json(&config, &stored, "alice-ap", "bob-ap", &published);
         assert!(document["published"].is_string());
-        assert!(
-            document["id"]
-                .as_str()
-                .is_some_and(|id| id.starts_with("http"))
-        );
+        assert_eq!(document["id"], stored.as_str());
     }
 }

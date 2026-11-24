@@ -12,7 +12,7 @@
 //! (`config/config.exs`) — the list `Pleroma.Web.AdminAPI.ConfigController`
 //! gates every `POST /api/pleroma/admin/config` entry against — with the
 //! registry itself spelled out here because wired-be whitelists exactly
-//! these eight keys, all in group `:pleroma`:
+//! these seven keys, all in group `:pleroma`:
 //!
 //! - `:instance` — the instance's public identity and registration gates,
 //!   whitelist-subkeyed to `name`, `description`, `email`,
@@ -20,11 +20,15 @@
 //!   `account_activation_required`, `invites_enabled`, `limit` and
 //!   `max_media_attachments`;
 //! - `:mrf` — the moderation pipeline, whitelist-subkeyed to `policies`;
-//! - `:mrf_simple`, `:mrf_keyword`, `:mrf_hellthread` and
-//!   `:mrf_object_age` — one whole parameter object per policy;
-//! - `:media_proxy` and `:restrict_unauthenticated` — whole values,
-//!   reported from the environment but not yet read at runtime, hence
-//!   [`RegistryEntry::requires_restart`].
+//! - `:mrf_simple`, `:mrf_keyword`, `:mrf_hellthread`, `:mrf_object_age`
+//!   and `:mrf_hashtag` — one whole parameter object per policy.
+//!
+//! A key is whitelisted only while a runtime consumer reads its stored
+//! row. `:media_proxy` and `:restrict_unauthenticated` are deliberately
+//! absent: the media proxy and the anonymous-read restrictions come from
+//! the environment alone, so accepting a row for them would report a
+//! restart that changes nothing. The admin API refuses both as not
+//! whitelisted.
 //!
 //! [`runtime_config`]: crate::services::runtime_config
 
@@ -44,14 +48,8 @@ pub const KEY_MRF_KEYWORD: &str = ":mrf_keyword";
 pub const KEY_MRF_HELLTHREAD: &str = ":mrf_hellthread";
 /// The `object_age` policy's age gates.
 pub const KEY_MRF_OBJECT_AGE: &str = ":mrf_object_age";
-/// The media proxy's runtime shape.
-pub const KEY_MEDIA_PROXY: &str = ":media_proxy";
-/// Which reads anonymous requests may not make.
-pub const KEY_RESTRICT_UNAUTHENTICATED: &str = ":restrict_unauthenticated";
-/// The `:media_proxy` value's reported subkeys: the public part of the
-/// proxy's shape, read off `MEDIA_PROXY_*` and documented here so the
-/// registry states its wire shape as data.
-const MEDIA_PROXY_SUBKEYS: &[&str] = &["enabled", "blacklist", "max_bytes"];
+/// The always-on `hashtag` policy's tag lists.
+pub const KEY_MRF_HASHTAG: &str = ":mrf_hashtag";
 /// Pleroma's `[:instance, :limit]` is the status text length; the
 /// instance document spells it `max_toot_chars`.
 const INSTANCE_LIMIT: &str = "limit";

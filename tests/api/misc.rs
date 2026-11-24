@@ -2,8 +2,8 @@
 //! endpoints of `src/api/misc.rs` (WBE-166): each endpoint's success
 //! shape, its disabled branch (the fallback 404), the credential
 //! failures of `check_password`, the healthcheck's unhealthy path over a
-//! closed pool, the frontend-configurations document, and the exact PWA
-//! manifest body.
+//! closed pool, the frontend-configurations document, and the removed PWA
+//! manifest route's fallback 404.
 
 #![cfg(test)]
 
@@ -378,55 +378,23 @@ async fn frontend_configurations_serves_the_stored_document() {
 
 // ---------------------------------------------------------------- manifest
 
-/// The exact manifest body for the default test configuration, content
-/// type included.
+/// The backend serves no PWA manifest (the frontend owns it): the path is the
+/// app-wide fallback's 404, marked `x-wired-fallback: 1`.
 #[tokio::test]
-async fn manifest_is_the_ticket_document() {
+async fn manifest_json_is_the_fallback_404() {
     let db = common::test_db().await;
     let pool = db.pool().clone();
     let app = common::test_app(pool);
     let response = common::TestRequest::get("/manifest.json").send(&app).await;
-    assert_eq!(response.status, StatusCode::OK, "manifest status");
+    assert_eq!(response.status, StatusCode::NOT_FOUND, "manifest status");
     assert_eq!(
-        response.header("content-type"),
-        Some("application/manifest+json"),
-        "the manifest media type"
+        response.json_value(),
+        json!({"error": "Not found"}),
+        "the standard not-found body"
     );
     assert_eq!(
-        response.text(),
-        r##"{"name":"Wired","short_name":"Wired","description":"A Wired instance, compatible with Pleroma clients","display":"standalone","scope":"/","start_url":"/","icons":[{"src":"/static/logo.svg","sizes":"any","type":"image/svg+xml"}],"theme_color":"#282c37","background_color":"#191b22"}"##,
-        "the exact manifest body"
-    );
-}
-
-/// The manifest's `name`, `short_name` and `description` follow the
-/// instance configuration.
-#[tokio::test]
-async fn manifest_follows_the_instance_config() {
-    let db = common::test_db().await;
-    let pool = db.pool().clone();
-    let mut config = common::test_config();
-    config.instance_name = "Snatter".to_owned();
-    config.instance_description = "Where we all chatter".to_owned();
-    let app = common::test_app_with_config(pool, config);
-    let response = common::TestRequest::get("/manifest.json").send(&app).await;
-    assert_eq!(response.status, StatusCode::OK, "manifest status");
-    let body = response.json_value();
-    assert_eq!(body["name"], json!("Snatter"), "name follows config");
-    assert_eq!(
-        body["short_name"],
-        json!("Snatter"),
-        "short_name follows config"
-    );
-    assert_eq!(
-        body["description"],
-        json!("Where we all chatter"),
-        "description follows config"
-    );
-    assert_eq!(body["display"], json!("standalone"), "fixed display");
-    assert_eq!(
-        body["icons"],
-        json!([{"src": "/static/logo.svg", "sizes": "any", "type": "image/svg+xml"}]),
-        "the one logo icon"
+        response.header("x-wired-fallback"),
+        Some("1"),
+        "the fallback marks its own 404"
     );
 }

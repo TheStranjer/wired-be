@@ -8,7 +8,7 @@ use reqwest::header::{CONTENT_TYPE, HeaderMap};
 use serde::Deserialize;
 use serde_json::{Map, Value};
 
-use crate::http_client::HttpResponse;
+use crate::{http_client::HttpResponse, util::media_type::essence};
 
 use super::{
     JRD_JSON, WebfingerError, XRD_XML, XRD_XML_VERSION,
@@ -87,13 +87,7 @@ fn declared_media_type(headers: &HeaderMap) -> Option<String> {
     headers
         .get(CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
-        .map(|value| {
-            value
-                .split_once(';')
-                .map_or(value, |(media_type, _parameters)| media_type)
-                .trim()
-                .to_ascii_lowercase()
-        })
+        .map(essence)
 }
 
 /// Whether `body`'s first non-whitespace byte opens a JSON value.

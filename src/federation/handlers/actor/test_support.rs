@@ -5,17 +5,18 @@ use serde_json::{Value, json};
 use sqlx::{PgPool, postgres::PgPoolOptions};
 use uuid::Uuid;
 
+pub(super) use crate::federation::handlers::test_support::{
+    accepted_follow, app_state, assert_handled, fresh_user, ignored, local_user,
+};
 use crate::{
-    config::Config,
     federation::{
-        dispatch::{ActivityView, FederationError, Outcome},
+        dispatch::ActivityView,
         remote_actor::{parse_actor, upsert_remote_user},
     },
     jobs::deletion::KIND_DELETE_REMOTE,
     models::{
-        follow::{self, Follow},
         status::{self, NewStatus, Status},
-        user::{self, Flag, NewUser, User, insert},
+        user::{Flag, NewUser, User, insert},
     },
     state::AppState,
 };
@@ -33,11 +34,6 @@ pub(super) const PEM: &str =
 /// The replacement key one update brings.
 pub(super) const NEW_PEM: &str =
     "-----BEGIN PUBLIC KEY-----\nNEWKEYMATERIAL\n-----END PUBLIC KEY-----\n";
-
-/// Test state over `pool` with the fixed test config.
-pub(super) fn app_state(pool: &PgPool) -> AppState {
-    AppState::for_tests(pool.clone(), Config::for_tests())
-}
 
 /// Test state over a pool that cannot answer: the database having gone
 /// away, as the handlers see it.
@@ -110,23 +106,6 @@ pub(super) async fn ready_for_update(pool: &PgPool, id: Uuid) -> User {
     fresh_user(pool, id).await
 }
 
-/// User `id` as it stands now.
-pub(super) async fn fresh_user(pool: &PgPool, id: Uuid) -> User {
-    user::get_by_id(pool, id)
-        .await
-        .expect("the user reads")
-        .expect("the user exists")
-}
-
-/// A local account named `nickname` at `{BASE}/users/{nickname}`, for
-/// the arms that must not let an inbound activity write over one.
-pub(super) async fn local_user(pool: &PgPool, nickname: &str) -> User {
-    let ap_id = user::local_ap_id(BASE, nickname);
-    insert(pool, &NewUser::local(nickname, &ap_id))
-        .await
-        .expect("the local fixture inserts")
-}
-
 /// A remote mirror named `nickname` on `peer.example`, at `ap_id`.
 pub(super) async fn remote_user(pool: &PgPool, nickname: &str, ap_id: &str) -> User {
     insert(
@@ -161,24 +140,6 @@ pub(super) async fn mirror_post(pool: &PgPool, author: &User, tag: &str) -> Stat
     .expect("the status fixture inserts")
 }
 
-/// The reason an ignored outcome carries, panicking when the handler did
-/// not ignore the activity at all.
-pub(super) fn ignored(outcome: Result<Outcome, FederationError>) -> &'static str {
-    match outcome {
-        Ok(Outcome::Ignored(reason)) => reason,
-        other => panic!("expected the activity to be ignored, got {other:?}"),
-    }
-}
-
-/// Asserts a handler folded its activity.
-pub(super) fn assert_handled(outcome: &Result<Outcome, FederationError>) {
-    assert_eq!(
-        outcome,
-        &Ok(Outcome::Handled),
-        "the handler folded the activity"
-    );
-}
-
 /// The row of the `users.delete_remote` job queued for account `id`, as
 /// `(queue, kind, args)`.
 pub(super) async fn queued_sweep(pool: &PgPool, id: Uuid) -> Option<(String, String, Value)> {
@@ -190,15 +151,4 @@ pub(super) async fn queued_sweep(pool: &PgPool, id: Uuid) -> Option<(String, Str
     .fetch_optional(pool)
     .await
     .expect("the job queue reads")
-}
-
-/// `follower` holds an accepted follow of `target` — granted through the
-/// model's own write, so the counters moved with it.
-pub(super) async fn accepted_follow(pool: &PgPool, follower: &User, target: &User) -> Follow {
-    let requested = follow::follow(pool, BASE, follower, target)
-        .await
-        .expect("the follow fixture is recorded");
-    follow::accept(pool, requested.id)
-        .await
-        .expect("the fixture grants the request")
 }

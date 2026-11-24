@@ -1,7 +1,8 @@
-//! Issuing and reading access tokens: [`create_token`] mints a pair,
-//! [`get_valid_token`] resolves a presented credential to its live owner,
-//! the by-id read returns a row as stored, and [`consume_refresh_token`]
-//! redeems a refresh token exactly once.
+//! Issuing and reading access tokens: [`create_token`] mints a pair, the
+//! by-id read returns a row as stored, and [`consume_refresh_token`]
+//! redeems a refresh token exactly once. Resolving a presented credential
+//! is [`get_with_app`](super::get_with_app) plus the validity rule in
+//! `crate::auth`.
 
 use std::time::Duration;
 
@@ -11,10 +12,9 @@ use uuid::Uuid;
 use super::{DEFAULT_TOKEN_TTL, NewToken, OauthToken};
 use crate::{
     error::AppResult,
-    models::user::{self, User},
     util::{
         id::new_id,
-        token::{CREDENTIAL_BYTES, random_token},
+        token::{CREDENTIAL_BYTES, random_token, sha256_hex},
     },
 };
 
@@ -35,6 +35,11 @@ const INSERT_TOKEN_SQL: &str = "INSERT INTO oauth_tokens (
 /// [`DEFAULT_TOKEN_TTL`]). Both token columns are unique, so a minted
 /// collision is rejected.
 ///
+/// The table stores only the SHA-256 hex digests of the pair. The returned
+/// row carries the **raw** values instead, the one and only time they are
+/// available: the caller hands them to the client and nothing can read them
+/// back out of the database.
+///
 /// # Errors
 ///
 /// Any database failure (connection, constraint, encoding) arrives as
@@ -48,86 +53,35 @@ where
     E: Executor<'e, Database = Postgres>,
 {
     let ttl = new_token.ttl.unwrap_or(DEFAULT_TOKEN_TTL);
-    let token = sqlx::query_as::<_, OauthToken>(INSERT_TOKEN_SQL)
+    let raw_token = random_token(CREDENTIAL_BYTES);
+    let raw_refresh_token = random_token(CREDENTIAL_BYTES);
+    let mut stored = sqlx::query_as::<_, OauthToken>(INSERT_TOKEN_SQL)
         .bind(new_id())
-        .bind(random_token(CREDENTIAL_BYTES))
-        .bind(random_token(CREDENTIAL_BYTES))
+        .bind(sha256_hex(&raw_token))
+        .bind(sha256_hex(&raw_refresh_token))
         .bind(new_token.user_id)
         .bind(new_token.app_id)
         .bind(new_token.scopes.as_str())
         .bind(ttl)
         .fetch_one(executor)
         .await?;
-    Ok(token)
-}
-
-/// Join row for [`get_valid_token`]: every [`OauthToken`] column plus
-/// the owning user's `is_active` flag, which a `LEFT JOIN` leaves `NULL`
-/// for user-unbound rows.
-#[derive(sqlx::FromRow)]
-struct ValidTokenRow {
-    /// The token row itself, flattened over the `t.*` columns.
-    #[sqlx(flatten)]
-    token: OauthToken,
-    /// `users.is_active` of the joined user; `None` for app-only tokens.
-    user_is_active: Option<bool>,
-}
-
-/// Looks up the access token `token` and, when it is still valid,
-/// returns it with its user (`None` for an app-only token).
-///
-/// A token is valid when its row exists, `valid_until` lies in the
-/// future, and — for user-bound tokens — the joined user is still
-/// active. Anything else (unknown token, expired, deactivated user) is
-/// `None`; a suspended account's bearer tokens stop working the moment
-/// the flag flips.
-///
-/// # Errors
-///
-/// Any database failure (connection, encoding) arrives as
-/// [`AppError::Database`](crate::error::AppError).
-pub async fn get_valid_token(
-    pool: &PgPool,
-    token: &str,
-) -> AppResult<Option<(OauthToken, Option<User>)>> {
-    let row = sqlx::query_as::<_, ValidTokenRow>(
-        "SELECT t.*, u.is_active AS user_is_active
-           FROM oauth_tokens t
-           LEFT JOIN users u ON u.id = t.user_id
-          WHERE t.token = $1 AND t.valid_until > now()",
-    )
-    .bind(token)
-    .fetch_optional(pool)
-    .await?;
-    let Some(ValidTokenRow {
-        token: found,
-        user_is_active,
-    }) = row
-    else {
-        return Ok(None);
-    };
-    // An app-only token (NULL user_id) answers NULL for the joined flag
-    // and passes; a user-bound one needs a live, active user.
-    if found.user_id.is_some() && !user_is_active.unwrap_or_default() {
-        return Ok(None);
-    }
-    let user = match found.user_id {
-        Some(user_id) => user::get_by_id(pool, user_id).await?,
-        None => None,
-    };
-    Ok(Some((found, user)))
+    stored.token = raw_token;
+    stored.refresh_token = raw_refresh_token;
+    Ok(stored)
 }
 
 /// The `SELECT` behind [`get_by_id`]: the token row verbatim by primary
-/// key — no validity filter, because the caller (the `push.deliver` job)
-/// reads the token string a subscription was registered for, expiry or not.
+/// key — no validity filter, because the callers (the `push.deliver` job and
+/// the streaming re-check) ask whether a token row stands, expiry or not.
 const GET_BY_ID_SQL: &str = "SELECT * FROM oauth_tokens WHERE id = $1";
 
 /// The access token row with id `id`, `None` when it is gone.
 ///
-/// The [`push.deliver` job](crate::jobs::web_push) reads the token string
-/// the payload carries through its subscription's `token_id`; the foreign
-/// key's cascade means a live subscription normally has one.
+/// The row's `token` and `refresh_token` are the stored digests, never the
+/// credentials. The [`push.deliver` job](crate::jobs::web_push) reads it
+/// through its subscription's `token_id` to see whether the token is still
+/// there; the foreign key's cascade means a live subscription normally has
+/// one.
 ///
 /// # Errors
 ///
@@ -180,7 +134,7 @@ where
     E: Executor<'e, Database = Postgres>,
 {
     let taken = sqlx::query_as::<_, OauthToken>(CONSUME_REFRESH_TOKEN_SQL)
-        .bind(refresh_token)
+        .bind(sha256_hex(refresh_token))
         .bind(app_id)
         .bind(grace)
         .fetch_optional(executor)
@@ -193,11 +147,11 @@ mod tests {
     use chrono::Utc;
 
     use super::super::test_support::*;
-    use super::super::{REFRESH_GRACE, list_for_user};
+    use super::super::{REFRESH_GRACE, get_with_app};
     use super::*;
 
     #[tokio::test]
-    async fn create_token_round_trips_and_validates() {
+    async fn create_token_round_trips() {
         let db = crate::test_db::test_db().await.expect("test database slot");
         let pool = db.pool().clone();
         let alice = insert_user(&pool, "alice").await;
@@ -244,20 +198,86 @@ mod tests {
             "the database stamps both timestamps"
         );
 
-        let (found, user) = get_valid_token(&pool, &token.token)
+        let (found, found_app) = get_with_app(&pool, &token.token)
             .await
             .unwrap()
-            .expect("a fresh token is valid");
+            .expect("a fresh token is found by its text");
         assert_eq!(found.id, token.id, "the token is found by its text");
-        assert_eq!(found.token, token.token, "the secret round trips");
         assert_eq!(
-            user.map(|loaded| loaded.id),
-            Some(alice.id),
-            "the owning user is loaded with it"
+            found.token,
+            sha256_hex(&token.token),
+            "the row read back holds the digest, not the secret"
         );
-        let listed = list_for_user(&pool, alice.id).await.unwrap();
-        assert_eq!(listed.len(), 1, "the user's list holds the token");
-        assert_eq!(listed.first().map(|t| t.id), Some(token.id), "same row");
+        assert_eq!(found.user_id, Some(alice.id), "stored with its owner");
+        assert_eq!(found_app.id, app.id, "and its issuing app");
+    }
+
+    /// The pair is stored as SHA-256 digests: the columns hold
+    /// `sha256_hex(raw)`, the raw values only look a token up, and the digest
+    /// itself is not a credential. A refresh redeems on the raw refresh token
+    /// alone.
+    #[tokio::test]
+    async fn the_table_holds_digests_and_only_raw_values_find_them() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = insert_user(&pool, "digest").await;
+        let app = insert_app(&pool, "Hashed").await;
+        let issued = create_token(&pool, &new_token(Some(alice.id), app.id))
+            .await
+            .unwrap();
+
+        let (stored_token, stored_refresh): (String, String) =
+            sqlx::query_as("SELECT token, refresh_token FROM oauth_tokens WHERE id = $1")
+                .bind(issued.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            stored_token,
+            sha256_hex(&issued.token),
+            "the access token is stored as its digest"
+        );
+        assert_eq!(
+            stored_refresh,
+            sha256_hex(&issued.refresh_token),
+            "the refresh token is stored as its digest"
+        );
+        assert_ne!(
+            stored_token, issued.token,
+            "the raw access token is not stored"
+        );
+        assert_ne!(
+            stored_refresh, issued.refresh_token,
+            "the raw refresh token is not stored"
+        );
+
+        assert!(
+            get_with_app(&pool, &issued.token).await.unwrap().is_some(),
+            "the raw access token finds the row"
+        );
+        assert!(
+            get_with_app(&pool, &stored_token).await.unwrap().is_none(),
+            "the stored digest is not a bearer token"
+        );
+        assert!(
+            consume_refresh_token(&pool, &issued.token, app.id, REFRESH_GRACE)
+                .await
+                .unwrap()
+                .is_none(),
+            "the access token does not redeem as a refresh token"
+        );
+        assert!(
+            consume_refresh_token(&pool, &stored_refresh, app.id, REFRESH_GRACE)
+                .await
+                .unwrap()
+                .is_none(),
+            "the refresh digest does not redeem"
+        );
+        let redeemed = consume_refresh_token(&pool, &issued.refresh_token, app.id, REFRESH_GRACE)
+            .await
+            .unwrap()
+            .expect("the raw refresh token redeems");
+        assert_eq!(redeemed.id, issued.id, "it is the pair's own row");
     }
 
     #[tokio::test]
@@ -297,8 +317,8 @@ mod tests {
         let found = get_by_id(&pool, created.id).await.unwrap();
         assert_eq!(
             found.map(|row| (row.id, row.token)),
-            Some((created.id, created.token.clone())),
-            "the row reads back verbatim"
+            Some((created.id, sha256_hex(&created.token))),
+            "the row reads back as stored: the digest"
         );
 
         expire_token(&pool, created.id).await;
@@ -306,13 +326,10 @@ mod tests {
             .await
             .unwrap()
             .expect("an expired row is still the row behind the id");
-        assert_eq!(stale.token, created.token, "no validity filter applies");
-        assert!(
-            get_valid_token(&pool, &created.token)
-                .await
-                .unwrap()
-                .is_none(),
-            "the validity read, by contrast, refuses it"
+        assert_eq!(
+            stale.token,
+            sha256_hex(&created.token),
+            "no validity filter applies"
         );
         assert!(
             get_by_id(&pool, new_id()).await.unwrap().is_none(),
@@ -321,26 +338,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn app_only_tokens_validate_without_a_user() {
+    async fn app_only_tokens_store_no_user() {
         let db = crate::test_db::test_db().await.expect("test database slot");
         let pool = db.pool().clone();
         let app = insert_app(&pool, "Machine").await;
         let token = create_token(&pool, &new_token(None, app.id)).await.unwrap();
-        let (found, user) = get_valid_token(&pool, &token.token)
+        assert!(
+            token.user_id.is_none(),
+            "a client_credentials token names no user"
+        );
+        let (found, _app) = get_with_app(&pool, &token.token)
             .await
             .unwrap()
-            .expect("a client_credentials token is valid on its own");
+            .expect("an app-only token is found on its own");
         assert_eq!(found.id, token.id, "the row comes back");
-        assert!(user.is_none(), "there is no user to load");
-        let nobody = new_id();
-        assert!(
-            list_for_user(&pool, nobody).await.unwrap().is_empty(),
-            "an app-only token belongs to no user's list"
-        );
     }
 
     #[tokio::test]
-    async fn expired_tokens_are_not_returned() {
+    async fn a_lapsed_pair_is_redeemable_within_the_grace_window() {
         let db = crate::test_db::test_db().await.expect("test database slot");
         let pool = db.pool().clone();
         let alice = insert_user(&pool, "carol").await;
@@ -349,13 +364,6 @@ mod tests {
             .await
             .unwrap();
         expire_token(&pool, token.id).await;
-        assert!(
-            get_valid_token(&pool, &token.token)
-                .await
-                .unwrap()
-                .is_none(),
-            "a token past valid_until is refused"
-        );
         let redeemed = consume_refresh_token(&pool, &token.refresh_token, app.id, REFRESH_GRACE)
             .await
             .unwrap()
@@ -377,10 +385,10 @@ mod tests {
         assert_eq!(outcome.rows_affected(), 1, "the back-dating hit the row");
     }
 
-    /// Rows of `oauth_tokens` holding `refresh_token`.
+    /// Rows of `oauth_tokens` holding the raw `refresh_token` (by digest).
     async fn rows_with_refresh_token(pool: &PgPool, refresh_token: &str) -> i64 {
         sqlx::query_scalar("SELECT count(*) FROM oauth_tokens WHERE refresh_token = $1")
-            .bind(refresh_token)
+            .bind(sha256_hex(refresh_token))
             .fetch_one(pool)
             .await
             .unwrap()
@@ -401,7 +409,11 @@ mod tests {
             .unwrap()
             .expect("the first redemption takes the row");
         assert_eq!(first.id, token.id, "it is the pair's own row");
-        assert_eq!(first.token, token.token, "returned with its access token");
+        assert_eq!(
+            first.token,
+            sha256_hex(&token.token),
+            "returned with its stored access token digest"
+        );
         assert_eq!(
             rows_with_refresh_token(&pool, &token.refresh_token).await,
             0,
@@ -505,32 +517,6 @@ mod tests {
             rows_with_refresh_token(&pool, &token.refresh_token).await,
             1,
             "a rollback puts the pair back"
-        );
-    }
-
-    #[tokio::test]
-    async fn deactivated_users_tokens_are_not_returned() {
-        let db = crate::test_db::test_db().await.expect("test database slot");
-        let pool = db.pool().clone();
-        let dave = insert_user(&pool, "dave").await;
-        let app = insert_app(&pool, "Suspension").await;
-        let token = create_token(&pool, &new_token(Some(dave.id), app.id))
-            .await
-            .unwrap();
-        assert!(
-            get_valid_token(&pool, &token.token)
-                .await
-                .unwrap()
-                .is_some(),
-            "freshly issued, the token works"
-        );
-        deactivate_user(&pool, dave.id).await;
-        assert!(
-            get_valid_token(&pool, &token.token)
-                .await
-                .unwrap()
-                .is_none(),
-            "a suspended user's bearer token stops working"
         );
     }
 }

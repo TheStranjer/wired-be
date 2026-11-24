@@ -52,12 +52,13 @@ mod rows;
 mod test_support;
 
 pub use limits_due::{
-    count_pending_for_user, count_pending_for_user_between, fetch_due, reserved_media_ids,
-    utc_day_bounds,
+    count_pending_for_user, count_pending_for_user_between, count_pending_for_user_between_conn,
+    count_pending_for_user_conn, fetch_due, lock_user, reserved_media_ids, utc_day_bounds,
 };
 pub use pages::page_for_user;
 pub use rows::{
-    delete, delete_all_for_user, delete_owned, get_by_id, get_owned, insert, reschedule,
+    delete, delete_all_for_user, delete_owned, get_by_id, get_owned, insert, insert_conn,
+    reschedule,
 };
 
 /// One row of `scheduled_statuses`: a create-status request waiting for its

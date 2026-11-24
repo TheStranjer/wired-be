@@ -1,15 +1,18 @@
-//! The JSON half of `/oauth/authorize` (WBE-666): what a frontend that
-//! renders the consent page itself needs from the API.
+//! The JSON half of `/oauth/authorize` (WBE-666): what the frontend that
+//! renders the consent page needs from the API.
 //!
 //! `GET /oauth/authorize` with `Accept: application/json` runs the
-//! browser flow's validation and answers `200` with the application's
+//! request validation and answers `200` with the application's
 //! name and website, the scope list, the `redirect_uri` and the client's
-//! `state` instead of the HTML page.
+//! `state`. (Without that header the endpoint redirects the browser to
+//! the frontend instead, see the parent module.)
 //!
 //! `POST /oauth/authorize` with an `Authorization: Bearer` header (or a
 //! JSON body that carries no form-style `authorization` object) is the
 //! frontend's verdict on that request: `{client_id, redirect_uri, scope,
-//! state, approve}`. The bearer token must belong to a *trusted* app
+//! state, approve}`. Any other `POST` — the retired
+//! `authorization[name]`/`authorization[password]` form post included —
+//! is refused with a 400 `invalid_request`. The bearer token must belong to a *trusted* app
 //! (`oauth_apps.trusted`, set through
 //! `PATCH /api/v1/pleroma/admin/oauth_app/{id}`) and cover every
 //! requested scope, so a token can never mint a code for more than it
@@ -75,6 +78,8 @@ const NOT_TRUSTED: &str = "The token's application is not trusted to approve aut
 const SCOPE_ESCALATION: &str = "The token does not cover every requested scope";
 /// Description of the 400 for a body without the `approve` verdict.
 const MISSING_APPROVE: &str = "Missing parameter: approve";
+/// Description of the 400 for a `POST` that is not a bearer-token JSON verdict.
+const JSON_REQUIRED: &str = "POST /oauth/authorize takes a bearer token and a JSON body";
 
 /// A refusal of the JSON half: an OAuth-shaped body, or any other error
 /// answered the way the rest of the API answers it.
@@ -195,7 +200,8 @@ fn is_json_media_type(value: &str) -> bool {
 }
 
 /// Whether the `Accept` header lists exactly `application/json`: what
-/// asks `GET /oauth/authorize` for the app info instead of the page.
+/// asks `GET /oauth/authorize` for the app info instead of the redirect
+/// to the frontend.
 pub(super) fn wants_json(headers: &HeaderMap) -> bool {
     headers
         .get_all(ACCEPT)
@@ -206,8 +212,8 @@ pub(super) fn wants_json(headers: &HeaderMap) -> bool {
 }
 
 /// Whether a `POST` is the frontend's JSON approval rather than the
-/// consent form: it carries a bearer token, or a JSON body without the
-/// form's `authorization` object.
+/// retired consent form: it carries a bearer token, or a JSON body without
+/// the form's `authorization` object.
 pub(super) fn is_json_approval(headers: &HeaderMap, body: &Value) -> bool {
     if auth::bearer_from_headers(headers).is_some() {
         return true;
@@ -219,6 +225,12 @@ pub(super) fn is_json_approval(headers: &HeaderMap, body: &Value) -> bool {
     json_body && body.get("authorization").is_none()
 }
 
+/// The 400 for a `POST` that is not the frontend's JSON verdict, such as
+/// the retired consent form post.
+pub(super) fn refuse_form() -> Response {
+    JsonFailure::invalid_request(JSON_REQUIRED).into_response()
+}
+
 /// `GET /oauth/authorize` as JSON: the validated request's description,
 /// or the refusal.
 pub(super) async fn describe(state: &AppState, query: &AuthorizeQuery) -> Response {
@@ -228,7 +240,7 @@ pub(super) async fn describe(state: &AppState, query: &AuthorizeQuery) -> Respon
     }
 }
 
-/// The validation of the `GET`, in the HTML page's order, and the body.
+/// The validation of the `GET`, in the order the redirect applies it, and the body.
 async fn describe_request(state: &AppState, query: &AuthorizeQuery) -> Result<Value, JsonFailure> {
     require_code_response(query.response_type.as_deref())?;
     let redirect_uri = query.redirect_uri.as_deref().unwrap_or_default();
@@ -401,7 +413,7 @@ mod tests {
         let listed = headers_with(ACCEPT, "text/plain, Application/JSON; q=0.9");
         assert!(wants_json(&listed), "one of a list, any case, with params");
         for other in [
-            "text/html,application/xhtml+xml,*/*;q=0.8",
+            "text/*,application/xhtml+xml,*/*;q=0.8",
             "application/jsonp",
             "application/activity+json",
             "*/*",
@@ -415,7 +427,7 @@ mod tests {
     }
 
     #[test]
-    fn approvals_are_told_from_the_consent_form() {
+    fn approvals_are_told_from_the_retired_consent_form() {
         let bearer = headers_with(axum::http::header::AUTHORIZATION, "Bearer abc");
         assert!(is_json_approval(&bearer, &json!({})), "a bearer token");
         let json_type = headers_with(CONTENT_TYPE, "application/json; charset=utf-8");

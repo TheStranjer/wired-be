@@ -22,7 +22,7 @@
 //! - `GET /api/v2/notifications` answers `{accounts, statuses,
 //!   notification_groups}`: one [`PageParams`] page of groups ordered by
 //!   each group's `most_recent_notification_id` — the cursor walks compare
-//!   that id, and the [`Link`](link_header) header carries it — with
+//!   that id, and the [`Link`](crate::pagination::link_header) header carries it — with
 //!   `types[]`, `exclude_types[]`, `account_id` and `grouped_types[]`
 //!   filters. Sample actors land in `accounts` and group statuses in
 //!   `statuses`, expanded once per response; a status the reader may not
@@ -75,26 +75,23 @@ use tracing::debug;
 use uuid::Uuid;
 
 use crate::{
-    api::helpers::{account_or_404, distinct},
+    api::helpers::{StringList, account_or_404, distinct, names_of, render_visible},
     auth::AuthUser,
     entities::{
         account::{Account, AccountViewer},
         notification::{GroupedNotifications, NotificationGroup},
-        relationship::{Relationship, RelationshipMap},
+        relationship::Relationship,
         status::Status as StatusEntity,
     },
     error::{AppError, AppResult},
     extract::{ApiParams, flex},
     models::{
         marker::{self, Marker},
-        notification::{self, GroupEntry, GroupInfo, GroupPageParams, NotificationFilters},
-        status::{self, Status as StatusRow},
-        status_visibility,
+        notification::{self, GroupInfo, GroupPageParams, NotificationFilters},
         user::{self, User},
     },
     oauth::scopes::{READ_NOTIFICATIONS, WRITE_NOTIFICATIONS},
-    pagination::{PageParams, link_header, set_link_header},
-    services::render_status::{ViewerMode, render_statuses},
+    pagination::{NO_EXTRA_QUERY, PageParams, keyset_link, set_link_header},
     state::AppState,
     util::id::parse_id,
 };
@@ -109,10 +106,6 @@ const EXPAND_FULL: &str = "full";
 /// The other accepted `expand_accounts` spelling (Mastodon's
 /// `partial_avatars`).
 const EXPAND_PARTIAL_AVATARS: &str = "partial_avatars";
-/// The `Link` header's query parameters carry nothing but the cursor: the
-/// listing's filters are not repeated on either link, as in no other paged
-/// listing here (the relationship listings' constant, same rule).
-pub(crate) const NO_EXTRA_QUERY: [(String, String); 0] = [];
 
 /// The `/api/v2` grouped-notifications router, merged into
 /// [`crate::api::v2`].
@@ -123,33 +116,6 @@ pub fn router() -> Router<AppState> {
         .route("/notifications/{group_key}", get(show_group))
         .route("/notifications/{group_key}/accounts", get(group_accounts))
         .route("/notifications/{group_key}/dismiss", post(dismiss_group))
-}
-
-/// One name list of a repeated parameter: one value or a list (a JSON
-/// array, or `types[]=…` keys in a query string) — the two spellings
-/// Mastodon clients and forms both send, like the markers' timeline names.
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
-pub(crate) enum StringList {
-    /// A lone name.
-    Single(String),
-    /// A list of names.
-    Multiple(Vec<String>),
-}
-
-impl StringList {
-    /// The names, borrowed, in the order sent.
-    pub(crate) fn names(&self) -> Vec<&str> {
-        match self {
-            Self::Single(name) => vec![name.as_str()],
-            Self::Multiple(names) => names.iter().map(String::as_str).collect(),
-        }
-    }
-}
-
-/// The names behind an optional list parameter, none when it was absent.
-pub(crate) fn names_of(list: Option<&StringList>) -> Vec<&str> {
-    list.map_or_else(Vec::new, StringList::names)
 }
 
 /// `GET /api/v2/notifications`' non-cursor parameters ([`ApiParams`],
@@ -206,11 +172,7 @@ impl ListParams {
     /// The `types[]` / `exclude_types[]` half of the read filters; the
     /// account half arrives through [`account_filter`].
     fn type_filters(&self) -> NotificationFilters<'_> {
-        NotificationFilters {
-            types: names_of(self.types.as_ref()),
-            exclude_types: names_of(self.exclude_types.as_ref()),
-            account_id: None,
-        }
+        type_filters(self.types.as_ref(), self.exclude_types.as_ref())
     }
 }
 
@@ -237,11 +199,21 @@ struct UnreadCountParams {
 impl UnreadCountParams {
     /// The `types[]` / `exclude_types[]` half of the read filters.
     fn type_filters(&self) -> NotificationFilters<'_> {
-        NotificationFilters {
-            types: names_of(self.types.as_ref()),
-            exclude_types: names_of(self.exclude_types.as_ref()),
-            account_id: None,
-        }
+        type_filters(self.types.as_ref(), self.exclude_types.as_ref())
+    }
+}
+
+/// The `types[]` / `exclude_types[]` half of the read filters, shared by
+/// every notification listing; the account half arrives through
+/// [`account_filter`].
+pub(crate) fn type_filters<'a>(
+    types: Option<&'a StringList>,
+    exclude: Option<&'a StringList>,
+) -> NotificationFilters<'a> {
+    NotificationFilters {
+        types: names_of(types),
+        exclude_types: names_of(exclude),
+        account_id: None,
     }
 }
 
@@ -308,7 +280,15 @@ async fn list_groups(
         user = %auth.0.id,
         "notification groups listed"
     );
-    let link = groups_link(&state.config.base_url, uri.path(), &entries);
+    // The cursor is each group's `most_recent_notification_id`, the id the
+    // listing walks on.
+    let link = keyset_link(
+        &state.config.base_url,
+        uri.path(),
+        &NO_EXTRA_QUERY,
+        &entries,
+        |entry| entry.info.most_recent_id,
+    );
     let mut headers = HeaderMap::new();
     set_link_header(&mut headers, link.as_deref())?;
     let groups: Vec<(&str, &GroupInfo)> = entries
@@ -453,16 +433,6 @@ async fn read_marker(pool: &PgPool, user_id: Uuid) -> AppResult<Option<Uuid>> {
     Ok(rows.first().and_then(|row| parse_id(&row.last_read_id)))
 }
 
-/// The `Link` header value for one fetched group page: [`link_header`]
-/// over the first (newest) and last (oldest) group's
-/// `most_recent_notification_id` — the cursor the listing walks on — and
-/// `None` for an empty page.
-fn groups_link(base_url: &str, path: &str, entries: &[GroupEntry]) -> Option<String> {
-    let newest = entries.first()?.info.most_recent_id.to_string();
-    let oldest = entries.last()?.info.most_recent_id.to_string();
-    link_header(base_url, path, &NO_EXTRA_QUERY, &newest, &oldest)
-}
-
 /// The `{accounts, statuses, notification_groups}` envelope for `groups`:
 /// each entry rendered under its key, every sample actor expanded once
 /// into `accounts` and every group status once into `statuses`, both as
@@ -523,7 +493,7 @@ async fn expand_accounts(
     }
     let users = user::get_many(&state.db, ids).await?;
     let mut by_id: HashMap<Uuid, User> = users.into_iter().map(|found| (found.id, found)).collect();
-    let relationships = expand_relationships(state, viewer, ids).await?;
+    let relationships = Relationship::load_map(&state.db, viewer, ids).await?;
     let accounts = ids
         .iter()
         .filter_map(|id| by_id.remove(id))
@@ -532,34 +502,11 @@ async fn expand_accounts(
     Ok(accounts)
 }
 
-/// The viewer's [`RelationshipMap`] for `ids`, or `None` for an anonymous
-/// expansion (every grouped endpoint is authenticated, but the helpers
-/// stay honest about the optional viewer).
-///
-/// # Errors
-///
-/// [`Database`](crate::error::AppError::Database) from the batched loader.
-async fn expand_relationships(
-    state: &AppState,
-    viewer: AccountViewer<'_>,
-    ids: &[Uuid],
-) -> AppResult<Option<RelationshipMap>> {
-    let Some(who) = viewer else {
-        return Ok(None);
-    };
-    let loaded = Relationship::load_many(&state.db, who.id, ids).await?;
-    let map = loaded
-        .into_iter()
-        .zip(ids.iter().copied())
-        .map(|(relationship, target)| (target, relationship))
-        .collect();
-    Ok(Some(map))
-}
-
 /// Expands status ids into [`StatusEntity`]s as seen by `viewer`: every
-/// stored status once, in the requested order, through the batched renderer
-/// [`render_statuses`]. A status with no row and one the visibility rules
-/// hide from this reader both drop out of the array — the groups still
+/// stored status once, in the requested order, through [`render_visible`]
+/// (the batched visibility filter and renderer). A status with no row and
+/// one the visibility rules hide from this reader both drop out of the
+/// array — the groups still
 /// carry their `status_id`, Pleroma's id-only reference aside — and a
 /// deleted one renders as nothing, which is what the renderer answers for
 /// a tombstone.
@@ -573,22 +520,7 @@ async fn expand_statuses(
     viewer: AccountViewer<'_>,
     ids: &[Uuid],
 ) -> AppResult<Vec<StatusEntity>> {
-    if ids.is_empty() {
-        return Ok(Vec::new());
-    }
-    let rows = status::get_many(&state.db, ids).await?;
-    let mut by_id: HashMap<Uuid, StatusRow> =
-        rows.into_iter().map(|found| (found.id, found)).collect();
-    let mut visible: Vec<StatusRow> = Vec::new();
-    for id in ids {
-        let Some(row) = by_id.remove(id) else {
-            continue;
-        };
-        if status_visibility::can_view(&state.db, &row, viewer).await? {
-            visible.push(row);
-        }
-    }
-    render_statuses(state, ViewerMode::User(viewer), &visible).await
+    render_visible(state, viewer, ids).await
 }
 
 #[cfg(test)]

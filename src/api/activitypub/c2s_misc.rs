@@ -22,7 +22,7 @@ use crate::{
     },
     oauth::scopes::{READ, WRITE_MEDIA},
     state::AppState,
-    util::id::{new_id, parse_id},
+    util::id::{new_activity_ap_id, parse_id},
 };
 
 use super::negotiation::document_response;
@@ -152,11 +152,7 @@ pub(super) async fn interactable_status(
     let row = status_by_reference(state, &reference)
         .await?
         .ok_or(AppError::NotFound)?;
-    if status_visibility::can_view(&state.db, &row, Some(&auth.0)).await? {
-        Ok(row)
-    } else {
-        Err(AppError::NotFound)
-    }
+    status_visibility::require_visible(&state.db, row, Some(&auth.0)).await
 }
 
 /// The status a boost lands on: `row` itself, or its original when the
@@ -185,7 +181,7 @@ pub(super) fn row_activity_id(config: &Config, ap_id: Option<&str>) -> String {
 /// (decision 6): the answer's `Location` for the writes that retire a
 /// fact instead of leaving a row behind — the `Delete` and the `Undo`s.
 pub(super) fn new_activity_id(config: &Config) -> String {
-    format!("{}/activities/{}", config.base_url, new_id())
+    new_activity_ap_id(&config.base_url)
 }
 
 #[cfg(test)]

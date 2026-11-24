@@ -5,7 +5,9 @@ use axum::http::StatusCode;
 use serde_json::json;
 use wired_be::models::user::{Flag, User};
 
-use super::support::{BASE, INVALID_TOKEN, MISSING_ACCT, NOT_FOUND, assert_identity, lookup};
+use super::support::{
+    BASE, INVALID_TOKEN, MISSING_ACCT, NO_SCOPE, NOT_FOUND, assert_identity, lookup,
+};
 use crate::common;
 
 /// `lookup` renders for its viewer exactly as `show` does: the same token
@@ -337,4 +339,42 @@ async fn lookup_rejects_an_invalid_bearer_token() {
         "the same extractor guards lookup"
     );
     assert_eq!(response.text(), INVALID_TOKEN, "MaybeAuthUser's 401 body");
+}
+
+/// A user token without `read:accounts` may not look an account up, nor
+/// trigger `resolve=true`: 403 with Pleroma's wording, while `read` and
+/// anonymous requests answer 200.
+#[tokio::test]
+async fn lookup_requires_read_accounts_on_a_presented_user_token() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let alice = common::create_local_user(&pool, "alice").await;
+    let narrow = common::create_app_and_token(&pool, &alice, "write:statuses").await;
+    let broad = common::create_app_and_token(&pool, &alice, "read").await;
+    let app = common::test_app(pool);
+
+    for query in ["?acct=alice", "?acct=nobody@remote.example&resolve=true"] {
+        let refused = common::TestRequest::get(&format!("/api/v1/accounts/lookup{query}"))
+            .bearer(&narrow)
+            .send(&app)
+            .await;
+        assert_eq!(
+            refused.status,
+            StatusCode::FORBIDDEN,
+            "`{query}` needs read:accounts"
+        );
+        assert_eq!(refused.text(), NO_SCOPE, "Pleroma's wording");
+    }
+
+    let allowed = common::TestRequest::get("/api/v1/accounts/lookup?acct=alice")
+        .bearer(&broad)
+        .send(&app)
+        .await;
+    assert_eq!(
+        allowed.status,
+        StatusCode::OK,
+        "`read` covers read:accounts"
+    );
+    let anonymous = lookup(&app, "?acct=alice").await;
+    assert_eq!(anonymous.status, StatusCode::OK, "anonymous still proceeds");
 }

@@ -10,7 +10,7 @@ use uuid::Uuid;
 use super::*;
 use crate::{
     jobs::{
-        QUEUE_BACKGROUND,
+        JobError, QUEUE_BACKGROUND,
         maintenance::test_support::{EVERY, FIRST_ATTEMPT, app_state, broken_state, row_exists},
         scheduler::periodic_jobs,
     },
@@ -278,7 +278,7 @@ async fn an_unreachable_database_retries_the_jobs_prune() {
 
     match outcome {
         Err(JobError::Retry(detail)) => assert!(
-            detail.starts_with("prune sweep failed"),
+            detail.starts_with("pruned maintenance rows failed"),
             "the retry states what failed: {detail}"
         ),
         Ok(()) => panic!("a closed pool must not read as a successful prune"),

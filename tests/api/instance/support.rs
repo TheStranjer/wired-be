@@ -14,7 +14,7 @@ pub(super) const BASE: &str = "https://test.example";
 /// The feature list Pleroma 2.10.2 advertises with its shipped defaults,
 /// spelled out here (as in `tests/nodeinfo.rs`) so the shared builder is
 /// checked against the ticket, not echoed by it.
-pub(super) const EXPECTED_FEATURES: [&str; 26] = [
+pub(super) const EXPECTED_FEATURES: [&str; 25] = [
     "pleroma_api",
     "mastodon_api",
     "mastodon_api_grouped_notifications",
@@ -37,7 +37,6 @@ pub(super) const EXPECTED_FEATURES: [&str; 26] = [
     "pleroma:pin_chats",
     "exposable_reactions",
     "profile_directory",
-    "pleroma:get:main/ostatus",
     "pleroma:group_actors",
     "pleroma:bookmark_folders",
     "pleroma:block_expiration",
@@ -129,7 +128,12 @@ pub(super) fn expected_pleroma(vapid_key: &str) -> Value {
             "features": EXPECTED_FEATURES,
             "federation": {
                 "enabled": true,
-                "mrf_policies": [],
+                "mrf_policies": ["HashtagPolicy"],
+                "mrf_hashtag": {
+                    "sensitive": ["nsfw"],
+                    "reject": [],
+                    "federated_timeline_removal": [],
+                },
                 "quarantined_instances": [],
                 "exclusions": false,
             },
@@ -146,8 +150,8 @@ pub(super) fn expected_pleroma(vapid_key: &str) -> Value {
                 "activities": { "local": false, "remote": false },
             },
             "markup": {
-                "allow_inline_images": false,
-                "allow_headings": false,
+                "allow_inline_images": true,
+                "allow_headings": true,
                 "allow_tables": false,
                 "allow_fonts": false,
             },
@@ -170,7 +174,7 @@ pub(super) fn expected_document(vapid_key: &str) -> Value {
         "version": instance_version(),
         "urls": { "streaming_api": "wss://test.example" },
         "stats": { "user_count": 0, "status_count": 0, "domain_count": 0 },
-        "thumbnail": format!("{BASE}/images/thumbnail.jpg"),
+        "thumbnail": format!("{BASE}/media/default/thumbnail.jpg"),
         "languages": ["en"],
         "registrations": true,
         "approval_required": false,
@@ -230,7 +234,7 @@ pub(super) fn other_config() -> Config {
     config.contact_email = Some("admin@example.org".to_owned());
     config.instance_languages = vec!["en".to_owned(), "de".to_owned()];
     config.base_url = "http://snatter.example:4000".to_owned();
-    config.frontend_base_url = "http://snatter.example:4000".to_owned();
+    config.media_base_url = "http://snatter.example:4000/media".to_owned();
     config.max_status_chars = 300;
     config.max_media_attachments = 6;
     config.max_poll_options = 12;

@@ -25,6 +25,7 @@ use sqlx::PgPool;
 use wired_be::{
     config::Config,
     models::{oauth_app::OauthApp, password_reset, user::User},
+    util::token::token_digest,
 };
 
 use crate::common;
@@ -101,8 +102,24 @@ async fn stored_tokens(pool: &PgPool, user: &User) -> Vec<password_reset::Passwo
     .expect("the token table reads back")
 }
 
+/// The raw reset token in the link of the mailed `letter`: the characters
+/// after `{RESET}/` up to the first one a token never carries.
+fn mailed_token(letter: &Value) -> String {
+    let body = letter["text_body"]
+        .as_str()
+        .expect("the letter has a text body");
+    let (_, after) = body
+        .split_once(&format!("{RESET}/"))
+        .expect("the letter carries the reset link");
+    after
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+        .collect()
+}
+
 /// Requests a reset for `user` naming it by `key` and hands back the
-/// issued token's text, checking the 204 on the way.
+/// issued token's text as the mailed link carries it, checking the 204 on
+/// the way and that the table stores only that text's digest.
 async fn request_reset(app: &Router, pool: &PgPool, user: &User, key: &str) -> String {
     let value = match key {
         "email" => email_of(&user.nickname),
@@ -110,12 +127,20 @@ async fn request_reset(app: &Router, pool: &PgPool, user: &User, key: &str) -> S
     };
     let response = request_form(app, key, &value).await;
     assert_no_content(&response, "the reset request");
-    stored_tokens(pool, user)
-        .await
-        .first()
-        .expect("the request minted a token")
-        .token
-        .clone()
+    let letters = queued_letters(pool).await;
+    let token = mailed_token(letters.last().expect("the request queued a letter"));
+    let stored = stored_tokens(pool, user).await;
+    assert!(
+        stored
+            .iter()
+            .any(|row| row.token_digest == token_digest(&token)),
+        "the stored row is the digest of the mailed token"
+    );
+    assert!(
+        stored.iter().all(|row| row.token_digest != token),
+        "the mailed token itself is not stored"
+    );
+    token
 }
 
 /// POSTs the completion form (Pleroma's nested `data[...]` names).
@@ -169,8 +194,8 @@ async fn set_pending(pool: &PgPool, user: &User, pending: bool) {
 
 /// Backdates `token`'s row outside the 24-hour window.
 async fn lapse_token(pool: &PgPool, token: &str) {
-    let aged = sqlx::query("UPDATE password_reset_tokens SET inserted_at = now() - interval '25 hours' WHERE token = $1")
-        .bind(token)
+    let aged = sqlx::query("UPDATE password_reset_tokens SET inserted_at = now() - interval '25 hours' WHERE token_digest = $1")
+        .bind(token_digest(token))
         .execute(pool)
         .await
         .expect("the ageing update runs");
@@ -191,7 +216,11 @@ async fn known_accounts_get_204_and_the_reset_letter() {
         let tokens = stored_tokens(&pool, &user).await;
         assert_eq!(tokens.len(), 1, "one token minted");
         assert!(!tokens[0].used, "and it starts unused");
-        assert_eq!(response, tokens[0].token, "the returned token is stored");
+        assert_eq!(
+            token_digest(&response),
+            tokens[0].token_digest,
+            "the mailed token's digest is stored"
+        );
         let letters = queued_letters(&pool).await;
         assert_eq!(letters.len(), 1, "exactly one letter queued");
         assert_eq!(
@@ -204,7 +233,7 @@ async fn known_accounts_get_204_and_the_reset_letter() {
             json!("Password reset"),
             "Pleroma's subject"
         );
-        let link = format!("https://test.example{RESET}/{}", tokens[0].token);
+        let link = format!("https://test.example{RESET}/{response}");
         assert!(
             letters[0]["text_body"]
                 .as_str()

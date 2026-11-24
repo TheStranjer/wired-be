@@ -122,9 +122,9 @@ use self::{
 };
 
 pub(crate) use self::{
-    chats_list::{chat_entities, chat_entity, page_link},
+    chats_list::{chat_entities, chat_entity},
     events::after_chat_message_created,
-    messages::{message_of, message_page_link},
+    messages::message_of,
 };
 
 pub mod chats_list;
@@ -186,11 +186,6 @@ const MEDIA_NOT_FOUND: &str = "Media not found";
 /// The header [`post_message`] reads its replay key from (Pleroma's
 /// `idempotency_key/1`).
 const IDEMPOTENCY_KEY_HEADER: HeaderName = HeaderName::from_static("idempotency-key");
-/// The `Link` header's query parameters carry nothing but the cursor: the
-/// list's filters are not repeated on either link, as in no other paged
-/// listing of this API.
-const NO_EXTRA_QUERY: [(String, String); 0] = [];
-
 /// The `/api/v1/pleroma/chats` router, nested into [`crate::api::v1`].
 ///
 /// Do not call [`Router::fallback`] here (or on anything merged into this

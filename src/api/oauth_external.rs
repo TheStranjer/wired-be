@@ -28,12 +28,23 @@
 //!    through the SSRF-guarded [`HttpClient`]. The configured `uid_field`
 //!    of that document names the account:
 //!    * linked to a local user by `user_identities` → that account is
-//!      logged in. The readiness gate ([`crate::api::oauth`]'s
-//!      `check_account_ready`, the one the token endpoint applies) runs, and the answer is exactly the one
-//!      `POST /oauth/authorize` gives for the *stored* parameters: a 302 to
-//!      the app's `redirect_uri` with `code` (and the client's `state`), or
-//!      the out-of-band code page. No consent screen is rendered and no
-//!      password asked for: the provider authenticated the user, and the
+//!      logged in, **but only for a trusted application**
+//!      (`oauth_apps.trusted`, an admin-set flag). `prepare_request` is
+//!      unauthenticated and `POST /api/v1/apps` lets anyone register an app
+//!      with their own `redirect_uris`, and no consent screen is rendered
+//!      here; a provider that auto-approves (GitHub and GitLab do for an
+//!      already-authorized app) would otherwise hand any victim's code to an
+//!      attacker's redirect URI on one click. So for an untrusted app the
+//!      state row is deleted and the answer is a 302 to the app's
+//!      `redirect_uri` with `error=access_denied&error_description=consent_required`
+//!      (and the client's `state`); no authorization is created. This is
+//!      interim, until the frontend consent flow exists. For a trusted app
+//!      the readiness gate ([`crate::api::oauth`]'s `check_account_ready`,
+//!      the one the token endpoint applies) runs, and the answer is
+//!      the authorization code for the *stored* parameters: a
+//!      302 to the app's `redirect_uri` with `code` (and the client's
+//!      `state`), or the JSON `{"code": …}` for the out-of-band URI. No
+//!      password is asked for: the provider authenticated the user, and the
 //!      scopes were validated when the round trip was prepared.
 //!    * not linked → the provider's account info is stored under the
 //!      `pending` key of the state's parameters and the browser is
@@ -347,7 +358,7 @@ mod tests {
         assert!(ok.is_ok(), "a plain URL redirects");
         let header = match ok {
             Ok(AuthorizeReply::Found(value)) => value,
-            Ok(AuthorizeReply::Page(_)) | Err(_) => {
+            Ok(AuthorizeReply::Page(_) | AuthorizeReply::Code(_)) | Err(_) => {
                 panic!("a URL redirect, not a page")
             }
         };

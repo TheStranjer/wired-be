@@ -3,7 +3,8 @@
 //!
 //! [`sanitize_html`] runs input through an `ammonia` allowlist built from
 //! the ticket policy: a fixed tag set, per-tag attribute sets, value-
-//! filtered `class` attributes, a fixed URL scheme set and a forced `rel`
+//! filtered `class` attributes (on `a`, `span` and `img`; links keep only
+//! `hashtag`, `u-url` and `mention`), a fixed URL scheme set and a forced `rel`
 //! on every link. Everything else — comments, `style` and `script`
 //! including their contents, `iframe` and `form` tags, all event handler
 //! attributes — is removed; text of stripped elements survives, "Links in
@@ -52,9 +53,14 @@ const ALLOWED_TAGS: [&str; 23] = [
 ];
 
 /// Attributes kept on `a`. `rel` is deliberately absent: it is not user-set,
-/// it is forced to [`FORCED_LINK_REL`] by the builder, and `class` carries
-/// no value restrictions for links (unlike [`SPAN_CLASSES`] for spans).
-const LINK_ATTRIBUTES: [&str; 3] = ["href", "class", "title"];
+/// it is forced to [`FORCED_LINK_REL`] by the builder. `class` is also
+/// absent: it is added through [`LINK_CLASSES`], which filters its values.
+const LINK_ATTRIBUTES: [&str; 2] = ["href", "title"];
+
+/// The only `class` values `a` may keep, as in Pleroma's scrubber
+/// (`hashtag`, `u-url`, `mention` and their combinations); ammonia filters
+/// per token, so `mention u-url` survives.
+const LINK_CLASSES: [&str; 3] = ["hashtag", "u-url", "mention"];
 
 /// Attributes kept on `img`, besides the value-filtered `class` from
 /// [`IMAGE_CLASSES`]. `img` exists for custom emoji only, hence the tight
@@ -101,6 +107,7 @@ fn builder() -> Builder<'static> {
         ]))
         .url_schemes(URL_SCHEMES.into_iter().collect())
         .link_rel(Some(FORCED_LINK_REL))
+        .add_allowed_classes("a", LINK_CLASSES)
         .add_allowed_classes("img", IMAGE_CLASSES)
         .add_allowed_classes("span", SPAN_CLASSES);
     builder
@@ -108,9 +115,11 @@ fn builder() -> Builder<'static> {
 
 /// Sanitizes a fragment of user HTML against the Pleroma-style allowlist.
 ///
-/// Kept verbatim: the `ALLOWED_TAGS` elements, `href`/`class`/`title` on
-/// links, `src`/`alt`/`title` and the `emoji` class on images (images
-/// exist for custom emoji only), and the `SPAN_CLASSES` classes on spans.
+/// Kept verbatim: the `ALLOWED_TAGS` elements, `href`/`title` and the
+/// `LINK_CLASSES` classes (`hashtag`, `u-url`, `mention`) on links,
+/// `src`/`alt`/`title` and the `emoji` class on images (images exist for
+/// custom emoji only), and the `SPAN_CLASSES` classes on spans. Other class
+/// tokens are dropped from the attribute.
 /// `rel` on every link is forced to `FORCED_LINK_REL`; no `target` is
 /// added. Everything else goes: comments, event handler attributes,
 /// `style`, and `script`, `iframe` and `form` tags (text of stripped
@@ -137,7 +146,10 @@ pub fn strip_html(input: &str) -> String {
 /// attribute values: `&`, `<`, `>`, `"` and `'`.
 ///
 /// The result is inert markup: nothing in `s` can open a tag or a
-/// reference.
+/// reference. The apostrophe becomes `&#39;`, a numeric character
+/// reference that is equally valid in XML, so the XRD documents of
+/// [`crate::api::well_known`] use this escaper too, in element text and
+/// quoted attribute values alike.
 #[must_use]
 pub fn escape_html(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
@@ -152,6 +164,12 @@ pub fn escape_html(s: &str) -> String {
         }
     }
     out
+}
+
+/// Appends `text` to `out` with the unsafe HTML characters escaped, as
+/// [`escape_html`] would.
+pub fn push_escaped(out: &mut String, text: &str) {
+    out.push_str(&escape_html(text));
 }
 
 /// Reduces arbitrary user-supplied display-name markup to one line of
@@ -241,6 +259,7 @@ fn collapse_control_chars(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::util::entities::{hashtag_html, mention_html};
 
     /// What every link's forced `rel` attribute looks like in output.
     const REL: &str = r#"rel="ugc nofollow noopener noreferrer""#;
@@ -403,16 +422,35 @@ mod tests {
     }
 
     #[test]
-    fn link_classes_are_not_value_filtered() {
+    fn link_classes_are_value_filtered() {
         assert_eq!(
             sanitize_html(r#"<a href="https://example.org" class="mention u-url">@b</a>"#),
             format!(r#"<a href="https://example.org" class="mention u-url" {REL}>@b</a>"#),
-            "link classes are kept as given"
+            "listed link classes are kept"
         );
         assert_eq!(
             sanitize_html(r#"<a href="https://example.org" class="anything">x</a>"#),
-            format!(r#"<a href="https://example.org" class="anything" {REL}>x</a>"#),
-            "the ticket puts no value list on a's class"
+            format!(r#"<a href="https://example.org" class="" {REL}>x</a>"#),
+            "an unlisted link class is dropped"
+        );
+        assert_eq!(
+            sanitize_html(r#"<a href="https://example.org" class="mention evil">x</a>"#),
+            format!(r#"<a href="https://example.org" class="mention" {REL}>x</a>"#),
+            "only the unlisted token goes"
+        );
+    }
+
+    #[test]
+    fn mention_and_hashtag_html_keep_their_classes() {
+        let mention = sanitize_html(&mention_html("https://x.example/u", "bob"));
+        assert!(
+            mention.contains(r#"class="u-url mention""#),
+            "mention classes survive byte for byte: {mention}"
+        );
+        let hashtag = sanitize_html(&hashtag_html("https://x.example", "tag"));
+        assert!(
+            hashtag.contains(r#"class="mention hashtag""#),
+            "hashtag classes survive byte for byte: {hashtag}"
         );
     }
 
@@ -496,6 +534,50 @@ mod tests {
             "safe text is untouched"
         );
         assert_eq!(escape_html(""), "", "empty stays empty");
+    }
+
+    #[test]
+    fn plain_text_and_unicode_pass_through_unescaped() {
+        for value in [
+            "",
+            "alice",
+            "acct:alice@test.example",
+            "https://test.example/users/alice",
+            "héllo wörld — ✓",
+        ] {
+            assert_eq!(escape_html(value), value, "{value:?} needs no escaping");
+        }
+    }
+
+    #[test]
+    fn every_special_character_becomes_its_reference() {
+        assert_eq!(escape_html("&"), "&amp;", "ampersand");
+        assert_eq!(escape_html("<"), "&lt;", "less-than");
+        assert_eq!(escape_html(">"), "&gt;", "greater-than");
+        assert_eq!(escape_html("\""), "&quot;", "double quote");
+        assert_eq!(escape_html("'"), "&#39;", "single quote");
+    }
+
+    #[test]
+    fn text_that_looks_like_references_is_escaped_once() {
+        assert_eq!(
+            escape_html("a<b>&c\"d'e"),
+            "a&lt;b&gt;&amp;c&quot;d&#39;e",
+            "each character is replaced once"
+        );
+        assert_eq!(
+            escape_html("<a href=\"x\">&amp;</a>"),
+            "&lt;a href=&quot;x&quot;&gt;&amp;amp;&lt;/a&gt;",
+            "text that already looks like entities is escaped as literal text"
+        );
+    }
+
+    #[test]
+    fn push_escaped_appends_the_escaped_text() {
+        let mut out = String::from("<p>");
+        push_escaped(&mut out, "a<b & 'c'");
+        push_escaped(&mut out, "");
+        assert_eq!(out, "<p>a&lt;b &amp; &#39;c&#39;", "appended, not replaced");
     }
 
     #[test]

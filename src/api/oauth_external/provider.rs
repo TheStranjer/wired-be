@@ -15,7 +15,7 @@ use crate::{
     },
     config::{Config, OauthProvider},
     error::{AppError, AppResult},
-    http_client::{HttpClient, HttpError, HttpResponse},
+    http_client::{DEFAULT_RESPONSE_BYTES, HttpClient, HttpError, HttpResponse},
     models::{user::User, user_identity},
     oauth::scopes::Scopes,
     state::AppState,
@@ -158,6 +158,7 @@ async fn exchanged(
             &provider.token_url,
             &[("content-type", FORM_TYPE), ("accept", ACCEPT_JSON)],
             body.into_bytes(),
+            DEFAULT_RESPONSE_BYTES,
         )
         .await;
     let document = json_document("token", &provider.token_url, outcome)?;

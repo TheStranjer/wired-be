@@ -97,7 +97,6 @@ use self::{
     likes::{apply_emoji_react, apply_like, apply_undo_emoji_react, apply_undo_like},
 };
 use crate::{
-    error::AppError,
     federation::dispatch::{ActivityView, FederationError, Handlers, Outcome},
     models::user::User,
     state::AppState,
@@ -215,13 +214,6 @@ pub fn handle_undo_announce(
     signer: User,
 ) -> BoxFuture<'static, Result<Outcome, FederationError>> {
     Box::pin(async move { apply_undo_announce(state, view, signer).await })
-}
-/// Shapes a database failure into the dispatcher's retryable arm, naming
-/// the read or write that failed.
-fn transient(what: &str, err: &AppError) -> FederationError {
-    FederationError::Transient(format!(
-        "could not fold the remote interaction's {what}: {err}"
-    ))
 }
 
 #[cfg(test)]

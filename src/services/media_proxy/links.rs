@@ -2,16 +2,16 @@
 //! and validating them with [`decode`].
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use hmac::{Hmac, KeyInit as _, Mac as _};
-use sha2_011::Sha256;
-use subtle::ConstantTimeEq as _;
 use url::Url;
 
 use super::{PROXY_PATH, ProxyError};
-use crate::config::Config;
-
-/// The HMAC flavor proxy signatures use: HMAC-SHA256 over the encoded URL.
-type HmacSha256 = Hmac<Sha256>;
+use crate::{
+    config::Config,
+    util::{
+        hmac::{hmac_sha256, verify_hmac_sha256},
+        url::{is_http_url, is_local_url},
+    },
+};
 
 /// Rewrites `remote_url` into a signed proxy link for serving by
 /// [`router`](super::router), following Pleroma's `MediaProxy.url/1`
@@ -99,7 +99,7 @@ fn proxy_target<'config>(config: &'config Config, remote_url: &str) -> Option<(&
 /// host of the configured media prefix — Pleroma's `local?` and its
 /// upload-`base_url` whitelist entry combined.
 fn is_local(config: &Config, url: &Url) -> bool {
-    if url.authority() == config.domain() {
+    if is_local_url(config, url) {
         return true;
     }
     let Some(host) = url.host_str() else {
@@ -127,17 +127,10 @@ fn filename_for(url: &Url) -> Option<String> {
     (!last.is_empty() && last != "." && last != "..").then(|| last.to_owned())
 }
 
-/// The raw HMAC-SHA256 of `message` keyed by `secret`.
-fn hmac_bytes(secret: &str, message: &[u8]) -> Option<Vec<u8>> {
-    let mut mac = HmacSha256::new_from_slice(secret.as_bytes()).ok()?;
-    mac.update(message);
-    Some(mac.finalize().into_bytes().to_vec())
-}
-
 /// The base64url signature over the already-encoded URL: Pleroma's
 /// `base64_sig64` with the ticket's SHA-256 pin.
 fn encoded_signature(secret: &str, encoded: &str) -> Option<String> {
-    Some(URL_SAFE_NO_PAD.encode(hmac_bytes(secret, encoded.as_bytes())?))
+    Some(URL_SAFE_NO_PAD.encode(hmac_sha256(secret.as_bytes(), encoded.as_bytes())?))
 }
 
 /// Validates a proxy link's two path segments and returns the original
@@ -161,21 +154,17 @@ pub fn decode(config: &Config, sig: &str, encoded: &str) -> Result<String, Proxy
         return Err(ProxyError::Disabled);
     }
     let secret = proxy.secret.as_deref().ok_or(ProxyError::Disabled)?;
-    let want = hmac_bytes(secret, encoded.as_bytes()).ok_or(ProxyError::InvalidSignature)?;
     let given = URL_SAFE_NO_PAD
         .decode(sig)
         .map_err(|_err| ProxyError::InvalidSignature)?;
-    if !bool::from(given.as_slice().ct_eq(want.as_slice())) {
+    if !verify_hmac_sha256(secret.as_bytes(), encoded.as_bytes(), &given) {
         return Err(ProxyError::InvalidSignature);
     }
     let decoded = URL_SAFE_NO_PAD
         .decode(encoded)
         .map_err(|_err| ProxyError::InvalidSignature)?;
     let url = String::from_utf8(decoded).map_err(|_err| ProxyError::InvalidUrl)?;
-    let Ok(parsed) = Url::parse(&url) else {
-        return Err(ProxyError::InvalidUrl);
-    };
-    if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+    if !is_http_url(&url) {
         return Err(ProxyError::InvalidUrl);
     }
     Ok(url)

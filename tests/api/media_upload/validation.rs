@@ -330,3 +330,64 @@ async fn the_client_header_never_decides_the_type() {
         "and it is the media the extension says"
     );
 }
+
+/// A text part carrying `value`, which is only known at run time.
+fn description_part(value: &str) -> MultipartPart {
+    MultipartPart {
+        name: "description",
+        filename: None,
+        content_type: None,
+        bytes: Bytes::from(value.to_owned()),
+    }
+}
+
+/// With `MAX_MEDIA_DESCRIPTION=10`, a description of eleven characters is a
+/// 422 "Description too long" on both versions and stores no row; ten
+/// multibyte characters (twenty bytes) are exactly the limit and succeed.
+#[tokio::test]
+async fn an_overlong_description_is_unprocessable() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let dir = uploads_dir();
+    let (user, token) = uploader(&pool, "gina", SCOPE).await;
+    let mut config = common::test_config_with_uploads_dir(dir.path());
+    config.max_media_description = 10;
+    let app = common::test_app_with_config(pool.clone(), config);
+
+    let too_long = "x".repeat(11);
+    for path in [V1, V2] {
+        let parts = [
+            file_part("mat.png", "image/png", png(32, 32)),
+            description_part(&too_long),
+        ];
+        let response = upload(&app, path, &token, &parts).await;
+        assert_eq!(
+            response.status,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "eleven characters pass a limit of ten on {path}"
+        );
+        assert_eq!(
+            response.text(),
+            error_body("Description too long"),
+            "the 422 names the description on {path}"
+        );
+    }
+    assert_eq!(
+        row_count(&pool, &user).await,
+        0,
+        "a rejected description stores no media"
+    );
+    assert_eq!(entries_in(&dir), 0, "and writes no file");
+
+    let exact = "é".repeat(10);
+    let parts = [
+        file_part("mat.png", "image/png", png(32, 32)),
+        description_part(&exact),
+    ];
+    let entity = upload(&app, V1, &token, &parts).await.json_value();
+    assert_eq!(
+        entity["description"], exact,
+        "ten characters are exactly the limit"
+    );
+    assert_eq!(row_count(&pool, &user).await, 1, "and are stored");
+}

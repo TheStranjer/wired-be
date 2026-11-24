@@ -46,6 +46,7 @@ pub use self::{fetch::fetch_card, parse::parse_card};
 
 use crate::{
     config::Config, http_client::HttpError, models::link_card::LinkCard, services::media_proxy,
+    util::url::http_host,
 };
 
 /// Maximum number of characters kept from a card title.
@@ -115,7 +116,8 @@ impl PartialEq for Card {
 #[must_use]
 pub fn card_json(card: &Card) -> Value {
     let provider_name = if card.site_name.is_empty() {
-        host_of(&card.url)
+        // The URL's host for the `provider_name` fallback; "" when it has none.
+        http_host(&card.url).unwrap_or_default()
     } else {
         card.site_name.clone()
     };
@@ -168,15 +170,6 @@ pub fn stored_card_json(card: &LinkCard, config: &Config) -> Option<Value> {
         *image = Value::String(media_proxy::proxy_url(config, url));
     }
     Some(json)
-}
-
-/// The host of `url` for [`card_json`]'s `provider_name` fallback; "" when
-/// the URL does not parse or names no host.
-fn host_of(url: &str) -> String {
-    Url::parse(url)
-        .ok()
-        .and_then(|parsed| parsed.host_str().map(str::to_owned))
-        .unwrap_or_default()
 }
 
 /// Whether `url`'s host is on `config`'s rich media ignore list: links to

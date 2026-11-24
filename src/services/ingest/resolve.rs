@@ -28,7 +28,7 @@ use crate::{
     state::AppState,
 };
 
-use super::{MAX_MENTION_LOOKUPS, MENTION_LOOKUP_TIMEOUT, ReplyLink, transient};
+use super::{MAX_MENTION_LOOKUPS, MENTION_LOOKUP_TIMEOUT, ReplyLink};
 
 /// Step 4, reply arm: resolve the object's `inReplyTo` against the stored
 /// statuses, and only when that misses inherit the conversation of a
@@ -43,7 +43,7 @@ pub(super) async fn resolve_reply(
     };
     let parent = status::get_by_uri(&state.db, parent_uri)
         .await
-        .map_err(|err| transient("the reply parent read", &err))?;
+        .map_err(|err| FederationError::transient("the reply parent read failed", &err))?;
     if parent.is_some() {
         return Ok(ReplyLink {
             parent,
@@ -53,7 +53,9 @@ pub(super) async fn resolve_reply(
     let context_conversation = match parsed.ap_context.as_deref() {
         Some(context) => status::conversation_id_for_context(&state.db, context)
             .await
-            .map_err(|err| transient("the context conversation read", &err))?,
+            .map_err(|err| {
+                FederationError::transient("the context conversation read failed", &err)
+            })?,
         None => None,
     };
     Ok(ReplyLink {
@@ -75,7 +77,7 @@ pub(super) async fn resolve_quote(
     };
     let found = status::get_by_uri(&state.db, uri)
         .await
-        .map_err(|err| transient("the quote uri read", &err))?;
+        .map_err(|err| FederationError::transient("the quote uri read failed", &err))?;
     Ok(found
         .filter(|row| row.deleted_at.is_none())
         .map(|row| row.id))
@@ -110,7 +112,7 @@ pub(crate) async fn resolve_mentions(
     for href in unique {
         let stored = user::get_by_ap_id(&state.db, href)
             .await
-            .map_err(|err| transient("the mention read", &err))?;
+            .map_err(|err| FederationError::transient("the mention read failed", &err))?;
         match stored {
             Some(account) => found.push(account),
             None if unknown.len() < MAX_MENTION_LOOKUPS => unknown.push(href),
@@ -125,6 +127,45 @@ pub(crate) async fn resolve_mentions(
     .await;
     found.extend(fetched.into_iter().flatten());
     Ok(found)
+}
+
+/// The local accounts a note addresses in `to`/`cc` (its
+/// [`ParsedNote::audience`]), in document order, each once.
+///
+/// A silent mention in Mastodon's sense: only stored rows count, and only
+/// `local` ones — an unknown or remote id is skipped and never fetched, as
+/// a remote recipient needs no access grant here.
+///
+/// # Errors
+///
+/// [`FederationError::Transient`] when a lookup fails.
+pub(crate) async fn resolve_local_audience(
+    state: &AppState,
+    audience: &[String],
+) -> Result<Vec<User>, FederationError> {
+    let mut found: Vec<User> = Vec::new();
+    for ap_id in audience {
+        let stored = user::get_by_ap_id(&state.db, ap_id)
+            .await
+            .map_err(|err| FederationError::transient("the audience read failed", &err))?;
+        if let Some(account) = stored
+            && account.local.get()
+            && found.iter().all(|seen| seen.id != account.id)
+        {
+            found.push(account);
+        }
+    }
+    Ok(found)
+}
+
+/// Appends each of `extra` to `mentioned` unless an account with its id is
+/// already there.
+pub(crate) fn merge_accounts(mentioned: &mut Vec<User>, extra: Vec<User>) {
+    for account in extra {
+        if mentioned.iter().all(|seen| seen.id != account.id) {
+            mentioned.push(account);
+        }
+    }
 }
 
 /// One unknown mention's capped fetch: the [`User`] when the actor answers
@@ -165,7 +206,7 @@ pub(super) async fn upsert_emojis(
             &emoji.url,
         )
         .await
-        .map_err(|err| transient("the custom emoji upsert", &err))?;
+        .map_err(|err| FederationError::transient("the custom emoji upsert failed", &err))?;
     }
     Ok(())
 }

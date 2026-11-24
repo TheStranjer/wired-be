@@ -16,10 +16,9 @@ use super::{
 };
 use crate::{
     error::AppResult,
-    federation::mrf,
+    federation::policy::host_refused,
     jobs::QUEUE_FEDERATOR_OUTGOING,
     models::{
-        instance_policy_domain,
         job::{NewJob, enqueue},
         user::User,
     },
@@ -60,12 +59,11 @@ pub fn best_inbox(actor: &User) -> Option<String> {
 /// instance serves itself (its authority is the actor's own, so the activity
 /// needs no round trip through HTTP), one that is not an `http(s)` URL with a
 /// host, and one whose host the instance refuses — a `reject` row of
-/// [`instance_policy_domain`] or a host its [`mrf`] domain lists reject
-/// ([`MrfConfig::rejected`]).
+/// the policy table (for the host or a parent domain) or a host its
+/// [`mrf`] domain lists reject ([`MrfConfig::rejected`]).
 ///
 /// [`mrf`]: crate::federation::mrf
 /// [`MrfConfig::rejected`]: crate::federation::mrf::MrfConfig::rejected
-/// [`instance_policy_domain`]: crate::models::instance_policy_domain::is_rejected
 /// [`handle`]: crate::federation::delivery::handle
 /// [`AppError::Unprocessable`]: crate::error::AppError::Unprocessable
 ///
@@ -94,8 +92,7 @@ pub async fn enqueue_delivery(
         return Ok(());
     }
     let host = target.host_str().unwrap_or_default();
-    let listed = instance_policy_domain::is_rejected(&state.db, host).await?;
-    if listed || mrf::load_config(state).await.rejected(host) {
+    if host_refused(state, host).await? {
         debug!(inbox, "delivery refused: instance policy rejects {host}");
         return Ok(());
     }

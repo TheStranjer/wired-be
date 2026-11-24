@@ -6,6 +6,7 @@ use serde_json::{Value, json};
 use sqlx::PgPool;
 use uuid::Uuid;
 
+pub(super) use crate::federation::handlers::test_support::app_state;
 use crate::{
     config::TEST_BASE_URL,
     federation::{
@@ -17,18 +18,12 @@ use crate::{
         status_edit,
         user::{self, Flag, NewUser, User},
     },
-    state::AppState,
     util::time::parse_time,
 };
 
 /// The actor every fixture here is delivered by, and the author of
 /// every fixture post.
 pub(super) const BOB: &str = "https://remote.example/users/bob";
-
-/// Test state: `pool` and the fixed test config, collaborators inert.
-pub(super) fn app_state(pool: &PgPool) -> AppState {
-    AppState::for_tests(pool.clone(), crate::config::Config::for_tests())
-}
 
 /// The stored mirror of the fixture author.
 pub(super) async fn author(pool: &PgPool) -> User {

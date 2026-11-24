@@ -25,6 +25,10 @@ use crate::{
     state::AppState,
 };
 
+/// Most response-body bytes read from the cache's `PURGE` answer: only the
+/// status matters, so 64 KiB is ample.
+const PURGE_RESPONSE_BYTES: usize = 64 * 1024;
+
 /// `GET /api/v1/pleroma/admin/media_proxy_caches` — Pleroma's `index`:
 /// the filtered ledger windowed by `page` / `page_size` (defaults 1 / 20,
 /// capped like the rest of the admin listings), answered as
@@ -175,7 +179,11 @@ async fn send_purge(state: &AppState, url: &str) {
         warn!(%target, "media proxy purge: PURGE is not a usable HTTP method");
         return;
     };
-    match state.http_client.request(method, &target, &[]).await {
+    match state
+        .http_client
+        .request(method, &target, &[], PURGE_RESPONSE_BYTES)
+        .await
+    {
         Ok(response) if response.status < ERROR_STATUS_MIN => {
             debug!(status = response.status, %target, "media proxy cache purged");
         }

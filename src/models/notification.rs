@@ -30,13 +30,13 @@
 //! Pleroma's `set_read_up_to` performs, [`delete_for_status`] the
 //! cleanup that takes a deleted status's notifications with it (and
 //! [`delete_for_chat_message`] its twin for a withdrawn chat message),
-//! [`already_notified`] the deduplication read [`crate::services::notify`]
+//! [`already_told`] the deduplication read [`crate::services::notify`]
 //! asks before telling a recipient the same fact twice, and
-//! [`delete_matching`] the withdrawal write that takes one telling back —
+//! [`delete_telling`] the withdrawal write that takes one telling back —
 //! a favourited post un-favourited, a boost withdrawn, a follow request
-//! granted. [`already_told`] and [`delete_telling`] are the same pair over
-//! the full five-part key — status *and* reaction emoji named — for the
-//! tellings that deduplicate per ballot and per emoji.
+//! granted. Both take the full five-part [`Telling`] key — recipient,
+//! actor, type, status *and* reaction emoji — where a `None` status or
+//! emoji names the rows that store none.
 //!
 //! Dismissal is soft: the writes stamp [`dismissed_at`](Notification::dismissed_at)
 //! and every read hides the stamped rows rather than deleting them. Every
@@ -60,10 +60,8 @@ mod unread;
 #[cfg(test)]
 mod test_support;
 
-pub use create::{already_notified, create, maybe_notify, recipient_refuses};
-pub use delete::{
-    delete_all_for_user, delete_for_chat_message, delete_for_status, delete_matching,
-};
+pub use create::{create, maybe_notify, recipient_refuses};
+pub use delete::{delete_all_for_user, delete_for_chat_message, delete_for_status};
 pub use dismiss::{dismiss, dismiss_all, dismiss_group, dismiss_ids, get, mark_read_through_id};
 pub use flat_page::{FlatPageParams, NotificationFilters, get_visible, page_for_user};
 pub use group_page::{

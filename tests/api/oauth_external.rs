@@ -28,7 +28,7 @@
 
 #![cfg(test)]
 
-/// The callback's successes: the login, the echo, the oob page and the
+/// The callback's successes: the login, the echo, the oob code and the
 /// unlinked hand-off.
 mod callback;
 /// The callback of an MFA-enabled linked account: the detour and the
@@ -36,6 +36,8 @@ mod callback;
 mod callback_mfa;
 /// The callback's refusals, the provider-call failures and the route edges.
 mod callback_refusals;
+/// The callback of a linked account for an untrusted application: refused.
+mod callback_untrusted;
 /// `GET /oauth/prepare_request` and the provider redirect it feeds.
 mod prepare;
 /// The flow's consts and the mock provider on its own loopback port.

@@ -82,21 +82,25 @@ pub struct PleromaMetadata {
     /// [`emoji_reaction::for_statuses`](crate::models::emoji_reaction::for_statuses).
     pub emoji_reactions: Vec<ReactionSummary>,
     /// `parent_visible`: whether the viewer may see the replied-to
-    /// status. `true`: callers hand whole pages already narrowed by
-    /// [`crate::models::status_visibility`], and the rows this crate's
-    /// renderer itself drops (tombstones, reblogs of gone originals)
-    /// never reach the wire, so every rendered reply's parent is visible
-    /// under that contract.
+    /// status, computed per viewer like Pleroma's
+    /// `visible_for_user?(reply_to, for)`. `true` for a root post and for
+    /// a reply whose parent the batch's one
+    /// [`filter_visible`](crate::models::status_visibility::filter_visible)
+    /// read over the page's parents admitted; `false` when the parent is
+    /// hidden from the viewer or gone. The page filter narrows the
+    /// rendered status, not its parent, so a public reply to a
+    /// followers-only post renders `false` for a stranger.
     pub parent_visible: JsonBool,
     /// `quotes_count`: the stored counter of statuses quoting this one.
     /// Pleroma emits it at the top level as well; here it belongs to the
     /// extension block only.
     pub quotes_count: i32,
-    /// `quote`: the quoted status as a nested entity — the SAME object as
-    /// top-level [`Status::quote`], the quoting ticket rendering it once
-    /// and mirroring it here the way Pleroma's `StatusView` does — or
-    /// `null` when this status quotes nothing or the viewer may not see
-    /// the quoted post (see [`quote_visible`](PleromaMetadata::quote_visible)).
+    /// `quote`: the bare quoted status as a nested entity — the object
+    /// the top-level [`Status::quote`] carries as its `quoted_status`,
+    /// rendered once and mirrored here the way Pleroma's `StatusView`
+    /// does — or `null` when this status quotes nothing or the viewer
+    /// may not see the quoted post (see
+    /// [`quote_visible`](PleromaMetadata::quote_visible)).
     pub quote: Option<Value>,
     /// `quote_visible`: whether this viewer may see the quoted status, as
     /// the quoting ticket's one batched
@@ -120,12 +124,13 @@ pub struct PleromaMetadata {
     pub pinned_at: Option<DateTime<Utc>>,
 }
 
-/// The five viewer facts the `pleroma` block renders, grouped because
+/// The six viewer facts the `pleroma` block renders, grouped because
 /// there are more than [`pleroma_block`] could take beside the row, its
 /// replied-to author and its reactions (decision 14's five-argument limit).
 ///
 /// Each is the batch's one read per fact, keyed to the row: [`StatusSource`]'s
-/// `pinned_at`, `muted`, `bookmark_folder`, `direct_participation` and `quote`.
+/// `pinned_at`, `muted`, `bookmark_folder`, `direct_participation`, `quote`
+/// and `parent_visible`.
 #[derive(Debug)]
 pub(super) struct BlockViewer {
     /// When the viewer pinned the row, `None` while they have pinned
@@ -142,9 +147,12 @@ pub(super) struct BlockViewer {
     pub(super) direct_participation: Option<Uuid>,
     /// The quoted original as the batch rendered it for this viewer,
     /// `None` when there is nothing this viewer may see — the same
-    /// object the entity's top-level [`Status::quote`] carries, which is
-    /// why the two mirrors can never disagree.
+    /// object the entity's top-level [`Status::quote`] carries as its
+    /// `quoted_status`, which is why the two mirrors can never disagree.
     pub(super) quote: Option<Value>,
+    /// Whether the viewer may see the replied-to status — the batch's
+    /// parent-visibility read, `true` for a root post.
+    pub(super) parent_visible: JsonBool,
 }
 
 /// Builds the `pleroma` block of `row`, whose replied-to author is
@@ -165,6 +173,7 @@ pub(super) fn pleroma_block(
         bookmark_folder,
         direct_participation,
         quote,
+        parent_visible,
     } = viewer;
     let quote_visible = JsonBool(quote.is_some());
     PleromaMetadata {
@@ -179,7 +188,7 @@ pub(super) fn pleroma_block(
         expires_at: row.expires_at,
         thread_muted: muted,
         emoji_reactions: reactions.iter().map(ReactionSummary::from_model).collect(),
-        parent_visible: JsonBool(true),
+        parent_visible,
         quotes_count: row.quotes_count,
         quote,
         quote_visible,
@@ -249,13 +258,17 @@ mod tests {
         let quoted_id = Uuid::parse_str("01955555-5555-7555-8555-555555555555").unwrap();
         let mut row = base_row();
         row.quote_of_id = Some(quoted_id);
-        let value = render(&row, &Parts::of(&alice), None);
+        let value = render(&row, &Parts::of(&alice).quoting_hidden(), None);
         assert_eq!(
             value["quote_id"],
             quoted_id.to_string(),
             "the id is emitted regardless of visibility"
         );
-        assert_eq!(value["quote"], Value::Null, "the render is withheld");
+        assert_eq!(
+            value["quote"],
+            json!({ "state": "unauthorized", "quoted_status": null }),
+            "the render is withheld"
+        );
         assert_eq!(
             value["pleroma"]["quote"],
             Value::Null,
@@ -263,7 +276,7 @@ mod tests {
         );
         assert_eq!(
             value["pleroma"]["quote_visible"], false,
-            "false exactly when quote is null — one fact, two keys"
+            "false exactly when the quote is not accepted — one fact, two keys"
         );
     }
 

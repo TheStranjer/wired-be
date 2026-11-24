@@ -109,9 +109,12 @@
 //!   400, which the ticket replaces with the same refusal the delete route
 //!   gives.
 //! - `POST …/accounts/{id}/action` is Mastodon's moderation umbrella.
-//!   `disable` clears `is_active`; `suspend` clears it too and queues the
-//!   `users.delete` sweep — the account's CONTENT, with no `deleted_at`
-//!   stamp and no token revoked, so the row stays and stays resolvable;
+//!   `disable` clears `is_active`; `suspend` does exactly the same and
+//!   nothing more — it deactivates only, queues no job, federates nothing
+//!   (no actor `Delete`, no `Update`), stamps no `deleted_at`, revokes no
+//!   token and removes no data, so `…/enable` reverses it completely
+//!   (Mastodon's suspension is reversible, and Pleroma has no `suspend`
+//!   at all; a dedicated suspension state is out of scope here);
 //!   `none`, `sensitive` and `silence` change nothing this schema can
 //!   change, because there is no sensitive flag and no silence state to set
 //!   (the same absence the reads answer with their `sensitive`-less entity

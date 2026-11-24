@@ -12,7 +12,8 @@
 //! the credential and security actions, rendering through `AdminAPI.AccountView`
 //! (`lib/pleroma/web/admin_api/views/account_view.ex`). Pleroma gates the
 //! account reads with `admin:read:accounts` and every write — and its
-//! issued reset token — with `admin:write:accounts`; the same gates are the
+//! issued reset token — with `admin:write:accounts`, except the forced
+//! follow pair (`admin:write:follows`); the same gates are the
 //! [`AdminUser::require`] call each handler makes first, on the area
 //! `accounts`. The listing and show answer Pleroma's admin account entity,
 //! [`AdminAccount`].
@@ -221,6 +222,10 @@ const CLASS_WRITE: &str = "write";
 /// (`admin:read:accounts`, Pleroma's `OAuthScopesPlug` pair for `index` and
 /// `show`).
 const AREA_ACCOUNTS: &str = "accounts";
+/// The admin scope area of the forced follow and unfollow
+/// (`admin:write:follows`, Pleroma's `OAuthScopesPlug` for `follow` and
+/// `unfollow`); `admin:write:accounts` does not authorize them.
+const AREA_FOLLOWS: &str = "follows";
 /// Ecto's inclusion message, the refusal [`SCOPES`] and [`ACTOR_TYPES`]
 /// answer a value outside their list with.
 const INCLUSION: &str = "is not included in the list";

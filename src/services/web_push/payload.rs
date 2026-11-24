@@ -60,9 +60,6 @@ pub fn verb_for(notification_type: &str) -> &'static str {
 /// from the database by the [`push.deliver` job](crate::jobs::web_push).
 #[derive(Clone, Debug)]
 pub struct PushPayload<'a> {
-    /// The subscription's access token string (`oauth_tokens.token`): what
-    /// the client wakes with to fetch what changed.
-    pub access_token: &'a str,
     /// The notification row's id.
     pub notification_id: Uuid,
     /// The notification's type, as stored.
@@ -79,14 +76,13 @@ pub struct PushPayload<'a> {
 
 /// The Mastodon-shaped push payload as compact JSON.
 ///
-/// The document: `access_token`, `notification_id` (hyphenated text,
+/// The document: `notification_id` (hyphenated text,
 /// decision 4), `notification_type`, `icon`, the fixed
 /// `PREFERRED_LOCALE` `preferred_locale`, the `"<actor display name> <verb>"` title (the verb
 /// from [`verb_for`]) and the plain-text `body`.
 #[must_use]
 pub fn payload_json(parts: &PushPayload<'_>) -> String {
     json!({
-        "access_token": parts.access_token,
         "notification_id": parts.notification_id.to_string(),
         "notification_type": parts.notification_type,
         "icon": parts.icon,
@@ -104,6 +100,22 @@ pub fn payload_json(parts: &PushPayload<'_>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn debug_output_shows_the_fields_and_no_token() {
+        let id = Uuid::from_u128(0x1234);
+        let payload = PushPayload {
+            notification_id: id,
+            notification_type: "follow",
+            icon: "https://example.test/a.png",
+            actor_display_name: "Alice",
+            body: "hello",
+        };
+        let shown = format!("{payload:?}");
+        assert!(!shown.contains("access_token"), "no token field: {shown}");
+        assert!(shown.contains(&id.to_string()), "keeps the id: {shown}");
+        assert!(shown.contains("Alice"), "keeps the other fields: {shown}");
+    }
 
     #[test]
     fn alert_flags_read_the_stored_object_with_a_default_on() {
@@ -153,7 +165,6 @@ mod tests {
     #[test]
     fn the_payload_document_carries_the_mastodon_fields() {
         let parts = PushPayload {
-            access_token: "tok3n",
             notification_id: Uuid::now_v7(),
             notification_type: notification::TYPE_FAVOURITE,
             icon: "https://wired.example/avatar.png",
@@ -162,9 +173,9 @@ mod tests {
         };
         let text = payload_json(&parts);
         let value: Value = serde_json::from_str(&text).expect("the payload is JSON");
-        assert_eq!(
-            value["access_token"], "tok3n",
-            "the client wakes with its token"
+        assert!(
+            value.get("access_token").is_none(),
+            "no credential rides in the payload: the table keeps digests only"
         );
         assert_eq!(
             value["notification_id"],

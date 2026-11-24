@@ -73,7 +73,11 @@
 //!   naming the option title and answering the question's uri (the shape
 //!   [`crate::federation::handlers::vote`] folds on the way in), addressed
 //!   to the poll's author alone and delivered to their inbox. A poll on a
-//!   local status is this instance's own fact and announces nothing;
+//!   local status sends no answer;
+//! - [`after_local_poll_changed`]: the `Update` of a LOCAL poll's
+//!   `Question` with its current tally, queued three minutes ahead under
+//!   the key `poll-update:{status id}` after a vote (local or federated)
+//!   and when the poll closes;
 //! - [`after_chat_message_created`] / [`after_chat_message_deleted`]: the
 //!   `Create{ChatMessage}` a local account's message to a REMOTE
 //!   counterpart is, delivered to that counterpart's inbox alone, and the
@@ -194,7 +198,7 @@ pub use follow_requests::{after_follow_request_resolved, after_follower_removed}
 pub use follows::{FollowAnswer, accept_follow, after_follow_changed, reject_follow};
 pub use likes::after_favourite_changed;
 pub use moves::after_account_moved;
-pub use polls::after_poll_vote;
+pub use polls::{after_local_poll_changed, after_poll_vote};
 pub use profile::{after_account_deleted, after_account_disabled, after_profile_updated};
 pub use reactions::after_reaction_changed;
 pub use reports::after_report_created;
@@ -414,7 +418,9 @@ mod tests {
         after_status_deleted(&state, &own).await;
         after_block_changed(&state, &row, false).await;
         after_profile_updated(&state, &alice).await;
-        after_account_deleted(&state, &alice).await;
+        after_account_deleted(&state, &alice)
+            .await
+            .expect("the Delete federation runs");
         after_favourite_changed(&state, &fav, true).await;
         after_reaction_changed(&state, &reaction, true).await;
         after_reblog_changed(&state, &reblog, true).await;

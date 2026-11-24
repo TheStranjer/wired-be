@@ -57,8 +57,6 @@
 //! [`crate::api`] mounts outside the versioned API, answers it in
 //! `confirm_email`.
 
-use std::time::Duration;
-
 use axum::{
     Json,
     extract::{Path, State},
@@ -70,23 +68,20 @@ use tracing::debug;
 use uuid::Uuid;
 
 use crate::{
+    api::oauth::issue::{TokenResponse, issue_token},
     auth::{AppAuth, require_scope},
     config::Config,
     error::{AppError, AppResult},
     extract::ApiBody,
     models::{
         invite_token::{self, InviteToken},
-        oauth_app::OauthApp,
-        oauth_token::{self, NewToken, OauthToken},
-        user::{User, confirmation, register::create_local_user},
+        user::{confirmation, register::create_local_user},
     },
-    oauth::scopes::WRITE_ACCOUNTS,
+    oauth::scopes::{Scopes, WRITE_ACCOUNTS},
     state::AppState,
 };
 
-use super::registration::{
-    CreateAccountParams, RegistrationAnswer, RegistrationMessage, RegistrationToken,
-};
+use super::registration::{CreateAccountParams, RegistrationAnswer, RegistrationMessage};
 
 /// The 403 body message `POST /api/v1/accounts` answers while
 /// `REGISTRATIONS_OPEN` is false and `INVITES_ENABLED` is false. Pleroma's
@@ -126,8 +121,9 @@ const AGREEMENT_REQUIRED: &str = "You have to accept the terms to sign up";
 /// gets 200 [`REGISTERED_AWAITING_APPROVAL`] and no token, an unconfirmed
 /// one 200 [`REGISTERED_AWAITING_CONFIRMATION`] and no token, and both at
 /// once the approval message. Only a ready account is issued credentials —
-/// [`issue_registration_token`] mints them for the presenting token's app
-/// with the presenting token's scopes, valid for `OAUTH_TOKEN_TTL_SECS`.
+/// [`issue_token`] mints them for the presenting token's app with the
+/// presenting token's scopes, valid for `OAUTH_TOKEN_TTL_SECS`, and the
+/// answer is the `/oauth/token` body without its `me` key.
 ///
 /// # Errors
 ///
@@ -150,11 +146,13 @@ pub(super) async fn create_account(
         return Err(AppError::Unprocessable(AGREEMENT_REQUIRED.to_owned()));
     }
     let user = create_local_user(&state, params.into_register_params(), invite.as_ref()).await?;
-    let answer = match RegistrationMessage::for_user(&user) {
-        Some(message) => RegistrationAnswer::Pending(message),
-        None => {
-            RegistrationAnswer::Ready(issue_registration_token(&state, &app, &token, &user).await?)
-        }
+    let answer = if let Some(message) = RegistrationMessage::for_user(&user) {
+        RegistrationAnswer::Pending(message)
+    } else {
+        // The presenting token's scopes, carried over as granted.
+        let scopes = Scopes::parse(&token.scopes);
+        let issued = issue_token(&state, Some(&user), &app, scopes).await?;
+        RegistrationAnswer::Ready(TokenResponse::new(issued, Some(&user)).without_me())
     };
     debug!(
         user = %user.id,
@@ -252,36 +250,4 @@ async fn load_invite(state: &AppState, submitted: Option<&str>) -> AppResult<Opt
         return Err(invalid());
     }
     Ok(Some(invite))
-}
-
-/// Mints the new user's bearer token and renders it: the presenting
-/// token's scopes on the issuing application, valid for the configured
-/// `OAUTH_TOKEN_TTL_SECS` (the `/oauth/token` grant's
-/// `issue_token`, with the scopes fixed by the presenting credential
-/// rather than requested).
-///
-/// # Errors
-///
-/// Any database failure arrives through `?` as [`AppError::Database`].
-async fn issue_registration_token(
-    state: &AppState,
-    app: &OauthApp,
-    presented: &OauthToken,
-    user: &User,
-) -> AppResult<RegistrationToken> {
-    // `OAUTH_TOKEN_TTL_SECS` is a `usize`; on any target where it could
-    // exceed `u64::MAX` the absurd upper bound fails the insert instead
-    // of silently shortening the lifetime.
-    let ttl_secs = u64::try_from(state.config.oauth_token_ttl_secs).unwrap_or(u64::MAX);
-    let issued = oauth_token::create_token(
-        &state.db,
-        &NewToken {
-            user_id: Some(user.id),
-            app_id: app.id,
-            scopes: presented.scopes.clone(),
-            ttl: Some(Duration::from_secs(ttl_secs)),
-        },
-    )
-    .await?;
-    Ok(RegistrationToken::new(issued))
 }

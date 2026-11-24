@@ -55,6 +55,18 @@ pub(super) async fn tag_timeline(
     timeline_response(&state, &query, &uri).await
 }
 
+/// The most tags each of `any`, `all` and `none` keeps, Mastodon's
+/// `TagFeed::LIMIT_PER_MODE`. Later values are dropped silently, so a request
+/// cannot grow the statement by one subquery per query-string key.
+const TAG_MODE_LIMIT: usize = 4;
+
+/// [`push_tag`] unless `list` already holds [`TAG_MODE_LIMIT`] names.
+fn push_capped_tag(list: &mut Vec<String>, raw: &str) {
+    if list.len() < TAG_MODE_LIMIT {
+        push_tag(list, raw);
+    }
+}
+
 /// The hashtag timeline's request parameters beyond the path tag and the
 /// [`PageParams`] page: the extra tag arrays and the narrowings, every one
 /// of them a no-op in its [`Default`] spelling. The booleans are [`Flag`]s
@@ -96,9 +108,9 @@ impl TagParams {
         let mut found = Self::default();
         for (key, value) in form_urlencoded::parse(query.unwrap_or_default().as_bytes()) {
             match key.as_ref() {
-                "any" | "any[]" => push_tag(&mut found.any, &value),
-                "all" | "all[]" => push_tag(&mut found.all, &value),
-                "none" | "none[]" => push_tag(&mut found.none, &value),
+                "any" | "any[]" => push_capped_tag(&mut found.any, &value),
+                "all" | "all[]" => push_capped_tag(&mut found.all, &value),
+                "none" | "none[]" => push_capped_tag(&mut found.none, &value),
                 "local" => found.local = Flag::new(is_true(&value)),
                 "remote" => found.remote = Flag::new(is_true(&value)),
                 "only_media" => found.only_media = Flag::new(is_true(&value)),
@@ -172,6 +184,51 @@ mod tests {
     }
 
     #[test]
+    fn each_tag_list_keeps_only_the_first_four() {
+        for key in ["any", "all", "none"] {
+            for spelling in [format!("{key}[]"), key.to_owned()] {
+                let query: Vec<String> = ('a'..='z').map(|c| format!("{spelling}={c}")).collect();
+                let params = parsed(&query.join("&"));
+                let list = match key {
+                    "any" => &params.any,
+                    "all" => &params.all,
+                    _ => &params.none,
+                };
+                assert_eq!(list, &["a", "b", "c", "d"], "`{spelling}` keeps four");
+            }
+        }
+    }
+
+    #[test]
+    fn dropped_values_do_not_count_toward_the_cap() {
+        let params = parsed("any[]=&any[]=a&any[]=%23&any[]=b&any[]=c&any[]=d&any[]=e");
+        assert_eq!(params.any, ["a", "b", "c", "d"], "empty names take no slot");
+    }
+
+    #[test]
+    fn the_path_tag_rides_on_top_of_a_full_any_list() {
+        let query = parsed("any[]=a&any[]=b&any[]=c&any[]=d&any[]=e").into_timeline(
+            "foo".to_owned(),
+            None,
+            PageParams {
+                max_id: None,
+                min_id: None,
+                since_id: None,
+                limit: 20,
+                offset: None,
+            },
+        );
+        let TimelineSource::Hashtag { any, .. } = &query.source else {
+            panic!("a tag timeline is a hashtag source");
+        };
+        assert_eq!(
+            any.len(),
+            TAG_MODE_LIMIT + 1,
+            "four `any[]` plus the path tag"
+        );
+    }
+
+    #[test]
     fn tag_values_that_normalize_to_nothing_are_dropped() {
         let params = parsed("any[]=&any[]=%23&any[]=%20%23x%20&all=a");
         assert_eq!(params.any, ["x"], "only the usable name is kept");
@@ -184,7 +241,7 @@ mod tests {
         assert!(params.local.get(), "`local=true`");
         assert!(params.remote.get(), "`remote=1`");
         assert!(params.only_media.get(), "`only_media` is case-insensitive");
-        assert!(!params.with_muted.get(), "`yes` is not true here");
+        assert!(params.with_muted.get(), "`yes` is a true spelling");
         let off = parsed("local=false&remote=");
         assert!(
             !off.local.get() && !off.remote.get(),

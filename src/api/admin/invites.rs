@@ -1,6 +1,5 @@
 //! The admin invite endpoints: the registration-invite maintenance API
-//! under `/api/v1/pleroma/admin/users` and the `/registration/{token}`
-//! link the invite emails carry (WBE-199).
+//! under `/api/v1/pleroma/admin/users` (WBE-199).
 //!
 //! The reference is Pleroma's `AdminAPI.InviteController`
 //! (`lib/pleroma/web/admin_api/controllers/invite_controller.ex`), routed
@@ -33,18 +32,12 @@
 //!   invite is minted and the [`user_invitation`](crate::mailer::templates::user_invitation)
 //!   letter to the body's `email` is queued through
 //!   [`mailer::deliver_later`], carrying the registration link
-//!   `{BASE_URL}/registration/{token}`. The answer is 204 with an empty
+//!   `{FRONTEND_BASE_URL}/registration/{token}` — the frontend's own page;
+//!   the backend serves no `/registration/{token}` route. The answer is 204 with an empty
 //!   body; a body without `email` is the 400 the ticket pins.
 //!   Pleroma reads the optional `name` as the recipient's display name;
 //!   this mailer addresses bare recipients, so the parameter is accepted
 //!   and goes no further than the debug line.
-//!
-//! [`registration_router`]'s `GET /registration/{token}` — the link the
-//! letter carries, which Pleroma resolves to its frontend page
-//! (`redirect_url Endpoint, :registration_page, token` in
-//! `lib/pleroma/emails/user_email.ex`) — answers 302 to
-//! `{FRONTEND_BASE_URL}/registration/{token}` for any token: the frontend
-//! validates the invite, so an unknown one redirects just the same.
 //!
 //! [`moderation_log`]: crate::models::moderation_log
 //! [`mailer::deliver_later`]: crate::mailer::deliver_later
@@ -52,8 +45,7 @@
 use axum::{
     Json, Router,
     extract::State,
-    http::{HeaderValue, StatusCode, Uri, header},
-    response::{IntoResponse as _, Response},
+    http::StatusCode,
     routing::{get, post},
 };
 use chrono::NaiveDate;
@@ -90,8 +82,8 @@ const MISSING_EMAIL: &str = "Missing parameter: email";
 /// 422 body of `POST /users/revoke_invite` with no `token` parameter
 /// (Pleroma's `CastAndValidate` refusal wording).
 const MISSING_TOKEN: &str = "Missing parameter: token";
-/// The path prefix of the registration link both the emailed letter and
-/// the redirect route name.
+/// The path prefix of the registration page the emailed letter links to on
+/// the frontend.
 const REGISTRATION_PREFIX: &str = "/registration/";
 
 /// The invite routes of the admin API, merged into [`super`].
@@ -101,15 +93,6 @@ pub fn router() -> Router<AppState> {
         .route("/users/invites", get(list_invites))
         .route("/users/revoke_invite", post(revoke_invite))
         .route("/users/email_invite", post(email_invite))
-}
-
-/// The root-level registration-link router, merged by [`crate::app`]:
-/// `GET /registration/{token}`, the address the invite letters carry.
-///
-/// Do not call [`Router::fallback`] on it: unmatched paths must reach the
-/// app-wide fallback in [`crate::app`].
-pub fn registration_router() -> Router<AppState> {
-    Router::new().route("/registration/{token}", get(registration_page))
 }
 
 /// The body of `POST /users/invite_token`: Pleroma's `create` parameters,
@@ -237,8 +220,8 @@ async fn revoke_invite(
 /// `POST /api/v1/pleroma/admin/users/email_invite` — Pleroma's `email`:
 /// mint a one-time invite and queue the [`user_invitation`](crate::mailer::templates::user_invitation)
 /// letter to the body's address, its link built on
-/// [`Config::base_url`] exactly like the registration route serves it.
-/// 204 with an empty body when the letter is on the queue.
+/// [`Config::frontend_base_url`] (the frontend serves the registration
+/// page). 204 with an empty body when the letter is on the queue.
 ///
 /// # Errors
 ///
@@ -266,7 +249,7 @@ async fn email_invite(
     }
     let invite = invite_token::create(&state.db, &InviteParams::one_time()).await?;
     let logged = moderation_log::invite_create(&state.db, &admin.0, invite.id).await?;
-    let link = format!("{REGISTRATION_PREFIX}{}", invite.token);
+    let link = registration_link(&state.config, &invite.token);
     let letter = templates::user_invitation(&state.config, to, &link);
     mailer::deliver_later(&state, letter).await?;
     debug!(
@@ -279,40 +262,16 @@ async fn email_invite(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// `GET /registration/{token}` — the link the invitation letters carry:
-/// 302 to the same path on [`Config::frontend_base_url`], which serves
-/// the registration page and validates the invite there. Any token
-/// redirects; none is looked up here.
-///
-/// # Errors
-///
-/// [`AppError::Internal`] when the composed target is not a header value
-/// (a request URI whose bytes no `Location` can carry; nothing the
-/// frontend URL itself is configured to hold reaches this).
-async fn registration_page(State(state): State<AppState>, uri: Uri) -> AppResult<Response> {
-    frontend_redirect(&state.config, uri.path())
-}
-
-/// The 302 to `path` on [`Config::frontend_base_url`]: the shape both
-/// registration routes answer with (see [`registration_router`]).
-///
-/// # Errors
-///
-/// [`AppError::Internal`] as in [`registration_page`].
-fn frontend_redirect(config: &Config, path: &str) -> AppResult<Response> {
-    let location = format!("{}{path}", config.frontend_base_url);
-    let value = HeaderValue::from_str(&location).map_err(|err| {
-        AppError::Internal(format!(
-            "the registration redirect target is not header-safe: {err}"
-        ))
-    })?;
-    Ok((StatusCode::FOUND, [(header::LOCATION, value)]).into_response())
+/// The absolute registration link of `token` on `config`'s frontend
+/// origin: [`Config::frontend_base_url`] (no trailing slash) followed by
+/// [`REGISTRATION_PREFIX`] and the token.
+fn registration_link(config: &Config, token: &str) -> String {
+    format!("{}{REGISTRATION_PREFIX}{token}", config.frontend_base_url)
 }
 
 #[cfg(test)]
 mod tests {
     use serde_json::json;
-    use uuid::Uuid;
 
     use super::*;
 
@@ -380,37 +339,27 @@ mod tests {
         assert_eq!(addressless.email, None, "reads as no address");
     }
 
-    /// The redirect target: the same path on the configured frontend
-    /// base, and the header refusal of an absurd target is an error,
-    /// never a panic.
+    /// The letter link is absolute on the frontend origin, never on the
+    /// backend's own `base_url`.
     #[test]
-    fn the_registration_redirect_hangs_the_path_on_the_frontend() {
+    fn the_registration_link_is_absolute_on_the_frontend() {
         let config = Config::for_tests();
-        let token = Uuid::now_v7().to_string();
-        let path = format!("{REGISTRATION_PREFIX}{token}");
-        let response = frontend_redirect(&config, &path).expect("the target is header-safe");
-        assert_eq!(response.status(), StatusCode::FOUND, "302");
         assert_eq!(
-            response.headers()[header::LOCATION],
-            format!("{}{path}", config.frontend_base_url),
-            "the frontend's registration page for this token"
+            registration_link(&config, "abc"),
+            format!("{}/registration/abc", config.frontend_base_url),
+            "the default frontend origin"
         );
 
         let mut frontended = Config::for_tests();
         frontended.frontend_base_url = "https://fe.example".to_owned();
-        let away = frontend_redirect(&frontended, "/registration/xyz")
-            .expect("a configured frontend is header-safe");
         assert_eq!(
-            away.headers()[header::LOCATION],
+            registration_link(&frontended, "xyz"),
             "https://fe.example/registration/xyz",
             "a separate frontend takes the link"
         );
-
-        let control = String::from("/registration/a\u{0}b");
-        let refused = frontend_redirect(&config, &control);
         assert!(
-            matches!(refused, Err(AppError::Internal(_))),
-            "a null byte is no header value: {refused:?}"
+            !registration_link(&frontended, "xyz").starts_with(frontended.base_url.as_str()),
+            "and the backend origin does not"
         );
     }
 }

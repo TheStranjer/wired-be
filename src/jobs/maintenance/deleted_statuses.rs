@@ -12,8 +12,9 @@ use serde_json::Value;
 use sqlx::{PgPool, query};
 use tracing::info;
 
+use super::run_sweep;
 use crate::{
-    jobs::{AttemptInfo, HandlerFuture, JobError},
+    jobs::{AttemptInfo, HandlerFuture},
     state::AppState,
 };
 
@@ -63,7 +64,7 @@ async fn purge_deleted(pool: &PgPool, age_days: i32) -> Result<u64, sqlx::Error>
 /// purged status's dependents go with it through their cascade
 /// constraints.
 ///
-/// A failed pass is a [`JobError::Retry`], and the scheduler enqueues the
+/// A failed pass is a [`JobError::Retry`](crate::jobs::JobError::Retry), and the scheduler enqueues the
 /// next day regardless, so the same purge runs again shortly; a pass lost
 /// to a database outage costs nothing but the storage.
 pub fn handle_purge_deleted_statuses(
@@ -77,15 +78,11 @@ pub fn handle_purge_deleted_statuses(
             info!(deleted = 0, "deleted-status purge disabled");
             return Ok(());
         }
-        match purge_deleted(&state.db, age_days).await {
-            Ok(deleted) => {
-                info!(deleted, "deleted local statuses purged");
-                Ok(())
-            }
-            Err(err) => Err(JobError::Retry(format!(
-                "deleted-status purge failed: {err}"
-            ))),
-        }
+        run_sweep(
+            "deleted local statuses purged",
+            purge_deleted(&state.db, age_days),
+        )
+        .await
     })
 }
 

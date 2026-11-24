@@ -13,7 +13,7 @@
 //!   follow is accepted, `follow_request` when a locked account let it
 //!   wait; an unfollow takes nothing back, and a pair the endpoint re-found
 //!   open is told only once (Pleroma's `recently_followed` skip, through
-//!   [`notification::already_notified`]).
+//!   [`notification::already_told`]).
 //! - [`on_follow_request_resolved`] — the answer route's replacement: an
 //!   accepted request's `follow_request` telling is taken back and a
 //!   `follow` one created in its place; a rejection says nothing new.
@@ -202,16 +202,23 @@ async fn tell_local(
 /// [`tell`] for the status-less follow pair, told at most once: a live
 /// row of `event_type` from `actor_id` already says it, so the fresh one
 /// is skipped (Pleroma's `recently_followed` skip; a dismissed one lets
-/// the next telling through — see [`notification::already_notified`]).
+/// the next telling through — see [`notification::already_told`]).
 async fn tell_once(
     state: &AppState,
     recipient: &User,
     actor_id: Uuid,
     event_type: &str,
 ) -> AppResult<()> {
+    let telling = Telling {
+        user_id: recipient.id,
+        from_account_id: actor_id,
+        notification_type: event_type,
+        status_id: None,
+        emoji: None,
+    };
     if recipient.local.get()
         && recipient.id != actor_id
-        && notification::already_notified(&state.db, recipient.id, actor_id, event_type).await?
+        && notification::already_told(&state.db, &telling).await?
     {
         return Ok(());
     }
@@ -228,21 +235,28 @@ async fn forget(
     event_type: &str,
     status_id: Option<Uuid>,
 ) -> AppResult<()> {
-    notification::delete_matching(&state.db, recipient_id, actor_id, event_type, status_id)
+    let telling = Telling {
+        user_id: recipient_id,
+        from_account_id: actor_id,
+        notification_type: event_type,
+        status_id,
+        emoji: None,
+    };
+    notification::delete_telling(&state.db, &telling)
         .await
         .map(drop)?;
     Ok(())
 }
 
-/// The [`NewNotification`] a [`Telling`] key names, emoji-free — the shape
-/// the `poll` tellings are told in.
+/// The [`NewNotification`] a [`Telling`] key names, carrying the key's
+/// emoji — the shape the `poll` and reaction tellings are told in.
 const fn told_row<'a>(telling: &Telling<'a>) -> NewNotification<'a> {
     NewNotification {
         user_id: telling.user_id,
         from_account_id: telling.from_account_id,
         notification_type: telling.notification_type,
         status_id: telling.status_id,
-        emoji: None,
+        emoji: telling.emoji,
         report_id: None,
         chat_message_id: None,
     }

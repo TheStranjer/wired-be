@@ -61,7 +61,7 @@ fn url_candidate(line: &str, at: usize) -> Option<usize> {
 /// The length of the case-insensitive `http(s)://` scheme starting at
 /// `at`, or `None` if no scheme starts there. Bytes past the end of the
 /// string are simply missing, so the match fails.
-pub(super) fn scheme_len(text: &str, at: usize) -> Option<usize> {
+pub(crate) fn scheme_len(text: &str, at: usize) -> Option<usize> {
     let rest = text.get(at..)?;
     if rest
         .get(..HTTPS_SCHEME.len())
@@ -82,7 +82,7 @@ pub(super) fn scheme_len(text: &str, at: usize) -> Option<usize> {
 /// the `-._~%` characters and `:/?#[]@!$&'()*+,;=`. Everything else —
 /// whitespace, `<`, `>`, `"`, backtick, `\`, `{|}` and all non-ASCII —
 /// ends a URL.
-const fn is_url_byte(b: u8) -> bool {
+pub(crate) const fn is_url_byte(b: u8) -> bool {
     matches!(
         b,
         b'a'..=b'z'

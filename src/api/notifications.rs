@@ -83,13 +83,13 @@ use uuid::Uuid;
 
 use crate::{
     api::{
-        helpers::{distinct, distinct_ids},
-        notifications_v2::{NO_EXTRA_QUERY, StringList, account_filter, names_of},
+        chats::message_of,
+        helpers::{StringList, distinct, keyed_json, render_visible},
+        notifications_v2::{account_filter, type_filters},
     },
     auth::AuthUser,
     entities::{
         account::{Account, AccountViewer},
-        chat::ChatMessage as ChatMessageEntity,
         notification::Notification as NotificationEntity,
         relationship::{Relationship, RelationshipMap},
     },
@@ -98,23 +98,22 @@ use crate::{
     models::{
         chat,
         filter::{Filter, list_active},
-        media_attachment,
         notification::{
             self, FlatPageParams, Notification as NotificationRow, NotificationFilters,
         },
-        status::{self, Status as StatusRow},
-        status_visibility,
         user::{self, User},
     },
     oauth::scopes::{READ_NOTIFICATIONS, WRITE_NOTIFICATIONS},
-    pagination::{PageParams, link_header, set_link_header},
-    services::{
-        filter::{FilterContext, apply_filters},
-        render_status::{ViewerMode, render_statuses},
-    },
+    pagination::{NO_EXTRA_QUERY, PageParams, keyset_link, set_link_header},
+    services::filter::{FilterContext, apply_filters},
     state::AppState,
     util::id::parse_id,
 };
+
+use self::destroy_params::DestroyParams;
+
+/// The `destroy_multiple` parameters and their id cap.
+mod destroy_params;
 
 /// The 400 body of the legacy dismissal given no `id`.
 const MISSING_ID: &str = "Missing parameter: id";
@@ -204,7 +203,14 @@ async fn list(
     let mut headers = HeaderMap::new();
     set_link_header(
         &mut headers,
-        page_link(&state.config.base_url, uri.path(), &rows).as_deref(),
+        keyset_link(
+            &state.config.base_url,
+            uri.path(),
+            &NO_EXTRA_QUERY,
+            &rows,
+            |row| row.id,
+        )
+        .as_deref(),
     )?;
     Ok((headers, Json(entities)))
 }
@@ -250,15 +256,6 @@ async fn show(
         .ok_or(AppError::NotFound)
 }
 
-/// The `Link` header value for one fetched page: [`link_header`] over the
-/// first (newest) and last (oldest) row's id — the cursors the listing
-/// walks on — and `None` for an empty page.
-fn page_link(base_url: &str, path: &str, rows: &[NotificationRow]) -> Option<String> {
-    let newest = rows.first()?.id.to_string();
-    let oldest = rows.last()?.id.to_string();
-    link_header(base_url, path, &NO_EXTRA_QUERY, &newest, &oldest)
-}
-
 /// `GET /api/v1/notifications`' non-cursor parameters ([`ApiParams`],
 /// decision 10; the cursors and `limit` ride on [`PageParams`]).
 #[derive(Debug, Deserialize)]
@@ -283,20 +280,14 @@ struct ListParams {
 }
 
 impl ListParams {
-    /// The kept type names: `types[]` when it came, else the
-    /// `include_types[]` alias, and neither means no restriction.
-    fn kept_types(&self) -> Vec<&str> {
-        names_of(self.types.as_ref().or(self.include_types.as_ref()))
-    }
-
-    /// The `types[]` / `exclude_types[]` half of the read filters; the
-    /// account half arrives through [`account_filter`].
+    /// The `types[]` / `exclude_types[]` half of the read filters: `types[]`
+    /// when it came, else the `include_types[]` alias, and neither means no
+    /// restriction. The account half arrives through [`account_filter`].
     fn type_filters(&self) -> NotificationFilters<'_> {
-        NotificationFilters {
-            types: self.kept_types(),
-            exclude_types: names_of(self.exclude_types.as_ref()),
-            account_id: None,
-        }
+        type_filters(
+            self.types.as_ref().or(self.include_types.as_ref()),
+            self.exclude_types.as_ref(),
+        )
     }
 
     /// Whether muted causes stay in the page.
@@ -419,11 +410,14 @@ impl DismissParams {
 /// notifications that belong to the caller and answer `{}`. Ids the
 /// caller does not own, that name nothing, or that are no id text at all
 /// simply match nothing; asking with no `ids` at all dismisses nothing and
-/// is likewise not an error.
+/// is likewise not an error. More than
+/// [`MAX_BATCH_IDS`](crate::api::helpers::MAX_BATCH_IDS) distinct ids is
+/// refused before anything is read or dismissed.
 ///
 /// # Errors
 ///
-/// The auth errors of [`clear`]. Any database failure arrives through `?`
+/// The auth errors of [`clear`]; [`Unprocessable`](crate::error::AppError::Unprocessable)
+/// (`Too many ids`) past the cap. Any database failure arrives through `?`
 /// as [`Database`](crate::error::AppError::Database).
 async fn destroy_multiple(
     State(state): State<AppState>,
@@ -431,7 +425,7 @@ async fn destroy_multiple(
     ApiParams(params): ApiParams<DestroyParams>,
 ) -> AppResult<Json<Value>> {
     auth.require(WRITE_NOTIFICATIONS)?;
-    let ids = params.parsed_ids();
+    let ids = params.parsed_ids()?;
     let dismissed = notification::dismiss_ids(&state.db, auth.0.id, &ids).await?;
     debug!(
         dismissed,
@@ -440,46 +434,6 @@ async fn destroy_multiple(
         "notifications dismissed in bulk"
     );
     Ok(empty_body())
-}
-
-/// The bulk dismissal's parameters: `ids` under either spelling clients
-/// send — a list (`ids[]=a&ids[]=b`, or a JSON array) or a lone value —
-/// from the query string, the body, or both merged.
-#[derive(Debug, Deserialize)]
-struct DestroyParams {
-    /// The notifications to dismiss; absent asks for none.
-    #[serde(default)]
-    ids: Option<IdList>,
-}
-
-/// One value or a list (a JSON array, or `ids[]=…` keys) — the two
-/// spellings Mastodon clients and forms both send.
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
-enum IdList {
-    /// A lone id.
-    Single(String),
-    /// A list of ids.
-    Multiple(Vec<String>),
-}
-
-impl IdList {
-    /// The values, borrowed, in the order sent.
-    fn values(&self) -> Vec<&str> {
-        match self {
-            Self::Single(value) => vec![value.as_str()],
-            Self::Multiple(values) => values.iter().map(String::as_str).collect(),
-        }
-    }
-}
-
-impl DestroyParams {
-    /// The parsed ids, in the order sent, each named once; values that
-    /// are not id text are skipped — they can name no row anyway.
-    fn parsed_ids(&self) -> Vec<Uuid> {
-        let values = self.ids.as_ref().map_or_else(Vec::new, IdList::values);
-        distinct_ids(values).0
-    }
 }
 
 /// `POST /api/pleroma/notifications/read` — mark seen and answer per the
@@ -746,11 +700,7 @@ async fn chat_message_entity(
     else {
         return Ok(None);
     };
-    let attachment = match reference.attachment_media_id {
-        Some(media_id) => media_attachment::get_by_id(&state.db, media_id).await?,
-        None => None,
-    };
-    let entity = ChatMessageEntity::from_reference(&reference, attachment.as_ref(), &state.config);
+    let entity = message_of(state, &reference).await?;
     let value = serde_json::to_value(entity).map_err(|err| {
         AppError::Internal(format!("chat message entity failed to serialize: {err}"))
     })?;
@@ -776,7 +726,7 @@ struct RenderedStatuses {
 /// The distinct status ids of `ids`, rendered as seen by `viewer`, run
 /// through [`apply_filters`] in the `notifications` context, serialized,
 /// and keyed by their row ids: rows that name no row, that a delete took,
-/// or that [`status_visibility`] hides from this reader are not in the map
+/// or that [`render_visible`] hides from this reader are not in the map
 /// (see [`RenderedStatuses`] for what the map and the hidden list carry).
 ///
 /// # Errors
@@ -797,34 +747,18 @@ async fn visible_statuses(
             hidden_by_filter: Vec::new(),
         });
     }
-    let rows = status::get_many(&state.db, ids).await?;
-    let mut visible: Vec<StatusRow> = Vec::new();
-    for row in rows {
-        if status_visibility::can_view(&state.db, &row, viewer).await? {
-            visible.push(row);
-        }
-    }
-    let page = render_statuses(state, ViewerMode::User(viewer), &visible).await?;
+    let page = render_visible(state, viewer, ids).await?;
     let mut all_ids: Vec<Uuid> = page
         .iter()
         .filter_map(|entity| parse_id(&entity.id))
         .collect();
-    let mut rendered = HashMap::new();
     let kept = apply_filters(
         page,
         filters,
         FilterContext::Notifications,
         viewer.map(|user| user.id),
     );
-    for entity in kept {
-        let Some(id) = parse_id(&entity.id) else {
-            continue;
-        };
-        let value = serde_json::to_value(entity).map_err(|err| {
-            AppError::Internal(format!("status entity failed to serialize: {err}"))
-        })?;
-        let _first = rendered.insert(id, value);
-    }
+    let rendered = keyed_json(kept)?;
     // What the render produced but the filtered page did not keep is what
     // an `irreversible` match removed — invisible rows never entered the
     // render at all, so the two hides stay distinguishable.
@@ -866,31 +800,6 @@ mod tests {
                 "which is a 400, not {err}"
             );
         }
-    }
-
-    #[test]
-    fn the_bulk_ids_parse_from_lists_and_lone_values() {
-        let id = "01934567-89ab-7cde-f012-3456789abcde";
-        let other = "01934567-89ab-7cde-f012-3456789abcdf";
-        let list: DestroyParams = params(json!({"ids": [id, other, id]}));
-        assert_eq!(
-            list.parsed_ids(),
-            vec![
-                id.parse::<Uuid>().expect("fixture id"),
-                other.parse().expect("fixture id")
-            ],
-            "the json array, each id once"
-        );
-        let lone: DestroyParams = params(json!({"ids": id}));
-        assert_eq!(lone.parsed_ids().len(), 1, "and the lone `ids=` value");
-        let mixed: DestroyParams = params(json!({"ids": [id, "not-an-id", "7"]}));
-        assert_eq!(
-            mixed.parsed_ids().len(),
-            1,
-            "values that name no row are skipped, not an error"
-        );
-        let empty: DestroyParams = params(json!({}));
-        assert!(empty.parsed_ids().is_empty(), "absent asks for none");
     }
 
     #[test]

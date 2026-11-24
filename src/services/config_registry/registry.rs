@@ -4,13 +4,11 @@
 use serde_json::{Map, Value, json};
 
 use super::{
-    GROUP_PLEROMA, INSTANCE_LIMIT, KEY_INSTANCE, KEY_MEDIA_PROXY, KEY_MRF, KEY_MRF_HELLTHREAD,
-    KEY_MRF_KEYWORD, KEY_MRF_OBJECT_AGE, KEY_MRF_SIMPLE, KEY_RESTRICT_UNAUTHENTICATED,
-    MEDIA_PROXY_SUBKEYS,
+    GROUP_PLEROMA, INSTANCE_LIMIT, KEY_INSTANCE, KEY_MRF, KEY_MRF_HASHTAG, KEY_MRF_HELLTHREAD,
+    KEY_MRF_KEYWORD, KEY_MRF_OBJECT_AGE, KEY_MRF_SIMPLE,
     children::{
-        INSTANCE_CHILDREN, MEDIA_PROXY_CHILDREN, MRF_CHILDREN, MRF_HELLTHREAD_CHILDREN,
+        INSTANCE_CHILDREN, MRF_CHILDREN, MRF_HASHTAG_CHILDREN, MRF_HELLTHREAD_CHILDREN,
         MRF_KEYWORD_CHILDREN, MRF_OBJECT_AGE_CHILDREN, MRF_SIMPLE_CHILDREN,
-        RESTRICT_UNAUTHENTICATED_CHILDREN,
     },
     types::{EntryDescription, RegistryEntry, ValueKind},
 };
@@ -35,8 +33,7 @@ pub fn descriptions() -> Vec<EntryDescription> {
 }
 
 /// The registry, in the order `GET /config` without `only_db` answers:
-/// the identity first, then the moderation family, then the two
-/// restart-gated entries.
+/// the identity first, then the moderation family.
 #[must_use]
 pub const fn entries() -> &'static [RegistryEntry] {
     &REGISTRY
@@ -59,8 +56,9 @@ pub fn requires_restart(group: &str, key: &str) -> bool {
     find(group, key).is_some_and(|entry| entry.requires_restart)
 }
 
-/// The whole registry: the eight entries the ticket whitelists.
-static REGISTRY: [RegistryEntry; 8] = [
+/// The whole registry: the seven entries the admin API may change, each one
+/// read at runtime.
+static REGISTRY: [RegistryEntry; 7] = [
     RegistryEntry {
         group: GROUP_PLEROMA,
         key: KEY_INSTANCE,
@@ -133,23 +131,13 @@ static REGISTRY: [RegistryEntry; 8] = [
     },
     RegistryEntry {
         group: GROUP_PLEROMA,
-        key: KEY_MEDIA_PROXY,
-        kind: ValueKind::Group,
-        description: "Media proxy",
-        children: &MEDIA_PROXY_CHILDREN,
-        subkeys: MEDIA_PROXY_SUBKEYS,
-        requires_restart: true,
-        defaults: media_proxy_defaults,
-    },
-    RegistryEntry {
-        group: GROUP_PLEROMA,
-        key: KEY_RESTRICT_UNAUTHENTICATED,
-        kind: ValueKind::Group,
-        description: "Disallow viewing timelines, user profiles and statuses for unauthenticated users.",
-        children: &RESTRICT_UNAUTHENTICATED_CHILDREN,
+        key: KEY_MRF_HASHTAG,
+        kind: ValueKind::Keyword,
+        description: "Hashtag policy: the tag lists it marks, unlists and rejects by",
+        children: &MRF_HASHTAG_CHILDREN,
         subkeys: &[],
-        requires_restart: true,
-        defaults: restrict_unauthenticated_defaults,
+        requires_restart: false,
+        defaults: empty_defaults,
     },
 ];
 
@@ -182,40 +170,6 @@ fn mrf_defaults(config: &Config) -> Value {
 /// keyword list, which on the wire is the empty tuple array.
 fn empty_defaults(_config: &Config) -> Value {
     Value::Object(Map::new())
-}
-
-/// The `:media_proxy` fallback: the three public subkeys
-/// ([`MEDIA_PROXY_SUBKEYS`]) read off `MEDIA_PROXY_*`. The HMAC secret is
-/// deliberately absent — the store never carries it, and an admin document
-/// readable by any token holder is no place for signing key material.
-fn media_proxy_defaults(config: &Config) -> Value {
-    json!({
-        "enabled": config.media_proxy.enabled,
-        "blacklist": config.media_proxy.blacklist,
-        "max_bytes": config.media_proxy.max_bytes,
-    })
-}
-
-/// The `:restrict_unauthenticated` fallback: Pleroma's nested shape —
-/// the `RESTRICT_UNAUTHENTICATED` flat `group_half` names regrouped into
-/// `{"timelines": {"local": …, "federated": …, "remote": …}, …}`.
-fn restrict_unauthenticated_defaults(config: &Config) -> Value {
-    let restricted = |area: &str| config.restrict_unauthenticated.contains(area);
-    json!({
-        "timelines": {
-            "local": restricted("timelines_local"),
-            "federated": restricted("timelines_federated"),
-            "remote": restricted("timelines_remote"),
-        },
-        "profiles": {
-            "local": restricted("profiles_local"),
-            "remote": restricted("profiles_remote"),
-        },
-        "activities": {
-            "local": restricted("activities_local"),
-            "remote": restricted("activities_remote"),
-        },
-    })
 }
 
 #[cfg(test)]

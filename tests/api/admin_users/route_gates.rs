@@ -184,6 +184,12 @@ fn credentials_patch() -> Route {
     }
 }
 
+/// Whether `route` is the forced follow or unfollow, the pair gated
+/// `admin:write:follows` instead of `admin:write:accounts`.
+fn is_follow_route(route: &Route) -> bool {
+    route.path == FOLLOW || route.path == UNFOLLOW
+}
+
 /// A [`TestRequest`] for one route; `token` is `None` for the anonymous
 /// request the gate must refuse with 401.
 fn request(route: &Route, token: Option<&str>) -> TestRequest {
@@ -259,7 +265,12 @@ async fn the_scope_class_sorts_the_maintenance_from_the_reads() {
     let seeded = seed(&db).await;
     for scopes in ["admin:write:accounts", "admin:write"] {
         let token = mint(&seeded.pool, &seeded.root, scopes).await;
-        for route in write_routes().into_iter().chain([credentials_patch()]) {
+        let skip_follows = scopes == "admin:write:accounts";
+        let routes = write_routes()
+            .into_iter()
+            .chain([credentials_patch()])
+            .filter(|route| !(skip_follows && is_follow_route(route)));
+        for route in routes {
             let response = request(&route, Some(&token)).send(&seeded.app).await;
             common::assert_answer(
                 &response,
@@ -289,5 +300,51 @@ async fn the_scope_class_sorts_the_maintenance_from_the_reads() {
             &format!("the read scope must not run {} {}", route.verb, route.path),
         );
         common::assert_error(&refused, NO_ADMIN_WRITE, "in the write class's words");
+    }
+}
+
+/// The follow pair's own area: `admin:write:follows` runs both forced
+/// follow routes, while `admin:write:accounts` — the account-moderation
+/// grant — and `admin:read:follows` are refused with the write class's
+/// 403, as Pleroma's `admin:write:follows` plug has it.
+#[tokio::test]
+async fn the_follows_scope_runs_exactly_the_forced_follow_pair() {
+    let db = common::test_db().await;
+    let seeded = seed(&db).await;
+    let follows = mint(&seeded.pool, &seeded.root, "admin:write:follows").await;
+    let accounts = mint(&seeded.pool, &seeded.root, "admin:write:accounts").await;
+    let read_follows = mint(&seeded.pool, &seeded.root, "admin:read:follows").await;
+
+    for route in write_routes().into_iter().filter(is_follow_route) {
+        let granted = request(&route, Some(&follows)).send(&seeded.app).await;
+        common::assert_answer(
+            &granted,
+            route.status,
+            &format!("admin:write:follows grants {} {}", route.verb, route.path),
+        );
+        for (token, what) in [
+            (&accounts, "admin:write:accounts"),
+            (&read_follows, "a read"),
+        ] {
+            let refused = request(&route, Some(token)).send(&seeded.app).await;
+            common::assert_answer(
+                &refused,
+                StatusCode::FORBIDDEN,
+                &format!("{what} must not run {} {}", route.verb, route.path),
+            );
+            common::assert_error(&refused, NO_ADMIN_WRITE, "in the write class's words");
+        }
+    }
+
+    for route in write_routes().into_iter().filter(|r| !is_follow_route(r)) {
+        let refused = request(&route, Some(&follows)).send(&seeded.app).await;
+        common::assert_answer(
+            &refused,
+            StatusCode::FORBIDDEN,
+            &format!(
+                "admin:write:follows must not run {} {}",
+                route.verb, route.path
+            ),
+        );
     }
 }

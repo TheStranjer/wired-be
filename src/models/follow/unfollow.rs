@@ -2,7 +2,7 @@
 //! pair, steps the counters it fed and clears the endorsement and list
 //! memberships that ride on it.
 
-use sqlx::PgPool;
+use sqlx::{PgConnection, PgPool};
 
 use crate::{
     error::AppResult,
@@ -50,22 +50,37 @@ const UNFOLLOW_LIST_MEMBERSHIPS_SQL: &str = "DELETE FROM list_members AS lm
 /// Any database failure (connection, constraint, encoding) arrives as
 /// [`AppError::Database`](crate::error::AppError).
 pub async fn unfollow(pool: &PgPool, follower: &User, target: &User) -> AppResult<bool> {
+    let mut tx = pool.begin().await?;
+    let removed = unfollow_conn(&mut tx, follower, target).await?;
+    tx.commit().await?;
+    Ok(removed)
+}
+
+/// [`unfollow`]'s writes on the open transaction `conn`: the row delete, the
+/// counter steps, the endorsement and the list memberships, none of them
+/// committed here. The caller owns the transaction, so dropping it without a
+/// commit undoes all four together.
+pub(super) async fn unfollow_conn(
+    conn: &mut PgConnection,
+    follower: &User,
+    target: &User,
+) -> AppResult<bool> {
     let removed = sqlx::query_as::<_, Follow>(UNFOLLOW_SQL)
         .bind(follower.id)
         .bind(target.id)
-        .fetch_optional(pool)
+        .fetch_optional(&mut *conn)
         .await?;
     let Some(follow) = removed else {
         return Ok(false);
     };
     if follow.state == FollowState::Accepted {
-        step_counters(pool, &follow, -1).await?;
+        step_counters(&mut *conn, &follow, -1).await?;
     }
-    endorsement::unendorse(pool, follower.id, target.id).await?;
+    endorsement::unendorse(&mut *conn, follower.id, target.id).await?;
     sqlx::query(UNFOLLOW_LIST_MEMBERSHIPS_SQL)
         .bind(follower.id)
         .bind(target.id)
-        .execute(pool)
+        .execute(&mut *conn)
         .await
         .map(drop)?;
     Ok(true)
@@ -241,6 +256,57 @@ mod tests {
             endorsement::endorsed_ids(&pool, dave.id).await.unwrap(),
             vec![carol.id],
             "and the failed unfollow pinned nothing away"
+        );
+    }
+
+    /// The row delete, both counter steps, the endorsement and the list
+    /// memberships ride one transaction: rolling it back undoes every one.
+    #[tokio::test]
+    async fn a_rolled_back_unfollow_changes_nothing() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = local_user(&pool, "alice").await;
+        let bob = local_user(&pool, "bob").await;
+        let accepted = follow(&pool, TEST_BASE_URL, &alice, &bob).await.unwrap();
+        assert_eq!(accepted.state, FollowState::Accepted, "the fixture counts");
+        endorsement::endorse(&pool, alice.id, bob.id)
+            .await
+            .expect("alice pins bob");
+        let hers = seeded_list(&pool, &alice, "hers").await;
+        let seeded = list::add_members(&pool, hers.id, &[bob.id])
+            .await
+            .expect("bob joins the list");
+        assert_eq!(seeded, 1, "one membership went in");
+
+        let mut tx = pool.begin().await.expect("the transaction opens");
+        assert!(
+            unfollow_conn(&mut tx, &alice, &bob).await.unwrap(),
+            "the accepted follow is removed inside the transaction"
+        );
+        tx.rollback().await.expect("the transaction rolls back");
+
+        assert_eq!(
+            relation(&pool, &alice, &bob).await,
+            accepted,
+            "the row is back as it stood"
+        );
+        assert_eq!(
+            (
+                fresh_user(&pool, bob.id).await.followers_count,
+                fresh_user(&pool, alice.id).await.following_count
+            ),
+            (1, 1),
+            "both counters are unchanged"
+        );
+        assert_eq!(
+            endorsement::endorsed_ids(&pool, alice.id).await.unwrap(),
+            vec![bob.id],
+            "the endorsement stays"
+        );
+        assert_eq!(
+            list::member_ids(&pool, hers.id).await.unwrap(),
+            vec![bob.id],
+            "and so does the list membership"
         );
     }
 

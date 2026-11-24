@@ -167,6 +167,37 @@ pub async fn save(pool: &PgPool, id: Uuid, settings: &MfaSettings) -> AppResult<
     Ok(())
 }
 
+/// The `UPDATE` behind [`consume_backup_code`]: removes one hash from the
+/// stored `backup_codes` array only while it is still there. A concurrent
+/// second statement waits on the row lock, re-checks the `WHERE` against
+/// the committed row and matches nothing, so a hash is spent exactly once.
+const CONSUME_BACKUP_CODE_SQL: &str = "UPDATE users \
+    SET mfa_settings = jsonb_set(mfa_settings, '{backup_codes}', \
+        (mfa_settings->'backup_codes') - $2::text), \
+        updated_at = now() \
+    WHERE id = $1 \
+      AND jsonb_typeof(mfa_settings->'backup_codes') = 'array' \
+      AND jsonb_exists(mfa_settings->'backup_codes', $2::text)";
+
+/// Atomically spends the backup-code `hash` of user `id`: removes it from
+/// the stored list in one statement and reports whether it was there.
+///
+/// Unlike a read-modify-[`save`], two concurrent calls with the same hash
+/// cannot both return `true`, and the rest of the settings is untouched.
+///
+/// # Errors
+///
+/// Any database failure arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn consume_backup_code(pool: &PgPool, id: Uuid, hash: &str) -> AppResult<bool> {
+    let result = sqlx::query(CONSUME_BACKUP_CODE_SQL)
+        .bind(id)
+        .bind(hash)
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected() > 0)
+}
+
 #[cfg(test)]
 mod tests {
     use sqlx::Row as _;
@@ -391,5 +422,113 @@ mod tests {
         save(&pool, Uuid::now_v7(), &MfaSettings::default())
             .await
             .unwrap();
+    }
+
+    /// The stored settings of user `id`.
+    async fn stored_settings(pool: &PgPool, id: Uuid) -> MfaSettings {
+        let stored: Value = sqlx::query("SELECT mfa_settings FROM users WHERE id = $1")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+            .get("mfa_settings");
+        MfaSettings::from_value(&stored)
+    }
+
+    #[tokio::test]
+    async fn consuming_a_backup_code_works_once_and_keeps_the_others() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let user = insert(&pool, &NewUser::local("gwen", &local_ap_id(BASE, "gwen")))
+            .await
+            .unwrap();
+        let mut settings = MfaSettings::default();
+        settings.setup_totp(SECRET);
+        settings.confirm_totp();
+        let hashes: Vec<String> = ["aaaa1111", "bbbb2222", "cccc3333"]
+            .iter()
+            .map(|code| hash_backup_code(code))
+            .collect();
+        settings.rotate_backup_codes(hashes.clone());
+        save(&pool, user.id, &settings).await.unwrap();
+
+        assert!(
+            consume_backup_code(&pool, user.id, &hashes[1])
+                .await
+                .unwrap(),
+            "the first spend of a stored hash succeeds"
+        );
+        assert!(
+            !consume_backup_code(&pool, user.id, &hashes[1])
+                .await
+                .unwrap(),
+            "the second spend of the same hash fails"
+        );
+        let stored = stored_settings(&pool, user.id).await;
+        assert_eq!(
+            stored.backup_codes,
+            [hashes[0].clone(), hashes[2].clone()],
+            "the other codes are intact"
+        );
+        assert!(stored.enabled, "the rest of the settings is untouched");
+        assert_eq!(stored.totp, settings.totp, "including the TOTP method");
+    }
+
+    #[tokio::test]
+    async fn consuming_an_unknown_code_or_user_changes_nothing() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let user = insert(&pool, &NewUser::local("hank", &local_ap_id(BASE, "hank")))
+            .await
+            .unwrap();
+        let held = hash_backup_code("dddd4444");
+        let mut settings = MfaSettings::default();
+        settings.rotate_backup_codes(vec![held.clone()]);
+        save(&pool, user.id, &settings).await.unwrap();
+
+        assert!(
+            !consume_backup_code(&pool, user.id, &hash_backup_code("zzzz9999"))
+                .await
+                .unwrap(),
+            "a hash that was never issued is not spent"
+        );
+        assert!(
+            !consume_backup_code(&pool, Uuid::now_v7(), &held)
+                .await
+                .unwrap(),
+            "another account's hash list is not touched"
+        );
+        assert_eq!(
+            stored_settings(&pool, user.id).await.backup_codes,
+            [held],
+            "the stored list did not change"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_account_without_backup_codes_spends_nothing() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let user = insert(&pool, &NewUser::local("iris", &local_ap_id(BASE, "iris")))
+            .await
+            .unwrap();
+        assert!(
+            !consume_backup_code(&pool, user.id, &hash_backup_code("eeee5555"))
+                .await
+                .unwrap(),
+            "an empty list holds no code"
+        );
+        sqlx::query("UPDATE users SET mfa_settings = '{}'::jsonb WHERE id = $1")
+            .bind(user.id)
+            .execute(&pool)
+            .await
+            .map(drop)
+            .unwrap();
+        assert!(
+            !consume_backup_code(&pool, user.id, &hash_backup_code("eeee5555"))
+                .await
+                .unwrap(),
+            "a row with no backup_codes key holds no code either"
+        );
     }
 }

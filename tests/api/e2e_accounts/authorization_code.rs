@@ -1,42 +1,50 @@
-//! Scenario 2: the authorization-code flow — the consent page, the
-//! approved submission's code, that code's exchange, the scope gate the
-//! approved scopes decide, the spent code's refusal, the rotation and the
-//! revocation. The consent URL, the grant posts and the consent form
-//! themselves live here too: no other scenario reaches the `/oauth` pair.
+//! Scenario 2: the authorization-code flow — the browser's redirect to
+//! the frontend's consent screen, the frontend's approval and its code,
+//! that code's exchange, the scope gate the approved scopes decide, the
+//! spent code's refusal, the rotation and the revocation. The consent URL,
+//! the grant posts and the approval themselves live here too: no other
+//! scenario reaches the `/oauth` pair.
 
 use axum::http::StatusCode;
 use serde_json::{Value, json};
 
 use super::support::{
-    AUTHORIZE, INVALID_CREDENTIALS, INVALID_TOKEN, PASSWORD, REVOKE, STATUSES, TOKEN, VERIFY,
-    World, assert_refused, string_field,
+    AUTHORIZE, CLIENT_SCOPES, INVALID_CREDENTIALS, INVALID_TOKEN, PASSWORD, REVOKE, STATUSES,
+    TOKEN, VERIFY, World, assert_refused, string_field,
 };
 use crate::common::{self, TestClient, TestResponse};
 
 // ───────────────────  Scenario 2: the OAuth code flow  ───────────────────
 
-/// The authorization-code flow end to end: the consent page, the approved
-/// submission's redirect, the code's exchange for a pair carrying the
-/// approved scopes, the spent code's refusal, the rotation that replaces
-/// the pair, and the revocation that ends it — with the scope gate proved
-/// on the way: a `read` token may read and may not post.
+/// The authorization-code flow end to end: the browser's redirect to the
+/// frontend's consent screen, the frontend's approval, the code's exchange
+/// for a pair carrying the approved scopes, the spent code's refusal, the
+/// rotation that replaces the pair, and the revocation that ends it — with
+/// the scope gate proved on the way: a `read` token may read and may not
+/// post.
 #[tokio::test]
 async fn the_authorization_code_flow_issues_rotates_and_retires_a_token() {
     let db = common::test_db().await;
     let world = World::open(db.pool().clone()).await;
     let _bob = world.register("bob").await;
 
-    // Step 1: the consent page renders for a valid request.
+    // Step 1: a valid browser request is sent on to the frontend's
+    // consent screen, query intact.
     let page = common::api_get(&world.app, None, &consent_url(&world.client, "read+write")).await;
-    common::assert_answer(&page, StatusCode::OK, "the consent page");
-    let html = page.text();
+    common::assert_answer(&page, StatusCode::FOUND, "the consent redirect");
+    let frontend = format!("{}{AUTHORIZE}?", world.state.config.frontend_base_url);
+    let location = page.header("location").expect("a Location header");
     assert!(
-        html.contains("<form method=\"post\" action=\"/oauth/authorize\">"),
-        "the page posts its consent back to the same route: {html}"
+        location.starts_with(&frontend),
+        "the browser lands on the frontend's authorize page: {location}"
+    );
+    assert!(
+        location.contains(&format!("client_id={}", world.client.client_id)),
+        "with the client the request named: {location}"
     );
 
-    // Step 2: the approved submission redirects to the client with a code.
-    let code = consent(&world, "bob", &["read"]).await;
+    // Step 2: the frontend's approval answers the client's redirect with a code.
+    let code = consent(&world, "bob", "read").await;
 
     // Step 3: the code is redeemed for a pair acting as its authorizer,
     // with the *approved* scopes and nothing else.
@@ -145,7 +153,7 @@ async fn grant(world: &World, body: &Value) -> TestResponse {
 }
 
 /// `POST`s `path` with the client credentials beside `body` — the shape
-/// every `/oauth` endpoint but the consent form takes.
+/// every `/oauth` endpoint but the approval takes.
 async fn grant_at(world: &World, path: &str, body: &Value) -> TestResponse {
     common::TestRequest::post(path)
         .json(&world.client.with_credentials(body.clone()))
@@ -153,35 +161,44 @@ async fn grant_at(world: &World, path: &str, body: &Value) -> TestResponse {
         .await
 }
 
-/// The approved `POST /oauth/authorize` for `username`, checking the boxes
-/// in `scopes`, answered as the code its redirect carries.
+/// The frontend's approval of `scope` for `username`, answered as the code
+/// its redirect carries.
 ///
-/// The form carries the login, not a bearer: this API has no browser
-/// session, so the consent submission authenticates the account it
-/// approves — the same [`PASSWORD`] the scenario registered it with.
+/// The frontend is a second client, marked trusted, that logs the account
+/// in with the password grant and then `POST`s the verdict to
+/// `/oauth/authorize` with that token as its bearer — the consent screen's
+/// whole conversation with the API.
 ///
 /// # Panics
 ///
-/// If the submission is not the 302, or its redirect carries no `code`.
-async fn consent(world: &World, username: &str, scopes: &[&str]) -> String {
-    let mut fields = vec![
-        ("authorization[client_id]", world.client.client_id.as_str()),
-        ("authorization[redirect_uri]", common::TEST_REDIRECT_URI),
-        ("authorization[name]", username),
-        ("authorization[password]", PASSWORD),
-    ];
-    for scope in scopes {
-        fields.push(("authorization[scope][]", scope));
-    }
-    let response = common::TestRequest::post(AUTHORIZE)
-        .form(&fields)
-        .send(&world.app)
-        .await;
-    common::assert_answer(&response, StatusCode::FOUND, "the consent submission");
-    let location = response
-        .header("location")
-        .expect("the approval redirects to the client")
-        .to_owned();
+/// If the login or the verdict is refused, or the answered redirect
+/// carries no `code`.
+async fn consent(world: &World, username: &str, scope: &str) -> String {
+    let frontend = common::register_client(&world.app, "Scenario Frontend", CLIENT_SCOPES).await;
+    let trusted = sqlx::query("UPDATE oauth_apps SET trusted = true WHERE client_id = $1")
+        .bind(&frontend.client_id)
+        .execute(&world.state.db)
+        .await
+        .expect("the frontend app is marked trusted");
+    assert_eq!(trusted.rows_affected(), 1, "the frontend app exists");
+    let login = common::login_password(&world.app, &frontend, username, PASSWORD).await;
+    common::assert_answer(&login, StatusCode::OK, "the frontend's login");
+    let bearer = common::access_token_of(&login);
+
+    let response = common::api_post(
+        &world.app,
+        Some(&bearer),
+        AUTHORIZE,
+        &json!({
+            "client_id": world.client.client_id,
+            "redirect_uri": common::TEST_REDIRECT_URI,
+            "scope": scope,
+            "approve": true,
+        }),
+    )
+    .await;
+    common::assert_answer(&response, StatusCode::OK, "the frontend's approval");
+    let location = string_field(&response.json_value(), "redirect_uri");
     let (_, query) = location.split_once('?').unwrap_or((location.as_str(), ""));
     let pairs = url::form_urlencoded::parse(query.as_bytes())
         .into_owned()

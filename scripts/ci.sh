@@ -20,6 +20,23 @@
 # `--locked` makes Cargo fail instead of silently updating Cargo.lock, so a
 # stale lockfile is caught here rather than drifting in CI.
 #
+# The output is terse: it reports what is broken and little else, because
+# its main reader is an agent paying for every line. A clean run prints one
+# header per check, one test tally and the verdict. To that end:
+#
+# - every Cargo command runs with `--quiet`, dropping the Compiling,
+#   Checking, Running and Finished status lines but keeping every diagnostic;
+# - rustfmt names the files that need formatting instead of printing a diff
+#   (the fix is always `cargo fmt`);
+# - the test build reports compiler errors one line each
+#   (`--message-format short`): Clippy has already printed them in full with
+#   their suggestions, since it checks the same targets;
+# - libtest's per-test progress, `running N tests` and passing `test result`
+#   lines are filtered out (see filter_test_output); failures, their
+#   captured output and the failing summary lines come through untouched;
+# - Clippy and rustdoc diagnostics lose their per-lint documentation link
+#   and `#[allow(...)]` advice (see without_lint_boilerplate).
+#
 # Usage:
 #
 #   scripts/ci.sh    # run the whole gate
@@ -60,7 +77,7 @@ failed_checks=()
 step() {
   local label="$1"
   shift
-  printf '\n==> %s\n' "$label"
+  printf '==> %s\n' "$label"
   if ! "$@"; then
     failed_checks+=("$label")
     printf 'FAILED: %s\n' "$label" >&2
@@ -115,11 +132,78 @@ check_file_lengths() {
   return 1
 }
 
+# check_formatting — rustfmt in check mode, naming each misformatted file
+# rather than printing its diff.
+check_formatting() {
+  if cargo fmt --all --check -- --files-with-diff; then
+    return 0
+  fi
+  printf 'run `cargo fmt` to fix the files above\n'
+  return 1
+}
+
+# filter_test_output — drop libtest's noise from a `cargo test --quiet`
+# stream on stdin, keeping everything that explains a failure.
+#
+# Dropped: `running N tests`, the progress lines of one character per test
+# (`.`, `i`, `F`, with an optional `N/M` count), and every `test result: ok.`
+# line. libtest writes a `has been running for over 60 seconds` warning
+# straight after the progress characters on the same line, so those are cut
+# off the front of it. Runs of blank lines collapse to one. Every other line passes through:
+# the `failures:` sections with each failing test's captured output, a
+# `test result: FAILED.` line, Cargo's errors and slow-test warnings. At the
+# end, one line tallies the results of every test binary that ran.
+#
+# Lines are flushed as they come so CI still streams the step's output.
+filter_test_output() {
+  awk '
+    function tally(i) {
+      for (i = 1; i < NF; i++) {
+        if ($(i + 1) ~ /^passed;/) passed += $i
+        else if ($(i + 1) ~ /^failed;/) failed += $i
+        else if ($(i + 1) ~ /^ignored;/) ignored += $i
+      }
+      seen = 1
+    }
+    /^[.iF]+test / { sub(/^[.iF]+/, "") }
+    /^running [0-9]+ tests?$/ { next }
+    /^[.iF]+( [0-9]+\/[0-9]+)?$/ { next }
+    /^test result: ok\./ { tally(); next }
+    /^test result: / { tally() }
+    /^[[:space:]]*$/ { if (printed && !blank) { print ""; blank = 1 }; fflush(); next }
+    { print; printed = 1; blank = 0; fflush() }
+    END {
+      if (seen) printf "tests: %d passed, %d failed, %d ignored\n", passed, failed, ignored
+    }
+  '
+}
+
+# run_tests — the whole suite, quiet, through filter_test_output, returning
+# Cargo's own exit status rather than the filter's.
+run_tests() {
+  cargo test --quiet --locked --no-fail-fast --all-targets --all-features \
+    --message-format short 2>&1 | filter_test_output
+  return "${PIPESTATUS[0]}"
+}
+
+# without_lint_boilerplate COMMAND... — run a Clippy or rustdoc command and
+# drop two `= help:` lines its diagnostics repeat under every lint: the
+# documentation link, and the advice to add `#[allow(...)]`, which AGENTS.md
+# forbids. The lint's name still shows in its `= note:` line. Returns the
+# command's exit status, not the filter's.
+without_lint_boilerplate() {
+  "$@" 2>&1 |
+    grep --line-buffered -vE '^ *= help: (for further information visit |to override )'
+  return "${PIPESTATUS[0]}"
+}
+
 step 'file length' check_file_lengths
-step 'rustfmt' cargo fmt --all --check
-step 'Clippy' cargo clippy --locked --keep-going --all-targets --all-features
-step 'tests' cargo test --locked --no-fail-fast --all-targets --all-features
-step 'rustdoc' env RUSTDOCFLAGS='-D warnings' cargo doc --locked --keep-going --no-deps --all-features
+step 'rustfmt' check_formatting
+step 'Clippy' without_lint_boilerplate \
+  cargo clippy --quiet --locked --keep-going --all-targets --all-features
+step 'tests' run_tests
+step 'rustdoc' without_lint_boilerplate env RUSTDOCFLAGS='-D warnings' \
+  cargo doc --quiet --locked --keep-going --no-deps --all-features
 
 # Exit explicitly: green means 0, anything else means 1.
 printf '\n'

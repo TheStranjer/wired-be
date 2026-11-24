@@ -32,7 +32,8 @@
 //!   both and puts the author's followers collection in `to`, which reads
 //!   back as `private`.
 //! * [`List::MediaRemoval`] drops the `attachment` entries of those notes;
-//!   [`List::MediaNsfw`] marks the ones that had any `sensitive`.
+//!   [`List::MediaNsfw`] marks every one of them `sensitive`, attachments
+//!   or not, as Pleroma's `check_media_nsfw` does.
 //! * [`List::ReportRemoval`] refuses `Flag` activities.
 //! * [`List::AvatarRemoval`], [`List::BannerRemoval`] and
 //!   [`List::BackgroundRemoval`] strip `icon`, `image` and `background`

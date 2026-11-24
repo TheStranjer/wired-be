@@ -8,22 +8,16 @@ use crate::{
     models::{
         block, follow,
         status::{NewStatus, Visibility, insert as insert_status, soft_delete},
-        user::{Flag, NewUser, insert as insert_user, local_ap_id},
+        user::{Flag, NewUser, insert as insert_user},
     },
+    test_fixtures::{local_new, local_user as local},
 };
+
+/// Rule 1b: a deactivated author's statuses are visible to nobody.
+mod deactivated;
 
 /// The instance origin the fixtures pretend to serve.
 const BASE: &str = TEST_BASE_URL;
-
-/// Inserts a local user named `nickname`.
-async fn local(pool: &PgPool, nickname: &str) -> User {
-    insert_user(
-        pool,
-        &NewUser::local(nickname, &local_ap_id(BASE, nickname)),
-    )
-    .await
-    .expect("the local fixture inserts")
-}
 
 /// Inserts a local user named `nickname` whose account is locked, so a
 /// follow of it waits for an answer and never grants one.
@@ -32,7 +26,7 @@ async fn locked_local(pool: &PgPool, nickname: &str) -> User {
         pool,
         &NewUser {
             locked: Flag::new(true),
-            ..NewUser::local(nickname, &local_ap_id(BASE, nickname))
+            ..local_new(nickname)
         },
     )
     .await
@@ -633,4 +627,61 @@ async fn a_reblog_rule_applies_to_a_mentioned_viewer() {
         for_dave.is_empty(),
         "an unmentioned viewer loses the reblog"
     );
+}
+
+/// `get_visible` answers the one 404 for a malformed id, an unknown id and a
+/// private status read by a stranger or an anonymous viewer, and the row for
+/// a public status and for the private one's author.
+#[tokio::test]
+async fn get_visible_hides_everything_but_what_the_viewer_may_see() {
+    let db = crate::test_db::test_db().await.expect("test database slot");
+    let pool = db.pool().clone();
+    let alice = local(&pool, "alice").await;
+    let mallory = local(&pool, "mallory").await;
+    let private = post(&pool, &alice, Visibility::Private, "followers only").await;
+    let public = post(&pool, &alice, Visibility::Public, "for everyone").await;
+
+    let malformed = get_visible(&pool, "not-an-id", Some(&mallory)).await;
+    assert!(matches!(malformed, Err(AppError::NotFound)));
+    let unknown = get_visible(&pool, &Uuid::new_v4().to_string(), Some(&mallory)).await;
+    assert!(matches!(unknown, Err(AppError::NotFound)));
+    let hidden = get_visible(&pool, &private.id.to_string(), Some(&mallory)).await;
+    assert!(matches!(hidden, Err(AppError::NotFound)));
+    let anonymous = get_visible(&pool, &private.id.to_string(), None).await;
+    assert!(matches!(anonymous, Err(AppError::NotFound)));
+
+    let seen = get_visible(&pool, &public.id.to_string(), Some(&mallory))
+        .await
+        .expect("a public status is visible to a stranger");
+    assert_eq!(seen.id, public.id);
+    let own = get_visible(&pool, &private.id.to_string(), Some(&alice))
+        .await
+        .expect("the author sees their private status");
+    assert_eq!(own.id, private.id);
+}
+
+/// `require_visible` hands the row back when it is visible and answers
+/// [`AppError::NotFound`] for a tombstone and for a hidden status.
+#[tokio::test]
+async fn require_visible_gates_a_loaded_status() {
+    let db = crate::test_db::test_db().await.expect("test database slot");
+    let pool = db.pool().clone();
+    let alice = local(&pool, "alice").await;
+    let mallory = local(&pool, "mallory").await;
+    let public = post(&pool, &alice, Visibility::Public, "for everyone").await;
+    let private = post(&pool, &alice, Visibility::Private, "followers only").await;
+
+    let kept = require_visible(&pool, public.clone(), None)
+        .await
+        .expect("a public status passes for an anonymous viewer");
+    assert_eq!(kept.id, public.id);
+    let hidden = require_visible(&pool, private, Some(&mallory)).await;
+    assert!(matches!(hidden, Err(AppError::NotFound)));
+
+    let tombstone = soft_delete(&pool, public.id)
+        .await
+        .expect("the soft delete runs")
+        .expect("the status exists to delete");
+    let deleted = require_visible(&pool, tombstone, Some(&alice)).await;
+    assert!(matches!(deleted, Err(AppError::NotFound)));
 }

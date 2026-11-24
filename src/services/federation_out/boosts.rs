@@ -22,11 +22,12 @@ use crate::{
 /// id is the row's stored `uri`, which is what a withdrawal's `Undo`
 /// embeds and a peer's later fetch names back), or the `Undo` wrapping it.
 ///
-/// The addressing follows the boost's own visibility as Pleroma's
-/// `Builder.announce` follows it: a public one names the world in `to`,
-/// an unlisted or private one the actor's followers collection, and the
-/// `cc` line carries the followers collection beside the boosted status'
-/// author either way — so the fan-out reaches the remote followers' and
+/// The addressing follows the boost's own visibility as Mastodon's
+/// `TagManager` does: a public one names the world in `to` and the
+/// followers collection plus the boosted status' author in `cc`; an
+/// unlisted one names the followers in `to` and the author plus the
+/// world in `cc`; a private one the followers in `to` and the author
+/// alone in `cc` — so the fan-out reaches the remote followers' and
 /// the original author's inboxes, and a boost of a LOCAL status federates
 /// to the followers alone (the publisher resolves the local author to
 /// nothing). A `local`-visibility boost federates nothing, and neither
@@ -59,12 +60,14 @@ pub(super) fn reblog_activity(
     undo: bool,
 ) -> Value {
     let followers = followers_address(&action.actor);
-    let to: [&str; 1] = if reblog.visibility == Visibility::Public {
-        [PUBLIC]
-    } else {
-        [followers.as_str()]
+    let author = action.author.ap_id.as_str();
+    let (to, cc): (Vec<&str>, Vec<&str>) = match reblog.visibility {
+        Visibility::Public => (vec![PUBLIC], vec![followers.as_str(), author]),
+        Visibility::Unlisted => (vec![followers.as_str()], vec![author, PUBLIC]),
+        Visibility::Private | Visibility::Direct | Visibility::Local => {
+            (vec![followers.as_str()], vec![author])
+        }
     };
-    let cc = [followers.as_str(), action.author.ap_id.as_str()];
     let announce = announce_json(&ObjectActivityContext {
         config: &state.config,
         id: &reblog.uri,
@@ -160,8 +163,9 @@ mod tests {
         );
     }
 
-    /// An unlisted boost names the followers collection in `to` — the
-    /// public address goes — while the `cc` line stays the pair.
+    /// An unlisted boost names the followers collection in `to` and puts
+    /// the boosted author and the public address in `cc` (Mastodon's
+    /// `TagManager` shape).
     #[tokio::test]
     async fn an_unlisted_boost_addresses_the_followers_in_to() {
         let db = crate::test_db::test_db().await.expect("test database slot");
@@ -191,8 +195,89 @@ mod tests {
         );
         assert_eq!(
             activity["cc"],
-            json!([format!("{}/followers", alice.ap_id), bob.ap_id]),
-            "the cc line is the same pair"
+            json!([bob.ap_id, PUBLIC]),
+            "the author and the public address ride cc"
+        );
+    }
+
+    /// A private boost carries no public address anywhere: followers in
+    /// `to`, the boosted author alone in `cc`.
+    #[tokio::test]
+    async fn a_private_boost_carries_no_public_address() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = local(&pool, "alice").await;
+        let bob = remote(&pool, "bob").await;
+        let original = remote_status(&pool, &bob, "boost-privately", Visibility::Public).await;
+        let (reblog, wrote) =
+            status::create_reblog(&pool, TEST_BASE_URL, &alice, &original, Visibility::Private)
+                .await
+                .expect("the reblog writes");
+        assert!(wrote, "the pair boosted");
+        let state = app_state(&pool);
+
+        after_reblog_changed(&state, &reblog, true).await;
+
+        let activity = the_single_activity(&pool).await;
+        assert_eq!(
+            activity["to"],
+            json!([format!("{}/followers", alice.ap_id)]),
+            "a private boost talks to the followers"
+        );
+        assert_eq!(
+            activity["cc"],
+            json!([bob.ap_id]),
+            "only the boosted author rides cc"
+        );
+        for line in ["to", "cc"] {
+            assert!(
+                !activity[line]
+                    .as_array()
+                    .expect("the line is an array")
+                    .contains(&json!(PUBLIC)),
+                "no public address in {line}"
+            );
+        }
+    }
+
+    /// Withdrawing an unlisted boost repeats the unlisted addressing on
+    /// the `Undo`.
+    #[tokio::test]
+    async fn unboosting_an_unlisted_boost_repeats_the_unlisted_addressing() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = local(&pool, "alice").await;
+        let bob = remote(&pool, "bob").await;
+        let original = remote_status(&pool, &bob, "unlisted-then-drop", Visibility::Public).await;
+        let (_, wrote) = status::create_reblog(
+            &pool,
+            TEST_BASE_URL,
+            &alice,
+            &original,
+            Visibility::Unlisted,
+        )
+        .await
+        .expect("the reblog writes");
+        assert!(wrote, "the pair boosted");
+        let removed = status::remove_reblog(&pool, alice.id, original.id)
+            .await
+            .expect("the withdrawal runs")
+            .expect("the boost went");
+        let state = app_state(&pool);
+
+        after_reblog_changed(&state, &removed, false).await;
+
+        let activity = the_single_activity(&pool).await;
+        assert_eq!(activity["type"], "Undo");
+        assert_eq!(
+            activity["to"],
+            json!([format!("{}/followers", alice.ap_id)]),
+            "the unlisted to line repeats"
+        );
+        assert_eq!(
+            activity["cc"],
+            json!([bob.ap_id, PUBLIC]),
+            "and its cc line, public address included"
         );
     }
 

@@ -3,8 +3,8 @@
 //! `lib/pleroma/web/mailer/subscription_controller.ex`) takes the
 //! HMAC-signed link [`unsubscribe_token`] mints, clears the user's
 //! `email_notifications` flag and answers the confirmation page; every
-//! refusal is the one 400 page. The shared page helpers and the
-//! [`HmacSha256`] flavor ride on [`super`].
+//! refusal is the one 400 page. The shared page helpers ride on
+//! [`super`].
 
 use axum::{
     extract::{Path, State},
@@ -12,15 +12,16 @@ use axum::{
     response::Response,
 };
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use hmac::{KeyInit as _, Mac as _};
-use subtle::ConstantTimeEq as _;
 use uuid::Uuid;
 
-use crate::{error::AppResult, models::user, state::AppState};
-
-use super::{
-    HmacSha256, INVALID_TOKEN_MESSAGE, UNSUBSCRIBED_MESSAGE, message_body, protected_page,
+use crate::{
+    error::AppResult,
+    models::user,
+    state::AppState,
+    util::hmac::{hmac_sha256, verify_hmac_sha256},
 };
+
+use super::{INVALID_TOKEN_MESSAGE, UNSUBSCRIBED_MESSAGE, message_body, protected_page};
 
 /// `GET /mailer/unsubscribe/{token}` (Pleroma's `SubscriptionController`,
 /// `lib/pleroma/web/mailer/subscription_controller.ex`): the link
@@ -28,8 +29,7 @@ use super::{
 /// `email_notifications` flag through
 /// [`set_email_notifications`](crate::models::user::set_email_notifications)
 /// and answers 200 [`UNSUBSCRIBED_MESSAGE`] as a [`protected_page`] —
-/// `X-Frame-Options: DENY`, unlike the embed pages, because a mailer
-/// link is no frame's content. Every refusal is the one 400
+/// `X-Frame-Options: DENY`, because a mailer link is no frame's content. Every refusal is the one 400
 /// [`INVALID_TOKEN_MESSAGE`] page: a token that does not verify, and,
 /// since no token can verify without a signing secret, a state built off
 /// the boot path with
@@ -59,15 +59,6 @@ pub(super) async fn unsubscribe(
     ))
 }
 
-/// The raw HMAC-SHA256 of `message` keyed by `secret`, the recipe of
-/// [`crate::services::media_proxy`]; `None` only for key material its
-/// API refuses, which HMAC cannot (it hashes keys of any length).
-fn hmac_signature(secret: &str, message: &str) -> Option<Vec<u8>> {
-    let mut mac = HmacSha256::new_from_slice(secret.as_bytes()).ok()?;
-    mac.update(message.as_bytes());
-    Some(mac.finalize().into_bytes().to_vec())
-}
-
 /// Mints the unsubscribe token of user `user_id` under `secret`:
 /// `base64url_nopad(HMAC-SHA256(secret, user-id-text))` + `.` + the
 /// hyphenated lowercase uuid.
@@ -80,7 +71,7 @@ fn hmac_signature(secret: &str, message: &str) -> Option<Vec<u8>> {
 #[must_use]
 pub fn unsubscribe_token(secret: &str, user_id: Uuid) -> String {
     let id_text = user_id.to_string();
-    let Some(signature) = hmac_signature(secret, &id_text) else {
+    let Some(signature) = hmac_sha256(secret.as_bytes(), id_text.as_bytes()) else {
         return String::new();
     };
     format!("{}.{id_text}", URL_SAFE_NO_PAD.encode(signature))
@@ -98,9 +89,8 @@ pub fn unsubscribe_token(secret: &str, user_id: Uuid) -> String {
 #[must_use]
 pub fn unsubscribe_user_id(secret: &str, token: &str) -> Option<Uuid> {
     let (provided, id_text) = token.split_once('.')?;
-    let want = hmac_signature(secret, id_text)?;
     let given = URL_SAFE_NO_PAD.decode(provided).ok()?;
-    if !bool::from(given.as_slice().ct_eq(want.as_slice())) {
+    if !verify_hmac_sha256(secret.as_bytes(), id_text.as_bytes(), &given) {
         return None;
     }
     Uuid::parse_str(id_text).ok()
@@ -260,7 +250,7 @@ mod tests {
         assert_eq!(
             headers[FRAME_OPTIONS_HEADER.clone()],
             "DENY",
-            "and not framable, like every non-embed page"
+            "and not framable, like every page"
         );
     }
 }

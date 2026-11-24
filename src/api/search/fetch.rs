@@ -23,7 +23,7 @@ use crate::{
         user::User,
     },
     state::AppState,
-    util::id::parse_id,
+    util::{id::parse_id, url::parse_http_url},
 };
 
 use super::{RESOLVE_BUDGET, STATUSES_SEGMENT, USERS_SEGMENT};
@@ -128,8 +128,7 @@ pub(super) async fn fetch_status_url(state: &AppState, url: &Url) -> Option<Stat
 /// anything else (a word, a handle, an `ftp:` or `mailto:` address) names no
 /// remote document, and is [`None`].
 pub(super) fn web_url(query: &str) -> Option<Url> {
-    let parsed = Url::parse(query).ok()?;
-    matches!(parsed.scheme(), "http" | "https").then_some(parsed)
+    parse_http_url(query)
 }
 
 /// The id a local status perma-link names: `{BASE_URL}/users/{nickname}/

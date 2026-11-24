@@ -173,7 +173,7 @@ async fn oauth_login_states_migration_creates_the_state_table() {
 
 /// The password-reset migration (WBE-135) creates the token table
 /// `src/models/password_reset.rs` reads and writes: the minted
-/// `uuid` key, the unique secret text, the cascading account
+/// `uuid` key, the secret's digest, the cascading account
 /// foreign key, the `false`-defaulted spend flag and the
 /// `now()`-stamped issue time the TTL counts from.
 #[tokio::test]
@@ -193,7 +193,12 @@ async fn password_reset_tokens_migration_creates_the_token_table() {
         described_of(columns),
         vec![
             ("id".to_owned(), "uuid".to_owned(), "NO".to_owned(), None),
-            ("token".to_owned(), "text".to_owned(), "NO".to_owned(), None),
+            (
+                "token_digest".to_owned(),
+                "text".to_owned(),
+                "NO".to_owned(),
+                None
+            ),
             (
                 "user_id".to_owned(),
                 "uuid".to_owned(),
@@ -229,23 +234,6 @@ async fn password_reset_tokens_migration_creates_the_token_table() {
     .unwrap();
     assert_eq!(key_columns, "id", "the id alone is the key {key}");
 
-    let uniques: Vec<String> = sqlx::query_scalar(
-        "SELECT con.conname
-           FROM pg_constraint con
-           JOIN pg_class cls ON cls.oid = con.conrelid
-           JOIN pg_attribute att ON att.attrelid = cls.oid AND att.attnum = ANY(con.conkey)
-          WHERE con.contype = 'u' AND cls.relname = 'password_reset_tokens'
-            AND att.attname = 'token'",
-    )
-    .fetch_all(&pool)
-    .await
-    .unwrap();
-    assert_eq!(
-        uniques,
-        vec!["password_reset_tokens_token_key".to_owned()],
-        "the secret text is the unique lookup key"
-    );
-
     let (foreign, action, target): (String, String, String) = sqlx::query_as(
         "SELECT con.conname, con.confdeltype::text, conf.relname
            FROM pg_constraint con
@@ -260,6 +248,49 @@ async fn password_reset_tokens_migration_creates_the_token_table() {
     .unwrap();
     assert_eq!(action, "c", "{foreign} deletes with the account");
     assert_eq!(target, "users", "{foreign} points at users");
+}
+
+/// The digest migration renames the secret column of both credential
+/// tables, so no column named `token` is left to hold a raw secret, and
+/// the reset table's unique constraint follows the column to the digest.
+#[tokio::test]
+async fn hash_reset_and_mfa_tokens_migration_renames_the_secret_columns() {
+    let db = crate::test_db::test_db().await.expect("test database slot");
+    let pool = db.pool().clone();
+    for table in ["password_reset_tokens", "mfa_tokens"] {
+        let columns: Vec<String> = sqlx::query_scalar(
+            "SELECT column_name FROM information_schema.columns
+              WHERE table_schema = 'public' AND table_name = $1
+                AND column_name IN ('token', 'token_digest')
+           ORDER BY column_name",
+        )
+        .bind(table)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            columns,
+            vec!["token_digest".to_owned()],
+            "{table} keeps only the digest column"
+        );
+    }
+
+    let uniques: Vec<String> = sqlx::query_scalar(
+        "SELECT con.conname
+           FROM pg_constraint con
+           JOIN pg_class cls ON cls.oid = con.conrelid
+           JOIN pg_attribute att ON att.attrelid = cls.oid AND att.attnum = ANY(con.conkey)
+          WHERE con.contype = 'u' AND cls.relname = 'password_reset_tokens'
+            AND att.attname = 'token_digest'",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        uniques,
+        vec!["password_reset_tokens_token_key".to_owned()],
+        "the secret's digest is the unique lookup key"
+    );
 }
 
 /// The same migration adds `password_reset_pending` to `users`: a

@@ -8,9 +8,9 @@
 //! |-------------|------------------------------------------------------|
 //! | `available` | enqueued, not yet claimed                             |
 //! | `executing` | claimed by a worker (`locked_at` set, `attempts` up)  |
-//! | `retryable` | failed with attempts left; due again at `run_at`      |
+//! | `retryable` | failed or lost with attempts left; due at `run_at`    |
 //! | `completed` | finished successfully (terminal)                      |
-//! | `discarded` | failed for good (terminal)                            |
+//! | `discarded` | failed for good, or lost at its attempt budget (terminal) |
 //!
 //! [`enqueue`] inserts, [`enqueue_batch`] many in one transaction,
 //! [`claim_next`] hands one due job to one worker,
@@ -165,8 +165,9 @@ pub async fn enqueue_batch(pool: &PgPool, jobs: &[NewJob<'_>]) -> AppResult<u64>
 /// `attempts` and stamps `locked_at`, using `FOR UPDATE SKIP LOCKED` in a
 /// sub-select so concurrent workers scan the same queue without ever
 /// blocking on — or handing out twice — the same job. Only jobs whose
-/// state is `available` or `retryable` and whose `run_at` has passed are
-/// eligible.
+/// state is `available` or `retryable`, whose `run_at` has passed and whose
+/// `attempts` is still below `max_attempts` are eligible, so a claim never
+/// pushes `attempts` past the budget.
 ///
 /// # Errors
 ///
@@ -185,6 +186,7 @@ pub async fn claim_next(pool: &PgPool, queues: &[&str]) -> AppResult<Option<Job>
                 FROM jobs
                WHERE state IN ('available', 'retryable')
                  AND run_at <= now()
+                 AND attempts < max_attempts
                  AND queue = ANY($1)
                ORDER BY run_at
                   FOR UPDATE SKIP LOCKED
@@ -315,14 +317,18 @@ async fn discard(pool: &PgPool, id: Uuid, attempt: i32, error: &str) -> AppResul
     Ok(done.rows_affected() > 0)
 }
 
-/// Returns `executing` jobs locked for longer than `older_than` to the
-/// queue, reporting how many rows changed.
+/// Settles `executing` jobs locked for longer than `older_than`, reporting
+/// how many rows changed.
 ///
 /// A worker that dies mid-job leaves its row stuck in `executing`; after
 /// its lock has demonstrably expired the row goes back to `retryable`
-/// (claimable again, `attempts` kept) with `locked_at` released. `run_at`
-/// is untouched, so a rescued job is due at once. Jobs in any other state
-/// are invisible to this sweep.
+/// (claimable again, `attempts` kept) with `locked_at` released — unless
+/// `attempts` has reached `max_attempts`, in which case the row is
+/// `discarded` with a `last_error` saying so. That bounds a poison job
+/// (one that aborts the process or never returns) to its attempt budget;
+/// the choice is made in the same statement as the write, so it is atomic.
+/// `run_at` is untouched, so a rescued job is due at once. Jobs in any other
+/// state are invisible to this sweep. The count covers both outcomes.
 ///
 /// # Errors
 ///
@@ -333,7 +339,14 @@ async fn discard(pool: &PgPool, id: Uuid, attempt: i32, error: &str) -> AppResul
 pub async fn rescue_stuck(pool: &PgPool, older_than: Duration) -> AppResult<u64> {
     let rescued = sqlx::query(
         "UPDATE jobs
-            SET state = 'retryable',
+            SET state = CASE
+                    WHEN attempts < max_attempts THEN 'retryable'
+                    ELSE 'discarded'
+                END,
+                last_error = CASE
+                    WHEN attempts < max_attempts THEN last_error
+                    ELSE 'lock expired at the attempt budget'
+                END,
                 locked_at = NULL,
                 updated_at = now()
           WHERE state = 'executing'
@@ -371,6 +384,8 @@ pub async fn cancel_pending(pool: &PgPool, unique_key: &str) -> AppResult<u64> {
 
 #[cfg(test)]
 mod fencing_tests;
+#[cfg(test)]
+mod rescue_tests;
 
 #[cfg(test)]
 mod tests {
@@ -871,12 +886,13 @@ mod tests {
         let waiting = fetch(&pool, running.id).await;
         assert_eq!(waiting.state, "retryable", "the row and its key stand");
 
-        let _backdated =
+        let rewound =
             sqlx::query("UPDATE jobs SET run_at = now() - interval '1 second' WHERE id = $1")
                 .bind(running.id)
                 .execute(&pool)
                 .await
                 .unwrap();
+        assert_eq!(rewound.rows_affected(), 1, "the retry was made due");
         let again = claim_next(&pool, &["scheduled"])
             .await
             .unwrap()

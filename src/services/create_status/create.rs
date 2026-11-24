@@ -215,10 +215,8 @@ pub(super) async fn quote_target(
     let row = status::get_by_id(&state.db, id)
         .await?
         .ok_or(AppError::NotFound)?;
-    let target = quoted_original(state, row).await?;
-    if !status_visibility::can_view(&state.db, &target, Some(user)).await? {
-        return Err(AppError::NotFound);
-    }
+    let original = quoted_original(state, row).await?;
+    let target = status_visibility::require_visible(&state.db, original, Some(user)).await?;
     if !matches!(target.visibility, Visibility::Public | Visibility::Unlisted)
         && target.user_id != user.id
     {

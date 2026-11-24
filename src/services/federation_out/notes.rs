@@ -79,7 +79,7 @@ pub(super) async fn note_publisher(state: &AppState, status: &Status) -> Option<
         return None;
     }
     let author = load_user(state, status.user_id).await?;
-    (author.local.get() && author.is_active.get()).then_some(author)
+    author.is_local_active().then_some(author)
 }
 
 /// Whether a status row is the kind this instance sends note activities

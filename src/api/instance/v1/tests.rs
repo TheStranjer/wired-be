@@ -137,7 +137,7 @@ fn the_empty_document_holds_the_instance_identity() {
     assert_eq!(document["email"], "", "an unconfigured email is empty");
     assert_eq!(
         document["thumbnail"],
-        "https://test.example/images/thumbnail.jpg"
+        "https://test.example/media/default/thumbnail.jpg"
     );
     assert_eq!(document["languages"], json!(["en"]), "the config languages");
     assert_eq!(document["registrations"], true, "open by default");
@@ -158,18 +158,20 @@ fn the_empty_document_holds_the_instance_identity() {
     );
 }
 
-/// Both documents' thumbnails hang under `FRONTEND_BASE_URL`, where the
-/// frontend ships the file, not under `BASE_URL`; the identity tests
-/// above pin the unchanged URL for the default config, where the
-/// variable is unset and the two origins are equal.
+/// Both documents' thumbnails hang under `MEDIA_BASE_URL`, where the
+/// backend serves the file, not under `FRONTEND_BASE_URL`; the identity
+/// tests above pin the URL for the default config.
 #[test]
-fn the_thumbnail_hangs_off_the_frontend_origin() {
+fn the_thumbnail_hangs_off_the_media_base_url() {
     let mut config = Config::for_tests();
+    config.media_base_url = "https://cdn.example/files".to_owned();
     config.frontend_base_url = "https://fe.example".to_owned();
     let stats = InstanceStats {
         users: 0,
         statuses: 0,
         domains: 0,
+        active_month: 0,
+        active_halfyear: 0,
     };
     let v1 = serde_json::to_value(Instance::build(
         &config,
@@ -180,9 +182,10 @@ fn the_thumbnail_hangs_off_the_frontend_origin() {
     ))
     .unwrap();
     let thumbnail = v1["thumbnail"].as_str().unwrap();
-    assert!(
-        thumbnail.starts_with("https://fe.example") && thumbnail.ends_with(THUMBNAIL_PATH),
-        "the v1 thumbnail follows FRONTEND_BASE_URL: {thumbnail}"
+    assert_eq!(
+        thumbnail,
+        format!("https://cdn.example/files{THUMBNAIL_PATH}"),
+        "the v1 thumbnail follows MEDIA_BASE_URL"
     );
     let v2 = serde_json::to_value(InstanceV2::build(
         &config,
@@ -193,9 +196,10 @@ fn the_thumbnail_hangs_off_the_frontend_origin() {
     ))
     .unwrap();
     let wrapped = v2["thumbnail"]["url"].as_str().unwrap();
-    assert!(
-        wrapped.starts_with("https://fe.example") && wrapped.ends_with(THUMBNAIL_PATH),
-        "the v2 thumbnail block follows FRONTEND_BASE_URL: {wrapped}"
+    assert_eq!(
+        wrapped,
+        format!("https://cdn.example/files{THUMBNAIL_PATH}"),
+        "the v2 thumbnail block follows MEDIA_BASE_URL"
     );
 }
 
@@ -207,6 +211,8 @@ fn invites_enabled_mirrors_the_config() {
         users: 0,
         statuses: 0,
         domains: 0,
+        active_month: 0,
+        active_halfyear: 0,
     };
     let mut config = Config::for_tests();
     config.invites_enabled = Toggle::new(true);
@@ -244,6 +250,8 @@ fn registration_modes_mirror_the_config() {
         users: 0,
         statuses: 0,
         domains: 0,
+        active_month: 0,
+        active_halfyear: 0,
     };
     let mut config = Config::for_tests();
     for (approval, activation) in [(false, false), (true, false), (false, true), (true, true)] {
@@ -345,7 +353,7 @@ fn limits_and_identity_follow_the_config() {
     config.contact_email = Some("admin@example.org".to_owned());
     config.instance_languages = vec!["en".to_owned(), "de".to_owned()];
     config.base_url = "http://snatter.example:4000".to_owned();
-    config.frontend_base_url = "http://snatter.example:4000".to_owned();
+    config.media_base_url = "http://snatter.example:4000/media".to_owned();
     config.max_status_chars = 300;
     config.max_media_attachments = 6;
     config.max_poll_options = 12;
@@ -355,6 +363,8 @@ fn limits_and_identity_follow_the_config() {
         users: 7,
         statuses: 11,
         domains: 3,
+        active_month: 2,
+        active_halfyear: 4,
     };
     let document = serde_json::to_value(Instance::build(
         &config,
@@ -378,7 +388,7 @@ fn limits_and_identity_follow_the_config() {
     );
     assert_eq!(
         document["thumbnail"],
-        "http://snatter.example:4000/images/thumbnail.jpg"
+        "http://snatter.example:4000/media/default/thumbnail.jpg"
     );
     assert_eq!(document["registrations"], false);
     assert_eq!(document["max_toot_chars"], 300);
@@ -425,6 +435,8 @@ fn empty_document_with_rules(rules: &[InstanceRule]) -> Instance {
         users: 0,
         statuses: 0,
         domains: 0,
+        active_month: 0,
+        active_halfyear: 0,
     };
     Instance::build(&config, &stats, rules, None, pleroma_block(&config))
 }
