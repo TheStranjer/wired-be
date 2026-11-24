@@ -212,6 +212,26 @@ async fn a_bare_user_has_the_documented_key_set() {
     );
 }
 
+/// The `featured` address the actor document advertises is a served
+/// collection: a peer matching a pin's `Add` target against it can read it.
+#[tokio::test]
+async fn the_advertised_featured_address_is_served() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let alice = common::create_local_user(&pool, "alice").await;
+    let document = fetch_actor(&pool, &alice).await;
+    let featured = document["featured"].as_str().expect("a featured address");
+    assert_eq!(featured, format!("{BASE}/users/alice/collections/featured"));
+    let path = featured
+        .strip_prefix(BASE)
+        .expect("the address is on this instance");
+    let app = common::test_app(pool);
+
+    let response = fetch_activity_json(&app, path).await;
+
+    common::assert_answer(&response, StatusCode::OK, "the advertised featured address");
+}
+
 /// `locked` is what `manuallyApprovesFollowers` means; it changes no key.
 #[tokio::test]
 async fn a_locked_user_approves_followers_manually() {

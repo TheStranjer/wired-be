@@ -143,7 +143,10 @@ mod tests {
         assert_eq!(activity["object"], featured_post.uri);
         assert_eq!(
             activity["target"],
-            alice.featured_url.expect("the fixture has a collection"),
+            alice
+                .featured_url
+                .clone()
+                .expect("the fixture has a collection"),
             "the target is the actor's own featured collection"
         );
         assert_eq!(activity["to"], json!([AS_PUBLIC]));
@@ -158,6 +161,11 @@ mod tests {
             "a fresh own-instance activity id: {id}"
         );
         assert_eq!(activity["published"], mastodon_time(&row.inserted_at));
+        let document = crate::federation::actor::actor_json(&alice, &state.config);
+        assert_eq!(
+            activity["target"], document["featured"],
+            "the target is the very collection the actor document advertises"
+        );
 
         run_publishes(&state, &pool).await;
         assert_eq!(
@@ -211,7 +219,7 @@ mod tests {
     }
 
     /// An actor row with no `featured_url` still gets a whole document:
-    /// the built `{ap_id}/featured` address rides the `target`.
+    /// the built `{ap_id}/collections/featured` address rides the `target`.
     #[tokio::test]
     async fn a_pin_without_a_stored_featured_url_names_the_built_address() {
         let db = crate::test_db::test_db().await.expect("test database slot");

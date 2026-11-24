@@ -28,14 +28,10 @@ use crate::{
         note::{LANGUAGE_UNDETERMINED, LITEPUB_SCHEMA_PATH, SECURITY_VOCABULARY},
         vocab::AS_VOCABULARY,
     },
-    models::user::{User, followers, following, inbox, outbox},
+    models::user::{User, featured, followers, following, inbox, outbox},
     util::time::mastodon_time,
 };
 
-/// Path appended to the actor id for the featured (pinned) collection, as
-/// Pleroma's `UserView` names it. Note this differs from
-/// [`crate::models::user::featured`], the column default's path.
-const FEATURED_PATH: &str = "/collections/featured";
 /// Fragment appended to the actor id for the key's own id (Pleroma's
 /// `common_actor_fields`, `"#{user.ap_id}#main-key"`).
 pub const MAIN_KEY_FRAGMENT: &str = "#main-key";
@@ -83,7 +79,7 @@ fn actor_fields(user: &User, config: &Config) -> Vec<(&'static str, Value)> {
         ("outbox", json!(outbox(ap_id))),
         ("followers", json!(followers(ap_id))),
         ("following", json!(following(ap_id))),
-        ("featured", json!(format!("{ap_id}{FEATURED_PATH}"))),
+        ("featured", json!(featured(ap_id))),
         ("endpoints", endpoints(config)),
         ("publicKey", public_key(user)),
         ("manuallyApprovesFollowers", json!(user.locked.get())),

@@ -34,7 +34,7 @@ pub(super) const STATUS_URI: &str =
 pub(super) const EMOJI_URL: &str = "https://test.example/emoji/railroad_track.png";
 /// The acting account's featured (pinned) collection, the `target` an
 /// `Add` or `Remove` names.
-pub(super) const FEATURED: &str = "https://test.example/users/alice/featured";
+pub(super) const FEATURED: &str = "https://test.example/users/alice/collections/featured";
 /// The instance actor's id, the `actor` a forwarded `Flag` carries.
 pub(super) const INSTANCE_AP: &str = "https://test.example/internal/fetch";
 /// Every fixture's creation moment, in the wire format.
