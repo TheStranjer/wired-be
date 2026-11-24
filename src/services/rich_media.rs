@@ -20,8 +20,10 @@
 //! only when the result is an `http(s)` URL: `data:` URIs and scheme-less
 //! protocol-relative values that do not resolve to `http(s)` are dropped.
 //! Title and description are cut to `MAX_CARD_TITLE` and
-//! `MAX_CARD_DESCRIPTION` characters. Every raw `og:*`/`twitter:*` pair
-//! found on the page rides along in [`Card::opengraph`], which
+//! `MAX_CARD_DESCRIPTION` characters. The first `MAX_RAW_META_PAIRS` raw
+//! `og:*`/`twitter:*` pairs found on the page (keys up to `MAX_RAW_META_KEY`
+//! characters, values cut to `MAX_RAW_META_VALUE`) ride along in
+//! [`Card::opengraph`], which
 //! [`card_json`] exposes under `pleroma.opengraph` the way Pleroma does.
 //!
 //! This root holds the card itself — [`Card`], its limits, [`card_json`]'s
@@ -51,6 +53,15 @@ const MAX_CARD_TITLE: usize = 255;
 
 /// Maximum number of characters kept from a card description.
 const MAX_CARD_DESCRIPTION: usize = 500;
+
+/// Maximum number of keys kept in a card's raw Open Graph map.
+const MAX_RAW_META_PAIRS: usize = 32;
+
+/// Maximum number of characters kept from one raw Open Graph value.
+const MAX_RAW_META_VALUE: usize = 1000;
+
+/// Maximum number of characters in a raw Open Graph key; longer keys are skipped.
+const MAX_RAW_META_KEY: usize = 64;
 
 /// The prefixes of the raw Open Graph and Twitter-card pairs kept on a [`Card`].
 const RAW_META_PREFIXES: [&str; 2] = ["og:", "twitter:"];
