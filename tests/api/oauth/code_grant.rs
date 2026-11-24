@@ -3,35 +3,16 @@
 //! a refused exchange leaves the code usable, and a missing URI is as
 //! wrong as a different one.
 
-use axum::{Router, http::StatusCode};
+use axum::http::StatusCode;
 use serde_json::{Value, json};
 use wired_be::models::oauth_app::OauthApp;
 
-use super::authorize_get::{consent_form, query_param, register_app};
+use super::authorize_get::{issue_code, register_app};
 use super::support::{PASSWORD, REDIRECT, error_text, post_json};
 use crate::common;
 
 /// A second URI the same client registers, never the one a code is issued for.
 const OTHER_REDIRECT: &str = "https://client.example/other";
-
-/// Approves a consent for `username` delivering to `redirect_uri`, and
-/// returns the code the redirect carries.
-async fn authorize_code(
-    http: &Router,
-    app: &OauthApp,
-    username: &str,
-    redirect_uri: &str,
-) -> String {
-    let mut fields = consent_form(app, username, PASSWORD, &["read"], None);
-    fields[1] = ("authorization[redirect_uri]", redirect_uri);
-    let response = common::TestRequest::post("/oauth/authorize")
-        .form(&fields)
-        .send(http)
-        .await;
-    assert_eq!(response.status, StatusCode::FOUND, "the consent redirects");
-    let location = response.header("location").expect("a Location header");
-    query_param(location, "code").expect("the redirect carries a code")
-}
 
 /// The exchange body for `code`, presenting `redirect_uri` when given.
 fn exchange_body(app: &OauthApp, code: &str, redirect_uri: Option<&str>) -> Value {
@@ -53,7 +34,7 @@ fn exchange_body(app: &OauthApp, code: &str, redirect_uri: Option<&str>) -> Valu
 async fn a_code_redeems_only_with_the_redirect_uri_it_was_issued_for() {
     let db = common::test_db().await;
     let pool = db.pool().clone();
-    let _rhea = common::create_user_with_password(&pool, "rhea", PASSWORD).await;
+    let rhea = common::create_user_with_password(&pool, "rhea", PASSWORD).await;
     let app = register_app(
         &pool,
         "Two URIs",
@@ -62,7 +43,7 @@ async fn a_code_redeems_only_with_the_redirect_uri_it_was_issued_for() {
     )
     .await;
     let http = common::test_app(pool.clone());
-    let code = authorize_code(&http, &app, "rhea", REDIRECT).await;
+    let code = issue_code(&pool, &rhea, &app, "read", REDIRECT).await;
 
     let other = post_json(&http, &exchange_body(&app, &code, Some(OTHER_REDIRECT))).await;
     assert_eq!(

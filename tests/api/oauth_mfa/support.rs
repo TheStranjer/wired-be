@@ -18,6 +18,7 @@ use uuid::Uuid;
 use wired_be::{
     config::DEFAULT_OAUTH_TOKEN_TTL_SECS,
     models::{
+        mfa_token,
         oauth_app::{self, NewOauthApp, OauthApp},
         oauth_token::{self, OauthAuthorization},
         user::{User, mfa},
@@ -29,7 +30,7 @@ use wired_be::{
 const PASSWORD: &str = "correct horse battery staple";
 /// The redirect URI the standard app fixture registers.
 const REDIRECT: &str = "https://client.example/callback";
-/// The out-of-band redirect URI: the code is shown on a page instead of
+/// The out-of-band redirect URI: the code is answered as JSON instead of
 /// redirected.
 const OOB: &str = "urn:ietf:wg:oauth:2.0:oob";
 /// The error body every failed challenge shares (Pleroma's
@@ -253,26 +254,42 @@ fn assert_invalid_code(response: &common::TestResponse, what: &str) {
     assert_no_store(response);
 }
 
-/// The urlencoded `POST /oauth/authorize` consent form logging in as
-/// `nickname`/[`PASSWORD`], approving `scope` and round-tripping `state`
-/// (absent when `None`) to `REDIRECT`.
-fn authorize_form<'a>(
-    app: &'a OauthApp,
-    nickname: &'a str,
-    scope: &'a str,
-    state: Option<&'a str>,
-) -> Vec<(&'a str, &'a str)> {
-    let mut fields = vec![
-        ("authorization[client_id]", app.client_id.as_str()),
-        ("authorization[redirect_uri]", REDIRECT),
-        ("authorization[name]", nickname),
-        ("authorization[password]", PASSWORD),
-        ("authorization[scope][]", scope),
+/// Parks what the MFA detour of an external login parks (the `read`
+/// authorization bound to `redirect_uri`, and the challenge linking it for
+/// `user`) and returns the `/oauth/mfa?…` location the browser is sent
+/// to, carrying `state` when given.
+///
+/// # Panics
+///
+/// If either insert fails.
+async fn park_detour(
+    pool: &PgPool,
+    app: &OauthApp,
+    user: &User,
+    redirect_uri: &str,
+    state: Option<&str>,
+) -> String {
+    let scope = "read";
+    let authorization =
+        oauth_token::create_authorization(pool, user.id, app.id, scope, redirect_uri)
+            .await
+            .expect("the authorization parks");
+    let challenge = mfa_token::create(pool, user.id, Some(authorization.id))
+        .await
+        .expect("the challenge parks");
+    let mut params = vec![
+        ("mfa_token", challenge.token.as_str()),
+        ("client_id", app.client_id.as_str()),
+        ("scope", scope),
+        ("redirect_uri", redirect_uri),
     ];
     if let Some(client_state) = state {
-        fields.push(("authorization[state]", client_state));
+        params.push(("state", client_state));
     }
-    fields
+    let query = url::form_urlencoded::Serializer::new(String::new())
+        .extend_pairs(params)
+        .finish();
+    format!("/oauth/mfa?{query}")
 }
 
 /// The `POST /oauth/mfa/verify` form: the challenge submission plus the
@@ -296,14 +313,6 @@ fn verify_form<'a>(
     fields
 }
 
-/// Posts the consent form.
-async fn post_authorize(http: &Router, fields: &[(&str, &str)]) -> common::TestResponse {
-    common::TestRequest::post("/oauth/authorize")
-        .form(fields)
-        .send(http)
-        .await
-}
-
 /// Posts the verification form.
 async fn post_verify(http: &Router, fields: &[(&str, &str)]) -> common::TestResponse {
     common::TestRequest::post("/oauth/mfa/verify")
@@ -319,20 +328,6 @@ fn query_param(url: &str, key: &str) -> Option<String> {
         .into_owned()
         .find(|(name, _)| name == key)
         .map(|(_, value)| value)
-}
-
-/// The code shown on the out-of-band page, between its markers.
-///
-/// # Panics
-///
-/// If the body holds no `<code id="authorization-code">` element.
-fn oob_page_code(body: &str) -> &str {
-    body.split_once("<code id=\"authorization-code\">")
-        .expect("the oob page shows the code")
-        .1
-        .split_once("</code>")
-        .expect("the code element is closed")
-        .0
 }
 
 /// Registers an app with the given `redirect_uris` and `scopes` (the

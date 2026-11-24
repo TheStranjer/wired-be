@@ -22,12 +22,11 @@ async fn wrong_challenges(http: &Router, app: &OauthApp, token: &str, secret: &s
     }
 }
 
-/// Starts the browser flow for `nickname` and returns the challenge token
+/// Parks the browser flow's challenge for `user` and returns the token
 /// the detour redirect carries.
-async fn browser_challenge(http: &Router, app: &OauthApp, nickname: &str) -> String {
-    let detour = post_authorize(http, &authorize_form(app, nickname, "read", None)).await;
-    let location = detour.header("location").expect("a Location header");
-    query_param(location, "mfa_token").expect("the challenge token rides along")
+async fn browser_challenge(pool: &PgPool, app: &OauthApp, user: &User) -> String {
+    let location = park_detour(pool, app, user, REDIRECT, None).await;
+    query_param(&location, "mfa_token").expect("the challenge token rides along")
 }
 
 /// Sends `count` wrong TOTP codes to `/oauth/mfa/verify` for `token`,
@@ -138,7 +137,7 @@ async fn five_wrong_codes_burn_the_browser_challenge() {
     let fix = mfa_account(&pool, "laura").await;
     let app = common::create_app(&pool, "read").await;
     let http = common::test_app(pool.clone());
-    let token = browser_challenge(&http, &app, "laura").await;
+    let token = browser_challenge(&pool, &app, &fix.user).await;
 
     wrong_verifications(&http, &token, &fix.secret, cap()).await;
     assert!(
@@ -174,7 +173,7 @@ async fn four_wrong_codes_leave_the_browser_challenge_usable() {
     let fix = mfa_account(&pool, "mallory").await;
     let app = common::create_app(&pool, "read").await;
     let http = common::test_app(pool.clone());
-    let token = browser_challenge(&http, &app, "mallory").await;
+    let token = browser_challenge(&pool, &app, &fix.user).await;
 
     wrong_verifications(&http, &token, &fix.secret, cap() - 1).await;
     let finished = post_verify(

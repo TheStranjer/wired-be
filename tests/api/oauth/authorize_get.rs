@@ -1,21 +1,33 @@
-//! `GET /oauth/authorize` (Pleroma's `OAuthController.authorize`): the
-//! consent page's render and its escaping of every dynamic value, and the
-//! 400 "Invalid client", "Invalid `redirect_uri`", "Invalid scope" and
-//! `unsupported_response_type` refusals. The app registration, the consent
-//! form body, the query readers, the oob code extractor, the cache
-//! assertion and the code counter are `pub(super)` because the POST
-//! submodule's approval tests flow through them.
+//! `GET /oauth/authorize` from a browser (Pleroma's
+//! `OAuthController.authorize`): the request is validated and the browser
+//! is sent on to the frontend's consent screen at
+//! `{FRONTEND_BASE_URL}/oauth/authorize` with its query intact; a request
+//! that fails validation is the JSON 400 ("Invalid client", "Invalid
+//! `redirect_uri`", "Invalid scope", `unsupported_response_type`) and
+//! never a redirect. The app registration, the query readers, the code
+//! issuer, the cache assertion and the code counter are `pub(super)`
+//! because the other authorize submodules flow through them.
 
 use axum::http::StatusCode;
 use sqlx::PgPool;
-use wired_be::models::oauth_app::{self, NewOauthApp, OauthApp};
+use wired_be::models::{
+    oauth_app::{self, NewOauthApp, OauthApp},
+    oauth_token,
+    user::User,
+};
 
 use super::support::{REDIRECT, error_text, fixtures};
 use crate::common;
 
-/// The urlencoded `GET /oauth/authorize` consent URL for `client_id`:
-/// the code flow delivering to `redirect`, asking `scope` and carrying
-/// the already-encoded `state`; an empty `state` omits the parameter.
+/// The frontend origin the redirect tests configure.
+const FRONTEND: &str = "https://fe.example";
+/// The `Accept` header a browser navigation sends.
+const BROWSER_ACCEPT: &str = "text/html,application/xhtml+xml,*/*;q=0.8";
+
+/// The urlencoded `GET /oauth/authorize` URL for `client_id`: the code
+/// flow delivering to `redirect`, asking `scope` and carrying the
+/// already-encoded `state`; an empty `scope` or `state` omits the
+/// parameter.
 fn authorize_get_url(client_id: &str, redirect: &str, scope: &str, state: &str) -> String {
     let mut url = format!(
         "/oauth/authorize?response_type=code&client_id={client_id}&redirect_uri={redirect}"
@@ -31,6 +43,14 @@ fn authorize_get_url(client_id: &str, redirect: &str, scope: &str, state: &str) 
         url.push_str(state);
     }
     url
+}
+
+/// The real router with the frontend at [`FRONTEND`], so the redirect
+/// target is not the API's own origin.
+fn frontend_app(pool: PgPool) -> axum::Router {
+    let mut config = common::test_config();
+    config.frontend_base_url = FRONTEND.to_owned();
+    common::test_app_with_config(pool, config)
 }
 
 /// Registers an app named `name` with `redirect_uris` and `scopes`
@@ -60,30 +80,24 @@ pub(super) async fn register_app(
     .expect("app registration inserts")
 }
 
-/// The consent form body logging in as `name`/`password` for `app`,
-/// approving `scopes` and carrying `state` when given. Callers tweak
-/// the entries (the redirect URI) or push more (`authorization[deny]`)
-/// as the flow under test needs.
-pub(super) fn consent_form<'a>(
-    app: &'a OauthApp,
-    name: &'a str,
-    password: &'a str,
-    scopes: &[&'a str],
-    state: Option<&'a str>,
-) -> Vec<(&'a str, &'a str)> {
-    let mut fields = vec![
-        ("authorization[client_id]", app.client_id.as_str()),
-        ("authorization[redirect_uri]", REDIRECT),
-        ("authorization[name]", name),
-        ("authorization[password]", password),
-    ];
-    for scope in scopes {
-        fields.push(("authorization[scope][]", scope));
-    }
-    if let Some(state) = state {
-        fields.push(("authorization[state]", state));
-    }
-    fields
+/// Mints an authorization code for `user` and `app`, approved for
+/// `scopes` and bound to `redirect_uri`, the way the frontend's approval
+/// does, and returns its text.
+///
+/// # Panics
+///
+/// If the insert fails.
+pub(super) async fn issue_code(
+    pool: &PgPool,
+    user: &User,
+    app: &OauthApp,
+    scopes: &str,
+    redirect_uri: &str,
+) -> String {
+    oauth_token::create_authorization(pool, user.id, app.id, scopes, redirect_uri)
+        .await
+        .expect("the authorization inserts")
+        .token
 }
 
 /// The urlencoded query pairs of a redirect target, decoded.
@@ -100,20 +114,6 @@ pub(super) fn query_param(url: &str, key: &str) -> Option<String> {
         .into_iter()
         .find(|(name, _)| name == key)
         .map(|(_, value)| value)
-}
-
-/// The code shown on the out-of-band page, between its markers.
-///
-/// # Panics
-///
-/// If the body holds no `<code id="authorization-code">` element.
-pub(super) fn oob_page_code(body: &str) -> &str {
-    body.split_once("<code id=\"authorization-code\">")
-        .expect("the oob page shows the code")
-        .1
-        .split_once("</code>")
-        .expect("the code element is closed")
-        .0
 }
 
 /// Assert the `Cache-Control: no-store` every authorize answer carries,
@@ -139,137 +139,98 @@ pub(super) async fn authorization_count(pool: &PgPool) -> i64 {
     rows
 }
 
-/// The full consent page a valid `GET` renders: the form posting to
-/// `/oauth/authorize` with the login fields, one checked box per
-/// requested scope, and the `client_id`/`redirect_uri`/`state`
-/// round-trip fields — plus the no-store header.
+/// A valid browser request is a 302 to the frontend's consent screen:
+/// `{FRONTEND_BASE_URL}/oauth/authorize` with the original parameters
+/// urlencoded again, in order, and no code minted yet.
 #[tokio::test]
-async fn get_authorize_renders_the_consent_form() {
+async fn browser_get_redirects_to_the_frontend() {
     let db = common::test_db().await;
     let pool = db.pool().clone();
     let (_user, app) = fixtures(&pool, "nina", "read write").await;
-    let http = common::test_app(pool.clone());
+    let http = frontend_app(pool.clone());
     let response = common::TestRequest::get(&authorize_get_url(
         &app.client_id,
         REDIRECT,
         "read+write",
         "xyz",
     ))
+    .header("accept", BROWSER_ACCEPT)
     .send(&http)
     .await;
 
-    assert_eq!(response.status, StatusCode::OK, "a valid request renders");
-    assert_eq!(
-        response.header("content-type"),
-        Some("text/html; charset=utf-8"),
-        "as a self-contained HTML page"
-    );
+    assert_eq!(response.status, StatusCode::FOUND, "a valid request");
     assert_cache_no_store(&response);
-
-    let body = response.text();
-    assert!(
-        body.contains("<form method=\"post\" action=\"/oauth/authorize\">"),
-        "the form posts back to /oauth/authorize"
-    );
-    assert!(
-        body.contains("<strong>Test Client</strong> is requesting access to your account."),
-        "the text names the app: {body}"
-    );
-    for field in [
-        "name=\"authorization[name]\"",
-        "name=\"authorization[password]\"",
-        "name=\"authorization[deny]\"",
-        "type=\"password\"",
-    ] {
-        assert!(body.contains(field), "the form carries `{field}`");
-    }
     assert_eq!(
-        body.matches("name=\"authorization[scope][]\"").count(),
-        2,
-        "one checkbox per requested scope"
+        response.header("location"),
+        Some(
+            format!(
+                "{FRONTEND}/oauth/authorize?response_type=code&client_id={}\
+                 &redirect_uri=https%3A%2F%2Fclient.example%2Fcallback\
+                 &scope=read+write&state=xyz",
+                app.client_id
+            )
+            .as_str()
+        ),
+        "the frontend's authorize page with the query preserved"
     );
-    assert!(body.contains("value=\"read\" checked"), "read is checked");
-    assert!(body.contains("value=\"write\" checked"), "so is write");
-    assert!(
-        body.contains(&format!(
-            "name=\"authorization[client_id]\" value=\"{}\">",
-            app.client_id
-        )),
-        "the client id round-trips"
-    );
-    assert!(
-        body.contains(&format!(
-            "name=\"authorization[redirect_uri]\" value=\"{REDIRECT}\">"
-        )),
-        "so does the redirect uri"
-    );
-    assert!(
-        body.contains("name=\"authorization[state]\" value=\"xyz\">"),
-        "and so does the state"
-    );
-    assert!(body.contains("<html lang=\"en\">"), "the default language");
+    assert_eq!(authorization_count(&pool).await, 0, "nothing minted yet");
 }
 
-/// Without a `scope` parameter the page offers the default, `read` —
-/// as a single checkbox.
+/// Every parameter survives the redirect decoded-equal: awkward `state`
+/// characters, a missing `scope` (the frontend applies the default) and
+/// parameters this server does not read, such as a PKCE challenge.
 #[tokio::test]
-async fn get_authorize_defaults_the_scope_to_read() {
+async fn browser_get_keeps_the_whole_query() {
     let db = common::test_db().await;
     let pool = db.pool().clone();
     let (_user, app) = fixtures(&pool, "oscar", "read write").await;
-    let http = common::test_app(pool.clone());
-    let response = common::TestRequest::get(&authorize_get_url(&app.client_id, REDIRECT, "", ""))
-        .send(&http)
-        .await;
+    let http = frontend_app(pool.clone());
+    let path = format!(
+        "{}&state=a%20b%26c%3Dd&code_challenge=xyz&code_challenge_method=S256",
+        authorize_get_url(&app.client_id, REDIRECT, "", "")
+    );
+    let response = common::TestRequest::get(&path).send(&http).await;
 
-    assert_eq!(response.status, StatusCode::OK, "read fits anywhere");
-    let body = response.text();
+    assert_eq!(response.status, StatusCode::FOUND, "read fits anywhere");
+    let location = response.header("location").expect("a Location header");
+    assert!(
+        location.starts_with(&format!("{FRONTEND}/oauth/authorize?")),
+        "on the frontend: {location}"
+    );
     assert_eq!(
-        body.matches("name=\"authorization[scope][]\"").count(),
-        1,
-        "just the default"
+        query_pairs(location),
+        query_pairs(&path),
+        "the same pairs in the same order"
+    );
+    assert_eq!(
+        query_param(location, "state").as_deref(),
+        Some("a b&c=d"),
+        "the awkward state decodes to what the client sent"
     );
     assert!(
-        body.contains("value=\"read\" checked"),
-        "the default is checked"
+        query_param(location, "scope").is_none(),
+        "no scope invented"
     );
-    assert!(!body.contains("value=\"write\""), "write was not asked for");
 }
 
-/// A malicious app name, `state` and `lang` come back HTML-escaped:
-/// none of them can open a tag or break out of its attribute.
+/// The redirect does not depend on what the browser says it accepts: no
+/// `Accept` header at all redirects too.
 #[tokio::test]
-async fn get_authorize_escapes_every_dynamic_value() {
+async fn browser_get_without_an_accept_header_redirects() {
     let db = common::test_db().await;
     let pool = db.pool().clone();
-    let app = register_app(&pool, "<script>evil</script>", REDIRECT, "read").await;
-    let http = common::test_app(pool.clone());
-    let response = common::TestRequest::get(&format!(
-        "/oauth/authorize?response_type=code&client_id={}&redirect_uri={}\
-         &state=%22%3E%3Cscript%3Ealert%28%27xss%27%29%3C%2Fscript%3E\
-         &lang=de%22onload%3D%22x",
-        app.client_id, REDIRECT
-    ))
-    .send(&http)
-    .await;
-
-    assert_eq!(response.status, StatusCode::OK, "the page still renders");
-    let body = response.text();
+    let (_user, app) = fixtures(&pool, "olga", "read").await;
+    let http = frontend_app(pool.clone());
+    let response =
+        common::TestRequest::get(&authorize_get_url(&app.client_id, REDIRECT, "read", ""))
+            .send(&http)
+            .await;
+    assert_eq!(response.status, StatusCode::FOUND, "redirected");
     assert!(
-        !body.contains("<script"),
-        "nothing in the page opens a script"
-    );
-    assert!(
-        body.contains("&lt;script&gt;evil&lt;/script&gt;"),
-        "the app name shows escaped"
-    );
-    assert!(
-        body.contains("value=\"&quot;&gt;&lt;script&gt;alert(&#39;xss&#39;)&lt;/script&gt;\""),
-        "the state shows escaped inside its attribute"
-    );
-    assert!(
-        body.contains("<html lang=\"de&quot;onload=&quot;x\">"),
-        "even the language attribute cannot be broken out of"
+        response
+            .header("location")
+            .is_some_and(|value| value.starts_with(FRONTEND)),
+        "to the configured frontend"
     );
 }
 
@@ -279,7 +240,7 @@ async fn get_authorize_refuses_unknown_clients() {
     let db = common::test_db().await;
     let pool = db.pool().clone();
     let (_user, _app) = fixtures(&pool, "peggy", "read").await;
-    let http = common::test_app(pool.clone());
+    let http = frontend_app(pool.clone());
 
     let unknown =
         common::TestRequest::get(&authorize_get_url("no-such-client", REDIRECT, "read", ""))
@@ -287,6 +248,7 @@ async fn get_authorize_refuses_unknown_clients() {
             .await;
     assert_eq!(unknown.status, StatusCode::BAD_REQUEST, "a 400");
     assert_eq!(error_text(&unknown), "Invalid client", "Pleroma's body");
+    assert!(unknown.header("location").is_none(), "never a redirect");
     assert_cache_no_store(&unknown);
 
     let missing = common::TestRequest::get(&format!(
@@ -300,17 +262,19 @@ async fn get_authorize_refuses_unknown_clients() {
         "a request without any client_id"
     );
     assert_eq!(error_text(&missing), "Invalid client", "is refused alike");
+    assert!(missing.header("location").is_none(), "never a redirect");
 }
 
 /// A `redirect_uri` that is not one of the app's registered URIs — not
 /// even a prefix or an extended spelling — is the 400
-/// "Invalid `redirect_uri`".
+/// "Invalid `redirect_uri`" as JSON, with no `Location` header: the
+/// browser is never bounced to an unvalidated target.
 #[tokio::test]
 async fn get_authorize_refuses_unregistered_redirect_uris() {
     let db = common::test_db().await;
     let pool = db.pool().clone();
     let (_user, app) = fixtures(&pool, "quinn", "read").await;
-    let http = common::test_app(pool.clone());
+    let http = frontend_app(pool.clone());
     for unregistered in [
         "https://evil.example/callback",
         "https://client.example",
@@ -320,6 +284,7 @@ async fn get_authorize_refuses_unregistered_redirect_uris() {
     ] {
         let response =
             common::TestRequest::get(&authorize_get_url(&app.client_id, unregistered, "read", ""))
+                .header("accept", BROWSER_ACCEPT)
                 .send(&http)
                 .await;
         assert_eq!(
@@ -328,6 +293,10 @@ async fn get_authorize_refuses_unregistered_redirect_uris() {
             "`{unregistered}` is refused"
         );
         assert_eq!(error_text(&response), "Invalid redirect_uri", "by name");
+        assert!(
+            response.header("location").is_none(),
+            "`{unregistered}` is not redirected to"
+        );
         assert_cache_no_store(&response);
     }
 }
@@ -339,7 +308,7 @@ async fn get_authorize_refuses_scopes_outside_the_registration() {
     let db = common::test_db().await;
     let pool = db.pool().clone();
     let (_user, app) = fixtures(&pool, "rosa", "read").await;
-    let http = common::test_app(pool.clone());
+    let http = frontend_app(pool.clone());
     let broad = common::TestRequest::get(&authorize_get_url(
         &app.client_id,
         REDIRECT,
@@ -350,6 +319,7 @@ async fn get_authorize_refuses_scopes_outside_the_registration() {
     .await;
     assert_eq!(broad.status, StatusCode::BAD_REQUEST, "unregistered write");
     assert_eq!(error_text(&broad), "Invalid scope", "is Invalid scope");
+    assert!(broad.header("location").is_none(), "never a redirect");
     assert_cache_no_store(&broad);
 
     let write_only = common::create_app(&pool, "write").await;
@@ -372,7 +342,7 @@ async fn get_authorize_requires_the_code_response_type() {
     let db = common::test_db().await;
     let pool = db.pool().clone();
     let (_user, app) = fixtures(&pool, "steve", "read").await;
-    let http = common::test_app(pool.clone());
+    let http = frontend_app(pool.clone());
 
     let other = common::TestRequest::get(&format!(
         "/oauth/authorize?response_type=token&client_id={}&redirect_uri={REDIRECT}",
@@ -386,6 +356,7 @@ async fn get_authorize_requires_the_code_response_type() {
         "unsupported_response_type",
         "is refused by its RFC name"
     );
+    assert!(other.header("location").is_none(), "never a redirect");
     assert_cache_no_store(&other);
 
     let absent = common::TestRequest::get(&format!(
