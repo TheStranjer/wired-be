@@ -23,6 +23,8 @@ use super::{FetchError, REFRESH_AFTER, error::server_error, fetch::fetch_and_sto
 pub use by_acct::get_or_fetch_by_acct;
 pub use by_ap_id::get_or_fetch_by_ap_id;
 
+pub(in crate::federation::fetch_actor) use by_acct::dev_webfinger_base;
+
 /// Refetches `user`'s actor document and updates the mirror right away,
 /// ignoring the 24-hour freshness window (Pleroma's
 /// `UserRefreshWorker` performs the same forced refresh).

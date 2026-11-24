@@ -15,7 +15,7 @@ use crate::{
         remote_actor::{parse_actor, upsert_remote_user},
     },
     http_client::HttpClient,
-    models::user::User,
+    models::user::{User, get_by_ap_id},
     state::AppState,
 };
 
@@ -23,6 +23,8 @@ use super::{
     ACTIVITY_JSON, ACTIVITYSTREAMS_PROFILE, ACTOR_ACCEPT, FetchError, LD_JSON, MAX_BODY_BYTES,
     STATUS_GONE, STATUS_NOT_FOUND,
     containment::{ensure_not_redirected, ensure_same_host, names_served_url},
+    error::server_error,
+    handle::confirm_nickname,
     signer::{Signer, fetch_signer, sign_get},
 };
 
@@ -164,11 +166,19 @@ fn document_id(document: &Value) -> Result<&str, FetchError> {
 /// With `SIGN_FETCHES` on (the default) every `GET` carries the instance
 /// actor's HTTP Signature, so peers in authorized-fetch mode answer; with
 /// it off the dereference goes out unsigned, like Pleroma's default.
+///
+/// The nickname the parser derives (`preferredUsername@<id host>`) is run
+/// through [`confirm_nickname`] before the write, so a split-domain
+/// account keeps the handle its `WebFinger` answer gave it.
 pub(super) async fn fetch_and_store(state: &AppState, ap_id: &str) -> Result<User, FetchError> {
     let signer = fetch_signer(state).await?;
     let document = fetch_actor_json(&state.http_client, ap_id, signer.as_ref()).await?;
     let document = mrf::filter_actor(state, document).await;
-    let new_user = parse_actor(&document).map_err(FetchError::from)?;
+    let mut new_user = parse_actor(&document).map_err(FetchError::from)?;
+    let stored = get_by_ap_id(&state.db, &new_user.ap_id)
+        .await
+        .map_err(|err| server_error(&err))?;
+    confirm_nickname(state, stored.as_ref(), &mut new_user).await;
     let user = upsert_remote_user(&state.db, new_user)
         .await
         .map_err(FetchError::from)?;
