@@ -4,10 +4,13 @@
 //! on `id`; the read that genuinely needs the due-time order is
 //! [`fetch_due`](super::fetch_due).
 
-use sqlx::{PgPool, Postgres, QueryBuilder};
+use sqlx::PgPool;
 use uuid::Uuid;
 
-use crate::{error::AppResult, pagination::PageParams};
+use crate::{
+    error::AppResult,
+    pagination::{PageParams, keyset_page_by},
+};
 
 use super::ScheduledStatus;
 
@@ -48,16 +51,7 @@ pub async fn page_for_user(
     user_id: Uuid,
     page: PageParams,
 ) -> AppResult<Vec<ScheduledStatus>> {
-    let mut builder = QueryBuilder::<Postgres>::new(PAGE_SQL);
-    // The builder's push methods hand back `&mut Self` for chaining; binding
-    // the result keeps these statements from being unused (decision 14).
-    let _bound: &mut _ = builder.push_bind(user_id);
-    page.apply_keyset(&mut builder, "id");
-    let rows = builder
-        .build_query_as::<ScheduledStatus>()
-        .fetch_all(pool)
-        .await?;
-    Ok(page.finish(rows))
+    keyset_page_by(pool, PAGE_SQL, user_id, "id", &page).await
 }
 
 #[cfg(test)]

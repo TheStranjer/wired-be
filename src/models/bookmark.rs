@@ -55,7 +55,7 @@ use uuid::Uuid;
 use crate::{
     error::AppResult,
     models::status::{self, Status},
-    pagination::PageParams,
+    pagination::{PageParams, keyset_page},
     util::id::new_id,
 };
 
@@ -90,7 +90,7 @@ const FLAGGED_IDS_SQL: &str = "SELECT status_id, folder_id FROM bookmarks
 /// [`status::get_many`] in a second read, so the keyset stays a plain walk
 /// of the `(user_id, id desc)` pair the table's migration indexes. The
 /// text stops where its one placeholder belongs, because that is where
-/// [`page_rows`] pushes its bind and the builder is what numbers it `$1`;
+/// [`page_for_user`] pushes its bind and the builder is what numbers it `$1`;
 /// the folder clause and the keyset it then append run on `b.folder_id`
 /// and the bookmark id `b.id`.
 const BOOKMARKS_PAGE_SQL: &str = "SELECT b.* FROM bookmarks b
@@ -270,7 +270,14 @@ pub async fn page_for_user(
     page: PageParams,
     folder_id: Option<Uuid>,
 ) -> AppResult<Vec<(Bookmark, Status)>> {
-    let bookmarks = page_rows(pool, user_id, folder_id, &page).await?;
+    let mut builder = QueryBuilder::<Postgres>::new(BOOKMARKS_PAGE_SQL);
+    // The builder's push methods hand back `&mut Self` for chaining; binding
+    // it keeps the statement from having an unused result (decision 14).
+    let _bound: &mut _ = builder.push_bind(user_id);
+    if let Some(folder) = folder_id {
+        let _narrowed: &mut _ = builder.push(" AND b.folder_id = ").push_bind(folder);
+    }
+    let bookmarks: Vec<Bookmark> = keyset_page(pool, builder, "b.id", &page).await?;
     let status_ids: Vec<Uuid> = bookmarks.iter().map(|row| row.status_id).collect();
     let live = status::get_many(pool, &status_ids).await?;
     let mut by_id: HashMap<Uuid, Status> = live.into_iter().map(|row| (row.id, row)).collect();
@@ -318,28 +325,6 @@ pub async fn backup_page(
         .fetch_all(pool)
         .await?;
     Ok(rows)
-}
-
-/// One keyset page of `user_id`'s bookmarks, optionally narrowed to
-/// `folder_id`: the same builder walk [`crate::models::favourite`] uses —
-/// the statement text stops at the bind, the keyset runs on the bookmark
-/// id `b.id`, and a `min_id` page comes back flipped to newest-first.
-async fn page_rows(
-    pool: &PgPool,
-    user_id: Uuid,
-    folder_id: Option<Uuid>,
-    page: &PageParams,
-) -> AppResult<Vec<Bookmark>> {
-    let mut builder = QueryBuilder::<Postgres>::new(BOOKMARKS_PAGE_SQL);
-    // The builder's push methods hand back `&mut Self` for chaining; binding
-    // it keeps the statement from having an unused result (decision 14).
-    let _bound: &mut _ = builder.push_bind(user_id);
-    if let Some(folder) = folder_id {
-        let _narrowed: &mut _ = builder.push(" AND b.folder_id = ").push_bind(folder);
-    }
-    page.apply_keyset(&mut builder, "b.id");
-    let rows = builder.build_query_as::<Bookmark>().fetch_all(pool).await?;
-    Ok(page.finish(rows))
 }
 
 #[cfg(test)]

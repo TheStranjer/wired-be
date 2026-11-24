@@ -1,10 +1,14 @@
 //! The read side of mutes: the existence check, the id sets and the page.
 
-use sqlx::{PgPool, Postgres, QueryBuilder};
+use sqlx::PgPool;
 use uuid::Uuid;
 
 use super::{Mute, MuteUserRow, into_entry};
-use crate::{error::AppResult, models::user::User, pagination::PageParams};
+use crate::{
+    error::AppResult,
+    models::user::User,
+    pagination::{PageParams, keyset_page_by},
+};
 
 /// [`is_muting`]: the one directional fact, asked as an existence check so a
 /// muter never costs more than a `true`. The expiry clause is what makes a
@@ -130,16 +134,8 @@ pub async fn muting_page(
     muter: Uuid,
     page: PageParams,
 ) -> AppResult<Vec<(Mute, User)>> {
-    let mut builder = QueryBuilder::<Postgres>::new(PAGE_SQL);
-    // The builder's push methods hand back `&mut Self` for chaining; binding
-    // it keeps the statement from having an unused result (decision 14).
-    let _bound: &mut _ = builder.push_bind(muter);
-    page.apply_keyset(&mut builder, "m.id");
-    let rows = builder
-        .build_query_as::<MuteUserRow>()
-        .fetch_all(pool)
-        .await?;
-    Ok(page.finish(rows).into_iter().map(into_entry).collect())
+    let rows: Vec<MuteUserRow> = keyset_page_by(pool, PAGE_SQL, muter, "m.id", &page).await?;
+    Ok(rows.into_iter().map(into_entry).collect())
 }
 
 #[cfg(test)]

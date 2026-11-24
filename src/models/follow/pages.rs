@@ -1,11 +1,14 @@
 //! The keyset-paged relationship listings: [`followers_page`] and
 //! [`following_page`] walk the accepted pairs, newest relationship first,
-//! through the shared [`page_rows`].
+//! through the shared [`keyset_page_by`].
 
-use sqlx::{FromRow, PgPool, Postgres, QueryBuilder, postgres::PgRow};
+use sqlx::PgPool;
 use uuid::Uuid;
 
-use crate::{error::AppResult, pagination::PageParams};
+use crate::{
+    error::AppResult,
+    pagination::{PageParams, keyset_page_by},
+};
 
 use super::types::FollowPageEntry;
 
@@ -13,7 +16,7 @@ use super::types::FollowPageEntry;
 /// the bound account was accepted (a suspended or deleted account is left
 /// out, as Pleroma's `deactivated: false` does), each entry led by the `follow_id` of the
 /// relationship row behind it — the id the page keys on. The text stops
-/// where its one placeholder belongs, because that is where [`page_rows`]
+/// where its one placeholder belongs, because that is where [`keyset_page_by`]
 /// pushes its bind and the builder is what numbers it `$1`; the keyset it
 /// then appends runs on the relationship id `f.id`.
 pub(super) const FOLLOWERS_PAGE_SQL: &str = "SELECT f.id AS follow_id, u.* FROM follows f
@@ -39,7 +42,7 @@ pub async fn followers_page(
     user_id: Uuid,
     page: PageParams,
 ) -> AppResult<Vec<FollowPageEntry>> {
-    page_rows(pool, FOLLOWERS_PAGE_SQL, user_id, &page).await
+    keyset_page_by(pool, FOLLOWERS_PAGE_SQL, user_id, "f.id", &page).await
 }
 
 /// The users `user_id` follows, accepted relationships only, newest
@@ -55,32 +58,7 @@ pub async fn following_page(
     user_id: Uuid,
     page: PageParams,
 ) -> AppResult<Vec<FollowPageEntry>> {
-    page_rows(pool, FOLLOWING_PAGE_SQL, user_id, &page).await
-}
-
-/// Runs one of the paged relationship lists: `sql` is one of the
-/// `SELECT … FROM follows f …` prefixes, which stop at the placeholder this
-/// binds `user_id` to, so the cursors [`PageParams::apply_keyset`] appends are
-/// numbered after it; the page comes back newest relationship first
-/// ([`PageParams::finish`] flips a `min_id` fetch). `T` is the row shape the
-/// statement selects: a bare [`User`] or a [`FollowPageEntry`] with the
-/// relationship id.
-pub(super) async fn page_rows<T>(
-    pool: &PgPool,
-    sql: &str,
-    user_id: Uuid,
-    page: &PageParams,
-) -> AppResult<Vec<T>>
-where
-    T: for<'r> FromRow<'r, PgRow> + Send + Unpin,
-{
-    let mut builder = QueryBuilder::<Postgres>::new(sql);
-    // The builder's push methods hand back `&mut Self` for chaining; binding
-    // it keeps the statement from having an unused result (decision 14).
-    let _bound: &mut _ = builder.push_bind(user_id);
-    page.apply_keyset(&mut builder, "f.id");
-    let rows = builder.build_query_as::<T>().fetch_all(pool).await?;
-    Ok(page.finish(rows))
+    keyset_page_by(pool, FOLLOWING_PAGE_SQL, user_id, "f.id", &page).await
 }
 
 #[cfg(test)]

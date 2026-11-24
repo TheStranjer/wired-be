@@ -2,7 +2,7 @@
 //! timeline or an inbox filters by, and the page behind
 //! `GET /api/v1/blocks`.
 
-use sqlx::{Executor, PgPool, Postgres, QueryBuilder};
+use sqlx::{Executor, PgPool, Postgres};
 use uuid::Uuid;
 
 #[cfg(doc)]
@@ -12,7 +12,7 @@ use super::{Block, BlockUserRow};
 use crate::{
     error::{AppError, AppResult},
     models::user::User,
-    pagination::PageParams,
+    pagination::{PageParams, keyset_page_by},
 };
 
 /// [`get`]: the one block of an ordered pair.
@@ -152,16 +152,8 @@ pub async fn blocking_page(
     blocker: Uuid,
     page: PageParams,
 ) -> AppResult<Vec<(Block, User)>> {
-    let mut builder = QueryBuilder::<Postgres>::new(PAGE_SQL);
-    // The builder's push methods hand back `&mut Self` for chaining; binding
-    // it keeps the statement from having an unused result (decision 14).
-    let _bound: &mut _ = builder.push_bind(blocker);
-    page.apply_keyset(&mut builder, "b.id");
-    let rows = builder
-        .build_query_as::<BlockUserRow>()
-        .fetch_all(pool)
-        .await?;
-    Ok(page.finish(rows).into_iter().map(into_entry).collect())
+    let rows: Vec<BlockUserRow> = keyset_page_by(pool, PAGE_SQL, blocker, "b.id", &page).await?;
+    Ok(rows.into_iter().map(into_entry).collect())
 }
 
 /// The block of the ordered pair (`blocker`, `target`), whatever wrote it:
