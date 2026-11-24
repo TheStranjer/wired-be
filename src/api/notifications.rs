@@ -84,7 +84,7 @@ use uuid::Uuid;
 use crate::{
     api::{
         chats::message_of,
-        helpers::{StringList, distinct},
+        helpers::{StringList, distinct, keyed_json, render_visible},
         notifications_v2::{account_filter, type_filters},
     },
     auth::AuthUser,
@@ -101,16 +101,11 @@ use crate::{
         notification::{
             self, FlatPageParams, Notification as NotificationRow, NotificationFilters,
         },
-        status::{self, Status as StatusRow},
-        status_visibility,
         user::{self, User},
     },
     oauth::scopes::{READ_NOTIFICATIONS, WRITE_NOTIFICATIONS},
     pagination::{NO_EXTRA_QUERY, PageParams, keyset_link, set_link_header},
-    services::{
-        filter::{FilterContext, apply_filters},
-        render_status::{ViewerMode, render_statuses},
-    },
+    services::filter::{FilterContext, apply_filters},
     state::AppState,
     util::id::parse_id,
 };
@@ -731,7 +726,7 @@ struct RenderedStatuses {
 /// The distinct status ids of `ids`, rendered as seen by `viewer`, run
 /// through [`apply_filters`] in the `notifications` context, serialized,
 /// and keyed by their row ids: rows that name no row, that a delete took,
-/// or that [`status_visibility`] hides from this reader are not in the map
+/// or that [`render_visible`] hides from this reader are not in the map
 /// (see [`RenderedStatuses`] for what the map and the hidden list carry).
 ///
 /// # Errors
@@ -752,34 +747,18 @@ async fn visible_statuses(
             hidden_by_filter: Vec::new(),
         });
     }
-    let rows = status::get_many(&state.db, ids).await?;
-    let mut visible: Vec<StatusRow> = Vec::new();
-    for row in rows {
-        if status_visibility::can_view(&state.db, &row, viewer).await? {
-            visible.push(row);
-        }
-    }
-    let page = render_statuses(state, ViewerMode::User(viewer), &visible).await?;
+    let page = render_visible(state, viewer, ids).await?;
     let mut all_ids: Vec<Uuid> = page
         .iter()
         .filter_map(|entity| parse_id(&entity.id))
         .collect();
-    let mut rendered = HashMap::new();
     let kept = apply_filters(
         page,
         filters,
         FilterContext::Notifications,
         viewer.map(|user| user.id),
     );
-    for entity in kept {
-        let Some(id) = parse_id(&entity.id) else {
-            continue;
-        };
-        let value = serde_json::to_value(entity).map_err(|err| {
-            AppError::Internal(format!("status entity failed to serialize: {err}"))
-        })?;
-        let _first = rendered.insert(id, value);
-    }
+    let rendered = keyed_json(kept)?;
     // What the render produced but the filtered page did not keep is what
     // an `irreversible` match removed — invisible rows never entered the
     // render at all, so the two hides stay distinguishable.

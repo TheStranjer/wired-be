@@ -30,7 +30,7 @@ use uuid::Uuid;
 use wired_be::{
     config::TEST_BASE_URL,
     models::{
-        conversation,
+        block, conversation,
         status::{self, NewStatus, Status, Visibility},
         user::User,
     },
@@ -538,6 +538,64 @@ async fn pleroma_statuses_page_the_thread_newest_first() {
     let hers = participation_for(&pool, &alice, &elsewhere).await;
     let miss = pleroma_get(&app, &bob_token, &format!("/{hers}/statuses")).await;
     common::assert_all_refused(&[miss], StatusCode::NOT_FOUND, UNKNOWN, "a foreign ask");
+}
+
+/// A participant's `direct` status disappears from the statuses page once
+/// that author blocks the viewer (the visibility model's rule 2, applied
+/// to the whole page in one batch); the statuses left keep their order.
+#[tokio::test]
+async fn pleroma_statuses_omit_a_status_whose_author_blocked_the_viewer() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let (alice, _) = actor(&pool, "alice", BOTH).await;
+    let (bob, bob_token) = actor(&pool, "bob", BOTH).await;
+    let (carol, _) = actor(&pool, "carol", BOTH).await;
+    let app = common::test_app(pool.clone());
+    let root = dm(&pool, &alice, &[&bob], "@bob root").await;
+    let from_carol = status::insert(
+        &pool,
+        TEST_BASE_URL,
+        &NewStatus {
+            visibility: Visibility::Direct,
+            in_reply_to_id: Some(root.id),
+            in_reply_to_account_id: Some(root.user_id),
+            conversation_id: Some(root.conversation_id),
+            mentioned_user_ids: vec![bob.id],
+            ..NewStatus::local(&carol, "@bob from carol")
+        },
+    )
+    .await
+    .expect("carol's direct fixture inserts");
+    conversation::participate_for_status(&pool, &from_carol)
+        .await
+        .expect("the participation hook runs");
+    let answered = reply(&pool, &bob, &from_carol, "@carol answered").await;
+    let mine = participation_for(&pool, &bob, &root).await;
+    let path = format!("/{mine}/statuses");
+
+    let before = pleroma_get(&app, &bob_token, &path).await;
+    common::assert_answer(&before, StatusCode::OK, "the page before the block");
+    assert_eq!(
+        ids_of(&before.json_value()),
+        vec![
+            answered.id.to_string(),
+            from_carol.id.to_string(),
+            root.id.to_string()
+        ],
+        "all three statuses, newest first, while nobody is blocked"
+    );
+
+    let blocked = block::block(&pool, TEST_BASE_URL, &carol, &bob)
+        .await
+        .expect("carol blocks bob");
+    assert_eq!(blocked.blocked_id, bob.id, "the block names bob");
+    let after = pleroma_get(&app, &bob_token, &path).await;
+    common::assert_answer(&after, StatusCode::OK, "the page after the block");
+    assert_eq!(
+        ids_of(&after.json_value()),
+        vec![answered.id.to_string(), root.id.to_string()],
+        "carol's status is gone and the others keep their order"
+    );
 }
 
 /// `PATCH` replaces the participation's whole recipient list with the

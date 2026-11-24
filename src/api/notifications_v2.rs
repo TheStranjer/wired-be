@@ -75,7 +75,7 @@ use tracing::debug;
 use uuid::Uuid;
 
 use crate::{
-    api::helpers::{StringList, account_or_404, distinct, names_of},
+    api::helpers::{StringList, account_or_404, distinct, names_of, render_visible},
     auth::AuthUser,
     entities::{
         account::{Account, AccountViewer},
@@ -88,13 +88,10 @@ use crate::{
     models::{
         marker::{self, Marker},
         notification::{self, GroupInfo, GroupPageParams, NotificationFilters},
-        status::{self, Status as StatusRow},
-        status_visibility,
         user::{self, User},
     },
     oauth::scopes::{READ_NOTIFICATIONS, WRITE_NOTIFICATIONS},
     pagination::{NO_EXTRA_QUERY, PageParams, keyset_link, set_link_header},
-    services::render_status::{ViewerMode, render_statuses},
     state::AppState,
     util::id::parse_id,
 };
@@ -506,9 +503,10 @@ async fn expand_accounts(
 }
 
 /// Expands status ids into [`StatusEntity`]s as seen by `viewer`: every
-/// stored status once, in the requested order, through the batched renderer
-/// [`render_statuses`]. A status with no row and one the visibility rules
-/// hide from this reader both drop out of the array — the groups still
+/// stored status once, in the requested order, through [`render_visible`]
+/// (the batched visibility filter and renderer). A status with no row and
+/// one the visibility rules hide from this reader both drop out of the
+/// array — the groups still
 /// carry their `status_id`, Pleroma's id-only reference aside — and a
 /// deleted one renders as nothing, which is what the renderer answers for
 /// a tombstone.
@@ -522,22 +520,7 @@ async fn expand_statuses(
     viewer: AccountViewer<'_>,
     ids: &[Uuid],
 ) -> AppResult<Vec<StatusEntity>> {
-    if ids.is_empty() {
-        return Ok(Vec::new());
-    }
-    let rows = status::get_many(&state.db, ids).await?;
-    let mut by_id: HashMap<Uuid, StatusRow> =
-        rows.into_iter().map(|found| (found.id, found)).collect();
-    let mut visible: Vec<StatusRow> = Vec::new();
-    for id in ids {
-        let Some(row) = by_id.remove(id) else {
-            continue;
-        };
-        if status_visibility::can_view(&state.db, &row, viewer).await? {
-            visible.push(row);
-        }
-    }
-    render_statuses(state, ViewerMode::User(viewer), &visible).await
+    render_visible(state, viewer, ids).await
 }
 
 #[cfg(test)]
