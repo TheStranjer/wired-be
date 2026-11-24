@@ -8,14 +8,14 @@ use uuid::Uuid;
 use crate::{
     error::{AppError, AppResult},
     models::user::User,
-    util::id::new_id,
+    util::id::{new_activity_ap_id, new_id},
 };
 
 use super::{
     counters::counted,
     guards::{SELF_FOLLOW, blocked_between, blocked_error},
     lookup::{by_id, get, required},
-    types::{Follow, FollowState, initial_state, local_activity_id},
+    types::{Follow, FollowState, initial_state},
 };
 
 /// [`follow`]'s write when the pair has no row yet. `ON CONFLICT DO NOTHING`
@@ -84,7 +84,8 @@ pub async fn follow(
         return Err(blocked_error(pool, follower, target).await?);
     }
     let state = initial_state(target);
-    let ap_id = local_activity_id(base_url, follower);
+    // A remote follower's own `Follow` id is recorded by the federation layer.
+    let ap_id = follower.local.get().then(|| new_activity_ap_id(base_url));
     match get(pool, follower.id, target.id).await? {
         // Already open: this follow changes nothing, so the stored row is
         // the answer and no counter moves.

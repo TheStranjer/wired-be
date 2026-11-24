@@ -1,12 +1,11 @@
-//! The row types of `follows` and the two pure helpers that decide what a
-//! new relationship holds: the state [`follow`](super::follow) starts it in
-//! ([`initial_state`]) and the activity id it carries
-//! ([`local_activity_id`](super::local_activity_id)).
+//! The row types of `follows` and the pure helper that decides what a new
+//! relationship holds: the state [`follow`](super::follow) starts it in
+//! ([`initial_state`]).
 
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
-use crate::{models::user::User, util::id::new_id};
+use crate::models::user::User;
 
 /// Lifecycle state of a [`Follow`] row, stored in the `state` text column as
 /// its lowercase variant name (`pending`, `accepted` or `rejected`, which is
@@ -108,24 +107,13 @@ pub(super) const fn initial_state(target: &User) -> FollowState {
     }
 }
 
-/// The `ap_id` to store for a new relationship: a freshly minted
-/// `{base_url}/activities/{uuid}` (decision 6) for a follower this instance
-/// owns, `None` for a remote follower, whose own activity id the federation
-/// layer records from the `Follow` activity it processed.
-pub(super) fn local_activity_id(base_url: &str, follower: &User) -> Option<String> {
-    follower
-        .local
-        .get()
-        .then(|| format!("{base_url}/activities/{}", new_id()))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{config::TEST_BASE_URL, models::follow::test_support::*};
+    use crate::models::follow::test_support::*;
 
     #[tokio::test]
-    async fn helpers_classify_the_target_and_mint_activity_ids() {
+    async fn initial_state_classifies_the_target() {
         let db = crate::test_db::test_db().await.expect("test database slot");
         let pool = db.pool().clone();
         let alice = local_user(&pool, "alice").await;
@@ -146,18 +134,6 @@ mod tests {
             initial_state(&bob),
             FollowState::Pending,
             "a remote account cannot be answered here at all"
-        );
-
-        let minted = local_activity_id(TEST_BASE_URL, &alice).expect("a local follower gets an id");
-        let other = local_activity_id(TEST_BASE_URL, &alice).expect("and gets one again");
-        assert_ne!(minted, other, "every `Follow` activity is its own object");
-        assert!(
-            minted.starts_with(&format!("{TEST_BASE_URL}{ACTIVITY_PREFIX}")),
-            "under this instance's activities path: {minted}"
-        );
-        assert!(
-            local_activity_id(TEST_BASE_URL, &bob).is_none(),
-            "a remote follower's id is the one its own instance minted"
         );
     }
 }

@@ -4,13 +4,13 @@
 use sqlx::PgPool;
 
 use super::{
-    Block, SELF_BLOCK, local_activity_id,
+    Block, SELF_BLOCK,
     read::{get, required},
 };
 use crate::{
     error::{AppError, AppResult},
     models::{endorsement, follow, list, user::User},
-    util::id::new_id,
+    util::id::{new_activity_ap_id, new_id},
 };
 
 /// [`block`]'s write when the pair has no row yet: the id this module mints
@@ -92,7 +92,14 @@ async fn write_block(
         .bind(new_id())
         .bind(blocker.id)
         .bind(target.id)
-        .bind(local_activity_id(base_url, blocker).as_deref())
+        // A remote blocker's own `Block` id is recorded by the federation layer.
+        .bind(
+            blocker
+                .local
+                .get()
+                .then(|| new_activity_ap_id(base_url))
+                .as_deref(),
+        )
         .fetch_optional(&mut *tx)
         .await?;
     let Some(block) = created else {

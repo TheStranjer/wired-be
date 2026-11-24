@@ -37,8 +37,6 @@
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
-use crate::util::id::new_id;
-
 mod delete;
 mod groups;
 mod read;
@@ -117,14 +115,6 @@ pub struct ReactionSummary {
     /// The reactors, earliest reaction first, at most
     /// [`MAX_SUMMARY_REACTORS`] of them.
     pub account_ids: Vec<Uuid>,
-}
-
-/// The `ap_id` [`react`] stores: a freshly minted
-/// `{base_url}/activities/{uuid}` (decision 6). Every reaction this model
-/// writes comes from a local account through the API; the federation ticket
-/// that mirrors a remote `EmojiReact` records that activity's own id.
-fn local_activity_id(base_url: &str) -> String {
-    format!("{base_url}/activities/{}", new_id())
 }
 
 #[cfg(test)]

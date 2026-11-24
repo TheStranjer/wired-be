@@ -54,7 +54,7 @@ use crate::{
         user::User,
     },
     pagination::{PageParams, keyset_page_by},
-    util::id::new_id,
+    util::id::{new_activity_ap_id, new_id},
 };
 
 /// [`favourite`]: the write, idempotent on `(user_id, status_id)`. A pair
@@ -174,7 +174,7 @@ pub async fn favourite(
     user_id: Uuid,
     status_id: Uuid,
 ) -> AppResult<Option<Favourite>> {
-    favourite_like(pool, user_id, status_id, &local_activity_id(base_url)).await
+    favourite_like(pool, user_id, status_id, &new_activity_ap_id(base_url)).await
 }
 
 /// Records `user_id`'s like of `status_id` standing for one `Like` activity
@@ -440,14 +440,6 @@ pub async fn backup_page(
         .fetch_all(pool)
         .await?;
     Ok(rows)
-}
-
-/// The `ap_id` [`favourite`] stores: a freshly minted
-/// `{base_url}/activities/{uuid}` (decision 6). Every favourite this model
-/// writes comes from a local account through the API; the federation
-/// ticket that mirrors a remote `Like` records that activity's own id.
-fn local_activity_id(base_url: &str) -> String {
-    format!("{base_url}/activities/{}", new_id())
 }
 
 #[cfg(test)]

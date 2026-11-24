@@ -51,7 +51,7 @@
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
-use crate::{models::user::User, util::id::new_id};
+use crate::models::user::User;
 
 mod activity;
 mod read;
@@ -110,15 +110,4 @@ struct BlockUserRow {
     /// The blocked account, decoded from the join's unaliased `u.*`.
     #[sqlx(flatten)]
     user: User,
-}
-
-/// The `ap_id` to store for a new block: a freshly minted
-/// `{base_url}/activities/{uuid}` (decision 6) for a blocker this instance
-/// owns, `None` for a remote blocker, whose own activity id the federation
-/// layer records from the `Block` activity it processed.
-fn local_activity_id(base_url: &str, blocker: &User) -> Option<String> {
-    blocker
-        .local
-        .get()
-        .then(|| format!("{base_url}/activities/{}", new_id()))
 }
