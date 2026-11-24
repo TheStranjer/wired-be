@@ -479,7 +479,7 @@ mod tests {
         let alice = insert(&pool, &local_new("alice")).await.unwrap();
         let gone = insert(&pool, &local_new("gone")).await.unwrap();
         set_activation(&pool, gone.id, false).await.unwrap();
-        insert(
+        let mirror = insert(
             &pool,
             &NewUser {
                 nickname: "mirror@remote.example".to_owned(),
@@ -501,7 +501,7 @@ mod tests {
             matches!(unknown, Err(AppError::RouteNotFound)),
             "an unknown nickname is a missing route, got {unknown:?}"
         );
-        let remote = require_local_active(&pool, "mirror@remote.example").await;
+        let remote = require_local_active(&pool, &mirror.nickname).await;
         assert!(
             matches!(remote, Err(AppError::RouteNotFound)),
             "a remote mirror is a missing route, got {remote:?}"
