@@ -138,10 +138,12 @@ async fn an_upload_a_schedule_reserves_drops_out_of_the_replacement() {
             user_id: alice.id,
             scheduled_at: Utc::now() + TimeDelta::hours(2),
             params: json!({"status": "later", "media_ids": [reserved.to_string()]}),
+            idempotency_key: None,
         },
     )
     .await
-    .expect("the schedule fixture inserts");
+    .expect("the schedule fixture inserts")
+    .expect("a keyless schedule never conflicts");
 
     let response = edit_row(
         &app,

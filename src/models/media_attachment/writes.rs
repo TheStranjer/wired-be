@@ -206,10 +206,12 @@ mod tests {
                     "status": "later",
                     "media_ids": [reserved.id.to_string()],
                 }),
+                idempotency_key: None,
             },
         )
         .await
-        .unwrap();
+        .unwrap()
+        .expect("a keyless schedule never conflicts");
         let posted = create_status(&pool, &alice).await;
 
         let others = attach_to_status(&pool, &[reserved.id, free.id], posted.id, alice.id, None)

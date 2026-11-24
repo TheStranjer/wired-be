@@ -127,10 +127,12 @@ mod tests {
                 user_id: bob.id,
                 scheduled_at: Utc::now() + TimeDelta::hours(1),
                 params: json!({ "status": "later", "media_ids": [reserved.id.to_string()] }),
+                idempotency_key: None,
             },
         )
         .await
-        .unwrap();
+        .unwrap()
+        .expect("a keyless schedule never conflicts");
 
         let ids = [
             free.id,
