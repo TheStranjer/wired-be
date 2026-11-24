@@ -40,6 +40,24 @@ const INSERT_SQL: &str = "INSERT INTO scrobbles (
      id, ap_id, user_id, title, artist, album, length, external_link, visibility
 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING *";
 
+/// [`insert_remote`]: a delivered listen, keyed on the `Listen`'s id so a
+/// redelivery inserts nothing, with the `published` time as `inserted_at`.
+const INSERT_REMOTE_SQL: &str = "INSERT INTO scrobbles (
+     id, ap_id, user_id, title, artist, album, length, external_link, visibility, inserted_at
+) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+ON CONFLICT (ap_id) DO NOTHING RETURNING *";
+
+/// [`delete_by_ap_id`]: the withdrawn listen, scoped to its owner.
+const DELETE_BY_AP_ID_SQL: &str = "DELETE FROM scrobbles WHERE ap_id = $1 AND user_id = $2";
+
+/// The longest title a scrobble keeps, in characters: the local API refuses
+/// more, and a delivered listen is truncated to it.
+pub const MAX_TITLE_CHARS: usize = 255;
+/// The longest artist or album a scrobble keeps, in characters.
+pub const MAX_TEXT_CHARS: usize = 255;
+/// The longest external link a scrobble keeps, in characters.
+pub const MAX_LINK_CHARS: usize = 2048;
+
 /// [`get_by_id`]: one scrobble by its primary key.
 const GET_SQL: &str = "SELECT * FROM scrobbles WHERE id = $1";
 
@@ -151,6 +169,57 @@ pub async fn insert(
         .fetch_one(pool)
         .await?;
     Ok(row)
+}
+
+/// Stores a listen delivered by a remote account: `scrobble` for `user_id`
+/// under the `Listen`'s `ap_id`, stamped `inserted_at` (the listen's own
+/// `published` time).
+///
+/// Returns `None` when a scrobble with that `ap_id` is already stored, so a
+/// redelivery is a no-op.
+///
+/// # Errors
+///
+/// Any database failure (connection, encoding) arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn insert_remote(
+    pool: &PgPool,
+    user_id: Uuid,
+    ap_id: &str,
+    scrobble: &NewScrobble,
+    inserted_at: DateTime<Utc>,
+) -> AppResult<Option<Scrobble>> {
+    let row = sqlx::query_as::<_, Scrobble>(INSERT_REMOTE_SQL)
+        .bind(new_id())
+        .bind(ap_id)
+        .bind(user_id)
+        .bind(&scrobble.title)
+        .bind(scrobble.artist.as_deref())
+        .bind(scrobble.album.as_deref())
+        .bind(scrobble.length)
+        .bind(scrobble.external_link.as_deref())
+        .bind(scrobble.visibility)
+        .bind(inserted_at)
+        .fetch_optional(pool)
+        .await?;
+    Ok(row)
+}
+
+/// Deletes the scrobble of `user_id` whose `Listen` id is `ap_id` and
+/// returns how many rows went (0 or 1).
+///
+/// # Errors
+///
+/// Any database failure arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn delete_by_ap_id(pool: &PgPool, user_id: Uuid, ap_id: &str) -> AppResult<u64> {
+    let deleted = sqlx::query(DELETE_BY_AP_ID_SQL)
+        .bind(ap_id)
+        .bind(user_id)
+        .execute(pool)
+        .await?
+        .rows_affected();
+    Ok(deleted)
 }
 
 /// The scrobble with primary key `id`, `None` when there is none.
@@ -503,6 +572,58 @@ mod tests {
         .await
         .expect("the polling page reads");
         assert_eq!(titles(&unseen), ["track 4"], "since_id gives the new ones");
+    }
+
+    #[tokio::test]
+    async fn insert_remote_keeps_the_listen_id_and_time_and_ignores_a_redelivery() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = user(&pool, "alice").await;
+        let listen_id = "https://remote.example/activities/listen-1";
+        let listened = DateTime::parse_from_rfc3339("2024-05-01T10:00:00Z")
+            .expect("the fixture time parses")
+            .with_timezone(&Utc);
+
+        let first = insert_remote(&pool, alice.id, listen_id, &titled("once"), listened)
+            .await
+            .expect("the first delivery stores")
+            .expect("a new listen returns its row");
+        assert_eq!(first.ap_id.as_deref(), Some(listen_id), "the Listen id");
+        assert_eq!(first.inserted_at, listened, "the listen's own time");
+
+        let again = insert_remote(&pool, alice.id, listen_id, &titled("twice"), listened)
+            .await
+            .expect("the redelivery reads");
+        assert_eq!(again, None, "a stored Listen id inserts nothing");
+        assert_eq!(count_scrobbles(&pool).await, 1, "one row stands");
+        let kept = get_by_id(&pool, first.id)
+            .await
+            .expect("the read succeeds")
+            .expect("the row exists");
+        assert_eq!(kept.title, "once", "and the first delivery's content");
+    }
+
+    #[tokio::test]
+    async fn delete_by_ap_id_is_scoped_to_the_owner() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = user(&pool, "alice").await;
+        let bob = user(&pool, "bob").await;
+        let listen_id = "https://remote.example/activities/listen-2";
+        let stored = insert_remote(&pool, alice.id, listen_id, &titled("mine"), Utc::now())
+            .await
+            .expect("the delivery stores");
+        assert!(stored.is_some(), "the fixture row exists");
+
+        let stranger = delete_by_ap_id(&pool, bob.id, listen_id)
+            .await
+            .expect("the delete runs");
+        assert_eq!(stranger, 0, "another account's delete removes nothing");
+        let owner = delete_by_ap_id(&pool, alice.id, listen_id)
+            .await
+            .expect("the delete runs");
+        assert_eq!(owner, 1, "the owner's delete removes the row");
+        assert_eq!(count_scrobbles(&pool).await, 0, "and nothing stands");
     }
 
     #[tokio::test]

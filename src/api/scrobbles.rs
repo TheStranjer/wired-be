@@ -60,7 +60,7 @@ use crate::{
     error::{AppError, AppResult},
     extract::{ApiBody, flex},
     models::{
-        scrobble::{self, NewScrobble},
+        scrobble::{self, MAX_LINK_CHARS, MAX_TEXT_CHARS, MAX_TITLE_CHARS, NewScrobble},
         status::Visibility,
     },
     oauth::scopes::{READ_SCROBBLES, WRITE_SCROBBLES},
@@ -70,12 +70,6 @@ use crate::{
     util::url::is_http_url,
 };
 
-/// The longest title the endpoint accepts (the ticket's 255).
-const MAX_TITLE_CHARS: usize = 255;
-/// The longest artist or album the endpoint accepts.
-const MAX_TEXT_CHARS: usize = 255;
-/// The longest external link the endpoint accepts.
-const MAX_LINK_CHARS: usize = 2048;
 /// 422 body for an external link that is too long or not an `http(s)` URL.
 const LINK_INVALID: &str = "externalLink: is invalid";
 /// 422 body for an absent or blank title, in Pleroma's changeset wording
