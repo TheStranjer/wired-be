@@ -1,6 +1,6 @@
 //! The relationship listings — `GET /api/v1/accounts/{id}/followers`
 //! and `…/{id}/following` — with the page render they answer through
-//! ([`page_response`], [`keyset_link`]) and the `RESTRICT_UNAUTHENTICATED`
+//! ([`account_page`], [`keyset_link`](crate::pagination::keyset_link)) and the `RESTRICT_UNAUTHENTICATED`
 //! profile gate the status listing shares ([`require_profile_read`]).
 //!
 //! `followers` and `following` are the account's relationship listings,
@@ -17,7 +17,7 @@
 //! [`FollowPageEntry`](crate::models::follow::FollowPageEntry) rather than
 //! bare rows. An authenticated viewer also gets their relationship to
 //! every listed account embedded, one batched
-//! [`Relationship::load_many`] per request. Privacy per Pleroma's
+//! [`Relationship::load_many`](crate::entities::relationship::Relationship::load_many) per request. Privacy per Pleroma's
 //! `cond`: an account with `hide_followers` (resp. `hide_follows`) answers
 //! the empty array to everyone but itself — the count-hiding flags alone
 //! never hide the list — while a locked account's lists stay visible,
@@ -32,17 +32,14 @@ use axum::{
 use uuid::Uuid;
 
 use crate::{
-    api::helpers::visible_account_or_404,
+    api::helpers::{AccountPageEntry, account_page, empty_account_page, visible_account_or_404},
     auth::MaybeAuthUser,
     config::Config,
-    entities::{
-        account::{Account, AccountViewer},
-        relationship::Relationship,
-    },
+    entities::account::{Account, AccountViewer},
     error::{AppError, AppResult},
     models::{follow, user::User},
     oauth::scopes::READ_ACCOUNTS,
-    pagination::{NO_EXTRA_QUERY, PageParams, keyset_link, set_link_header},
+    pagination::PageParams,
     state::AppState,
 };
 
@@ -64,7 +61,7 @@ const PROFILES_REMOTE: &str = "profiles_remote";
 /// page at a time (limit 20 by default, at most
 /// [`MAX_LIMIT`](crate::pagination::MAX_LIMIT)). Auth is optional; a
 /// presented user token must grant `read:accounts`, as in Pleroma's plug
-/// for this action, and the viewer it names decides whose [`Relationship`]
+/// for this action, and the viewer it names decides whose [`Relationship`](crate::entities::relationship::Relationship)
 /// the entries embed.
 ///
 /// Pleroma's `followers` `cond`: an account that hides its followers is
@@ -88,7 +85,7 @@ const PROFILES_REMOTE: &str = "profiles_remote";
 /// from [`require_profile_read`] for an anonymous request while
 /// `RESTRICT_UNAUTHENTICATED` closes the account's profile half;
 /// [`AppError::BadRequest`] from [`PageParams`] for a malformed cursor. Any database failure arrives through `?` as
-/// [`AppError::Database`], and [`set_link_header`] reports a `Link` value
+/// [`AppError::Database`], and [`set_link_header`](crate::pagination::set_link_header) reports a `Link` value
 /// that is not header-safe as [`AppError::Internal`].
 pub(super) async fn list_followers(
     State(state): State<AppState>,
@@ -102,10 +99,10 @@ pub(super) async fn list_followers(
     let viewer = auth.0.as_ref();
     require_profile_read(&state.config, viewer, &target)?;
     if target.hide_followers.get() && !viewer_is(viewer, &target) {
-        return Ok(empty_page());
+        return Ok(empty_account_page());
     }
     let entries = follow::followers_page(&state.db, target.id, page).await?;
-    page_response(&state, viewer, &entries, uri.path()).await
+    account_page(&state, viewer, uri.path(), &entries).await
 }
 
 /// `GET /api/v1/accounts/{id}/following` — the accounts `id` follows with
@@ -131,10 +128,10 @@ pub(super) async fn list_following(
     let viewer = auth.0.as_ref();
     require_profile_read(&state.config, viewer, &target)?;
     if target.hide_follows.get() && !viewer_is(viewer, &target) {
-        return Ok(empty_page());
+        return Ok(empty_account_page());
     }
     let entries = follow::following_page(&state.db, target.id, page).await?;
-    page_response(&state, viewer, &entries, uri.path()).await
+    account_page(&state, viewer, uri.path(), &entries).await
 }
 
 /// The `RESTRICT_UNAUTHENTICATED` gate of the account's reads (`show`,
@@ -178,43 +175,16 @@ fn viewer_is(viewer: AccountViewer<'_>, target: &User) -> bool {
     viewer.is_some_and(|who| who.id == target.id)
 }
 
-/// The answer to a hidden relationship listing: the empty array as a plain
-/// 200 with no `Link` header at all — Pleroma's `[]` branch, where the
-/// page never got a cursor to link from.
-fn empty_page() -> (HeaderMap, Json<Vec<Account>>) {
-    (HeaderMap::new(), Json(Vec::new()))
-}
+/// A relationship-list row: the cursors key on the `follows` row
+/// ([`follow::FollowPageEntry::follow_id`]), not on the users.
+impl AccountPageEntry for follow::FollowPageEntry {
+    fn cursor(&self) -> Uuid {
+        self.follow_id
+    }
 
-/// Renders one fetched relationship page for `viewer`: every entry's
-/// [`User`] as an [`Account`] with the viewer's relationship embedded
-/// where one is preloaded (see [`Relationship::load_map`]), under the
-/// `Link` header [`keyset_link`] derives from the relationship ids.
-async fn page_response(
-    state: &AppState,
-    viewer: AccountViewer<'_>,
-    entries: &[follow::FollowPageEntry],
-    path: &str,
-) -> AppResult<(HeaderMap, Json<Vec<Account>>)> {
-    let targets: Vec<Uuid> = entries.iter().map(|entry| entry.user.id).collect();
-    let relationships = Relationship::load_map(&state.db, viewer, &targets).await?;
-    // The cursors key on the `follows` row
-    // ([`follow::FollowPageEntry::follow_id`]), not on the users.
-    let link = keyset_link(
-        &state.config.base_url,
-        path,
-        &NO_EXTRA_QUERY,
-        entries,
-        |e| e.follow_id,
-    );
-    let mut headers = HeaderMap::new();
-    set_link_header(&mut headers, link.as_deref())?;
-    let accounts = entries
-        .iter()
-        .map(|entry| {
-            Account::from_user_for(viewer, &entry.user, &state.config, relationships.as_ref())
-        })
-        .collect();
-    Ok((headers, Json(accounts)))
+    fn user(&self) -> &User {
+        &self.user
+    }
 }
 
 #[cfg(test)]

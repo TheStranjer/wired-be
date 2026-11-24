@@ -46,9 +46,11 @@ use crate::{
     util::{id::parse_id, params::truthy},
 };
 
+mod account_page;
 mod accounts;
 mod visible;
 
+pub use account_page::{AccountPageEntry, account_page, empty_account_page};
 pub use accounts::{accounts_with_relationships, expand_accounts};
 pub use visible::{keyed_json, render_visible};
 

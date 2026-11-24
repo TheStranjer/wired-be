@@ -60,7 +60,7 @@ use tracing::debug;
 use uuid::Uuid;
 
 use crate::{
-    api::helpers::account_or_404,
+    api::helpers::{AccountPageEntry, account_or_404, account_page},
     auth::AuthUser,
     entities::{
         account::{Account, AccountViewer},
@@ -69,14 +69,9 @@ use crate::{
     error::AppResult,
     models::{block, block::Block, user::User},
     oauth::scopes::{FOLLOW, READ_BLOCKS, WRITE_BLOCKS},
-    pagination::{NO_EXTRA_QUERY, PageParams, keyset_link, set_link_header},
+    pagination::{ACCOUNT_LIST_MAX_LIMIT, PageParams},
     state::AppState,
 };
-
-/// Page size cap of the blocked list: Mastodon's account-list limit (80),
-/// above [`crate::pagination::MAX_LIMIT`] — the follow-request queue's
-/// counterpart constant, with Pleroma's global 20 as the default.
-const MAX_LIMIT: i64 = 80;
 
 /// The `/api/v1` blocks router, merged into [`crate::api::v1`].
 pub fn router() -> Router<AppState> {
@@ -167,7 +162,7 @@ async fn unblock_account(
 
 /// `GET /api/v1/blocks` — the accounts the caller blocks, newest block
 /// first, one [`PageParams`] page at a time (default limit 20, at most
-/// [`MAX_LIMIT`]) under a `Link` header keyed on the block row ids. The list
+/// [`ACCOUNT_LIST_MAX_LIMIT`]) under a `Link` header keyed on the block row ids. The list
 /// is the caller's own, so no privacy check applies.
 ///
 /// The `Link` header's path is the request's own [`OriginalUri`], not the
@@ -180,7 +175,7 @@ async fn unblock_account(
 /// [`AppError::Forbidden`](crate::error::AppError::Forbidden) when the token does not grant `read:blocks`;
 /// [`AppError::BadRequest`](crate::error::AppError::BadRequest) from [`PageParams`] for a malformed cursor. Any
 /// database failure arrives through `?` as [`AppError::Database`](crate::error::AppError::Database), and
-/// [`set_link_header`] reports a `Link` value that is not header-safe as
+/// [`set_link_header`](crate::pagination::set_link_header) reports a `Link` value that is not header-safe as
 /// [`AppError::Internal`](crate::error::AppError::Internal).
 async fn list_blocks(
     State(state): State<AppState>,
@@ -188,7 +183,7 @@ async fn list_blocks(
     OriginalUri(uri): OriginalUri,
 ) -> AppResult<(HeaderMap, Json<Vec<Account>>)> {
     auth.require(READ_BLOCKS)?;
-    let page = PageParams::from_query(uri.query(), MAX_LIMIT)?;
+    let page = PageParams::from_query(uri.query(), ACCOUNT_LIST_MAX_LIMIT)?;
     let entries = block::blocking_page(&state.db, auth.0.id, page).await?;
     debug!(
         count = entries.len(),
@@ -196,39 +191,19 @@ async fn list_blocks(
         "blocked accounts listed"
     );
     let viewer: AccountViewer<'_> = Some(&auth.0);
-    page_response(&state, viewer, &entries, uri.path()).await
+    account_page(&state, viewer, uri.path(), &entries).await
 }
 
-/// Renders one fetched blocked page for `viewer`: every entry's [`User`] as
-/// an [`Account`] with the viewer's relationship embedded where one is
-/// preloaded (see [`Relationship::load_map`]), under the `Link` header
-/// [`keyset_link`] derives from the block row ids.
-async fn page_response(
-    state: &AppState,
-    viewer: AccountViewer<'_>,
-    entries: &[(Block, User)],
-    path: &str,
-) -> AppResult<(HeaderMap, Json<Vec<Account>>)> {
-    let targets: Vec<Uuid> = entries.iter().map(|(_, blocked)| blocked.id).collect();
-    let relationships = Relationship::load_map(&state.db, viewer, &targets).await?;
-    // The cursors key on the `blocks` row ([`Block::id`]), not on the
-    // blocked accounts.
-    let link = keyset_link(
-        &state.config.base_url,
-        path,
-        &NO_EXTRA_QUERY,
-        entries,
-        |e| e.0.id,
-    );
-    let mut headers = HeaderMap::new();
-    set_link_header(&mut headers, link.as_deref())?;
-    let accounts = entries
-        .iter()
-        .map(|(_, blocked)| {
-            Account::from_user_for(viewer, blocked, &state.config, relationships.as_ref())
-        })
-        .collect();
-    Ok((headers, Json(accounts)))
+/// A blocked-list row: the cursors key on the `blocks` row ([`Block::id`]),
+/// not on the blocked account.
+impl AccountPageEntry for (Block, User) {
+    fn cursor(&self) -> Uuid {
+        self.0.id
+    }
+
+    fn user(&self) -> &User {
+        &self.1
+    }
 }
 
 /// Post-write hook of both block routes: hands the write to

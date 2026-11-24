@@ -47,6 +47,10 @@ const DEFAULT_LIMIT: i64 = 20;
 /// instead of the plain [`PageParams`] extractor.
 pub const MAX_LIMIT: i64 = 40;
 
+/// Page size cap of the account lists (blocked, muted, follow requests):
+/// Mastodon's account-list limit (80), above [`MAX_LIMIT`].
+pub const ACCOUNT_LIST_MAX_LIMIT: i64 = 80;
+
 /// 400 body for an id query parameter that is not a valid id.
 const INVALID_ID: &str = "Invalid id";
 
