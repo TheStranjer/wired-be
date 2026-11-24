@@ -10,7 +10,7 @@ use serde_json::{Value, json};
 use tempfile::TempDir;
 use wired_be::models::user::{Flag, NewUser};
 
-use super::expectations::{Expected, assert_delivered, assert_flags, id_of};
+use super::expectations::{Expected, assert_delivered, assert_flags};
 use super::support::{
     ACCOUNTS, AS_PUBLIC, BOB, PNG, SCOPES, followers_of, get_json, instance_actor,
     keyed_with_password, local, lookup, peer_follows, personal, publishes_with_key,
@@ -266,7 +266,7 @@ async fn a_flag_reaches_the_remote_inbox_and_the_admin_queue() {
     let before = peer.delivery_count();
     let carol = remote::keyed_local_user(&pool, "eo-flag-carol").await;
     let carol_id = lookup(&app, &format!("{}@test.example", carol.nickname)).await;
-    let local_path = format!("{ACCOUNTS}/{}/flag", id_of(&carol_id));
+    let local_path = format!("{ACCOUNTS}/{}/flag", common::id_of(&carol_id));
     let local_filed = common::TestRequest::post(&local_path)
         .bearer(&alice_token)
         .json(&json!({"comment": "our own moderator problem"}))

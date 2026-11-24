@@ -8,7 +8,7 @@ use uuid::Uuid;
 use super::server::{
     BASE, Part, SCOPES, Server, Verb, call, expect, get_value, png_fixture, post_multipart,
 };
-use super::sockets::{account, id_of, post_status};
+use super::sockets::{account, post_status};
 use crate::common;
 
 // ────────────────  Scenario 3: client-to-server ActivityPub  ────────────────
@@ -175,7 +175,7 @@ async fn the_c2s_inbox_reads_mentions_as_create_activities() {
         "and names its first page"
     );
 
-    let mentioned = id_of(
+    let mentioned = common::id_of(
         &post_status(
             &srv,
             &dave_token,
@@ -184,7 +184,7 @@ async fn the_c2s_inbox_reads_mentions_as_create_activities() {
         )
         .await,
     );
-    let _unmentioned = id_of(&post_status(&srv, &dave_token, "to nobody", "public").await);
+    let _unmentioned = common::id_of(&post_status(&srv, &dave_token, "to nobody", "public").await);
 
     let page = get_value(
         &srv,

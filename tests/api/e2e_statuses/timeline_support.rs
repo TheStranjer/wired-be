@@ -7,9 +7,7 @@ use axum::{Router, http::StatusCode};
 use serde_json::{Value, json};
 use sqlx::PgPool;
 
-use super::support::{
-    Actor, World, entity_id, get, posted, posted_form, uploaded, world_with_uploads,
-};
+use super::support::{Actor, World, get, posted, posted_form, uploaded, world_with_uploads};
 use super::thread_support::{Thread, newest_first, page_ids, post_thread};
 use crate::common;
 
@@ -108,7 +106,7 @@ pub(super) async fn plain_kind(
     visibility: &str,
     text: &str,
 ) -> String {
-    entity_id(
+    common::id_of(
         &posted(
             app,
             &world.author.token,
@@ -120,7 +118,7 @@ pub(super) async fn plain_kind(
 
 /// The [`posted`] create answered by its `id` alone.
 pub(super) async fn posted_id(app: &Router, token: &str, body: Value) -> String {
-    entity_id(&posted(app, token, body).await)
+    common::id_of(&posted(app, token, body).await)
 }
 
 /// Post every timeline kind as the author through the client API: part 2's
@@ -146,7 +144,7 @@ pub(super) async fn post_kinds(app: &Router, world: &World) -> Kinds {
     let media = posted_id(
         app,
         &world.author.token,
-        json!({"status": "a timeline tune", "media_ids": [entity_id(&attachment)]}),
+        json!({"status": "a timeline tune", "media_ids": [common::id_of(&attachment)]}),
     )
     .await;
     let warned = json!({"status": "a warned timeline word", "spoiler_text": "twist inside", "sensitive": true});
@@ -162,7 +160,7 @@ pub(super) async fn post_kinds(app: &Router, world: &World) -> Kinds {
         ],
     )
     .await;
-    let poll = entity_id(&ballot);
+    let poll = common::id_of(&ballot);
     let tagpost = posted_id(
         app,
         &world.author.token,

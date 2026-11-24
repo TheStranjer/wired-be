@@ -191,15 +191,6 @@ async fn bookmarked_pairs(pool: &PgPool, user_id: Uuid) -> Vec<(Uuid, Uuid)> {
     .expect("the pairs read")
 }
 
-/// The status ids of a `Status` array, in answer order.
-fn status_ids(body: &Value) -> Vec<String> {
-    body.as_array()
-        .expect("the answer is an array")
-        .iter()
-        .map(|entry| entry["id"].as_str().unwrap_or_default().to_owned())
-        .collect()
-}
-
 /// A `Link` header keyed on bookmark row ids: `next` walks to `oldest`,
 /// `prev` back to `newest`.
 fn assert_bookmark_keyed_link(link: Option<&str>, path: &str, newest: Uuid, oldest: Uuid) {
@@ -429,7 +420,7 @@ async fn the_bookmarks_list_pages_on_bookmark_ids() {
         .iter()
         .map(|(_, status_id)| status_id.to_string())
         .collect();
-    assert_eq!(status_ids(&body), want, "newest bookmark first");
+    assert_eq!(common::ids_of(&body), want, "newest bookmark first");
     assert!(
         body.as_array()
             .expect("an array")
@@ -442,7 +433,7 @@ async fn the_bookmarks_list_pages_on_bookmark_ids() {
     let first = bookmarks(&app, &token, "limit=2").await;
     common::assert_answer(&first, StatusCode::OK, "a sized page answers");
     assert_eq!(
-        status_ids(&first.json_value()),
+        common::ids_of(&first.json_value()),
         vec![live[0].1.to_string(), live[1].1.to_string()],
         "the two newest bookmarks"
     );
@@ -450,7 +441,7 @@ async fn the_bookmarks_list_pages_on_bookmark_ids() {
     let tail = bookmarks(&app, &token, &format!("max_id={}", all[1])).await;
     common::assert_answer(&tail, StatusCode::OK, "the continuation answers");
     assert_eq!(
-        status_ids(&tail.json_value()),
+        common::ids_of(&tail.json_value()),
         vec![live[2].1.to_string()],
         "max_id walks alice's own bookmark ids, not status ids"
     );
@@ -488,7 +479,7 @@ async fn the_bookmarks_list_drops_the_invisible_and_the_deleted() {
     let narrowed = bookmarks(&app, &token, "").await;
     common::assert_answer(&narrowed, StatusCode::OK, "the narrowed page answers");
     assert_eq!(
-        status_ids(&narrowed.json_value()),
+        common::ids_of(&narrowed.json_value()),
         vec![live[0].1.to_string(), live[2].1.to_string()],
         "the private one dropped out and the order stayed"
     );
@@ -508,7 +499,7 @@ async fn the_bookmarks_list_drops_the_invisible_and_the_deleted() {
         .expect("the fixture tombstones the newest post");
     let rest = bookmarks(&app, &token, "").await;
     assert_eq!(
-        status_ids(&rest.json_value()),
+        common::ids_of(&rest.json_value()),
         vec![live[2].1.to_string()],
         "only the still-visible bookmark is left"
     );
@@ -706,7 +697,7 @@ async fn the_bookmarks_list_filters_by_folder() {
     common::assert_answer(&page, StatusCode::OK, "the folder page answers");
     let body = page.json_value();
     assert_eq!(
-        status_ids(&body),
+        common::ids_of(&body),
         vec![second.id.to_string(), first.id.to_string()],
         "the shelved bookmarks only, newest bookmark first"
     );
@@ -721,14 +712,14 @@ async fn the_bookmarks_list_filters_by_folder() {
 
     let other = bookmarks(&app, &token, &format!("folder_id={}", later.id)).await;
     assert_eq!(
-        status_ids(&other.json_value()),
+        common::ids_of(&other.json_value()),
         vec![third.id.to_string()],
         "the other folder answers its own bookmark"
     );
 
     let everything = bookmarks(&app, &token, "").await;
     assert_eq!(
-        status_ids(&everything.json_value()).len(),
+        common::ids_of(&everything.json_value()).len(),
         4,
         "no folder named is the whole list, filed or not"
     );
@@ -739,7 +730,7 @@ async fn the_bookmarks_list_filters_by_folder() {
         "an empty folder_id asks for nothing",
     );
     assert_eq!(
-        status_ids(&blank.json_value()).len(),
+        common::ids_of(&blank.json_value()).len(),
         4,
         "and the list is the whole list"
     );

@@ -202,21 +202,6 @@ fn json_keys(value: &Value) -> Vec<&str> {
     keys
 }
 
-/// The `id` of every entry of an entity array, in the answered order.
-fn entity_ids(value: &Value) -> Vec<String> {
-    value
-        .as_array()
-        .expect("the lists are arrays")
-        .iter()
-        .map(|entry| {
-            entry["id"]
-                .as_str()
-                .expect("entities carry id strings")
-                .to_owned()
-        })
-        .collect()
-}
-
 /// A GET through the real app.
 async fn get(app: &Router, token: &str, path: &str) -> common::TestResponse {
     common::TestRequest::get(path).bearer(token).send(app).await

@@ -11,8 +11,7 @@ use wired_be::models::{
 
 use super::support::{
     BASE, INVALID_TOKEN, NO_READ, NO_TOKEN, NO_WRITE_ACCOUNTS, NOT_FOUND, USER_REQUIRED,
-    deactivate, delete, fixture, get, listed_ids, newest_first, seed_follow, suggested,
-    wrapped_ids,
+    deactivate, delete, fixture, get, newest_first, seed_follow, suggested, wrapped_ids,
 };
 use crate::common;
 
@@ -47,7 +46,7 @@ async fn suggestions_answer_the_staff_pool_in_both_shapes() {
     common::assert_answer(&v1, StatusCode::OK, "the v1 listing");
     let v1_body = v1.json_value();
     assert_eq!(
-        listed_ids(&v1_body),
+        common::ids_of(&v1_body),
         expected,
         "the pool, newest account first, as plain accounts"
     );
@@ -82,7 +81,7 @@ async fn suggestions_answer_the_staff_pool_in_both_shapes() {
     }
     for absent in [plain.id, mirror.id, closed.id, alice.id] {
         assert!(
-            !listed_ids(&v1_body).contains(&absent.to_string()),
+            !common::ids_of(&v1_body).contains(&absent.to_string()),
             "{absent} is in nobody's pool: an unflagged, non-local, \
              deactivated or self account is out"
         );
@@ -127,7 +126,7 @@ async fn suggestions_exclude_every_relationship_the_viewer_has() {
         .await
         .json_value();
     assert_eq!(
-        listed_ids(&mine),
+        common::ids_of(&mine),
         vec![kept.id.to_string()],
         "only the account alice has no relationship with is left"
     );
@@ -135,7 +134,7 @@ async fn suggestions_exclude_every_relationship_the_viewer_has() {
         .await
         .json_value();
     assert_eq!(
-        listed_ids(&theirs).len(),
+        common::ids_of(&theirs).len(),
         5,
         "carol sees the whole pool: alice's relationships are her own business"
     );
@@ -160,7 +159,7 @@ async fn suggestions_honour_the_limit_on_both_versions() {
         .await
         .json_value();
     assert_eq!(
-        listed_ids(&capped),
+        common::ids_of(&capped),
         expected[..2],
         "`limit=2` answers the head of the pool"
     );
@@ -176,7 +175,7 @@ async fn suggestions_honour_the_limit_on_both_versions() {
         .await
         .json_value();
     assert_eq!(
-        listed_ids(&whole),
+        common::ids_of(&whole),
         expected,
         "an unreadable limit is the default page of 40, which holds all three"
     );
@@ -286,7 +285,7 @@ async fn dismissing_a_suggestion_is_per_viewer_and_keeps_the_flag() {
         .await
         .json_value();
     assert_eq!(
-        listed_ids(&still),
+        common::ids_of(&still),
         vec![pick.id.to_string()],
         "and carol keeps seeing it, because she dismissed nothing"
     );

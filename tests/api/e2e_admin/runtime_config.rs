@@ -13,8 +13,7 @@ use serde_json::{Value, json};
 use wired_be::streaming::hub::Audience;
 
 use super::support::{
-    BASE, BOUNDARY, CONFIG, FUTURE, P_ADMIN, PAST, World, assert_log, get_array, id_of,
-    post_configs, wire,
+    BASE, BOUNDARY, CONFIG, FUTURE, P_ADMIN, PAST, World, assert_log, get_array, post_configs, wire,
 };
 use crate::common;
 
@@ -194,7 +193,7 @@ async fn rules_walk(world: &World) {
     )
     .await;
     common::assert_answer(&keep, StatusCode::OK, "the rule create");
-    let keep_id = id_of(&keep.json_value());
+    let keep_id = common::id_of(&keep.json_value());
     let drop_me = common::api_post(
         &world.app,
         Some(&world.admin),
@@ -203,7 +202,7 @@ async fn rules_walk(world: &World) {
     )
     .await;
     common::assert_answer(&drop_me, StatusCode::OK, "the second rule create");
-    let drop_id = id_of(&drop_me.json_value());
+    let drop_id = common::id_of(&drop_me.json_value());
 
     let public = get_array(&world.app, None, "/api/v1/instance/rules").await;
     assert_eq!(
@@ -283,7 +282,7 @@ async fn announcements_walk(world: &World) {
     )
     .await;
     common::assert_answer(&created, StatusCode::OK, "the announcement create");
-    let announcement_id = id_of(&created.json_value());
+    let announcement_id = common::id_of(&created.json_value());
     assert_eq!(
         created.json_value()["pleroma"]["raw_content"],
         json!("Down at five"),

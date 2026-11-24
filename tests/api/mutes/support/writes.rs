@@ -191,7 +191,7 @@ async fn a_lapsed_mute_is_absent_from_flags_and_listing() {
     );
     let listed = get(&app, Some(&token), MUTES).await;
     assert_eq!(
-        listed_ids(&listed.json_value()),
+        common::ids_of(&listed.json_value()),
         vec![carol.id.to_string()],
         "the listing holds only the live mute"
     );

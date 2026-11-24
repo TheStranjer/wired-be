@@ -4,9 +4,7 @@
 use axum::{Router, http::StatusCode};
 use serde_json::{Value, json};
 
-use super::support::{
-    CHATS, CHATS_V2, NOT_FOUND, acted, entity_id, got, got_array, ids_of, posted, user,
-};
+use super::support::{CHATS, CHATS_V2, NOT_FOUND, acted, got, got_array, ids_of, posted, user};
 use crate::common;
 
 /// The `POST /api/v1/pleroma/chats/by-account-id/{id}` that gets or
@@ -69,8 +67,8 @@ async fn a_chat_pair_agrees_on_the_peers_unread_counts() {
     let hers = open_chat(&app, &alice_token, &bob_id).await;
     let restated = open_chat(&app, &alice_token, &bob_id).await;
     assert_eq!(restated, hers, "opening the same chat twice restates it");
-    let her_chat = entity_id(&hers);
-    let his_chat = entity_id(&open_chat(&app, &bob_token, &alice_id).await);
+    let her_chat = common::id_of(&hers);
+    let his_chat = common::id_of(&open_chat(&app, &bob_token, &alice_id).await);
     assert_ne!(her_chat, his_chat, "each participant holds their own row");
     assert_eq!(hers["account"]["id"], json!(bob_id), "hers names bob");
     assert_eq!(hers["unread"], json!(0), "a fresh chat owes nothing");
@@ -185,8 +183,8 @@ async fn the_chat_read_empties_the_count_and_a_stranger_is_locked_out() {
     let (alice, alice_token) = user(&pool, "alice").await;
     let (bob, bob_token) = user(&pool, "bob").await;
     let (_carol, carol_token) = user(&pool, "carol").await;
-    let her_chat = entity_id(&open_chat(&app, &alice_token, &bob.id.to_string()).await);
-    let his_chat = entity_id(&open_chat(&app, &bob_token, &alice.id.to_string()).await);
+    let her_chat = common::id_of(&open_chat(&app, &alice_token, &bob.id.to_string()).await);
+    let his_chat = common::id_of(&open_chat(&app, &bob_token, &alice.id.to_string()).await);
 
     let _first = send_message(&app, &alice_token, &her_chat, "one").await;
     let _second = send_message(&app, &bob_token, &his_chat, "two").await;

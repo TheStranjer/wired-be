@@ -195,35 +195,9 @@ async fn removed(app: &Router, token: &str, id: Uuid) -> common::TestResponse {
 
 // --- answer readers --------------------------------------------------------------------
 
-/// The ids of an answered array, in the answered order.
-fn ids_of(answer: &Value) -> Vec<String> {
-    id_list(
-        answer
-            .as_array()
-            .expect("the ledger answers an array of entities"),
-    )
-}
-
 /// The ids of an envelope's `activities` array, in the answered order.
 fn activity_ids(answer: &Value) -> Vec<String> {
-    id_list(
-        answer["activities"]
-            .as_array()
-            .expect("the page answers an activities array"),
-    )
-}
-
-/// The `id` text of every entity of `entries`, in order.
-fn id_list(entries: &[Value]) -> Vec<String> {
-    entries
-        .iter()
-        .map(|entry| {
-            entry["id"]
-                .as_str()
-                .expect("entities carry id text")
-                .to_owned()
-        })
-        .collect()
+    common::ids_of(&answer["activities"])
 }
 
 /// The ids of `rows` in the order a listing answers them: the fixtures seed

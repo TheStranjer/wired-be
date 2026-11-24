@@ -79,7 +79,7 @@ async fn every_admin_chat_route_demands_a_user_token_of_the_right_role() {
     let (_late, late_token) = admin(&pool, "late-reader", "admin:read:chats").await;
     let still_listed = get(&app, &late_token, &messages_path(&chat_id)).await;
     assert_eq!(
-        entity_ids(&still_listed.json_value()),
+        common::ids_of(&still_listed.json_value()),
         vec![message_id],
         "the refusals deleted nothing"
     );
@@ -158,7 +158,7 @@ async fn the_chats_scopes_gate_reads_and_write_apart() {
     );
     let still_there = get(&app, &read_only, &messages_path(&chat_id)).await;
     assert_eq!(
-        entity_ids(&still_there.json_value()),
+        common::ids_of(&still_there.json_value()),
         vec![message_id.clone()],
         "and the refused delete touched nothing"
     );

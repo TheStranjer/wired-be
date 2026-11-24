@@ -10,8 +10,8 @@ use uuid::Uuid;
 use wired_be::util::time::mastodon_time;
 
 use super::routes_support::{
-    NOT_AN_ID, READ, cancel, day, entity_ids, entity_texts, expected_link, list, manager, move_to,
-    reader, row_ids, seeded, seeded_text, show,
+    NOT_AN_ID, READ, cancel, day, entity_texts, expected_link, list, manager, move_to, reader,
+    row_ids, seeded, seeded_text, show,
 };
 use super::support::{NOT_FOUND, keys, object_keys, stored_schedule, upload};
 use crate::common;
@@ -44,12 +44,12 @@ async fn the_listing_answers_the_callers_own_schedules_newest_id_first() {
         "newest id first, which is not the due-time order"
     );
     assert_eq!(
-        entity_ids(&body),
+        common::ids_of(&body),
         row_ids(&[&newest, &middle, &oldest]),
         "the three ids, in that order"
     );
     assert!(
-        !entity_ids(&body).contains(&theirs.id.to_string()),
+        !common::ids_of(&body).contains(&theirs.id.to_string()),
         "and not one word of another account's schedule"
     );
     assert_eq!(
@@ -81,7 +81,7 @@ async fn the_listing_answers_the_callers_own_schedules_newest_id_first() {
     assert_eq!(shown["media_attachments"], json!([]), "nothing reserved");
 
     assert_eq!(
-        entity_ids(&list(&app, &bob_read, "").await.json_value()),
+        common::ids_of(&list(&app, &bob_read, "").await.json_value()),
         row_ids(&[&theirs]),
         "and bob's page is his own one row, not alice's three"
     );
@@ -105,7 +105,7 @@ async fn the_listing_walks_its_id_cursors_in_both_directions() {
     let page = list(&app, &read, "?limit=2").await;
     common::assert_answer(&page, StatusCode::OK, "a two-row page");
     assert_eq!(
-        entity_ids(&page.json_value()),
+        common::ids_of(&page.json_value()),
         row_ids(&[&newest, &middle]),
         "the limit cuts the oldest row off the end"
     );
@@ -117,19 +117,19 @@ async fn the_listing_walks_its_id_cursors_in_both_directions() {
 
     let older = list(&app, &read, &format!("?max_id={}", middle.id)).await;
     assert_eq!(
-        entity_ids(&older.json_value()),
+        common::ids_of(&older.json_value()),
         row_ids(&[&oldest]),
         "max_id continues where the page ended"
     );
     let newer = list(&app, &read, &format!("?min_id={}", middle.id)).await;
     assert_eq!(
-        entity_ids(&newer.json_value()),
+        common::ids_of(&newer.json_value()),
         row_ids(&[&newest]),
         "min_id answers the newer page, still newest first"
     );
     let unseen = list(&app, &read, &format!("?since_id={}", middle.id)).await;
     assert_eq!(
-        entity_ids(&unseen.json_value()),
+        common::ids_of(&unseen.json_value()),
         row_ids(&[&newest]),
         "since_id reads everything made after its cursor"
     );
@@ -167,25 +167,25 @@ async fn the_listing_is_twenty_rows_by_default_and_forty_at_most() {
     let first = list(&app, &read, "").await;
     common::assert_answer(&first, StatusCode::OK, "the default page");
     assert_eq!(
-        entity_ids(&first.json_value()),
+        common::ids_of(&first.json_value()),
         newest_first[..20],
         "20 of the 45, newest id first"
     );
     for query in ["?limit=0", "?limit=-5", "?limit=abc"] {
         assert_eq!(
-            entity_ids(&list(&app, &read, query).await.json_value()).len(),
+            common::ids_of(&list(&app, &read, query).await.json_value()).len(),
             20,
             "`{query}` is no usable limit, so the default page answers"
         );
     }
     assert_eq!(
-        entity_ids(&list(&app, &read, "?limit=5").await.json_value()).len(),
+        common::ids_of(&list(&app, &read, "?limit=5").await.json_value()).len(),
         5,
         "a usable limit goes straight through"
     );
     for query in ["?limit=40", "?limit=41", "?limit=1000"] {
         assert_eq!(
-            entity_ids(&list(&app, &read, query).await.json_value()).len(),
+            common::ids_of(&list(&app, &read, query).await.json_value()).len(),
             40,
             "`{query}` is past the cap, and the cap is what the page holds"
         );
@@ -196,7 +196,7 @@ async fn the_listing_is_twenty_rows_by_default_and_forty_at_most() {
     for _ in 0..10 {
         let query = cursor.map_or_else(String::new, |id| format!("?max_id={id}"));
         let page = list(&app, &read, &query).await;
-        let ids = entity_ids(&page.json_value());
+        let ids = common::ids_of(&page.json_value());
         if ids.is_empty() {
             assert_eq!(
                 page.header("link"),

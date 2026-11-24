@@ -189,28 +189,6 @@ pub(super) async fn follows(app: &Router, token: &str, target: &str) {
     );
 }
 
-/// The ids of a rendered page, in answer order.
-pub(super) fn ids_of(body: &Value) -> Vec<String> {
-    body.as_array()
-        .expect("a page is a JSON array")
-        .iter()
-        .map(|status| {
-            status["id"]
-                .as_str()
-                .expect("every Status entity carries its id")
-                .to_owned()
-        })
-        .collect()
-}
-
-/// The `id` of a rendered entity, as its JSON spells it.
-pub(super) fn entity_id(entity: &Value) -> String {
-    entity["id"]
-        .as_str()
-        .expect("the entity carries its id")
-        .to_owned()
-}
-
 /// The row of a rendered page that carries `wanted`, for `who`.
 pub(super) fn row_of<'a>(page: &'a Value, wanted: &str, who: &str) -> &'a Value {
     page.as_array()

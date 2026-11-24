@@ -239,17 +239,6 @@ async fn is_tombstone(pool: &PgPool, id: &str) -> bool {
         .0
 }
 
-/// The account ids of an [`Account`] array, in answer order.
-///
-/// [`Account`]: wired_be::entities::account::Account
-fn account_ids(body: &Value) -> Vec<String> {
-    body.as_array()
-        .expect("the answer is an array")
-        .iter()
-        .map(|entry| entry["id"].as_str().unwrap_or_default().to_owned())
-        .collect()
-}
-
 /// A `Link` header keyed on reblog row ids: `next` walks to `oldest`, `prev`
 /// back to `newest`, both on the route's own `path`.
 fn assert_boost_keyed_link(link: Option<&str>, path: &str, newest: Uuid, oldest: Uuid) {
@@ -692,7 +681,7 @@ async fn reblogged_by_lists_the_boosters_and_pages_on_boost_ids() {
     let page = reblogged_by(&app, None, &id, "").await;
     common::assert_answer(&page, StatusCode::OK, "the listing answers");
     assert_eq!(
-        account_ids(&page.json_value()),
+        common::ids_of(&page.json_value()),
         boosters
             .iter()
             .rev()
@@ -704,7 +693,7 @@ async fn reblogged_by_lists_the_boosters_and_pages_on_boost_ids() {
 
     let first = reblogged_by(&app, None, &id, "limit=2").await;
     assert_eq!(
-        account_ids(&first.json_value()),
+        common::ids_of(&first.json_value()),
         vec![boosters[2].0.id.to_string(), boosters[1].0.id.to_string()],
         "limit cuts the page at the newest two"
     );
@@ -712,14 +701,14 @@ async fn reblogged_by_lists_the_boosters_and_pages_on_boost_ids() {
 
     let tail = reblogged_by(&app, None, &id, &format!("max_id={}", all[1])).await;
     assert_eq!(
-        account_ids(&tail.json_value()),
+        common::ids_of(&tail.json_value()),
         vec![boosters[0].0.id.to_string()],
         "max_id continues where the page ended, keyed on the reblog row id"
     );
 
     let past = reblogged_by(&app, None, &id, &format!("max_id={}", all[2])).await;
     assert_eq!(
-        account_ids(&past.json_value()),
+        common::ids_of(&past.json_value()),
         Vec::<String>::new(),
         "a walk past the oldest boost answers the empty page"
     );
@@ -727,7 +716,7 @@ async fn reblogged_by_lists_the_boosters_and_pages_on_boost_ids() {
 
     let forward = reblogged_by(&app, None, &id, &format!("min_id={}", all[2])).await;
     assert_eq!(
-        account_ids(&forward.json_value()),
+        common::ids_of(&forward.json_value()),
         vec![boosters[2].0.id.to_string(), boosters[1].0.id.to_string()],
         "min_id answers the newer page, still newest-first"
     );
@@ -736,7 +725,7 @@ async fn reblogged_by_lists_the_boosters_and_pages_on_boost_ids() {
     let empty = reblogged_by(&app, None, &quiet.id.to_string(), "").await;
     common::assert_answer(&empty, StatusCode::OK, "an unboosted status answers");
     assert_eq!(
-        account_ids(&empty.json_value()),
+        common::ids_of(&empty.json_value()),
         Vec::<String>::new(),
         "with the empty list"
     );
@@ -766,7 +755,7 @@ async fn reblogged_by_answers_the_original_through_a_boost_id() {
         "a boost's id answers its original's list",
     );
     assert_eq!(
-        account_ids(&through_the_row.json_value()),
+        common::ids_of(&through_the_row.json_value()),
         vec![carol.id.to_string(), bob.id.to_string()],
         "the boosters of the original, newest boost first"
     );
@@ -790,7 +779,7 @@ async fn a_withdrawn_boost_leaves_the_listing() {
 
     let page = reblogged_by(&app, None, &id, "").await;
     assert_eq!(
-        account_ids(&page.json_value()),
+        common::ids_of(&page.json_value()),
         vec![carol.id.to_string()],
         "a tombstoned boost names no reblogger"
     );
@@ -949,7 +938,7 @@ async fn reblogged_by_demands_read_from_a_presented_user_token() {
     let anonymous = reblogged_by(&app, None, &id, "").await;
     common::assert_answer(&anonymous, StatusCode::OK, "an anonymous read proceeds");
     assert_eq!(
-        account_ids(&anonymous.json_value()),
+        common::ids_of(&anonymous.json_value()),
         Vec::<String>::new(),
         "and answers the empty list of an unboosted post"
     );

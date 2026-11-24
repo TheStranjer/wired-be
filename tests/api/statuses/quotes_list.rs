@@ -17,8 +17,7 @@ use wired_be::{
 };
 
 use super::support::{
-    INVALID_TOKEN, NO_SCOPE, NOT_FOUND, SCOPES, UNKNOWN_ID, deleted, entity_ids, quote_of,
-    user_with_token,
+    INVALID_TOKEN, NO_SCOPE, NOT_FOUND, SCOPES, UNKNOWN_ID, deleted, quote_of, user_with_token,
 };
 use crate::common;
 
@@ -111,7 +110,7 @@ async fn the_quotes_routes_answer_the_quoters_newest_first() {
         common::assert_answer(&page, StatusCode::OK, route);
         let body = page.json_value();
         assert_eq!(
-            entity_ids(&body),
+            common::ids_of(&body),
             want_ids,
             "{route}: every quoter, newest first"
         );
@@ -159,7 +158,7 @@ async fn the_quotes_page_drops_what_the_viewer_may_not_see() {
     )
     .await;
     common::assert_answer(&as_alice, StatusCode::OK, "alice reads her post's quoters");
-    let alice_page = entity_ids(&as_alice.json_value());
+    let alice_page = common::ids_of(&as_alice.json_value());
     assert_eq!(
         alice_page,
         texts(&newest_first(&[&public, &quiet, &own])),
@@ -173,7 +172,7 @@ async fn the_quotes_page_drops_what_the_viewer_may_not_see() {
     let anonymous = fetch(&app, &quotes_path("/api/v1/pleroma", &id, ""), None).await;
     common::assert_answer(&anonymous, StatusCode::OK, "the anonymous Pleroma twin");
     assert_eq!(
-        entity_ids(&anonymous.json_value()),
+        common::ids_of(&anonymous.json_value()),
         texts(&newest_first(&[&public, &quiet])),
         "the anonymous page carries only the public and unlisted quoters"
     );
@@ -214,7 +213,7 @@ async fn the_quotes_routes_page_with_limit_and_max_id_and_link_their_pages() {
         let page = fetch(&app, &base, None).await;
         common::assert_answer(&page, StatusCode::OK, route);
         assert_eq!(
-            entity_ids(&page.json_value()),
+            common::ids_of(&page.json_value()),
             texts(&all),
             "{route}: the whole page"
         );
@@ -222,7 +221,7 @@ async fn the_quotes_routes_page_with_limit_and_max_id_and_link_their_pages() {
 
         let first = fetch(&app, &quotes_path(mount, &id, "limit=2"), None).await;
         assert_eq!(
-            entity_ids(&first.json_value()),
+            common::ids_of(&first.json_value()),
             texts(&all[..2]),
             "{route}: the limit cuts the page at the newest two"
         );
@@ -235,7 +234,7 @@ async fn the_quotes_routes_page_with_limit_and_max_id_and_link_their_pages() {
         )
         .await;
         assert_eq!(
-            entity_ids(&tail.json_value()),
+            common::ids_of(&tail.json_value()),
             texts(&all[2..]),
             "{route}: max_id walks to the older quoters, keyed on quoter row ids"
         );
@@ -282,7 +281,7 @@ async fn the_quotes_routes_walk_the_forward_cursors_and_the_link_edges() {
         )
         .await;
         assert_eq!(
-            entity_ids(&forward.json_value()),
+            common::ids_of(&forward.json_value()),
             texts(&all[..2]),
             "{route}: min_id answers the newer page, still newest-first"
         );
@@ -294,7 +293,7 @@ async fn the_quotes_routes_walk_the_forward_cursors_and_the_link_edges() {
         )
         .await;
         assert_eq!(
-            entity_ids(&fresh.json_value()),
+            common::ids_of(&fresh.json_value()),
             texts(&all[..1]),
             "{route}: since_id polls the newer rows, descending like a first page"
         );
@@ -308,7 +307,7 @@ async fn the_quotes_routes_walk_the_forward_cursors_and_the_link_edges() {
     let base = quotes_path("/api/v1", &id, "");
     let rest = fetch(&app, &base, None).await;
     assert_eq!(
-        entity_ids(&rest.json_value()),
+        common::ids_of(&rest.json_value()),
         texts(&all[..2]),
         "a tombstoned quoter leaves the page"
     );
@@ -408,7 +407,7 @@ async fn the_quotes_routes_run_the_optional_read_statuses_gate() {
         let scoped = fetch(&app, &path, Some(alice_token.as_str())).await;
         common::assert_answer(&scoped, StatusCode::OK, route);
         assert_eq!(
-            entity_ids(&scoped.json_value()),
+            common::ids_of(&scoped.json_value()),
             vec![quote.id.to_string()],
             "{route}: the scoped token's page"
         );

@@ -89,16 +89,6 @@ fn entity_client_id(response: &common::TestResponse) -> String {
         .to_owned()
 }
 
-/// The id list of a listing answer's `apps` array.
-fn listed_ids(page: &Value) -> Vec<String> {
-    page["apps"]
-        .as_array()
-        .expect("the apps array")
-        .iter()
-        .map(|row| row["id"].as_str().expect("an id text").to_owned())
-        .collect()
-}
-
 /// The app-CRUD fixture pair: an untrusted `Alpha` and a trusted `Beta`
 /// created in that order (so `Beta` is the newer row).
 async fn alpha_and_beta(app: &axum::Router, token: &str) -> (String, String, String, String) {

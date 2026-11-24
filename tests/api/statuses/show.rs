@@ -16,8 +16,8 @@ use wired_be::{
 };
 
 use super::support::{
-    NOT_FOUND, SCOPES, UNKNOWN_ID, batch, deleted, direct_to, entity_ids, followed, id_query,
-    ids_of, reblog_of, show, user_with_token,
+    NOT_FOUND, SCOPES, UNKNOWN_ID, batch, deleted, direct_to, followed, id_query, ids_of,
+    reblog_of, show, user_with_token,
 };
 use crate::common;
 
@@ -194,7 +194,7 @@ async fn a_deleted_status_is_gone_for_everyone() {
     .await;
     common::assert_answer(&after, StatusCode::OK, "the batch after a delete");
     assert_eq!(
-        entity_ids(&after.json_value()),
+        common::ids_of(&after.json_value()),
         ids_of(&[&survivor]),
         "the tombstone is skipped and the live row answers"
     );

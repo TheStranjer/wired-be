@@ -162,14 +162,18 @@ async fn index_filters_by_exact_name_and_client_id() {
         .send(&app)
         .await;
     let page = by_name.json_value();
-    assert_eq!(listed_ids(&page), vec![beta_id.clone()], "one exact match");
+    assert_eq!(
+        common::ids_of(&page["apps"]),
+        vec![beta_id.clone()],
+        "one exact match"
+    );
 
     let near_miss = TestRequest::get(&format!("{APPS}?name=alph"))
         .bearer(&token)
         .send(&app)
         .await;
     assert!(
-        listed_ids(&near_miss.json_value()).is_empty(),
+        common::ids_of(&near_miss.json_value()["apps"]).is_empty(),
         "the name filter is exact, not a pattern"
     );
 
@@ -178,7 +182,7 @@ async fn index_filters_by_exact_name_and_client_id() {
         .send(&app)
         .await;
     assert_eq!(
-        listed_ids(&by_client.json_value()),
+        common::ids_of(&by_client.json_value()["apps"]),
         vec![beta_id],
         "the client id finds its app"
     );
@@ -199,7 +203,7 @@ async fn index_windows_pages_and_filters_on_trusted() {
         .bearer(&token)
         .send(&app)
         .await;
-    let trusted_ids = listed_ids(&trusted.json_value());
+    let trusted_ids = common::ids_of(&trusted.json_value()["apps"]);
     assert!(
         trusted_ids.contains(&beta_id) && !trusted_ids.contains(&alpha_id),
         "the trusted app is listed, the untrusted one is not: {trusted_ids:?}"
@@ -209,14 +213,14 @@ async fn index_windows_pages_and_filters_on_trusted() {
         .bearer(&token)
         .send(&app)
         .await;
-    let untrusted_ids = listed_ids(&untrusted.json_value());
+    let untrusted_ids = common::ids_of(&untrusted.json_value()["apps"]);
     assert!(
         untrusted_ids.contains(&alpha_id) && !untrusted_ids.contains(&beta_id),
         "trusted=0 is the mirror filter: {untrusted_ids:?}"
     );
 
     let both = TestRequest::get(APPS).bearer(&token).send(&app).await;
-    let both_ids = listed_ids(&both.json_value());
+    let both_ids = common::ids_of(&both.json_value()["apps"]);
     assert!(
         both_ids.contains(&alpha_id) && both_ids.contains(&beta_id),
         "absent trusted lists every kind"
@@ -227,7 +231,7 @@ async fn index_windows_pages_and_filters_on_trusted() {
         .send(&app)
         .await;
     let cut = window.json_value();
-    assert_eq!(listed_ids(&cut).len(), 1, "one row");
+    assert_eq!(common::ids_of(&cut["apps"]).len(), 1, "one row");
     assert_eq!(cut["page_size"], json!(1), "the echo of the window");
     assert_eq!(
         cut["count"].as_i64(),

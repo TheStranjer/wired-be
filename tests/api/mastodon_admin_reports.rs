@@ -159,16 +159,6 @@ async fn list(app: &Router, query: &str, token: &str) -> Value {
     read(app, &path, token).await
 }
 
-/// The `id` fields of a listing answer, in order.
-fn listed_ids(answer: &Value) -> Vec<String> {
-    answer
-        .as_array()
-        .expect("an array of report entities")
-        .iter()
-        .filter_map(|report| report["id"].as_str().map(str::to_owned))
-        .collect()
-}
-
 /// The ids a listing must answer for `wanted`, as entity-key text.
 fn wanted_ids(wanted: &[Uuid]) -> Vec<String> {
     wanted.iter().map(ToString::to_string).collect()
@@ -399,7 +389,7 @@ async fn the_listing_pages_the_open_queue_under_a_link_header() {
         .await;
     common::assert_answer(&first, StatusCode::OK, "the first page");
     assert_eq!(
-        listed_ids(&first.json_value()),
+        common::ids_of(&first.json_value()),
         wanted_ids(&open[..2]),
         "the two newest open filings, the resolved one excluded"
     );
@@ -418,7 +408,7 @@ async fn the_listing_pages_the_open_queue_under_a_link_header() {
         .await;
     common::assert_answer(&second, StatusCode::OK, "the followed page");
     assert_eq!(
-        listed_ids(&second.json_value()),
+        common::ids_of(&second.json_value()),
         wanted_ids(&open[2..]),
         "the walk continues where the page ended"
     );
@@ -488,7 +478,7 @@ async fn the_listing_filters_select_their_own_rows() {
     ];
     for (query, wanted) in cases {
         assert_eq!(
-            listed_ids(&list(&app, query, &token).await),
+            common::ids_of(&list(&app, query, &token).await),
             wanted_ids(wanted),
             "the listing of `{query}`"
         );

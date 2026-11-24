@@ -9,7 +9,7 @@ use wired_be::models::user::Flag;
 use super::support::{
     BAD_DAY, BAD_MONTH, BIRTHDAYS_PATH, FAMILIAR_PATH, INVALID_TOKEN, NO_READ_ACCOUNTS,
     NO_READ_FOLLOWS, NOT_IMPLEMENTED, USER_REQUIRED, born, deactivate, familiar_path, fixture, get,
-    listed_ids, newest_first, seed_follow,
+    newest_first, seed_follow,
 };
 use crate::common;
 
@@ -45,18 +45,18 @@ async fn familiar_followers_answers_one_entry_per_known_id() {
     common::assert_answer(&answer, StatusCode::OK, "the familiar batch");
     let body = answer.json_value();
     assert_eq!(
-        listed_ids(&body),
+        common::ids_of(&body),
         vec![target.id.to_string(), other.id.to_string()],
         "the two known ids in the order asked, the junk and the unknown one skipped"
     );
     assert_eq!(
-        listed_ids(&body[0]["accounts"]),
+        common::ids_of(&body[0]["accounts"]),
         vec![friend.id.to_string()],
         "the one account alice follows that follows the target, and not \
          the stranger who follows it too"
     );
     assert_eq!(
-        listed_ids(&body[1]["accounts"]),
+        common::ids_of(&body[1]["accounts"]),
         vec![friend.id.to_string()],
         "friend follows both, so both entries name them"
     );
@@ -76,7 +76,7 @@ async fn familiar_followers_answers_one_entry_per_known_id() {
     .await
     .json_value();
     assert_eq!(
-        listed_ids(&single),
+        common::ids_of(&single),
         vec![target.id.to_string()],
         "a lone `id=` is read too, Pleroma's List.wrap"
     );
@@ -115,14 +115,14 @@ async fn familiar_followers_respects_the_hidden_collections() {
 
     let stranger = get(&app, Some(&alice_token), &path).await.json_value();
     assert_eq!(
-        listed_ids(&stranger[0]["accounts"]),
+        common::ids_of(&stranger[0]["accounts"]),
         Vec::<String>::new(),
         "a target that hides its followers answers nobody else"
     );
 
     let own = get(&app, Some(&hidden_token), &path).await.json_value();
     assert_eq!(
-        listed_ids(&own[0]["accounts"]),
+        common::ids_of(&own[0]["accounts"]),
         vec![open.id.to_string()],
         "asked about themself the target sees its followers, and the one of \
          them that hides its follows is still never named"
@@ -235,13 +235,13 @@ async fn birthdays_list_the_viewer_and_their_follows_on_the_day() {
     common::assert_answer(&answer, StatusCode::OK, "the birthday listing");
     let body = answer.json_value();
     assert_eq!(
-        listed_ids(&body),
+        common::ids_of(&body),
         expected,
         "the viewer and the one follow born that day, newest account first"
     );
     for absent in [other_day.id, undisclosed.id, unfollowed.id, closed.id] {
         assert!(
-            !listed_ids(&body).contains(&absent.to_string()),
+            !common::ids_of(&body).contains(&absent.to_string()),
             "{absent} is out: another day, an undisclosed birthday, nobody \
              the viewer follows, and a closed account"
         );
@@ -266,7 +266,7 @@ async fn birthdays_default_to_today_in_utc() {
 
     let now = get(&app, Some(&token), BIRTHDAYS_PATH).await.json_value();
     assert_eq!(
-        listed_ids(&now),
+        common::ids_of(&now),
         vec![party.id.to_string()],
         "today's birthday is on the list with no parameters at all, and the \
          viewer is absent because alice named no birthday"
@@ -284,7 +284,7 @@ async fn birthdays_default_to_today_in_utc() {
     .await
     .json_value();
     assert_eq!(
-        listed_ids(&moved),
+        common::ids_of(&moved),
         Vec::<String>::new(),
         "`month` alone keeps today's day and asks about another month"
     );
@@ -296,7 +296,7 @@ async fn birthdays_default_to_today_in_utc() {
     .await
     .json_value();
     assert_eq!(
-        listed_ids(&by_day),
+        common::ids_of(&by_day),
         vec![shifted.id.to_string()],
         "and `day` alone asks about another day of this month"
     );
@@ -318,7 +318,7 @@ async fn an_empty_birthday_part_is_treated_as_absent() {
         let asked = get(&app, Some(&token), &format!("{BIRTHDAYS_PATH}?{query}")).await;
         common::assert_answer(&asked, StatusCode::OK, query);
         assert_eq!(
-            listed_ids(&asked.json_value()),
+            common::ids_of(&asked.json_value()),
             vec![party.id.to_string()],
             "`?{query}` asks about today, as no parameter at all does"
         );
@@ -348,7 +348,7 @@ async fn birthdays_match_a_leap_day_only_on_the_leap_day() {
     .await
     .json_value();
     assert_eq!(
-        listed_ids(&on),
+        common::ids_of(&on),
         vec![leaper.id.to_string()],
         "2/29 finds the account born on it"
     );
@@ -357,7 +357,7 @@ async fn birthdays_match_a_leap_day_only_on_the_leap_day() {
             .await
             .json_value();
         assert!(
-            !listed_ids(&miss).contains(&leaper.id.to_string()),
+            !common::ids_of(&miss).contains(&leaper.id.to_string()),
             "`{query}` does not find the leap-day account"
         );
     }

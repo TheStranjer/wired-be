@@ -7,8 +7,8 @@ use sqlx::PgPool;
 use wired_be::models::user::User;
 
 use super::support::{
-    HEART, HEART_SEGMENT, PARTY, PARTY_SEGMENT, clear, dismiss, entity_id, flat, follow, grouped,
-    groups, post, react, row_of, sorted, status_action, unread, user,
+    HEART, HEART_SEGMENT, PARTY, PARTY_SEGMENT, clear, dismiss, flat, follow, grouped, groups,
+    post, react, row_of, sorted, status_action, unread, user,
 };
 use crate::common;
 
@@ -45,7 +45,7 @@ fn expected_groups(rows: &[Value]) -> Vec<ExpectedGroup> {
             .as_str()
             .expect("an actor id")
             .to_owned();
-        let id = entity_id(row);
+        let id = common::id_of(row);
         match listed.iter_mut().find(|group| group.key == key) {
             Some(group) => {
                 group.count += 1;
@@ -129,8 +129,8 @@ struct Posts {
 /// favourite of a second account on her second post, and an ungrouped
 /// follow by that account.
 async fn seed_grouped(app: &Router, pool: &PgPool, alice: &User, alice_token: &str) -> Posts {
-    let first = entity_id(&post(app, alice_token, "merge me").await);
-    let second = entity_id(&post(app, alice_token, "one fan only").await);
+    let first = common::id_of(&post(app, alice_token, "merge me").await);
+    let second = common::id_of(&post(app, alice_token, "one fan only").await);
     let (_bob, bob_token) = user(pool, "bob").await;
     let (_carol, carol_token) = user(pool, "carol").await;
     let (_dave, dave_token) = user(pool, "dave").await;
@@ -223,7 +223,7 @@ fn assert_group_keys(rows: &[Value], want: &[ExpectedGroup], posts: &Posts) {
             format!("pleroma:emoji_reaction-{}-{PARTY}", posts.first),
             format!("pleroma:emoji_reaction-{}-{HEART}", posts.first),
             format!("favourite-{}", posts.second),
-            format!("ungrouped-{}", entity_id(row_of(rows, "follow"))),
+            format!("ungrouped-{}", common::id_of(row_of(rows, "follow"))),
         ]),
         "the groupable types key on the status (and the emoji); the \
          follow keeps its unique ungrouped key"

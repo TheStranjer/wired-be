@@ -9,7 +9,7 @@ use wired_be::streaming::hub::Audience;
 
 use super::support::{
     ALL_ADMIN, BLANK, ENDS_AFTER, FUTURE, INVALID_TIME, NOTICES, PAST, RULES, a_notice, admin, app,
-    app_with_state, create_notice, destroy, entity_id, get, notice_count, patch, post_notice,
+    app_with_state, create_notice, destroy, get, notice_count, patch, post_notice,
 };
 use crate::common;
 
@@ -85,7 +85,7 @@ async fn a_notice_patch_checks_the_window_it_merges() {
         &json!({"content": "anchored", "starts_at": PAST}),
     )
     .await;
-    let id = entity_id(&stored);
+    let id = common::id_of(&stored);
 
     let nulled = patch(
         &app,
@@ -220,7 +220,7 @@ async fn neither_a_patched_nor_a_deleted_notice_is_published() {
     let (app, state) = app_with_state(&pool);
     let (_root, token) = admin(&pool, "root", ALL_ADMIN).await;
     let entity = a_notice(&app, &token, "once").await;
-    let id = entity_id(&entity);
+    let id = common::id_of(&entity);
     let mut rx = state.hub.subscribe();
 
     let patched = patch(

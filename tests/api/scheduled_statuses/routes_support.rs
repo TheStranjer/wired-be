@@ -193,20 +193,6 @@ pub(super) async fn cancel(app: &Router, token: &str, id: &str) -> common::TestR
         .await
 }
 
-/// The `id` of every entity in a listing answer, in the order they came.
-pub(super) fn entity_ids(body: &Value) -> Vec<String> {
-    body.as_array()
-        .expect("the listing is an array")
-        .iter()
-        .map(|entity| {
-            entity["id"]
-                .as_str()
-                .expect("every entity carries its id")
-                .to_owned()
-        })
-        .collect()
-}
-
 /// The `params.text` echo of every entity in a listing answer: which parked
 /// post each row is, so an order reads as text.
 pub(super) fn entity_texts(body: &Value) -> Vec<String> {

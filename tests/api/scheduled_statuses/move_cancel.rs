@@ -12,8 +12,8 @@ use wired_be::{
 };
 
 use super::routes_support::{
-    NOT_AN_ID, SCHEDULES, TOO_SOON, assert_one_fire, cancel, day, entity_ids, fires_for, list,
-    manager, move_form, move_to, parked, seeded, seeded_text, show,
+    NOT_AN_ID, SCHEDULES, TOO_SOON, assert_one_fire, cancel, day, fires_for, list, manager,
+    move_form, move_to, parked, seeded, seeded_text, show,
 };
 use super::support::{
     INVALID_SCHEDULED_AT, NOT_FOUND, in_minutes, jobs_of_kind, keys, object_keys, post_count,
@@ -315,7 +315,7 @@ async fn a_cancel_takes_the_row_and_its_fire() {
         "no publish job of any schedule is left"
     );
     assert!(
-        entity_ids(&list(&app, &read, "").await.json_value()).is_empty(),
+        common::ids_of(&list(&app, &read, "").await.json_value()).is_empty(),
         "and the listing has nothing left to answer"
     );
 

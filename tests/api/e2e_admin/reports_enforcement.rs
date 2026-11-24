@@ -14,7 +14,7 @@ use serde_json::{Value, json};
 
 use super::support::{
     Account, DISABLED, M_ADMIN_REPORTS, P_ADMIN, STATUSES, USERS, VERIFY, World, assert_log,
-    carries, get_array, id_of, post_status, public_ids,
+    carries, get_array, post_status, public_ids,
 };
 use crate::common;
 
@@ -195,7 +195,7 @@ pub(super) async fn admin_edits_and_deletes(world: &World, reported_id: &str, su
 /// reactivation returns it — both moves logged.
 pub(super) async fn deactivation_blinds_then_restores(world: &World, target: &Account) {
     let fresh = post_status(world, target, "the live one").await;
-    let fresh_id = id_of(&fresh);
+    let fresh_id = common::id_of(&fresh);
     assert!(
         public_ids(&world.app).await.contains(&fresh_id),
         "the fresh post rides the timeline"

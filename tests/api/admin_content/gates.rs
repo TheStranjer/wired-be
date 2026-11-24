@@ -7,8 +7,8 @@ use sqlx::PgPool;
 use wired_be::models::user::{Flag, NewUser};
 
 use super::support::{
-    ALL_ADMIN, NOTICES, RULES, a_notice, a_rule, admin, app, destroy, entity_id, get, ids_of,
-    notice_count, patch, post_rule, rule_count,
+    ALL_ADMIN, NOTICES, RULES, a_notice, a_rule, admin, app, destroy, get, notice_count, patch,
+    post_rule, rule_count,
 };
 use crate::common;
 
@@ -188,7 +188,7 @@ async fn the_content_scopes_pass_their_own_routes() {
     let everyone = tokens(&pool).await;
 
     let written = a_rule(&app, &everyone.write_rules, "scoped", 0).await;
-    let id = entity_id(&written);
+    let id = common::id_of(&written);
     common::assert_answer(
         &patch(
             &app,
@@ -212,7 +212,7 @@ async fn the_content_scopes_pass_their_own_routes() {
     );
 
     let notice = a_notice(&app, &everyone.write_notices, "scoped").await;
-    let nid = entity_id(&notice);
+    let nid = common::id_of(&notice);
     common::assert_answer(
         &get(&app, &everyone.read_notices, &format!("{NOTICES}/{nid}")).await,
         StatusCode::OK,
@@ -262,12 +262,12 @@ async fn the_admin_class_roots_pass_every_route_of_their_class() {
     let rules = get(&app, &read, RULES).await.json_value();
     assert_eq!(
         rules,
-        json!([{"id": entity_id(&written), "text": "by the root", "hint": "", "priority": 1}]),
+        json!([{"id": common::id_of(&written), "text": "by the root", "hint": "", "priority": 1}]),
         "the read root lists what the write root made"
     );
     assert_eq!(
-        ids_of(&get(&app, &read, NOTICES).await.json_value()),
-        vec![entity_id(&notice)],
+        common::ids_of(&get(&app, &read, NOTICES).await.json_value()),
+        vec![common::id_of(&notice)],
         "and reads the notice area too"
     );
 }
