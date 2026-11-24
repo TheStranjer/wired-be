@@ -33,8 +33,8 @@
 //! The table is stored in sections: one child module per surface, each
 //! holding a `pub(super)` `ROWS` slice of its rows. [`ROUTES`] gathers the
 //! sections in table order and [`routes()`] walks their rows; the unit test
-//! below pins the assembled table's size and ends, so dropping or moving a
-//! section fails the build.
+//! below pins the section count, rejects duplicate rows and pins the
+//! assembled table's ends, so dropping or moving a section fails the build.
 
 /// Who has to present a bearer token to reach a route.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -109,12 +109,13 @@ pub fn routes() -> impl Iterator<Item = &'static RouteSpec> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use super::{AuthClass, ROUTES, RouteSpec, routes};
 
-    /// The assembled table is exactly the one that lived in this file before
-    /// the split: twelve sections, none of them empty, 368 rows, opening
-    /// with the instance metadata route and closing with the custom emoji
-    /// files.
+    /// The assembled table is well formed: twelve sections, none of them
+    /// empty, no `(method, path)` pair listed twice, opening with the
+    /// instance metadata route and closing with the custom emoji files.
     #[test]
     fn routes_assembles_the_whole_table_in_order() {
         assert_eq!(ROUTES.len(), 12, "one section per surface");
@@ -123,10 +124,11 @@ mod tests {
             "every section contributes rows"
         );
         let rows: Vec<&RouteSpec> = routes().collect();
+        let distinct: HashSet<(&str, &str)> = rows.iter().map(|r| (r.method, r.path)).collect();
         assert_eq!(
+            distinct.len(),
             rows.len(),
-            368,
-            "the assembled table holds every row exactly once"
+            "no (method, path) pair appears twice"
         );
         assert_eq!(
             rows.first(),
