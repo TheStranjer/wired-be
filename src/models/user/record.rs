@@ -9,6 +9,7 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use super::{AccountStatus, Flag};
+use crate::util::password::verify_password;
 
 /// One row of `users`: a local account or a mirror of a remote actor
 /// (decision 7).
@@ -318,6 +319,19 @@ impl User {
         }
         AccountStatus::Active
     }
+
+    /// Whether `password` matches the stored hash. A row without a hash (a
+    /// remote mirror, a bot-created account) fails exactly like a wrong
+    /// password, as Pleroma's `confirm_current_password` does.
+    ///
+    /// The MFA and account-settings endpoints both confirm the current
+    /// password through this one check.
+    #[must_use]
+    pub fn password_matches(&self, password: &str) -> bool {
+        self.password_hash
+            .as_deref()
+            .is_some_and(|hash| verify_password(password, hash))
+    }
 }
 
 #[cfg(test)]
@@ -329,6 +343,32 @@ mod tests {
         NewUser, featured, followers, following, get_by_nickname, inbox, insert, outbox,
         test_support::*,
     };
+
+    #[tokio::test]
+    async fn password_matches_accepts_only_the_stored_password() {
+        const PASSWORD: &str = "correct horse battery staple";
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let hash = crate::util::password::hash_password(PASSWORD).expect("hashing works");
+        let mut user = insert(
+            &pool,
+            &NewUser {
+                password_hash: Some(hash),
+                ..local_new("frank")
+            },
+        )
+        .await
+        .unwrap();
+        assert!(user.password_matches(PASSWORD), "the right password");
+        assert!(!user.password_matches("wrong password"), "a wrong password");
+        assert!(!user.password_matches(""), "an empty password");
+
+        user.password_hash = None;
+        assert!(
+            !user.password_matches(PASSWORD),
+            "a hashless row fails like a wrong password"
+        );
+    }
 
     #[tokio::test]
     async fn remote_user_nickname_carries_the_host() {
