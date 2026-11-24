@@ -16,7 +16,7 @@ use sqlx::PgPool;
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 use wired_be::{
-    federation::{delivery::KIND_DELIVER, dispatch::handle_incoming},
+    federation::dispatch::handle_incoming,
     models::{
         follow::{self, Follow},
         relay,
@@ -30,7 +30,7 @@ use wired_be::{
     state::AppState,
 };
 
-use crate::common;
+use crate::common::{self, delivery_jobs};
 
 /// The instance origin of [`common::test_config`].
 pub(super) const BASE: &str = "https://test.example";
@@ -267,29 +267,6 @@ pub(super) async fn followed_and_accepted(state: &AppState, mock: &MockRelay) ->
         .await
         .expect("the pair stands after the grant");
     (granted, relay_user)
-}
-
-/// Delivers `activity` through the real dispatcher as `signer`.
-pub(super) async fn deliver(state: &AppState, activity: &Value, signer: &User) {
-    let kind = activity["type"].as_str().unwrap_or("activity");
-    handle_incoming(
-        state.clone(),
-        json!({"activity": activity, "signer_id": signer.id.to_string(), "inbox_owner": null}),
-    )
-    .await
-    .unwrap_or_else(|err| panic!("the {kind} delivery completes the job: {err}"));
-}
-
-/// The args of every queued `federator.deliver` job, in insertion order.
-pub(super) async fn delivery_jobs(pool: &PgPool) -> Vec<Value> {
-    sqlx::query_as::<_, (Value,)>("SELECT args FROM jobs WHERE kind = $1 ORDER BY inserted_at, id")
-        .bind(KIND_DELIVER)
-        .fetch_all(pool)
-        .await
-        .expect("the delivery jobs read")
-        .into_iter()
-        .map(|(args,)| args)
-        .collect()
 }
 
 /// The `relays` row for `actor_ap_id`, insisting it stands.

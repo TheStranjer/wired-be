@@ -26,7 +26,7 @@ use wired_be::{
     models::{
         block::{self, Block},
         follow::{self, FollowState},
-        user::{User, get_by_id},
+        user::User,
     },
 };
 
@@ -226,11 +226,6 @@ async fn follow_pair(pool: &PgPool, follower: &User, target: &User) {
     );
 }
 
-/// The row of user `id`, for reading the denormalised counters back.
-async fn fresh_user(pool: &PgPool, id: Uuid) -> User {
-    get_by_id(pool, id).await.unwrap().expect("the user exists")
-}
-
 /// Whether the pair still has any follow row, in either direction.
 async fn follows_between(pool: &PgPool, first: &User, second: &User) -> bool {
     follow::get(pool, first.id, second.id)
@@ -257,10 +252,10 @@ async fn blocking_severs_the_pair_and_lights_both_flags() {
     follow_pair(&pool, &bob, &alice).await;
     assert_eq!(
         (
-            fresh_user(&pool, alice.id).await.followers_count,
-            fresh_user(&pool, alice.id).await.following_count,
-            fresh_user(&pool, bob.id).await.followers_count,
-            fresh_user(&pool, bob.id).await.following_count
+            common::reload_user(&pool, alice.id).await.followers_count,
+            common::reload_user(&pool, alice.id).await.following_count,
+            common::reload_user(&pool, bob.id).await.followers_count,
+            common::reload_user(&pool, bob.id).await.following_count
         ),
         (1, 1, 1, 1),
         "the mutual fixture counts both ways"
@@ -291,10 +286,10 @@ async fn blocking_severs_the_pair_and_lights_both_flags() {
     );
     assert_eq!(
         (
-            fresh_user(&pool, alice.id).await.followers_count,
-            fresh_user(&pool, alice.id).await.following_count,
-            fresh_user(&pool, bob.id).await.followers_count,
-            fresh_user(&pool, bob.id).await.following_count
+            common::reload_user(&pool, alice.id).await.followers_count,
+            common::reload_user(&pool, alice.id).await.following_count,
+            common::reload_user(&pool, bob.id).await.followers_count,
+            common::reload_user(&pool, bob.id).await.following_count
         ),
         (0, 0, 0, 0),
         "and every counter those two follows fed stepped down"
@@ -363,7 +358,7 @@ async fn unblocking_lifts_the_block_without_rewinding() {
 
     follow_pair(&pool, &alice, &bob).await;
     assert_eq!(
-        fresh_user(&pool, bob.id).await.followers_count,
+        common::reload_user(&pool, bob.id).await.followers_count,
         1,
         "the pair may follow again, and that counts"
     );

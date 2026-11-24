@@ -22,7 +22,7 @@ use wired_be::{
     config::TEST_BASE_URL,
     models::{
         follow::{self, Follow, FollowState},
-        user::{Flag, User, get_by_id},
+        user::{Flag, User},
     },
 };
 
@@ -212,11 +212,6 @@ fn expected_relationship(target: &Uuid, computed: &Value) -> Value {
         );
     }
     value
-}
-
-/// The row of user `id` as it stands now, for reading counters back.
-async fn fresh_user(pool: &PgPool, id: Uuid) -> User {
-    get_by_id(pool, id).await.unwrap().expect("the user exists")
 }
 
 /// The queue answers the accounts waiting on the caller — full `Account`
@@ -439,12 +434,12 @@ async fn authorize_grants_flips_counters_and_answers_the_relationship() {
     );
     assert_eq!(stored.id, request.id, "the same row, not a new one");
     assert_eq!(
-        fresh_user(&pool, carol.id).await.followers_count,
+        common::reload_user(&pool, carol.id).await.followers_count,
         1,
         "the followee gained a follower"
     );
     assert_eq!(
-        fresh_user(&pool, alice.id).await.following_count,
+        common::reload_user(&pool, alice.id).await.following_count,
         1,
         "the requester gained a follow"
     );
@@ -464,7 +459,7 @@ async fn authorize_grants_flips_counters_and_answers_the_relationship() {
     );
     assert_eq!(twice.text(), NOT_FOUND, "decision 8's 404 body");
     assert_eq!(
-        fresh_user(&pool, carol.id).await.followers_count,
+        common::reload_user(&pool, carol.id).await.followers_count,
         1,
         "and the refused repeat moved no counters"
     );
@@ -500,12 +495,12 @@ async fn reject_removes_the_row_and_answers_the_relationship() {
         "the row is removed, not stored as rejected"
     );
     assert_eq!(
-        fresh_user(&pool, carol.id).await.followers_count,
+        common::reload_user(&pool, carol.id).await.followers_count,
         0,
         "a refused request never counted, so nothing moved"
     );
     assert_eq!(
-        fresh_user(&pool, alice.id).await.following_count,
+        common::reload_user(&pool, alice.id).await.following_count,
         0,
         "on either side"
     );

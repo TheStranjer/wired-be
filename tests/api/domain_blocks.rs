@@ -22,14 +22,13 @@ use sqlx::PgPool;
 use uuid::Uuid;
 use wired_be::{
     config::TEST_BASE_URL,
-    federation::delivery::KIND_DELIVER,
     models::{
         follow,
         user::{Flag, User, get_by_id},
     },
 };
 
-use crate::common;
+use crate::common::{self, delivery_jobs};
 
 /// The instance origin the fixtures live on (`Config::for_tests`).
 const BASE: &str = "https://test.example";
@@ -647,15 +646,6 @@ async fn relationships_carry_the_domain_blocking_flag() {
         !flag(2),
         "and a local account never, not even under its own instance's domain"
     );
-}
-
-/// The args of every queued `federator.deliver` job, in insertion order.
-async fn delivery_jobs(pool: &PgPool) -> Vec<Value> {
-    sqlx::query_scalar::<_, Value>("SELECT args FROM jobs WHERE kind = $1 ORDER BY inserted_at, id")
-        .bind(KIND_DELIVER)
-        .fetch_all(pool)
-        .await
-        .expect("the delivery jobs read")
 }
 
 /// Whether a follow row of the pair is stored.

@@ -20,7 +20,7 @@ use wired_be::{
     config::TEST_BASE_URL,
     models::{
         follow::{self, Follow, FollowState},
-        user::{Flag, User, get_by_id},
+        user::{Flag, User},
     },
 };
 
@@ -121,11 +121,6 @@ async fn pending_follower(pool: &PgPool, follower: &User, target: &User) -> Foll
     row
 }
 
-/// The row of user `id` as it stands now, for reading counters back.
-async fn fresh_user(pool: &PgPool, id: Uuid) -> User {
-    get_by_id(pool, id).await.unwrap().expect("the user exists")
-}
-
 /// `POST /api/v1/accounts/{target}/remove_from_followers` as `token`.
 async fn remove(app: &Router, token: &str, target: &Uuid) -> common::TestResponse {
     common::TestRequest::post(&route(target))
@@ -171,18 +166,18 @@ async fn removing_a_follower_moves_counts_and_answers_the_relationship() {
         "the accepted row is deleted, not restated"
     );
     assert_eq!(
-        fresh_user(&pool, carol.id).await.followers_count,
+        common::reload_user(&pool, carol.id).await.followers_count,
         1,
         "carol kept exactly erin"
     );
     assert_eq!(
-        fresh_user(&pool, alice.id).await.following_count,
+        common::reload_user(&pool, alice.id).await.following_count,
         0,
         "alice follows nobody again"
     );
     assert_eq!(
         (
-            fresh_user(&pool, erin.id).await.following_count,
+            common::reload_user(&pool, erin.id).await.following_count,
             follow::get(&pool, erin.id, carol.id)
                 .await
                 .unwrap()
@@ -205,7 +200,7 @@ async fn removing_a_follower_moves_counts_and_answers_the_relationship() {
         "and answers the same unchanged relationship"
     );
     assert_eq!(
-        fresh_user(&pool, carol.id).await.followers_count,
+        common::reload_user(&pool, carol.id).await.followers_count,
         1,
         "the no-op moved no counters"
     );
@@ -255,7 +250,7 @@ async fn non_followers_answer_the_unchanged_relationship() {
         "the outgoing follow row stands"
     );
     assert_eq!(
-        fresh_user(&pool, bob.id).await.followers_count,
+        common::reload_user(&pool, bob.id).await.followers_count,
         1,
         "and so does its count"
     );
@@ -302,8 +297,8 @@ async fn a_pending_request_stays_out_of_reach() {
     );
     assert_eq!(
         (
-            fresh_user(&pool, carol.id).await.followers_count,
-            fresh_user(&pool, alice.id).await.following_count,
+            common::reload_user(&pool, carol.id).await.followers_count,
+            common::reload_user(&pool, alice.id).await.following_count,
         ),
         (0, 0),
         "a request never counted, and still does not"
@@ -370,7 +365,7 @@ async fn removing_yourself_is_the_documented_422() {
     );
     assert_eq!(response.text(), SELF_REMOVE, "this endpoint's own wording");
     assert_eq!(
-        fresh_user(&pool, carol.id).await.followers_count,
+        common::reload_user(&pool, carol.id).await.followers_count,
         0,
         "and the refused call wrote nothing"
     );
@@ -494,7 +489,7 @@ async fn the_route_gates_on_the_follow_scopes() {
         "every refusal and every no-op left its row in place"
     );
     assert_eq!(
-        fresh_user(&pool, carol.id).await.followers_count,
+        common::reload_user(&pool, carol.id).await.followers_count,
         1,
         "and exactly the three removed follows came off the count"
     );

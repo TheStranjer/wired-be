@@ -29,17 +29,13 @@ use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
 use sqlx::PgPool;
 use uuid::Uuid;
-use wired_be::{
-    federation::dispatch::handle_incoming,
-    models::{
-        block, chat, media_attachment,
-        notification::TYPE_CHAT_MENTION,
-        user::{self, User},
-    },
-    state::AppState,
+use wired_be::models::{
+    block, chat, media_attachment,
+    notification::TYPE_CHAT_MENTION,
+    user::{self, User},
 };
 
-use crate::common;
+use crate::common::{self, deliver, delivering_state};
 
 /// The remote author every fixture delivers as.
 const BOB: &str = "https://remote.example/users/bob";
@@ -83,24 +79,6 @@ fn chat_delete(actor: &str, object_ap: &str, n: &str) -> Value {
         "actor": actor,
         "object": { "id": object_ap, "type": "ChatMessage" },
     })
-}
-
-/// The job args the inbox routes write for a delivery signed by `who`.
-fn incoming_args(activity: &Value, who: &User) -> Value {
-    json!({"activity": activity, "signer_id": who.id.to_string(), "inbox_owner": null})
-}
-
-/// Runs one activity through the real dispatcher and fails the test if
-/// the job wants a retry or refuses the document.
-async fn deliver(state: &AppState, activity: &Value, who: &User) {
-    handle_incoming(state.clone(), incoming_args(activity, who))
-        .await
-        .expect("the chat fixture delivery completes the job");
-}
-
-/// The dispatcher state over the stock test config.
-fn delivering_state(pool: &PgPool) -> AppState {
-    common::test_app_state(pool.clone(), common::test_config())
 }
 
 /// `user_id`'s side of the pair's chat, if the delivery created one.

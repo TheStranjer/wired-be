@@ -32,7 +32,7 @@ use wired_be::{
     config::TEST_BASE_URL,
     models::{
         follow::{self, Follow, FollowState},
-        user::{Flag, User, get_by_ap_id, get_by_id},
+        user::{Flag, User, get_by_ap_id},
     },
 };
 
@@ -69,11 +69,6 @@ async fn fixture(pool: &PgPool, nickname: &str, scopes: &str) -> (User, String) 
     let created = common::create_local_user(pool, nickname).await;
     let token = common::create_app_and_token(pool, &created, scopes).await;
     (created, token)
-}
-
-/// The row of user `id` as it stands now, for reading counters back.
-async fn fresh_user(pool: &PgPool, id: uuid::Uuid) -> User {
-    get_by_id(pool, id).await.unwrap().expect("the user exists")
 }
 
 /// The stored relationship of the pair, which the test expects to exist.
@@ -178,7 +173,7 @@ async fn follows_local_accounts_by_handle_forms() {
         );
     }
     assert_eq!(
-        fresh_user(&pool, alice.id).await.following_count,
+        common::reload_user(&pool, alice.id).await.following_count,
         3,
         "three follows, three counts"
     );
@@ -198,8 +193,8 @@ async fn follows_a_local_account_by_actor_url() {
     assert_followed_account(&response, &bob, (true, false));
     assert_eq!(
         (
-            fresh_user(&pool, bob.id).await.followers_count,
-            fresh_user(&pool, alice.id).await.following_count,
+            common::reload_user(&pool, bob.id).await.followers_count,
+            common::reload_user(&pool, alice.id).await.following_count,
         ),
         (1, 1),
         "both counters moved"
@@ -231,8 +226,8 @@ async fn follows_a_mirrored_remote_account_by_handle() {
     );
     assert_eq!(
         (
-            fresh_user(&pool, erin.id).await.followers_count,
-            fresh_user(&pool, alice.id).await.following_count,
+            common::reload_user(&pool, erin.id).await.followers_count,
+            common::reload_user(&pool, alice.id).await.following_count,
         ),
         (0, 0),
         "a waiting request counts for nothing"
@@ -371,7 +366,7 @@ async fn unknown_targets_are_the_shared_404() {
     }
     assert_eq!(row_count(&pool).await, 0, "the six 404s wrote nothing");
     assert_eq!(
-        fresh_user(&pool, alice.id).await.following_count,
+        common::reload_user(&pool, alice.id).await.following_count,
         0,
         "and counted nothing"
     );
@@ -469,8 +464,8 @@ async fn a_locked_target_waits_as_a_request() {
     );
     assert_eq!(
         (
-            fresh_user(&pool, carol.id).await.followers_count,
-            fresh_user(&pool, alice.id).await.following_count,
+            common::reload_user(&pool, carol.id).await.followers_count,
+            common::reload_user(&pool, alice.id).await.following_count,
         ),
         (0, 0),
         "a request counts for nothing"

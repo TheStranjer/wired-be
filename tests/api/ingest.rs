@@ -36,7 +36,6 @@ use sqlx::PgPool;
 use uuid::Uuid;
 use wired_be::{
     config::Config,
-    federation::dispatch::handle_incoming,
     models::{
         follow,
         status::{self, Status},
@@ -46,7 +45,7 @@ use wired_be::{
     state::AppState,
 };
 
-use crate::common;
+use crate::common::{self, deliver, delivering_state};
 
 /// The Mastodon-flavour `Create`: a public note mentioning `carol`,
 /// tagging `#Rust` and `:ralph:`, with a `Document` pair attached.
@@ -717,25 +716,6 @@ fn direct_create(alice: &User, n: &str) -> Value {
             "context": "https://remote.example/contexts/dm-thread",
         }
     })
-}
-
-/// The job args the inbox routes write for a delivery signed by `who`.
-fn incoming_args(activity: &Value, who: &User) -> Value {
-    json!({"activity": activity, "signer_id": who.id.to_string(), "inbox_owner": null})
-}
-
-/// Runs one activity through the real `federator.incoming` handler — the
-/// whole dispatcher: containment, ledger, MRF, registry — and fails the
-/// test if the job wants a retry or refuses the document.
-async fn deliver(state: &AppState, activity: &Value, who: &User) {
-    handle_incoming(state.clone(), incoming_args(activity, who))
-        .await
-        .expect("the fixture delivery completes the job");
-}
-
-/// The dispatcher state over the stock test config.
-fn delivering_state(pool: &PgPool) -> AppState {
-    common::test_app_state(pool.clone(), common::test_config())
 }
 
 /// The dispatcher state with `ACCEPT_UNSOLICITED_PUBLIC=false`.

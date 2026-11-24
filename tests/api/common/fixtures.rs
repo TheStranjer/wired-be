@@ -1,12 +1,15 @@
 //! Row fixtures: users, statuses, notifications, reactions and attachments.
 
 use sqlx::PgPool;
+use uuid::Uuid;
 use wired_be::{
     models::{
         media_attachment::{self, MediaAttachment, NewMediaAttachment},
         notification::{self, NewNotification, Notification},
         status::{self, NewStatus, Status, Visibility},
-        user::{NewUser, User, followers, following, inbox, insert, local_ap_id, outbox},
+        user::{
+            NewUser, User, followers, following, get_by_id, inbox, insert, local_ap_id, outbox,
+        },
     },
     util::password::hash_password,
 };
@@ -29,6 +32,18 @@ pub async fn create_local_user(pool: &PgPool, nickname: &str) -> User {
     insert(pool, &NewUser::local(nickname, &ap_id))
         .await
         .expect("local user fixture inserts")
+}
+
+/// User `id` as it stands now (counters and all).
+///
+/// # Panics
+///
+/// If the read fails or no user has that id.
+pub async fn reload_user(pool: &PgPool, id: Uuid) -> User {
+    get_by_id(pool, id)
+        .await
+        .expect("the user reads")
+        .expect("the user exists")
 }
 
 /// Inserts a local [`User`] named `nickname` that can log in with
