@@ -4,10 +4,13 @@
 //!
 //! A ballot on a poll of a local status answers nobody; what it changes is
 //! the poll's tally, which [`after_local_poll_changed`] re-announces as a
-//! debounced `Update` of the `Question` (after a vote and when the poll
-//! closes). The row readers and the publisher hand are the root's.
+//! debounced `Update` of the `Question` (after a vote, and at once through
+//! [`after_local_poll_closed`] when the poll closes). The `Update` is
+//! rendered by the queued job, not by the hook. The row readers and the
+//! publisher hand are the root's.
 
-use chrono::{TimeDelta, Utc};
+use chrono::{DateTime, TimeDelta, Utc};
+use serde::Deserialize;
 use serde_json::{Value, json};
 use tracing::{debug, warn};
 use uuid::Uuid;
@@ -18,8 +21,13 @@ use super::{
     queue_activity,
 };
 use crate::{
-    federation::{note, publisher},
+    federation::{
+        note,
+        publisher::{self, PublishOpts},
+    },
+    jobs::{AttemptInfo, HandlerFuture, JobError, QUEUE_FEDERATOR_OUTGOING},
     models::{
+        job::{NewJob, enqueue},
         poll::{self, Poll as PollRow, PollOption},
         status::Status,
         user::User,
@@ -39,35 +47,100 @@ fn poll_update_key(status_id: Uuid) -> String {
     format!("poll-update:{status_id}")
 }
 
+/// The job kind of a local poll's deferred `Update`, on
+/// [`QUEUE_FEDERATOR_OUTGOING`], handled by [`handle_publish_update`].
+pub const KIND_PUBLISH_UPDATE: &str = "polls.publish_update";
+
+/// The [`KIND_PUBLISH_UPDATE`] job arguments: only the status whose poll
+/// changed, so the document is rendered when the job runs.
+#[derive(Debug, Deserialize)]
+struct UpdateArgs {
+    /// `statuses.id` of the local status carrying the poll.
+    status_id: Uuid,
+}
+
 /// Re-announce the tally of a LOCAL status' poll as a debounced `Update`.
 ///
-/// The `Question` carries its current `votersCount`, option counts and
-/// `closed` state. The job is queued three minutes ahead under the key
+/// Queues a [`KIND_PUBLISH_UPDATE`] job three minutes ahead under the key
 /// `poll-update:{status id}`, so votes landing meanwhile collapse into it.
 ///
-/// The document is the edit hook's own (the status' note wrapped in an
-/// `Update`) and travels to the audience the `Create` reached. It is
-/// rendered when this hook runs, so a debounced job carries the tally of
-/// the first change it folded. Silence is the answer when federation is
-/// off, and for a row the note publishing gate refuses (a mirror, a
-/// reblog, a `local`-visibility post or an author that is gone or switched
-/// off).
+/// Nothing is rendered here: the job carries the status id and
+/// [`handle_publish_update`] renders the `Question` (current `votersCount`,
+/// option counts and `closed` state) when it runs, so the one deferred
+/// `Update` carries the tally as of the last vote it folded. Silence is the
+/// answer when federation is off, and for a row the note publishing gate
+/// refuses (a mirror, a reblog, a `local`-visibility post or an author that
+/// is gone or switched off).
 pub async fn after_local_poll_changed(state: &AppState, status: &Status) {
+    let run_at = Utc::now() + TimeDelta::minutes(POLL_UPDATE_DELAY_MINUTES);
+    queue_poll_update(state, status, run_at).await;
+}
+
+/// Announce that a LOCAL status' poll closed, without the vote delay.
+///
+/// The same keyed [`KIND_PUBLISH_UPDATE`] job, due now. A job already
+/// pending under the key is kept: it renders the closed poll when it runs.
+pub async fn after_local_poll_closed(state: &AppState, status: &Status) {
+    queue_poll_update(state, status, Utc::now()).await;
+}
+
+/// Queues the keyed [`KIND_PUBLISH_UPDATE`] job of `status`, due at `run_at`.
+async fn queue_poll_update(state: &AppState, status: &Status, run_at: DateTime<Utc>) {
     if !state.config.federation_enabled.get() {
         return;
     }
     let Some(author) = note_publisher(state, status).await else {
         return;
     };
-    let Some(document) = note_document(state, status.id, NoteActivity::Update).await else {
-        return;
-    };
     let key = poll_update_key(status.id);
-    let run_at = Utc::now() + TimeDelta::minutes(POLL_UPDATE_DELAY_MINUTES);
-    match publisher::publish_in_background_at(state, author.id, &document, &key, run_at).await {
-        Ok(()) => debug!(actor = %author.ap_id, "queued poll Update"),
+    let queued = enqueue(
+        &state.db,
+        NewJob {
+            queue: QUEUE_FEDERATOR_OUTGOING,
+            kind: KIND_PUBLISH_UPDATE,
+            args: json!({ "status_id": status.id }),
+            run_at: Some(run_at),
+            max_attempts: None,
+            unique_key: Some(&key),
+        },
+    )
+    .await;
+    match queued {
+        Ok(_job) => debug!(actor = %author.ap_id, "queued poll Update"),
         Err(err) => warn!(%err, actor = %author.ap_id, "could not queue poll Update"),
     }
+}
+
+/// The [`KIND_PUBLISH_UPDATE`] handler, registered by [`crate::serve`]:
+/// renders the poll's `Update` now and fans it out as the author.
+///
+/// Malformed arguments discard; a status that is gone, no longer federates
+/// or has no author to speak for is nothing to announce; a failed fan-out
+/// retries.
+pub fn handle_publish_update(state: AppState, _attempt: AttemptInfo, args: Value) -> HandlerFuture {
+    Box::pin(async move { run_publish_update(&state, args).await })
+}
+
+/// Renders and publishes the `Update` of the status `args` names.
+async fn run_publish_update(state: &AppState, args: Value) -> Result<(), JobError> {
+    let args = serde_json::from_value::<UpdateArgs>(args)
+        .map_err(|err| JobError::Discard(format!("malformed poll update arguments: {err}")))?;
+    if !state.config.federation_enabled.get() {
+        return Ok(());
+    }
+    let Some(status) = load_status(state, args.status_id).await else {
+        return Ok(());
+    };
+    let Some(author) = note_publisher(state, &status).await else {
+        return Ok(());
+    };
+    let Some(document) = note_document(state, status.id, NoteActivity::Update).await else {
+        return Ok(());
+    };
+    publisher::publish(state, &author, &document, PublishOpts::default())
+        .await
+        .map(drop)
+        .map_err(|err| JobError::Retry(format!("could not publish a poll Update: {err}")))
 }
 
 /// The parts one federated answer document of a remote poll is built from:
@@ -201,8 +274,8 @@ mod tests {
     use crate::{
         models::{poll::PollParams, status::Visibility},
         services::federation_out::test_support::{
-            app_state, job_count, local, local_post, local_status, publish_jobs, remote,
-            remote_status, state_with, unfederated,
+            accepted_follow, app_state, delivery_jobs, first_attempt, job_count, local, local_post,
+            local_status, publish_jobs, remote, remote_status, state_with, unfederated,
         },
         util::id::new_id,
     };
@@ -254,11 +327,55 @@ mod tests {
             .expect("the run_at reads")
     }
 
+    /// The `(args, unique key, due in the future)` of every queued
+    /// `polls.publish_update` job.
+    async fn update_jobs(pool: &PgPool) -> Vec<(Value, Option<String>, bool)> {
+        sqlx::query_as::<_, (Value, Option<String>, bool)>(
+            "SELECT args, unique_key, run_at > now() FROM jobs WHERE kind = $1 \
+              ORDER BY inserted_at",
+        )
+        .bind(KIND_PUBLISH_UPDATE)
+        .fetch_all(pool)
+        .await
+        .expect("the update jobs read")
+    }
+
+    /// Runs the queued `polls.publish_update` job for `status_id` the way
+    /// a worker would, then retires its row so the key is free again.
+    async fn run_update_job(state: &AppState, status_id: Uuid) {
+        let outcome = handle_publish_update(
+            state.clone(),
+            first_attempt(),
+            json!({ "status_id": status_id }),
+        )
+        .await;
+        assert_eq!(outcome, Ok(()), "the update job runs");
+        let retired = sqlx::query(
+            "UPDATE jobs SET state = 'completed' WHERE kind = $1 AND state = 'available'",
+        )
+        .bind(KIND_PUBLISH_UPDATE)
+        .execute(&state.db)
+        .await
+        .expect("the job retires")
+        .rows_affected();
+        assert_eq!(retired, 1, "the one queued job is retired");
+    }
+
+    /// The per-option `totalItems` of an `Update`'s `Question`.
+    fn option_counts(body: &Value) -> Vec<i64> {
+        body["object"]["oneOf"]
+            .as_array()
+            .expect("a single-choice Question carries oneOf")
+            .iter()
+            .map(|choice| choice["replies"]["totalItems"].as_i64().expect("a count"))
+            .collect()
+    }
+
     /// A vote on a poll of a LOCAL status sends no answer but queues one
-    /// delayed `Update` of the `Question` carrying the new count; a second
+    /// delayed job naming the status, with no rendered document; a second
     /// vote folds into that same job through the unique key.
     #[tokio::test]
-    async fn local_votes_queue_one_debounced_question_update() {
+    async fn local_votes_queue_one_deferred_update_job() {
         let db = crate::test_db::test_db().await.expect("test database slot");
         let pool = db.pool().clone();
         let carol = local(&pool, "carol").await;
@@ -269,31 +386,145 @@ mod tests {
 
         cast(&state, &stand, &alice, options[0]).await;
 
-        let jobs = publish_jobs(&pool).await;
+        let jobs = update_jobs(&pool).await;
         assert_eq!(jobs.len(), 1, "one job after the first vote");
-        let (args, key) = &jobs[0];
-        let activity = &args["activity"];
-        assert_eq!(activity["type"], "Update", "an Update, not an answer");
-        assert_eq!(activity["object"]["type"], "Question", "of the Question");
-        assert_eq!(activity["object"]["votersCount"], 1, "with the new count");
+        let (args, key, delayed) = &jobs[0];
         assert_eq!(
-            args["actor_id"],
-            json!(carol.id),
-            "published as the poll's author"
+            *args,
+            json!({ "status_id": stand.status_id }),
+            "the job names the status and carries no document"
         );
         assert_eq!(
             key.as_deref(),
             Some(format!("poll-update:{}", stand.status_id).as_str()),
             "under the per-status key"
         );
-        assert!(all_publishes_delayed(&pool).await, "due in the future");
+        assert!(delayed, "due in the future");
+        assert!(publish_jobs(&pool).await.is_empty(), "nothing rendered yet");
 
         cast(&state, &stand, &dave, options[1]).await;
         assert_eq!(
-            publish_jobs(&pool).await.len(),
+            update_jobs(&pool).await.len(),
             1,
             "the second vote folds into the queued job"
         );
+    }
+
+    /// Three quick votes queue one job; running it fans out one `Update`
+    /// whose counts are the final tally, not the first vote's; a vote after
+    /// it ran schedules a fresh job.
+    #[tokio::test]
+    async fn the_deferred_job_renders_the_tally_when_it_runs() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let carol = local(&pool, "carol").await;
+        let alice = local(&pool, "alice").await;
+        let dave = local(&pool, "dave").await;
+        let erin = local(&pool, "erin").await;
+        let fay = local(&pool, "fay").await;
+        let bob = remote(&pool, "bob").await;
+        accepted_follow(&pool, &bob, &carol).await;
+        let state = app_state(&pool);
+        let (stand, options) = local_poll(&pool, &carol).await;
+
+        cast(&state, &stand, &alice, options[0]).await;
+        cast(&state, &stand, &dave, options[0]).await;
+        cast(&state, &stand, &erin, options[1]).await;
+        assert_eq!(update_jobs(&pool).await.len(), 1, "one job for three votes");
+
+        run_update_job(&state, stand.status_id).await;
+        let deliveries = delivery_jobs(&pool).await;
+        assert_eq!(deliveries.len(), 1, "one Update fans out to the follower");
+        let body = &deliveries[0]["body"];
+        assert_eq!(body["type"], "Update", "an Update");
+        assert_eq!(body["object"]["type"], "Question", "of the Question");
+        assert_eq!(body["object"]["votersCount"], 3, "with all three voters");
+        assert_eq!(option_counts(body), vec![2, 1], "and the final counts");
+        assert!(body["object"].get("closed").is_none(), "the poll is open");
+
+        cast(&state, &stand, &fay, options[1]).await;
+        let jobs = update_jobs(&pool).await;
+        assert_eq!(jobs.len(), 2, "a vote after the run schedules a new job");
+        assert!(jobs[1].2, "the new job is delayed");
+    }
+
+    /// The close hook queues an immediate job whose run publishes the
+    /// `Question` with `closed` set and the final counts; a job already
+    /// pending is kept, not doubled.
+    #[tokio::test]
+    async fn closing_a_poll_publishes_the_closed_question() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let carol = local(&pool, "carol").await;
+        let alice = local(&pool, "alice").await;
+        let bob = remote(&pool, "bob").await;
+        accepted_follow(&pool, &bob, &carol).await;
+        let state = app_state(&pool);
+        let (stand, options) = local_poll(&pool, &carol).await;
+        cast(&state, &stand, &alice, options[1]).await;
+        let closing =
+            sqlx::query("UPDATE polls SET expires_at = now() - interval '1 minute' WHERE id = $1")
+                .bind(stand.id)
+                .execute(&pool)
+                .await
+                .expect("the deadline passes")
+                .rows_affected();
+        assert_eq!(closing, 1, "the poll row closes");
+        let asked = load_status(&state, stand.status_id)
+            .await
+            .expect("the status stands");
+
+        after_local_poll_closed(&state, &asked).await;
+        let pending = update_jobs(&pool).await;
+        assert_eq!(pending.len(), 1, "the vote's pending job is kept");
+
+        run_update_job(&state, stand.status_id).await;
+        after_local_poll_closed(&state, &asked).await;
+        let after_close = update_jobs(&pool).await;
+        assert_eq!(after_close.len(), 2, "the close queues its own job");
+        assert!(!after_close[1].2, "due at once, without the vote delay");
+
+        run_update_job(&state, stand.status_id).await;
+        let deliveries = delivery_jobs(&pool).await;
+        let last = &deliveries.last().expect("the close Update is delivered")["body"];
+        assert!(last["object"]["closed"].is_string(), "closed is set");
+        assert_eq!(option_counts(last), vec![0, 1], "with the final counts");
+    }
+
+    /// The job handler discards malformed arguments and is silent for a
+    /// status that is gone or an instance with federation off.
+    #[tokio::test]
+    async fn the_update_handler_refuses_what_it_cannot_publish() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let carol = local(&pool, "carol").await;
+        let bob = remote(&pool, "bob").await;
+        accepted_follow(&pool, &bob, &carol).await;
+        let asked = local_status(&pool, &carol, "tea or coffee?").await;
+
+        let malformed =
+            handle_publish_update(app_state(&pool), first_attempt(), json!({ "nope": 1 })).await;
+        assert!(
+            matches!(malformed, Err(JobError::Discard(_))),
+            "malformed arguments discard"
+        );
+
+        let gone = handle_publish_update(
+            app_state(&pool),
+            first_attempt(),
+            json!({ "status_id": new_id() }),
+        )
+        .await;
+        assert_eq!(gone, Ok(()), "a gone status is nothing to announce");
+
+        let off = handle_publish_update(
+            state_with(&pool, unfederated()),
+            first_attempt(),
+            json!({ "status_id": asked.id }),
+        )
+        .await;
+        assert_eq!(off, Ok(()), "federation off is silence");
+        assert_eq!(job_count(&pool).await, 0, "and nothing was queued");
     }
 
     /// The Update hook stays silent when federation is off, when the poll's
