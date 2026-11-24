@@ -7,8 +7,13 @@
 //! (`lib/pleroma/web/admin_api/controllers/admin_api_controller.ex`), routed
 //! in `lib/pleroma/web/router.ex` and gated by `admin:read:chats` on the
 //! reads and `admin:write:chats` on the delete — the same gates as the
-//! [`AdminUser::require`] call each handler makes first, on the area
-//! `chats`, behind the [`AdminUser`] role extractor.
+//! `require` call each handler makes first, on the area `chats`. The role
+//! half follows Pleroma's privileges: the three reads sit behind
+//! `:require_privileged_role_messages_read`, which only admins hold, so they
+//! take the [`AdminUser`] extractor and a moderator is refused; the delete
+//! shares the `:require_privileged_role_messages_delete` scope with the
+//! status writes, a privilege moderators hold, so it takes the [`StaffUser`]
+//! extractor and a moderator can remove abusive messages reported to them.
 //!
 //! The entities are the ordinary [`Chat`] and [`ChatMessage`] of the client
 //! API (decision 3), rendered **without ownership checks**: a chat belongs
@@ -51,7 +56,7 @@
 //!   read first.
 //!
 //! [`AdminUser`]: crate::auth::admin::AdminUser
-//! [`AdminUser::require`]: crate::auth::admin::AdminUser::require
+//! [`StaffUser`]: crate::auth::admin::StaffUser
 
 use axum::{
     Json, Router,
@@ -64,7 +69,7 @@ use tracing::debug;
 
 use crate::{
     api::chats::{chat_entities, chat_entity, message_of},
-    auth::admin::AdminUser,
+    auth::admin::{AdminUser, StaffUser},
     entities::chat::{Chat, ChatMessage},
     error::{AppError, AppResult},
     models::{chat, chat::ChatFilter, moderation_log, user::admin},
@@ -76,7 +81,7 @@ use crate::{
 
 /// The read endpoint class of [`AdminUser::require`].
 const CLASS_READ: &str = "read";
-/// The write endpoint class of [`AdminUser::require`].
+/// The write endpoint class of [`StaffUser::require`].
 const CLASS_WRITE: &str = "write";
 /// The admin scope area these endpoints live in (`admin:read:chats` and
 /// `admin:write:chats`, Pleroma's `OAuthScopesPlug` grants for the chat
@@ -217,7 +222,7 @@ async fn list_messages(
 ///
 /// # Errors
 ///
-/// [`AppError::Unauthorized`] / [`AppError::Forbidden`] from [`AdminUser`]
+/// [`AppError::Unauthorized`] / [`AppError::Forbidden`] from [`StaffUser`]
 /// and its `admin:write` gate; [`AppError::NotFound`] for a malformed or
 /// unknown `id`, or a `message_id` that is malformed, names no reference
 /// *of that chat* (another chat's reference is foreign here, exactly as on
@@ -226,10 +231,10 @@ async fn list_messages(
 /// [`AppError::Database`].
 async fn delete_message(
     State(state): State<AppState>,
-    admin: AdminUser,
+    staff: StaffUser,
     Path((raw, message_raw)): Path<(String, String)>,
 ) -> AppResult<Json<ChatMessage>> {
-    admin.require(CLASS_WRITE, AREA_CHATS)?;
+    staff.require(CLASS_WRITE, AREA_CHATS)?;
     let row = chat_by_id(&state.db, &raw).await?;
     let Some(reference_id) = parse_id(&message_raw) else {
         return Err(AppError::NotFound);
@@ -244,13 +249,13 @@ async fn delete_message(
         return Err(AppError::NotFound);
     }
     federation_out::after_chat_message_deleted_by_admin(&state, &row, &reference).await;
-    let logged = moderation_log::chat_message_delete(&state.db, &admin.0, reference.id).await?;
+    let logged = moderation_log::chat_message_delete(&state.db, &staff.0, reference.id).await?;
     debug!(
         log = %logged.id,
         chat = %row.id,
         message = %reference.message_id,
-        actor = %admin.0.id,
-        "admin deleted a chat message"
+        actor = %staff.0.id,
+        "staff deleted a chat message"
     );
     Ok(Json(entity))
 }
