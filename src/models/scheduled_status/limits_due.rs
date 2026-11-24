@@ -8,7 +8,7 @@
 //! index, and the sweep is that index read in due order.
 
 use chrono::{DateTime, Duration as ChronoDuration, NaiveTime, Utc};
-use sqlx::PgPool;
+use sqlx::{PgConnection, PgPool};
 use uuid::Uuid;
 
 use crate::error::AppResult;
@@ -27,6 +27,11 @@ const COUNT_FOR_USER_SQL: &str = "SELECT count(*) FROM scheduled_statuses WHERE 
 /// the index it is written for.
 const COUNT_FOR_USER_BETWEEN_SQL: &str = "SELECT count(*) FROM scheduled_statuses
       WHERE user_id = $1 AND scheduled_at >= $2 AND scheduled_at < $3";
+
+/// [`lock_user`]: the transaction-scoped advisory lock keyed by the account,
+/// hashed to the `bigint` the lock functions take.
+const LOCK_USER_SQL: &str =
+    "SELECT pg_advisory_xact_lock(hashtextextended('scheduled_statuses:' || $1::text, 0))";
 
 /// [`fetch_due`]: the worker's sweep — everything due by `now`, oldest first,
 /// a bounded page. `scheduled_at` orders the fire sequence; `id` (a `UUIDv7`,
@@ -60,11 +65,49 @@ const RESERVED_MEDIA_SQL: &str = "SELECT m.id FROM UNNEST($1::uuid[]) AS m(id)
 /// Any database failure (connection, decoding) arrives as
 /// [`AppError::Database`](crate::error::AppError).
 pub async fn count_pending_for_user(pool: &PgPool, user_id: Uuid) -> AppResult<i64> {
+    let mut conn = pool.acquire().await?;
+    count_pending_for_user_conn(&mut conn, user_id).await
+}
+
+/// [`count_pending_for_user`] on a connection the caller holds, so the count
+/// can run inside the transaction that [`lock_user`] serialises.
+///
+/// # Errors
+///
+/// The same as [`count_pending_for_user`].
+pub async fn count_pending_for_user_conn(conn: &mut PgConnection, user_id: Uuid) -> AppResult<i64> {
     let counted = sqlx::query_scalar::<_, i64>(COUNT_FOR_USER_SQL)
         .bind(user_id)
-        .fetch_one(pool)
+        .fetch_one(conn)
         .await?;
     Ok(counted)
+}
+
+/// Takes the transaction-scoped advisory lock that serialises the schedule
+/// writers of one account.
+///
+/// The create arm counts an account's pending rows and then inserts one; run
+/// as separate statements, concurrent requests all read the same count under
+/// the cap and all insert. Holding this lock from before the counts until the
+/// transaction ends makes the count-then-insert pair atomic per account: a
+/// second request waits here, and on release its counts (a fresh snapshot per
+/// statement under `READ COMMITTED`) see the first one's committed row. The
+/// lock key is the account id, so other accounts never wait on each other,
+/// and it is released by the commit or rollback, never by the caller.
+///
+/// Call it on the connection of an open transaction: outside one, the lock is
+/// released as soon as this statement finishes and protects nothing.
+///
+/// # Errors
+///
+/// Any database failure arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn lock_user(conn: &mut PgConnection, user_id: Uuid) -> AppResult<()> {
+    let _locked = sqlx::query(LOCK_USER_SQL)
+        .bind(user_id)
+        .execute(conn)
+        .await?;
+    Ok(())
 }
 
 /// The UTC calendar day holding `when`, as the half-open bounds
@@ -97,11 +140,27 @@ pub async fn count_pending_for_user_between(
     from: DateTime<Utc>,
     to: DateTime<Utc>,
 ) -> AppResult<i64> {
+    let mut conn = pool.acquire().await?;
+    count_pending_for_user_between_conn(&mut conn, user_id, from, to).await
+}
+
+/// [`count_pending_for_user_between`] on a connection the caller holds, so
+/// the count can run inside the transaction that [`lock_user`] serialises.
+///
+/// # Errors
+///
+/// The same as [`count_pending_for_user_between`].
+pub async fn count_pending_for_user_between_conn(
+    conn: &mut PgConnection,
+    user_id: Uuid,
+    from: DateTime<Utc>,
+    to: DateTime<Utc>,
+) -> AppResult<i64> {
     let counted = sqlx::query_scalar::<_, i64>(COUNT_FOR_USER_BETWEEN_SQL)
         .bind(user_id)
         .bind(from)
         .bind(to)
-        .fetch_one(pool)
+        .fetch_one(conn)
         .await?;
     Ok(counted)
 }
