@@ -46,7 +46,6 @@ use axum::{
     routing::{get, post},
 };
 use tracing::debug;
-use uuid::Uuid;
 
 use crate::{
     auth::AuthUser,
@@ -155,7 +154,9 @@ async fn authorize(
         "follow request authorized"
     );
     after_follow_request_resolved(&state, &auth.0, &granted, true).await;
-    answered_relationship(&state, auth.0.id, granted.follower_id).await
+    Ok(Json(
+        Relationship::load_one(&state.db, auth.0.id, granted.follower_id).await?,
+    ))
 }
 
 /// `POST /api/v1/follow_requests/{id}/reject` — withdraw the pending
@@ -180,7 +181,9 @@ async fn reject(
         "follow request rejected"
     );
     after_follow_request_resolved(&state, &auth.0, &removed, false).await;
-    answered_relationship(&state, auth.0.id, removed.follower_id).await
+    Ok(Json(
+        Relationship::load_one(&state.db, auth.0.id, removed.follower_id).await?,
+    ))
 }
 
 /// The caller's pending request from the account `id_str` names, or the
@@ -201,28 +204,6 @@ async fn pending_request_of(state: &AppState, resolver: &User, id_str: &str) -> 
         .await?
         .filter(|request| request.state == FollowState::Pending)
         .ok_or(AppError::NotFound)
-}
-
-/// The [`Relationship`] the two answer routes report after resolving a
-/// request: [`Relationship::load_many`] from the resolver's perspective
-/// over the single requester, so `followed_by` reflects exactly what the
-/// resolution wrote.
-///
-/// # Errors
-///
-/// Any database failure arrives through `?` as [`AppError::Database`];
-/// the [`AppError::Internal`] arm only documents that the loader answers
-/// one row per requested id, which a single-target batch always does.
-async fn answered_relationship(
-    state: &AppState,
-    resolver_id: Uuid,
-    requester_id: Uuid,
-) -> AppResult<Json<Relationship>> {
-    let loaded = Relationship::load_many(&state.db, resolver_id, &[requester_id]).await?;
-    let relationship = loaded.into_iter().next().ok_or_else(|| {
-        AppError::Internal("the relationship loader skipped its only target".to_owned())
-    })?;
-    Ok(Json(relationship))
 }
 
 /// Post-resolution hook of both answer routes: the notification telling the

@@ -14,7 +14,7 @@ use crate::{
     entities::{
         account::JsonBool,
         poll::Poll as PollEntity,
-        relationship::RelationshipMap,
+        relationship::{Relationship, RelationshipMap},
         status::{Status, StatusSource},
     },
     error::AppResult,
@@ -37,9 +37,7 @@ use super::{
         load_pins, load_quotes, load_reactions, load_reblogs, load_statuses_by_id, load_tags,
         load_thread_mutes, load_users, load_visible_parents,
     },
-    loaders_polls_cards::{
-        load_cards, load_poll_options, load_poll_votes, load_polls, load_relationships,
-    },
+    loaders_polls_cards::{load_cards, load_poll_options, load_poll_votes, load_polls},
     page_ids::{PageIds, distinct},
 };
 
@@ -204,7 +202,7 @@ impl<'a> Batch<'a> {
             polls,
             poll_options,
             poll_votes,
-            relationships: load_relationships(pool, viewer, &ids.authors).await?,
+            relationships: Relationship::load_map(pool, viewer, &ids.authors).await?,
             cards: load_cards(pool, &ids.rendered).await?,
         })
     }

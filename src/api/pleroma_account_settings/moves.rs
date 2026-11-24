@@ -149,14 +149,9 @@ pub(super) async fn move_by_id(
     user::mark_moved(&state.db, auth.0.id, &target.ap_id).await?;
     transfer_followers(&state, &auth.0, &target).await?;
     after_account_moved(&state, &auth.0, &target).await;
-    let relationships = Relationship::load_many(&state.db, auth.0.id, &[target.id]).await?;
-    relationships
-        .into_iter()
-        .next()
-        .map(Json)
-        .ok_or(AppError::Internal(
-            "the relationship to a just-resolved account vanished".to_owned(),
-        ))
+    Ok(Json(
+        Relationship::load_one(&state.db, auth.0.id, target.id).await?,
+    ))
 }
 
 /// Resolves the destination of `POST /api/v1/accounts/move`: an account id

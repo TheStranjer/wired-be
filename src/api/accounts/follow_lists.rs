@@ -37,7 +37,7 @@ use crate::{
     config::Config,
     entities::{
         account::{Account, AccountViewer},
-        relationship::{Relationship, RelationshipMap},
+        relationship::Relationship,
     },
     error::{AppError, AppResult},
     models::{follow, user::User},
@@ -187,7 +187,7 @@ fn empty_page() -> (HeaderMap, Json<Vec<Account>>) {
 
 /// Renders one fetched relationship page for `viewer`: every entry's
 /// [`User`] as an [`Account`] with the viewer's relationship embedded
-/// where one is preloaded (see [`preload_page_relationships`]), under the
+/// where one is preloaded (see [`Relationship::load_map`]), under the
 /// `Link` header [`keyset_link`] derives from the relationship ids.
 async fn page_response(
     state: &AppState,
@@ -195,7 +195,8 @@ async fn page_response(
     entries: &[follow::FollowPageEntry],
     path: &str,
 ) -> AppResult<(HeaderMap, Json<Vec<Account>>)> {
-    let relationships = preload_page_relationships(state, viewer, entries).await?;
+    let targets: Vec<Uuid> = entries.iter().map(|entry| entry.user.id).collect();
+    let relationships = Relationship::load_map(&state.db, viewer, &targets).await?;
     // The cursors key on the `follows` row
     // ([`follow::FollowPageEntry::follow_id`]), not on the users.
     let link = keyset_link(
@@ -214,30 +215,6 @@ async fn page_response(
         })
         .collect();
     Ok((headers, Json(accounts)))
-}
-
-/// The [`RelationshipMap`] for one relationship page: the viewer's
-/// relationship to every listed account in a single batched
-/// [`Relationship::load_many`], keyed by target id (which is how
-/// [`Account::from_user_for`] reads its preload). [`None`] only for an
-/// anonymous viewer, whose entries keep Pleroma's empty
-/// `pleroma.relationship` object and so need no query at all.
-async fn preload_page_relationships(
-    state: &AppState,
-    viewer: AccountViewer<'_>,
-    entries: &[follow::FollowPageEntry],
-) -> AppResult<Option<RelationshipMap>> {
-    let Some(who) = viewer else {
-        return Ok(None);
-    };
-    let targets: Vec<Uuid> = entries.iter().map(|entry| entry.user.id).collect();
-    let loaded = Relationship::load_many(&state.db, who.id, &targets).await?;
-    let map = loaded
-        .into_iter()
-        .zip(targets)
-        .map(|(relationship, target)| (target, relationship))
-        .collect();
-    Ok(Some(map))
 }
 
 #[cfg(test)]
