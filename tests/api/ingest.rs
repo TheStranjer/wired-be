@@ -158,7 +158,7 @@ fn assert_attachment_entities(media: &[Value]) {
     );
     assert_eq!(media[0]["meta"]["original"]["height"], 720, "both");
     assert_eq!(
-        media[0]["blurhash"], "eEZjQaxtcPtOt1aeWCoLKlxZe1ayyZa}OHWC",
+        media[0]["blurhash"], "LEHV6nWB2yk8pyo0adR*.7kCMdnj",
         "and its placeholder"
     );
     assert_eq!(

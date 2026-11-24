@@ -84,7 +84,7 @@ fn satellites_object() -> Value {
                 "mediaType": "image/png",
                 "url": "https://remote.example/media/b.png",
                 "name": "Second",
-                "blurhash": "LeHK",
+                "blurhash": "LEHV6nWB2yk8pyo0adR*.7kCMdnj",
                 "width": 640,
                 "height": 480
             },
@@ -120,7 +120,7 @@ fn assert_media_rows(media: &[media_attachment::MediaAttachment]) {
     );
     assert_eq!(
         media[0].blurhash.as_deref(),
-        Some("LeHK"),
+        Some("LEHV6nWB2yk8pyo0adR*.7kCMdnj"),
         "and its placeholder"
     );
     assert_eq!(media[0].width, Some(640), "and its dimensions");
