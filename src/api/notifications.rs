@@ -84,14 +84,13 @@ use uuid::Uuid;
 use crate::{
     api::{
         chats::message_of,
-        helpers::{StringList, distinct},
+        helpers::{StringList, accounts_with_relationships, distinct},
         notifications_v2::{account_filter, type_filters},
     },
     auth::AuthUser,
     entities::{
         account::{Account, AccountViewer},
         notification::Notification as NotificationEntity,
-        relationship::{Relationship, RelationshipMap},
     },
     error::{AppError, AppResult},
     extract::{ApiBody, ApiParams, flex},
@@ -103,7 +102,7 @@ use crate::{
         },
         status::{self, Status as StatusRow},
         status_visibility,
-        user::{self, User},
+        user::User,
     },
     oauth::scopes::{READ_NOTIFICATIONS, WRITE_NOTIFICATIONS},
     pagination::{NO_EXTRA_QUERY, PageParams, keyset_link, set_link_header},
@@ -607,17 +606,8 @@ pub(crate) async fn render_notifications(
     }
     let actor_ids = distinct(rows.iter().map(|row| row.from_account_id));
     let status_ids = distinct(rows.iter().filter_map(|row| row.status_id));
-    let users = user::get_many(&state.db, &actor_ids)
-        .await?
-        .into_iter()
-        .map(|found| (found.id, found))
-        .collect::<HashMap<Uuid, User>>();
-    let relationships = Relationship::load_many(&state.db, viewer.id, &actor_ids)
-        .await?
-        .into_iter()
-        .zip(actor_ids)
-        .map(|(relationship, target)| (target, relationship))
-        .collect::<RelationshipMap>();
+    let (users, relationships) =
+        accounts_with_relationships(state, Some(viewer), &actor_ids).await?;
     let statuses = visible_statuses(state, Some(viewer), &status_ids, filters).await?;
     let chat_messages = rendered_chat_messages(state, viewer, rows).await?;
     let mut entities = Vec::with_capacity(rows.len());
@@ -639,11 +629,12 @@ pub(crate) async fn render_notifications(
             .and_then(|id| chat_messages.get(&id).cloned());
         entities.push(NotificationEntity::from_row(
             row,
-            Account::from_user_for(Some(viewer), actor, &state.config, Some(&relationships)),
+            Account::from_user_for(Some(viewer), actor, &state.config, relationships.as_ref()),
             status,
             chat_message,
             relationships
-                .get(&row.from_account_id)
+                .as_ref()
+                .and_then(|map| map.get(&row.from_account_id))
                 .is_some_and(|found| found.muting.0),
         ));
     }

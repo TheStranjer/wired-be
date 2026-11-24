@@ -46,6 +46,10 @@ use crate::{
     util::{id::parse_id, params::truthy},
 };
 
+mod accounts;
+
+pub use accounts::{accounts_with_relationships, expand_accounts};
+
 /// The `RESTRICT_UNAUTHENTICATED` area that closes anonymous reads of a
 /// local status.
 const ACTIVITIES_LOCAL: &str = "activities_local";
