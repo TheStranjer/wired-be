@@ -19,7 +19,7 @@ use crate::{
 };
 
 use super::{
-    Version,
+    NO_OFFSET, Version,
     params::{HashtagList, SearchParams},
 };
 /// Whether a request may search statuses at all: every authenticated
@@ -110,7 +110,13 @@ pub(super) async fn find_hashtags(
     params: &SearchParams,
     version: Version,
 ) -> AppResult<HashtagList> {
-    let found = hashtag::search_prefix(&state.db, &params.q, params.text_page.limit).await?;
+    let found = hashtag::search_prefix(
+        &state.db,
+        &params.q,
+        params.text_page.limit,
+        params.text_page.offset.unwrap_or(NO_OFFSET),
+    )
+    .await?;
     debug!(
         count = found.len(),
         version = ?version,
