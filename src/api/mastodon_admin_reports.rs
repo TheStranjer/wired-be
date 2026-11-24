@@ -104,7 +104,7 @@ use crate::{
     },
     error::{AppError, AppResult},
     models::{
-        instance_rule, moderation_log,
+        instance_rule,
         report::{self, Report as ReportRow, ReportState},
         status, user,
         user::User,
@@ -112,7 +112,7 @@ use crate::{
     pagination::{PageParams, link_header, set_link_header},
     services::{
         render_status::{ViewerMode, render_statuses},
-        report_moderation::set_report_state,
+        report_moderation::{assign_report, set_report_state},
     },
     state::AppState,
     util::id::parse_id,
@@ -257,6 +257,7 @@ async fn reopen_report(
 /// [`AppError::NotFound`] when the row went between the two reads;
 /// [`AppError::Database`] from the write, the target read and the log.
 ///
+/// [`moderation_log`]: crate::models::moderation_log
 /// [`webhooks`]: crate::services::webhooks
 async fn move_state(
     state: &AppState,
@@ -283,7 +284,7 @@ async fn assign_to_self(
 ) -> AppResult<Json<MastodonAdminReport>> {
     staff.require(CLASS_WRITE, AREA_REPORTS)?;
     let filed = report_by_id(&state.db, &raw).await?;
-    let row = move_assignment(&state, &staff.0, &filed, Some(staff.0.id)).await?;
+    let row = move_assignment(&state, &staff.0, &filed, Some(&staff.0)).await?;
     entity(&state, &staff.0, &row).await.map(Json)
 }
 
@@ -305,8 +306,8 @@ async fn unassign_report(
     entity(&state, &staff.0, &row).await.map(Json)
 }
 
-/// The shared write of the two assignment routes: [`report::assign`], then
-/// the entry Pleroma's controller logs beside each — `report_assigned`
+/// The shared write of the two assignment routes: [`assign_report`], which
+/// writes the entry Pleroma's controller logs beside each — `report_assigned`
 /// naming the new owner by nickname, `report_unassigned` the release.
 /// Assignment is not a state change: the entity answers in whatever state
 /// the report already stood, and nothing else about the row moves.
@@ -319,31 +320,11 @@ async fn move_assignment(
     state: &AppState,
     staff: &User,
     filed: &ReportRow,
-    assignee: Option<Uuid>,
+    assignee: Option<&User>,
 ) -> AppResult<ReportRow> {
-    let moved = report::assign(&state.db, filed.id, assignee)
+    assign_report(&state.db, staff, filed.id, assignee)
         .await?
-        .ok_or(AppError::NotFound)?;
-    let target = user::get_by_id(&state.db, moved.target_id).await?;
-    let logged = if assignee.is_some() {
-        moderation_log::report_assigned(
-            &state.db,
-            staff,
-            moved.id,
-            &staff.nickname,
-            target.as_ref(),
-        )
-        .await?
-    } else {
-        moderation_log::report_unassigned(&state.db, staff, moved.id, target.as_ref()).await?
-    };
-    debug!(
-        log = %logged.id,
-        report = %moved.id,
-        assigned = moved.assigned_to.is_some(),
-        "admin mastodon report assignment changed"
-    );
-    Ok(moved)
+        .ok_or(AppError::NotFound)
 }
 
 /// The `{id}` segment of an admin report route as the stored row: text
