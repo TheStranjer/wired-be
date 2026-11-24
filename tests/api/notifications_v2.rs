@@ -13,6 +13,8 @@
 
 #![cfg(test)]
 
+/// The caller's content filters applied to grouped statuses like v1.
+mod content_filters;
 /// The listing filters, `expand_accounts`, emoji reaction groups and the gates.
 mod filters_and_gates;
 /// The grouped listing's envelope: merging, keys, expansions and samples.
