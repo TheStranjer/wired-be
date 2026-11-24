@@ -245,7 +245,7 @@ async fn update_mascot(
         .files
         .take(FILE_FIELD)
         .ok_or_else(|| AppError::Unprocessable(MISSING_FILE.to_owned()))?;
-    let content_type = image_type(&file.bytes)
+    let content_type = uploads::sniff_image(&file.bytes)
         .ok_or_else(|| AppError::UnsupportedMediaType(MASCOTS_IMAGES_ONLY.to_owned()))?;
     let attachment = upload_mascot(&state, auth.0.id, file, content_type).await?;
     save_store(
@@ -447,14 +447,6 @@ async fn save_store(state: &AppState, user_id: Uuid, store: &Value) -> AppResult
     user::set_settings_store(&state.db, user_id, store).await
 }
 
-/// The media type of an upload's bytes when [`infer`] names an image for
-/// them; `None` for anything else, including bytes no matcher can name.
-fn image_type(bytes: &[u8]) -> Option<&'static str> {
-    infer::get(bytes)
-        .filter(|kind| matches!(kind.matcher_type(), infer::MatcherType::Image))
-        .map(|kind| kind.mime_type())
-}
-
 /// Store `file` through the uploader and render it as the mascot
 /// attachment: a fresh `UUIDv7` id (decision 4), the public URL of the
 /// stored key, the fixed `image` type and the detected MIME type in the
@@ -465,13 +457,15 @@ async fn upload_mascot(
     file: UploadedFile,
     content_type: &str,
 ) -> AppResult<Value> {
-    let key = uploads::media_key(user_id, file.filename.as_deref(), content_type);
-    state.uploader.put(&key, file.bytes, content_type).await?;
-    Ok(mascot_attachment(
-        &new_id().to_string(),
-        &state.uploader.public_url(&key),
+    let url = uploads::store_public(
+        state,
+        user_id,
+        file.bytes,
+        file.filename.as_deref(),
         content_type,
-    ))
+    )
+    .await?;
+    Ok(mascot_attachment(&new_id().to_string(), &url, content_type))
 }
 
 /// The attachment JSON a mascot upload answers and stores.
@@ -700,12 +694,15 @@ mod tests {
         const NOTHING: &[u8] = b"a plain text file, definitely not an image\n";
 
         assert_eq!(
-            image_type(PNG),
+            uploads::sniff_image(PNG),
             Some("image/png"),
             "a png reads as an image"
         );
         for bytes in [PDF, NOTHING, b""] {
-            assert!(image_type(bytes).is_none(), "non-image bytes name no type");
+            assert!(
+                uploads::sniff_image(bytes).is_none(),
+                "non-image bytes name no type"
+            );
         }
 
         assert_eq!(
