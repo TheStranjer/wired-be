@@ -381,7 +381,7 @@ const CURSOR_KEYS: [&str; 4] = ["max_id", "min_id", "since_id", "offset"];
 /// its viewer, post-process the page through
 /// [`apply_active`](crate::services::filter::apply_active) in the source's
 /// filter context ([`TimelineSource::filter_context`] — `None` for the
-/// direct and list timelines, whose answer skips the pass entirely), and
+/// direct timeline, whose answer skips the pass entirely), and
 /// answer the newest-first [`StatusEntity`] array with the `Link` header
 /// this module's own page cursor derives from the request's `uri` and the
 /// fetched rows' ids (Pleroma's `add_link_headers`). An empty page carries
