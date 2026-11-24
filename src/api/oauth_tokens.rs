@@ -10,12 +10,13 @@
 //! - `GET /api/oauth_tokens` — the caller's **valid, unexpired** tokens
 //!   as `[{"id", "app_name", "valid_until"}]`, newest first. Unlike
 //!   Pleroma's `TokenView`, no `scopes` key; unlike its unfiltered
-//!   `Token.get_user_tokens`, expiry is applied here. No particular
-//!   scope is required beyond a user token.
+//!   `Token.get_user_tokens`, expiry is applied here. It requires
+//!   `read:security` (a `read` token covers it).
 //! - `DELETE /api/oauth_tokens/{id}` — revoke one of the caller's own
 //!   tokens and answer `200 {}`. Pleroma always answers 201 with an
 //!   empty body; here a foreign or unknown (or malformed) id is the
-//!   404 `{"error":"Record not found"}` of decision 8 instead.
+//!   404 `{"error":"Record not found"}` of decision 8 instead. It
+//!   requires `write:security` (a `write` token covers it).
 //! - `GET /api/v1/pleroma/apps` — the applications the caller
 //!   registered (`oauth_apps.user_id`), newest app first, never those
 //!   they merely hold a token for (the entry carries the client secret).
@@ -27,8 +28,9 @@
 //!   `with_vapid_key` puts on the render once push is configured — it
 //!   always is here, see [`crate::services::vapid`]).
 //!
-//! All three routes require a user token ([`AuthUser`]); only the apps
-//! listing demands a particular scope. The queries live in [`crate::models::oauth_token`]
+//! All three routes require a user token ([`AuthUser`]) and each demands
+//! a scope: `read:security`, `write:security` and `read` or `follow`
+//! respectively. The queries live in [`crate::models::oauth_token`]
 //! and [`crate::models::oauth_app`].
 
 use axum::{
@@ -71,12 +73,14 @@ pub fn apps_router() -> Router<AppState> {
 ///
 /// # Errors
 ///
-/// [`AppError::Unauthorized`] / [`AppError::Forbidden`] from [`AuthUser`].
+/// [`AppError::Unauthorized`] / [`AppError::Forbidden`] from [`AuthUser`];
+/// [`AppError::Forbidden`] when the token lacks `read:security`.
 /// Any database failure arrives through `?` as [`AppError::Database`].
 async fn list_tokens(
     State(state): State<AppState>,
     auth: AuthUser,
 ) -> AppResult<Json<Vec<TokenEntry>>> {
+    auth.require(scopes::READ_SECURITY)?;
     let rows = oauth_token::list_valid_with_app_names(&state.db, auth.0.id).await?;
     debug!(
         count = rows.len(),
@@ -92,6 +96,7 @@ async fn list_tokens(
 /// # Errors
 ///
 /// [`AppError::Unauthorized`] / [`AppError::Forbidden`] from [`AuthUser`];
+/// [`AppError::Forbidden`] when the token lacks `write:security`;
 /// [`AppError::NotFound`] when the id is malformed, names no token or
 /// names another user's (Pleroma's silent no-op reads as a 404 here).
 /// Any database failure arrives through `?` as [`AppError::Database`].
@@ -100,6 +105,7 @@ async fn revoke_token(
     auth: AuthUser,
     Path(id): Path<String>,
 ) -> AppResult<Json<Value>> {
+    auth.require(scopes::WRITE_SECURITY)?;
     let Some(token_id) = parse_id(&id) else {
         return Err(AppError::NotFound);
     };
