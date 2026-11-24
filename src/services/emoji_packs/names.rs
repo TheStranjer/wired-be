@@ -3,10 +3,7 @@
 //! on client-supplied names, and the shared error and path builders every
 //! other child routes the filesystem through.
 
-use std::{
-    io,
-    path::{Path, PathBuf},
-};
+use std::path::{Path, PathBuf};
 
 use crate::error::{AppError, AppResult};
 
@@ -73,12 +70,6 @@ pub(super) fn check_file_name(file: &str) -> AppResult<()> {
             "invalid emoji file name: {file}"
         )))
     }
-}
-
-/// Wraps a filesystem failure, keeping the operation and path for the log:
-/// [`AppError::Internal`] never sends its detail to a client.
-pub(super) fn io_error(operation: &str, path: &Path, err: &io::Error) -> AppError {
-    AppError::Internal(format!("{operation} {} failed: {err}", path.display()))
 }
 
 /// The 403 for anything an archive may not include: a pack that is not
