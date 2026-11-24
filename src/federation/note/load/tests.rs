@@ -271,6 +271,94 @@ async fn load_note_context_loads_media_and_the_expired_poll() {
 }
 
 #[tokio::test]
+async fn load_note_context_loads_emojis_used_only_in_the_cw_or_a_poll_option() {
+    let db = crate::test_db::test_db().await.expect("test database slot");
+    let pool = db.pool().clone();
+    let alice = create_local(&pool, "cwemojialice").await;
+    let stored = upsert_emoji(
+        &pool,
+        &NewCustomEmoji::local("wiredcat", &format!("{BASE}/emoji/wiredcat.png")),
+    )
+    .await
+    .expect("emoji row");
+    assert_eq!(stored.shortcode, "wiredcat", "the emoji row is stored");
+    let config = Config::for_tests();
+
+    let with_cw = post(
+        &pool,
+        &NewStatus {
+            spoiler_text: "CW with :wiredcat: emoji".to_owned(),
+            ..NewStatus::local(&alice, "body without emoji")
+        },
+    )
+    .await;
+    let ctx = load_note_context(&pool, &config, with_cw.id)
+        .await
+        .expect("the CW context loads");
+    assert_eq!(ctx.emojis.len(), 1, "the CW-only emoji loads");
+    assert_eq!(ctx.emojis[0].shortcode, "wiredcat", "…by name");
+    let document = note_json(&ctx).expect("the CW note renders");
+    assert_eq!(
+        document["tag"].as_array().map(Vec::len),
+        Some(1),
+        "and it is tagged"
+    );
+
+    let with_poll = post(&pool, &NewStatus::local(&alice, "poll emoji test")).await;
+    let mut conn = pool.acquire().await.expect("slot connection");
+    let created = create_poll(
+        &mut conn,
+        with_poll.id,
+        &PollParams {
+            options: vec![":wiredcat: yes".to_owned(), "no".to_owned()],
+            expires_at: Some(Utc::now() + TimeDelta::hours(1)),
+            ..PollParams::default()
+        },
+    )
+    .await
+    .expect("fixture poll creates");
+    assert_eq!(created.status_id, with_poll.id, "the poll names its status");
+    drop(conn);
+    let poll_ctx = load_note_context(&pool, &config, with_poll.id)
+        .await
+        .expect("the poll context loads");
+    assert_eq!(poll_ctx.emojis.len(), 1, "the option-only emoji loads");
+    let poll_document = note_json(&poll_ctx).expect("the poll note renders");
+    assert_eq!(
+        poll_document["tag"].as_array().map(Vec::len),
+        Some(1),
+        "and it is tagged"
+    );
+}
+
+#[test]
+fn used_shortcodes_cover_the_cw_and_poll_options_once_each() {
+    let mut ctx = note_context(status::Visibility::Public);
+    ctx.status.raw_text = ":a: body".to_owned();
+    ctx.status.spoiler_text = ":b: :a:".to_owned();
+    let poll_data = PollData {
+        multiple: false,
+        expires_at: None,
+        closed: false,
+        voters_count: 0,
+        options: vec![PollOptionData {
+            title: ":c: :b:".to_owned(),
+            votes_count: 0,
+        }],
+    };
+    assert_eq!(
+        used_shortcodes(&ctx.status, Some(&poll_data)),
+        vec!["a".to_owned(), "b".to_owned(), "c".to_owned()],
+        "first-appearance order, deduplicated across all texts"
+    );
+    assert_eq!(
+        used_shortcodes(&ctx.status, None),
+        vec!["a".to_owned(), "b".to_owned()],
+        "no poll, no option codes"
+    );
+}
+
+#[tokio::test]
 async fn load_note_context_adds_a_silent_reply_s_parent_author() {
     let db = crate::test_db::test_db().await.expect("test database slot");
     let pool = db.pool().clone();

@@ -59,8 +59,8 @@ pub async fn load_note_context(
     let mentions = load_mentions(pool, &status).await?;
     let hashtags = load_hashtags(pool, &status).await?;
     let attachments = load_attachments(pool, &status).await?;
-    let emojis = load_emojis(pool, &status).await?;
     let poll_data = load_poll(pool, &status).await?;
+    let emojis = load_emojis(pool, &status, poll_data.as_ref()).await?;
     let quote_uri = load_quote_uri(pool, &status).await?;
     Ok(NoteContext {
         status,
@@ -130,11 +130,16 @@ async fn load_attachments(pool: &PgPool, status: &Status) -> AppResult<Vec<Media
         .unwrap_or_default())
 }
 
-/// The enabled local emoji rows for every `:shortcode:` the status's text
-/// carries — in shortcode order (the table read's), which is all the tag
-/// list needs since the builder re-checks each code against the content.
-async fn load_emojis(pool: &PgPool, status: &Status) -> AppResult<Vec<CustomEmoji>> {
-    let codes = used_shortcodes(status);
+/// The enabled local emoji rows for every `:shortcode:` the status's text,
+/// content warning or poll options carry — in shortcode order (the table
+/// read's), which is all the tag list needs since the builder re-checks
+/// each code against the same texts.
+async fn load_emojis(
+    pool: &PgPool,
+    status: &Status,
+    poll_data: Option<&PollData>,
+) -> AppResult<Vec<CustomEmoji>> {
+    let codes = used_shortcodes(status, poll_data);
     if codes.is_empty() {
         return Ok(Vec::new());
     }
@@ -176,12 +181,17 @@ async fn load_quote_uri(pool: &PgPool, status: &Status) -> AppResult<Option<Stri
     }
 }
 
-/// The distinct `:shortcode:` texts the status's raw text and rendered
-/// HTML carry, in order of first appearance.
-fn used_shortcodes(status: &Status) -> Vec<String> {
+/// The distinct `:shortcode:` texts the status's raw text, rendered HTML,
+/// content warning and poll option titles carry, in order of first
+/// appearance.
+fn used_shortcodes(status: &Status, poll_data: Option<&PollData>) -> Vec<String> {
     let mut seen: HashSet<String> = HashSet::new();
     let mut codes: Vec<String> = Vec::new();
-    for text in [&status.raw_text, &status.content] {
+    let options = poll_data.iter().flat_map(|poll| &poll.options);
+    let texts = [&status.raw_text, &status.content, &status.spoiler_text]
+        .into_iter()
+        .chain(options.map(|option| &option.title));
+    for text in texts {
         for code in shortcodes_in(text) {
             if seen.insert(code.clone()) {
                 codes.push(code);

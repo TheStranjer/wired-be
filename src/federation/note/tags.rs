@@ -5,9 +5,7 @@
 use serde_json::{Map, Number, Value, json};
 
 use crate::{
-    models::{
-        custom_emoji::CustomEmoji, media_attachment::MediaAttachment, status::Status, user::User,
-    },
+    models::{custom_emoji::CustomEmoji, media_attachment::MediaAttachment, user::User},
     util::{entities::hashtag_spellings, time::mastodon_time},
 };
 
@@ -61,19 +59,26 @@ fn mention_tag(person: &User) -> Value {
 }
 
 /// The emoji tags for the `ctx`'s known local emojis whose `:shortcode:`
-/// appears in the post's text (source or rendered HTML).
+/// appears in the post's text (source or rendered HTML), its content
+/// warning or a poll option title.
 fn used_emoji_tags(ctx: &NoteContext) -> Vec<Value> {
     ctx.emojis
         .iter()
-        .filter(|emoji| content_uses(&ctx.status, &emoji.shortcode))
+        .filter(|emoji| content_uses(ctx, &emoji.shortcode))
         .map(emoji_tag)
         .collect()
 }
 
-/// Whether either text of `status` carries `:shortcode:` verbatim.
-fn content_uses(status: &Status, shortcode: &str) -> bool {
+/// Whether any text of the note carries `:shortcode:` verbatim: the source,
+/// the rendered HTML, the content warning or a poll option title.
+fn content_uses(ctx: &NoteContext, shortcode: &str) -> bool {
     let needle = format!(":{shortcode}:");
-    status.raw_text.contains(&needle) || status.content.contains(&needle)
+    let status = &ctx.status;
+    let options = ctx.poll.iter().flat_map(|poll| &poll.options);
+    [&status.raw_text, &status.content, &status.spoiler_text]
+        .into_iter()
+        .chain(options.map(|option| &option.title))
+        .any(|text| text.contains(&needle))
 }
 
 /// One custom emoji as its tag object: the image URL as both `id` and
@@ -211,6 +216,79 @@ mod tests {
             ]),
             "hashtags, mentions, then the emojis the content actually uses"
         );
+    }
+
+    /// A context holding the `wiredcat` emoji, ready for one placement.
+    fn wiredcat_context() -> NoteContext {
+        let mut ctx = note_context(Visibility::Public);
+        ctx.emojis = vec![fixture_emoji("wiredcat", "wiredcat")];
+        ctx
+    }
+
+    /// A one-option open poll whose only option reads `title`.
+    fn poll_titled(title: &str) -> PollData {
+        PollData {
+            multiple: false,
+            expires_at: None,
+            closed: false,
+            voters_count: 0,
+            options: vec![PollOptionData {
+                title: title.to_owned(),
+                votes_count: 0,
+            }],
+        }
+    }
+
+    #[test]
+    fn an_emoji_used_only_in_the_content_warning_is_tagged() {
+        let mut ctx = wiredcat_context();
+        ctx.status.raw_text = "body without emoji".to_owned();
+        ctx.status.content = "<p>body without emoji</p>".to_owned();
+        ctx.status.spoiler_text = "CW with :wiredcat: emoji".to_owned();
+        let document = note_json(&ctx).expect("a CW note federates");
+        assert_eq!(
+            document["tag"],
+            json!([emoji_tag(&ctx.emojis[0])]),
+            "the CW alone earns the Emoji tag"
+        );
+    }
+
+    #[test]
+    fn an_emoji_used_only_in_a_poll_option_is_tagged() {
+        let mut ctx = wiredcat_context();
+        ctx.status.raw_text = "poll emoji test".to_owned();
+        ctx.status.content = "<p>poll emoji test</p>".to_owned();
+        ctx.poll = Some(poll_titled(":wiredcat: yes"));
+        let document = note_json(&ctx).expect("a poll note federates");
+        assert_eq!(
+            document["tag"],
+            json!([emoji_tag(&ctx.emojis[0])]),
+            "the option alone earns the Emoji tag"
+        );
+    }
+
+    #[test]
+    fn an_emoji_used_everywhere_is_tagged_once() {
+        let mut ctx = wiredcat_context();
+        ctx.status.raw_text = ":wiredcat: body".to_owned();
+        ctx.status.content = "<p>:wiredcat: body</p>".to_owned();
+        ctx.status.spoiler_text = ":wiredcat: cw".to_owned();
+        ctx.poll = Some(poll_titled(":wiredcat: yes"));
+        let document = note_json(&ctx).expect("a note federates");
+        assert_eq!(
+            document["tag"],
+            json!([emoji_tag(&ctx.emojis[0])]),
+            "body, CW and option still yield exactly one tag"
+        );
+    }
+
+    #[test]
+    fn an_emoji_used_nowhere_is_not_tagged() {
+        let mut ctx = wiredcat_context();
+        ctx.status.spoiler_text = "plain cw".to_owned();
+        ctx.poll = Some(poll_titled("plain option"));
+        let document = note_json(&ctx).expect("a note federates");
+        assert_eq!(document["tag"], json!([]), "an unused emoji is no tag");
     }
 
     #[test]
