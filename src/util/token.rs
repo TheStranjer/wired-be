@@ -74,6 +74,19 @@ pub fn sha256_hex_bytes(bytes: &[u8]) -> String {
     to_hex(&Sha256::digest(bytes))
 }
 
+/// The at-rest form of a high-entropy random credential: the lowercase
+/// hex `SHA-256` of `token`, 64 characters.
+///
+/// Password-reset and MFA challenge tokens are 32 CSPRNG bytes
+/// ([`random_token`] over [`CREDENTIAL_BYTES`]), so there is nothing to
+/// brute-force and no need for a salt or a slow hash: the digest only has
+/// to make a leaked row useless as a credential. Storage keeps this
+/// digest and every lookup binds the digest of the submitted text.
+#[must_use]
+pub fn token_digest(token: &str) -> String {
+    sha256_hex(token)
+}
+
 /// `bytes` random bytes from the OS CSPRNG, base64url-encoded with no
 /// padding.
 ///
@@ -168,6 +181,24 @@ mod tests {
                 .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)),
             "`{digest}` is lowercase hex"
         );
+    }
+
+    #[test]
+    fn token_digest_is_64_lowercase_hex_and_stable() {
+        let digest = token_digest("abc");
+        assert_eq!(
+            digest, "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+            "the digest of \"abc\" is the SHA-256 test vector"
+        );
+        assert_eq!(token_digest("abc"), digest, "the digest is stable");
+        assert_eq!(digest.len(), 64, "SHA-256 is 64 hex characters");
+        assert!(
+            digest
+                .chars()
+                .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)),
+            "`{digest}` is lowercase hex"
+        );
+        assert_ne!(token_digest("abd"), digest, "another token, another digest");
     }
 
     #[test]
