@@ -254,14 +254,6 @@ pub(super) fn uploads_dir() -> TempDir {
     TempDir::new().expect("temp dir for the media upload")
 }
 
-/// The `id` of a rendered entity, as its JSON spells it.
-pub(super) fn entity_id(entity: &Value) -> String {
-    entity["id"]
-        .as_str()
-        .expect("the entity carries its id")
-        .to_owned()
-}
-
 /// `GET` `path` as `token` (`None`: the anonymous caller).
 pub(super) async fn get(app: &Router, token: Option<&str>, path: &str) -> common::TestResponse {
     let request = common::TestRequest::get(path);

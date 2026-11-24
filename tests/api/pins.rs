@@ -241,15 +241,6 @@ fn flag_and_stamp(body: &Value) -> (Value, Value) {
     (body["pinned"].clone(), body["pleroma"]["pinned_at"].clone())
 }
 
-/// The status ids of a `Status` array, in answer order.
-fn status_ids(body: &Value) -> Vec<String> {
-    body.as_array()
-        .expect("the answer is an array")
-        .iter()
-        .map(|entry| entry["id"].as_str().unwrap_or_default().to_owned())
-        .collect()
-}
-
 #[tokio::test]
 async fn pinning_marks_the_status_and_repeating_restates_it() {
     let db = common::test_db().await;
@@ -337,7 +328,7 @@ async fn a_whole_page_flags_the_pinned_rows_only() {
     let body = page.json_value();
     let entries = body.as_array().expect("the answer is an array");
     assert_eq!(
-        status_ids(&body),
+        common::ids_of(&body),
         vec![kept.id.to_string(), ignored.id.to_string()],
         "the batch answers in the requested order"
     );

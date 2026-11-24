@@ -171,7 +171,7 @@ impl Account {
         let response = common::api_get(app, Some(&token), VERIFY).await;
         common::assert_answer(&response, StatusCode::OK, "the account reads itself");
         Self {
-            id: id_of(&response.json_value()),
+            id: common::id_of(&response.json_value()),
             nickname: username.to_owned(),
             token,
         }
@@ -183,14 +183,6 @@ async fn login(app: &Router, client: &common::TestClient, username: &str) -> Str
     let response = common::login_password(app, client, username, PASSWORD).await;
     common::assert_answer(&response, StatusCode::OK, "the scenario login");
     common::access_token_of(&response)
-}
-
-/// The string `id` of an entity answer.
-pub(super) fn id_of(entity: &Value) -> String {
-    entity["id"]
-        .as_str()
-        .expect("the entity carries a string id")
-        .to_owned()
 }
 
 /// `GET` of `path` as `token` (`None` anonymous), asserted 200 and
@@ -210,7 +202,7 @@ pub(super) async fn public_ids(app: &Router) -> Vec<String> {
     get_array(app, None, PUBLIC_TIMELINE)
         .await
         .into_iter()
-        .map(|entry| id_of(&entry))
+        .map(|entry| common::id_of(&entry))
         .collect()
 }
 

@@ -7,8 +7,8 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use super::support::{
-    CONVERSATIONS, NOT_FOUND, PLEROMA_CONVERSATIONS, STATUSES, acted, direct_post, entity_id,
-    got_array, ids_of, posted, sorted, user, withdrawn,
+    CONVERSATIONS, NOT_FOUND, PLEROMA_CONVERSATIONS, STATUSES, acted, direct_post, got_array,
+    ids_of, posted, sorted, user, withdrawn,
 };
 use crate::common;
 
@@ -28,7 +28,7 @@ fn participant_ids(entity: &Value) -> Vec<String> {
             .as_array()
             .expect("accounts is a list")
             .iter()
-            .map(entity_id)
+            .map(common::id_of)
             .collect::<Vec<String>>(),
     )
 }
@@ -63,7 +63,7 @@ async fn a_direct_post_threads_the_three_participants() {
     let (bob, bob_token) = user(&pool, "bob").await;
     let (carol, carol_token) = user(&pool, "carol").await;
     let dm = direct_post(&app, &alice_token, "@bob @carol psst").await;
-    let dm_id = entity_id(&dm);
+    let dm_id = common::id_of(&dm);
 
     let alices = got_array(&app, &alice_token, CONVERSATIONS).await;
     let bobs = got_array(&app, &bob_token, CONVERSATIONS).await;
@@ -80,9 +80,9 @@ async fn a_direct_post_threads_the_three_participants() {
         carol.id.to_string(),
     );
     let mut parts = vec![
-        entity_id(&alices[0]),
-        entity_id(&bobs[0]),
-        entity_id(&carols[0]),
+        common::id_of(&alices[0]),
+        common::id_of(&bobs[0]),
+        common::id_of(&carols[0]),
     ];
     parts.sort();
     parts.dedup();
@@ -115,7 +115,7 @@ async fn a_direct_post_threads_the_three_participants() {
     let both = format!("?recipients={alice_id}&recipients={carol_id}");
     assert_eq!(
         ids_of(&got_array(&app, &bob_token, &format!("{CONVERSATIONS}{both}")).await),
-        vec![entity_id(&bobs[0])],
+        vec![common::id_of(&bobs[0])],
         "bob's thread addresses alice and carol together"
     );
     assert!(
@@ -157,9 +157,9 @@ async fn open_thread(app: &Router, pool: &PgPool) -> Thread {
     let (_carol, carol_token) = user(pool, "carol").await;
     let _dm = direct_post(app, &alice_token, "@bob @carol thread me").await;
     Thread {
-        alice_part: entity_id(&got_array(app, &alice_token, CONVERSATIONS).await.remove(0)),
-        bob_part: entity_id(&got_array(app, &bob_token, CONVERSATIONS).await.remove(0)),
-        carol_part: entity_id(&got_array(app, &carol_token, CONVERSATIONS).await.remove(0)),
+        alice_part: common::id_of(&got_array(app, &alice_token, CONVERSATIONS).await.remove(0)),
+        bob_part: common::id_of(&got_array(app, &bob_token, CONVERSATIONS).await.remove(0)),
+        carol_part: common::id_of(&got_array(app, &carol_token, CONVERSATIONS).await.remove(0)),
         alice: alice_token,
         bob: bob_token,
         carol: carol_token,
@@ -184,7 +184,7 @@ async fn a_conversation_reply_joins_the_thread_and_read_all_flips_the_sides() {
         &json!({ "status": "aye", "in_reply_to_conversation_id": thread.carol_part }),
     )
     .await;
-    let reply_id = entity_id(&reply);
+    let reply_id = common::id_of(&reply);
     assert_eq!(
         reply["visibility"],
         json!("direct"),
@@ -193,7 +193,7 @@ async fn a_conversation_reply_joins_the_thread_and_read_all_flips_the_sides() {
 
     let alices = got_array(&app, &thread.alice, CONVERSATIONS).await;
     assert_eq!(
-        entity_id(&alices[0]),
+        common::id_of(&alices[0]),
         thread.alice_part,
         "the reply joined the same thread, not a new one"
     );
@@ -220,7 +220,7 @@ async fn a_conversation_reply_joins_the_thread_and_read_all_flips_the_sides() {
         "exactly the one unread participation flipped"
     );
     assert_eq!(
-        entity_id(&rows[0]),
+        common::id_of(&rows[0]),
         thread.alice_part,
         "the caller's own row"
     );
@@ -254,7 +254,7 @@ async fn a_conversation_delete_withdraws_only_the_owners_side() {
         &json!({ "status": "aye", "in_reply_to_conversation_id": thread.carol_part }),
     )
     .await;
-    let reply_id = entity_id(&reply);
+    let reply_id = common::id_of(&reply);
 
     let foreign = common::TestRequest::delete(&format!("{CONVERSATIONS}/{}", thread.carol_part))
         .bearer(&thread.bob)

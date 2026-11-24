@@ -5,8 +5,8 @@ use axum::http::StatusCode;
 use serde_json::{Value, json};
 
 use super::support::{
-    POLLS, SECOND_BALLOT, STATUSES, assert_every, created, entity_id, follows, get, pick, post,
-    posted, representations, shown, user,
+    POLLS, SECOND_BALLOT, STATUSES, assert_every, created, follows, get, pick, post, posted,
+    representations, shown, user,
 };
 use crate::common;
 
@@ -29,7 +29,7 @@ async fn a_poll_ballot_moves_the_tallies_and_locks_a_second_vote() {
         json!({"status": "tea or coffee?", "poll": {"options": ["tea", "coffee"]}}),
     )
     .await;
-    let id = entity_id(&created);
+    let id = common::id_of(&created);
     let poll_id = pick(&created, &["poll", "id"])
         .as_str()
         .expect("a poll create answers the poll entity")
@@ -138,7 +138,7 @@ async fn an_edit_rewrites_the_post_and_the_history_keeps_the_old_text() {
     let app = common::test_app(pool.clone());
     let (alice, alice_token) = user(&pool, "alice").await;
     let (_bob, bob_token) = user(&pool, "bob").await;
-    let id = entity_id(&post(&app, &alice_token, "original words").await);
+    let id = common::id_of(&post(&app, &alice_token, "original words").await);
     follows(&app, &bob_token, &alice.id.to_string()).await;
 
     let response = common::TestRequest::put(&format!("{STATUSES}/{id}"))

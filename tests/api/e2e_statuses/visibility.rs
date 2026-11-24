@@ -9,8 +9,8 @@ use wired_be::{
 };
 
 use super::support::{
-    ADDRESSED, FOLLOWERS, LOCAL, NOT_FOUND, OPEN, STATUSES, Shape, UNKNOWN_ID, entity_id, get,
-    posted, posted_form, sweep, uploaded, uploads_dir, world, world_with_uploads,
+    ADDRESSED, FOLLOWERS, LOCAL, NOT_FOUND, OPEN, STATUSES, Shape, UNKNOWN_ID, get, posted,
+    posted_form, sweep, uploaded, uploads_dir, world, world_with_uploads,
 };
 use crate::common;
 
@@ -33,7 +33,7 @@ async fn public_and_unlisted_posts_answer_every_viewer_but_the_blocked_one() {
         )
         .await;
         let shape = Shape {
-            id: entity_id(&created),
+            id: common::id_of(&created),
             visibility,
             content: json!(format!("<p>{text}</p>")),
             acct: "author",
@@ -60,7 +60,7 @@ async fn a_private_post_reaches_the_author_and_the_accepted_follower_only() {
     )
     .await;
     let shape = Shape {
-        id: entity_id(&created),
+        id: common::id_of(&created),
         visibility: "private",
         content: json!("<p>for followers only</p>"),
         acct: "author",
@@ -121,7 +121,7 @@ async fn a_direct_post_reaches_the_author_and_the_addressed_account_only() {
     .await;
     let card = mention_html(&world.mentioned.user.ap_id, "mentioned");
     let shape = Shape {
-        id: entity_id(&created),
+        id: common::id_of(&created),
         visibility: "direct",
         content: json!(format!("<p>{card}, a word between us</p>")),
         acct: "author",
@@ -156,7 +156,7 @@ async fn a_local_mention_post_reaches_local_viewers_and_loses_the_anonymous_call
     .await;
     let card = mention_html(&world.follower.user.ap_id, "follower");
     let shape = Shape {
-        id: entity_id(&created),
+        id: common::id_of(&created),
         visibility: "local",
         content: json!(format!("<p>{card}, kept on the instance</p>")),
         acct: "author",
@@ -189,7 +189,7 @@ async fn a_media_post_carries_its_upload_to_the_open_audience() {
     let (app, world) = world_with_uploads(&pool, dir.path()).await;
 
     let attachment = uploaded(&app, &world.author.token).await;
-    let media_id = entity_id(&attachment);
+    let media_id = common::id_of(&attachment);
     assert_eq!(
         attachment["type"],
         json!("audio"),
@@ -202,7 +202,7 @@ async fn a_media_post_carries_its_upload_to_the_open_audience() {
     )
     .await;
     let shape = Shape {
-        id: entity_id(&created),
+        id: common::id_of(&created),
         visibility: "public",
         content: json!("<p>a tune, hummed</p>"),
         acct: "author",
@@ -243,7 +243,7 @@ async fn a_content_warning_post_states_its_subject_to_the_open_audience() {
     )
     .await;
     let shape = Shape {
-        id: entity_id(&created),
+        id: common::id_of(&created),
         visibility: "public",
         content: json!("<p>the butler did it</p>"),
         acct: "author",
@@ -281,7 +281,7 @@ async fn a_poll_post_carries_its_open_stand_to_the_open_audience() {
     )
     .await;
     let shape = Shape {
-        id: entity_id(&created),
+        id: common::id_of(&created),
         visibility: "public",
         content: json!("<p>soup or salad?</p>"),
         acct: "author",
@@ -323,7 +323,7 @@ async fn a_hashtag_post_links_its_tag_for_the_open_audience() {
     .await;
     let tag = hashtag_html(TEST_BASE_URL, "e2etag");
     let shape = Shape {
-        id: entity_id(&created),
+        id: common::id_of(&created),
         visibility: "public",
         content: json!(format!("<p>tagged {tag} for the matrix</p>")),
         acct: "author",

@@ -18,7 +18,7 @@ async fn the_ledger_lists_the_public_statuses_newest_first() {
 
     let answer = listed(&app, LEDGER, &token).await;
     assert_eq!(
-        ids_of(&answer),
+        common::ids_of(&answer),
         newest(&rows[..2]),
         "public and unlisted only, newest first: the private visibilities \
          are held out until godmode is asked for"
@@ -56,14 +56,14 @@ async fn godmode_admits_every_visibility() {
 
     let open = listed(&app, &format!("{LEDGER}?godmode=true"), &token).await;
     assert_eq!(
-        ids_of(&open),
+        common::ids_of(&open),
         newest(&rows),
         "every stored visibility, newest first"
     );
 
     let quiet = listed(&app, &format!("{LEDGER}?godmode=false"), &token).await;
     assert_eq!(
-        ids_of(&quiet),
+        common::ids_of(&quiet),
         newest(&rows[..2]),
         "the stated default is the public ledger again"
     );
@@ -85,14 +85,14 @@ async fn local_only_and_with_reblogs_narrow_the_ledger() {
 
     let default = listed(&app, LEDGER, &token).await;
     assert_eq!(
-        ids_of(&default),
+        common::ids_of(&default),
         vec![mirrored.id.to_string(), own.id.to_string()],
         "boosts are held out by default, remote posts are not"
     );
 
     let reblogs = listed(&app, &format!("{LEDGER}?with_reblogs=true"), &token).await;
     assert_eq!(
-        ids_of(&reblogs),
+        common::ids_of(&reblogs),
         vec![
             boosted.id.to_string(),
             mirrored.id.to_string(),
@@ -108,7 +108,7 @@ async fn local_only_and_with_reblogs_narrow_the_ledger() {
 
     let locals = listed(&app, &format!("{LEDGER}?local_only=true"), &token).await;
     assert_eq!(
-        ids_of(&locals),
+        common::ids_of(&locals),
         vec![own.id.to_string()],
         "local_only drops the remote post, and the default still holds the \
          boost out"
@@ -121,7 +121,7 @@ async fn local_only_and_with_reblogs_narrow_the_ledger() {
     )
     .await;
     assert_eq!(
-        ids_of(&stacked),
+        common::ids_of(&stacked),
         vec![boosted.id.to_string(), own.id.to_string()],
         "and the two filters stack: the local set with the boost row in"
     );
@@ -142,7 +142,7 @@ async fn the_page_window_walks_the_ledger() {
 
     let first = listed(&app, &format!("{LEDGER}?godmode=true&page_size=2"), &token).await;
     assert_eq!(
-        ids_of(&first),
+        common::ids_of(&first),
         vec![every[0].clone(), every[1].clone()],
         "the first window is the two newest"
     );
@@ -153,16 +153,19 @@ async fn the_page_window_walks_the_ledger() {
     )
     .await;
     assert_eq!(
-        ids_of(&second),
+        common::ids_of(&second),
         vec![every[2].clone(), every[3].clone()],
         "page 2 of the same window is the pair after them"
     );
     let past = listed(&app, &format!("{LEDGER}?godmode=true&page=99"), &token).await;
-    assert!(ids_of(&past).is_empty(), "past the end is the empty array");
+    assert!(
+        common::ids_of(&past).is_empty(),
+        "past the end is the empty array"
+    );
 
     let junk = listed(&app, &format!("{LEDGER}?page=nope&page_size=5000"), &token).await;
     assert_eq!(
-        ids_of(&junk),
+        common::ids_of(&junk),
         vec![every[3].clone(), every[4].clone()],
         "an unusable `page` is the first page and a 5000-row ask is the \
          200-row cap, so the whole public ledger answers"

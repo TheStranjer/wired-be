@@ -99,20 +99,6 @@ fn keys_of(entry: &Value) -> Vec<&str> {
         .collect()
 }
 
-/// The string ids of the entries of a JSON array body, in order.
-fn ids_of(body: &Value) -> Vec<String> {
-    body.as_array()
-        .expect("a JSON array body")
-        .iter()
-        .map(|entry| {
-            entry["id"]
-                .as_str()
-                .expect("entries carry a string id")
-                .to_owned()
-        })
-        .collect()
-}
-
 /// The `name` of each entry of a JSON array body, in order.
 fn names_of(body: &Value) -> Vec<&str> {
     body.as_array()
@@ -145,7 +131,7 @@ async fn token_list_shows_the_callers_valid_tokens_newest_first() {
     assert_eq!(response.status, StatusCode::OK, "listing works");
     let body = response.json_value();
     assert_eq!(
-        ids_of(&body),
+        common::ids_of(&body),
         vec![
             newest.id.to_string(),
             older.id.to_string(),
@@ -166,7 +152,7 @@ async fn token_list_shows_the_callers_valid_tokens_newest_first() {
     assert_eq!(body[1]["app_name"], "App X", "the older token's app");
     assert_eq!(body[2]["app_name"], "Session", "and the session's app");
     assert!(
-        !ids_of(&body).contains(&foreign.id.to_string()),
+        !common::ids_of(&body).contains(&foreign.id.to_string()),
         "bob's token never appears in alice's list"
     );
 }
@@ -206,7 +192,7 @@ async fn revoke_removes_the_owners_token_and_answers_empty_object() {
         .await;
     let body = listing.json_value();
     assert!(
-        !ids_of(&body).contains(&doomed.id.to_string()),
+        !common::ids_of(&body).contains(&doomed.id.to_string()),
         "and no longer appears in the list: {body}"
     );
 
@@ -283,7 +269,7 @@ async fn pleroma_apps_are_only_the_ones_the_caller_owns_newest_first() {
     assert_eq!(response.status, StatusCode::OK, "apps listing works");
     let body = response.json_value();
     assert_eq!(
-        ids_of(&body),
+        common::ids_of(&body),
         vec![owned.id.to_string(), alice.token.app_id.to_string()],
         "only the owned apps, newest first"
     );
@@ -304,7 +290,7 @@ async fn pleroma_apps_are_only_the_ones_the_caller_owns_newest_first() {
     let text = body.to_string();
     for hidden in [&tokened, &foreign, &stranger] {
         assert!(
-            !ids_of(&body).contains(&hidden.id.to_string()),
+            !common::ids_of(&body).contains(&hidden.id.to_string()),
             "{} stays out",
             hidden.client_name
         );

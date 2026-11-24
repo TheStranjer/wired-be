@@ -27,6 +27,7 @@ mod config;
 mod credentials;
 mod fixtures;
 mod jobs;
+mod json;
 mod request;
 mod response;
 
@@ -55,6 +56,7 @@ pub use self::{
         create_remote_user, create_status, create_status_attachment, create_user_with_password,
     },
     jobs::run_all_jobs,
+    json::{id_of, ids_of},
     request::{MultipartPart, TestRequest},
     response::{
         TestResponse, activity_json, assert_all_answered, assert_all_errors, assert_all_refused,

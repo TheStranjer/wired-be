@@ -4,8 +4,8 @@ use serde_json::{Value, json};
 use wired_be::models::notification::TYPE_CHAT_MENTION;
 
 use super::support::{
-    AS_PUBLIC, BOB, CHATS, DAVE, STATUSES, activity, carries_uri, deliver, entry_for, get, id_of,
-    list, local, note_object, post_status, public_timeline, told_of, uri_of,
+    AS_PUBLIC, BOB, CHATS, DAVE, STATUSES, activity, carries_uri, deliver, entry_for, get, list,
+    local, note_object, post_status, public_timeline, told_of, uri_of,
 };
 use crate::{common, remote};
 
@@ -49,7 +49,7 @@ async fn a_delivered_reply_backfills_its_missing_parent_from_the_peer() {
         carries_uri(&public, &parent_uri),
         "and the backfill fetched and ingested the parent"
     );
-    let child_id = id_of(entry_for(&public, &child_uri));
+    let child_id = common::id_of(entry_for(&public, &child_uri));
     let context = get(&app, None, &format!("{STATUSES}/{child_id}/context"))
         .await
         .json_value();
@@ -102,7 +102,7 @@ async fn a_reply_to_a_missing_parent_stands_when_the_peer_404s() {
         carries_uri(&public, &child_uri),
         "the reply stands on the timeline despite its parent being gone"
     );
-    let child_id = id_of(entry_for(&public, &child_uri));
+    let child_id = common::id_of(entry_for(&public, &child_uri));
     let context = get(&app, None, &format!("{STATUSES}/{child_id}/context"))
         .await
         .json_value();
@@ -134,7 +134,7 @@ async fn a_remote_ballot_marks_a_local_poll_and_tells_its_author() {
         json!({"status": "tea or coffee?", "poll": {"options": ["tea", "coffee"], "expires_in": 3600}}),
     )
     .await;
-    let poll_id = id_of(&posted["poll"]);
+    let poll_id = common::id_of(&posted["poll"]);
     let question_uri = uri_of(&posted);
 
     let vote = vote_create(&peer, &actor, "ballot-1", &question_uri, "tea");

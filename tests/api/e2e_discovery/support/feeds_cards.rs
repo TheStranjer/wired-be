@@ -16,7 +16,7 @@ async fn the_rich_media_job_turns_a_linked_page_into_a_card() {
 
     let page = format!("{}/page", peer.base);
     let status = published(&app, &alice_token, &format!("look at {page}"), "public").await;
-    let id = id_of(&status);
+    let id = common::id_of(&status);
 
     let before = read(&app, &alice_token, &format!("{STATUSES}/{id}")).await;
     common::assert_answer(&before, StatusCode::OK, "the fresh post reads");

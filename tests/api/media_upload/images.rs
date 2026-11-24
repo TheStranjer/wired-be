@@ -6,9 +6,9 @@ use serde_json::{Value, json};
 
 use super::support::{
     MP3, MP4, SCOPE, V1, animated_gif, assert_attachment_entity, assert_both_files_serve,
-    assert_stored_keys, assert_stored_png, entity_id, entries_in, error_body, file_part, jpeg,
-    key_extension, mime_of, original_meta, png, row_count, small_meta, storage_key, stored_row,
-    transparent_png, upload, upload_file, uploader, uploads_dir, url_of,
+    assert_stored_keys, assert_stored_png, entries_in, error_body, file_part, jpeg, key_extension,
+    mime_of, original_meta, png, row_count, small_meta, storage_key, stored_row, transparent_png,
+    upload, upload_file, uploader, uploads_dir, url_of,
 };
 use crate::common;
 /// An uploaded `PNG` answers the `Attachment` entity with its dimensions,
@@ -30,7 +30,7 @@ async fn png_upload_answers_the_entity_and_serves_the_file() {
         file_part("cat.png", "image/png", fixture.clone()),
     )
     .await;
-    let id = entity_id(&entity);
+    let id = common::id_of(&entity);
     assert_attachment_entity(&entity, &id);
 
     let row = stored_row(&pool, &id).await;
@@ -129,7 +129,7 @@ async fn a_transparent_png_previews_as_png() {
         file_part("ghost.png", "image/png", transparent_png(800, 600)),
     )
     .await;
-    let id = entity_id(&entity);
+    let id = common::id_of(&entity);
     assert_eq!(
         entity["meta"],
         json!({
@@ -205,7 +205,7 @@ async fn video_and_audio_keep_no_detection() {
         (MP4, "clip.mp4", "video/mp4"),
     ] {
         let entity = upload_file(&app, V1, &token, file_part(filename, mime, bytes)).await;
-        let id = entity_id(&entity);
+        let id = common::id_of(&entity);
         assert_eq!(entity["meta"], json!({}), "{filename} detects nothing");
         assert_eq!(entity["blurhash"], Value::Null, "and hashes nothing");
         assert_eq!(

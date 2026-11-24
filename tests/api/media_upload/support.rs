@@ -210,18 +210,6 @@ pub(super) async fn stored_row(pool: &PgPool, id: &str) -> media_attachment::Med
     row.unwrap_or_else(|| panic!("the upload stored no row for {id}"))
 }
 
-/// The entity id an upload answered.
-///
-/// # Panics
-///
-/// If the entity carries no id.
-pub(super) fn entity_id(entity: &Value) -> String {
-    entity["id"]
-        .as_str()
-        .expect("the id is a string")
-        .to_owned()
-}
-
 /// The storage key of an upload: the part of its public URL below the media
 /// prefix the test instance announces.
 ///

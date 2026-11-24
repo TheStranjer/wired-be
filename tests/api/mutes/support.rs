@@ -180,15 +180,6 @@ async fn set_expiry(pool: &PgPool, muter: &User, target: &User, seconds: i64) {
     assert_eq!(moved.rows_affected(), 1, "the pair's row was there to move");
 }
 
-/// The `id` of every entity of a listing response, in response order.
-fn listed_ids(body: &Value) -> Vec<String> {
-    body.as_array()
-        .expect("the listing is an array")
-        .iter()
-        .map(|account| account["id"].as_str().expect("an account id").to_owned())
-        .collect()
-}
-
 /// The muted ids of `stored`, in order.
 fn muted_ids(stored: &[Listed]) -> Vec<String> {
     stored.iter().map(|(_, muted, _)| muted.clone()).collect()

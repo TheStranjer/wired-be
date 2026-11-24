@@ -3,8 +3,8 @@
 use serde_json::json;
 
 use super::support::{
-    AS_PUBLIC, BOB, REACTIONS, STATUSES, activity, carries_uri, deliver, get, id_of, list, local,
-    merge, post_status, public_timeline, told_of, uri_of,
+    AS_PUBLIC, BOB, REACTIONS, STATUSES, activity, carries_uri, deliver, get, list, local, merge,
+    post_status, public_timeline, told_of, uri_of,
 };
 use crate::{common, remote};
 
@@ -18,7 +18,7 @@ async fn a_remote_like_and_its_undo_move_the_count_and_telling() {
     let peer = remote::MockPeer::start().await;
     let (_alice, alice_token) = local(&pool, "ei-like-alice").await;
     let posted = post_status(&app, &alice_token, json!({"status": "favourite me"})).await;
-    let id = id_of(&posted);
+    let id = common::id_of(&posted);
     let actor = peer.actor(BOB);
 
     let like = activity(&peer, "Like", "like-1", &actor, json!(uri_of(&posted)));
@@ -77,7 +77,7 @@ async fn a_remote_reaction_and_its_undo_land_in_the_reactions_read() {
     let peer = remote::MockPeer::start().await;
     let (alice, alice_token) = local(&pool, "ei-react-alice").await;
     let posted = post_status(&app, &alice_token, json!({"status": "react to me"})).await;
-    let id = id_of(&posted);
+    let id = common::id_of(&posted);
     let actor = peer.actor(BOB);
 
     let react = {
@@ -150,7 +150,7 @@ async fn a_remote_announce_and_its_undo_boost_the_public_timeline() {
     let peer = remote::MockPeer::start().await;
     let (_alice, alice_token) = local(&pool, "ei-announce-alice").await;
     let posted = post_status(&app, &alice_token, json!({"status": "boost me"})).await;
-    let id = id_of(&posted);
+    let id = common::id_of(&posted);
     let actor = peer.actor(BOB);
 
     let announce = {

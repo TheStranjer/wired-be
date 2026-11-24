@@ -8,9 +8,7 @@ use axum::{Router, http::StatusCode};
 use serde_json::{Value, json};
 use sqlx::PgPool;
 
-use super::support::{
-    ACCOUNTS, STATUSES, World, entity_id, get, posted, uploaded, world_with_uploads,
-};
+use super::support::{ACCOUNTS, STATUSES, World, get, posted, uploaded, world_with_uploads};
 use crate::common;
 
 /// The conversation listing the matrix reads a participation id back from.
@@ -105,7 +103,7 @@ pub(super) async fn own_participation(app: &Router, token: &str, last_id: &str) 
 /// author's own participation back from `GET /api/v1/conversations` and
 /// post a `direct` continuation naming it as `in_reply_to_conversation_id`.
 pub(super) async fn post_thread(app: &Router, world: &World) -> Thread {
-    let root = entity_id(
+    let root = common::id_of(
         &posted(
             app,
             &world.author.token,
@@ -113,7 +111,7 @@ pub(super) async fn post_thread(app: &Router, world: &World) -> Thread {
         )
         .await,
     );
-    let reply = entity_id(
+    let reply = common::id_of(
         &posted(
             app,
             &world.author.token,
@@ -121,7 +119,7 @@ pub(super) async fn post_thread(app: &Router, world: &World) -> Thread {
         )
         .await,
     );
-    let deep = entity_id(
+    let deep = common::id_of(
         &posted(
             app,
             &world.author.token,
@@ -139,7 +137,7 @@ pub(super) async fn post_thread(app: &Router, world: &World) -> Thread {
         json!(&side),
         "the entity renders its own side id"
     );
-    let dm = entity_id(
+    let dm = common::id_of(
         &posted(
             app,
             &world.author.token,
@@ -163,7 +161,7 @@ pub(super) async fn post_thread(app: &Router, world: &World) -> Thread {
 /// the client API.
 pub(super) async fn post_exhibit(app: &Router, world: &World) -> Exhibit {
     let thread = post_thread(app, world).await;
-    let quote = entity_id(
+    let quote = common::id_of(
         &posted(
             app,
             &world.author.token,
@@ -172,20 +170,20 @@ pub(super) async fn post_exhibit(app: &Router, world: &World) -> Exhibit {
         .await,
     );
     let attachment = uploaded(app, &world.author.token).await;
-    let media = entity_id(
+    let media = common::id_of(
         &posted(
             app,
             &world.author.token,
             json!({
                 "status": "a warned tune",
-                "media_ids": [entity_id(&attachment)],
+                "media_ids": [common::id_of(&attachment)],
                 "spoiler_text": "audio inside",
                 "sensitive": true,
             }),
         )
         .await,
     );
-    let tagpost = entity_id(
+    let tagpost = common::id_of(
         &posted(
             app,
             &world.author.token,
@@ -193,7 +191,7 @@ pub(super) async fn post_exhibit(app: &Router, world: &World) -> Exhibit {
         )
         .await,
     );
-    let extra = entity_id(
+    let extra = common::id_of(
         &posted(
             app,
             &world.author.token,
@@ -207,7 +205,7 @@ pub(super) async fn post_exhibit(app: &Router, world: &World) -> Exhibit {
         json!(true),
         "the pin write answers the entity flagged"
     );
-    let original = entity_id(
+    let original = common::id_of(
         &posted(
             app,
             &world.mentioned.token,
@@ -222,7 +220,7 @@ pub(super) async fn post_exhibit(app: &Router, world: &World) -> Exhibit {
         media,
         tagpost,
         extra,
-        reblog: entity_id(&boost),
+        reblog: common::id_of(&boost),
     }
 }
 

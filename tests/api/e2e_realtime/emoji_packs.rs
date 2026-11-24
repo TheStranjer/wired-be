@@ -24,7 +24,7 @@ use super::server::{
     BASE, Part, SCOPES, Server, Verb, call, expect, get_value, png_fixture, post_multipart,
     write_ok,
 };
-use super::sockets::{account, admin, id_of, post_status};
+use super::sockets::{account, admin, post_status};
 use crate::common;
 
 // ──────────────────────────  Scenario 5: emoji packs  ──────────────────────────
@@ -202,7 +202,7 @@ async fn a_pack_is_created_filled_shared_archived_and_reacted_with() {
     assert_pack_listed(&srv).await;
 
     let status = post_status(&srv, &reactor_token, "react to this", "public").await;
-    let status_id = id_of(&status);
+    let status_id = common::id_of(&status);
     let reacted = call(
         &srv,
         Verb::Put,

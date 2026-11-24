@@ -11,7 +11,7 @@ use super::messages_support::{
     post_message, post_text, poster,
 };
 use super::support::{
-    MESSAGE_KEYS, READ_SCOPE, SCOPE, count_messages, delete_as, entity_ids, error_message, fixture,
+    MESSAGE_KEYS, READ_SCOPE, SCOPE, count_messages, delete_as, error_message, fixture,
     get_anonymous, get_as, json_keys, message_delete_path, messages_path, open_chat,
 };
 use crate::common;
@@ -73,7 +73,7 @@ async fn a_recipient_delete_only_removes_the_recipients_copy() {
         .await
         .json_value();
     assert_eq!(
-        entity_ids(&hers),
+        common::ids_of(&hers),
         vec![alice_ref.clone()],
         "alice keeps her copy"
     );

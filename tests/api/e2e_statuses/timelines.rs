@@ -4,7 +4,7 @@
 use axum::http::StatusCode;
 use serde_json::json;
 
-use super::support::{NOT_FOUND, STATUSES, UNKNOWN_ID, entity_id, get, relate, uploads_dir};
+use super::support::{NOT_FOUND, STATUSES, UNKNOWN_ID, get, relate, uploads_dir};
 use super::thread_support::newest_first;
 use super::timeline_support::{
     DIRECT, HOME, LIST, NO_SCOPE, NO_TOKEN, PUBLIC, RESTRICTED, TAG, authorize_request,
@@ -376,7 +376,7 @@ async fn the_list_timeline_holds_the_member_authors_posting_under_the_stored_pol
         json!("list"),
         "the stored default policy"
     );
-    let list_id = entity_id(&list);
+    let list_id = common::id_of(&list);
     let author_id = world.author.user.id.to_string();
     members_added(&app, &world.author.token, &list_id, &author_id).await;
 
@@ -402,7 +402,7 @@ async fn another_accounts_list_is_the_shows_shared_404() {
     let (app, world, _kinds) = timelines_matrix(&pool, dir.path()).await;
 
     let list = created_list(&app, &world.author.token, "someone else's circle").await;
-    let route = format!("{LIST}/{}", entity_id(&list));
+    let route = format!("{LIST}/{}", common::id_of(&list));
     page_shows(
         &app,
         Some(&world.author.token),

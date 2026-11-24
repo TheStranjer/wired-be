@@ -191,7 +191,7 @@ async fn the_expire_job_removes_the_lapsed_rows() {
     let app = common::test_app(pool);
     let listed = get(&app, Some(&token), MUTES).await;
     assert_eq!(
-        listed_ids(&listed.json_value()).len(),
+        common::ids_of(&listed.json_value()).len(),
         2,
         "the listing is what it was before the sweep, too"
     );

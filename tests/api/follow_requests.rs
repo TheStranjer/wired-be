@@ -152,16 +152,6 @@ fn wanted_follows(requests: &[Request]) -> Vec<Uuid> {
         .collect()
 }
 
-/// The account ids of every entity of a listing response, in response
-/// order.
-fn listed_ids(body: &Value) -> Vec<String> {
-    body.as_array()
-        .expect("the queue is an array")
-        .iter()
-        .map(|account| account["id"].as_str().expect("an account id").to_owned())
-        .collect()
-}
-
 /// The entity of account `id` in a listing body, however deep in the page
 /// the id's millisecond landed it.
 fn listed_entry<'a>(body: &'a Value, id: &Uuid) -> &'a Value {
@@ -257,7 +247,7 @@ async fn the_queue_lists_pending_requests_newest_first() {
     );
     let body = listed.json_value();
     assert_eq!(
-        listed_ids(&body),
+        common::ids_of(&body),
         wanted_requesters(&waiting),
         "the two waiting requests, newest row first; the accepted follower, \
          the outgoing request and the other accounts' rows stay out"
@@ -317,7 +307,7 @@ async fn the_queue_pages_key_on_follow_row_ids_and_link() {
 
     let first = queue(&app, Some(&token), "?limit=2").await;
     assert_eq!(
-        listed_ids(&first.json_value()),
+        common::ids_of(&first.json_value()),
         wanted_users[..2],
         "two newest first"
     );
@@ -334,14 +324,14 @@ async fn the_queue_pages_key_on_follow_row_ids_and_link() {
     )
     .await;
     assert_eq!(
-        listed_ids(&older.json_value()),
+        common::ids_of(&older.json_value()),
         wanted_users[2..4],
         "max_id continues where the page ended"
     );
 
     let newer = queue(&app, Some(&token), &format!("?min_id={}", wanted_rows[3])).await;
     assert_eq!(
-        listed_ids(&newer.json_value()),
+        common::ids_of(&newer.json_value()),
         wanted_users[..3],
         "min_id answers the newest-first page just after the cursor"
     );
@@ -380,19 +370,19 @@ async fn the_default_page_is_forty_and_the_cap_is_eighty() {
 
     let default = queue(&app, Some(&token), "").await;
     assert_eq!(
-        listed_ids(&default.json_value()).len(),
+        common::ids_of(&default.json_value()).len(),
         40,
         "the account-list default, not Pleroma's 20"
     );
     let greedy = queue(&app, Some(&token), "?limit=100").await;
     assert_eq!(
-        listed_ids(&greedy.json_value()).len(),
+        common::ids_of(&greedy.json_value()).len(),
         80,
         "and the account-list cap, never more"
     );
     let between = queue(&app, Some(&token), "?limit=60").await;
     assert_eq!(
-        listed_ids(&between.json_value()).len(),
+        common::ids_of(&between.json_value()).len(),
         60,
         "a page above the global cap but under 80 goes through"
     );
@@ -537,7 +527,7 @@ async fn only_the_target_user_sees_and_answers_requests() {
 
     let seen = queue(&app, Some(&carol_token), "").await;
     assert_eq!(
-        listed_ids(&seen.json_value()),
+        common::ids_of(&seen.json_value()),
         vec![alice.id.to_string()],
         "carol sees alice's request"
     );

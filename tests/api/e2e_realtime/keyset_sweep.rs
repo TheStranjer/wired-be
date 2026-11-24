@@ -9,7 +9,8 @@ use wired_be::models::user::User;
 use super::server::{
     BASE, SCOPES, Server, Verb, action_ok, call, expect, get_json, get_value, write_ok,
 };
-use super::sockets::{account, favourite, follow, id_of, ids_of, post_status};
+use super::sockets::{account, favourite, follow, post_status};
+use crate::common;
 
 // ──────────────────  Scenario 4: the pagination conformance sweep  ──────────────────
 
@@ -106,7 +107,7 @@ async fn sweep_walk(
             StatusCode::OK,
             &format!("{} max_id walk", listing.who),
         );
-        let ids = ids_of(&reply.json());
+        let ids = common::ids_of(&reply.json());
         let Some(page_link) = reply.header("link").map(str::to_owned) else {
             assert!(
                 ids.is_empty(),
@@ -143,7 +144,7 @@ async fn sweep_cursors(
     )
     .await;
     assert_eq!(
-        ids_of(&polled),
+        common::ids_of(&polled),
         expected[..SWEEP_ROWS - 1],
         "{}: since_id reads the newer rows, still newest-first",
         listing.who
@@ -155,7 +156,7 @@ async fn sweep_cursors(
     )
     .await;
     assert_eq!(
-        ids_of(&flipped),
+        common::ids_of(&flipped),
         expected[..SWEEP_ROWS - 1],
         "{}: the min_id page after the cursor answers newest-first too",
         listing.who
@@ -167,7 +168,7 @@ async fn sweep_cursors(
     )
     .await;
     assert_eq!(
-        ids_of(&middle),
+        common::ids_of(&middle),
         expected[..DEFAULT_PAGE - 1],
         "{}: a mid-listing cursor polls exactly the newer rows",
         listing.who
@@ -192,11 +193,11 @@ async fn sweep(srv: &Server, listing: &SweepListing) {
         &format!("{}?limit={PAGE_CAP}", listing.path),
     )
     .await;
-    let expected = ids_of(&all.json());
+    let expected = common::ids_of(&all.json());
     assert_eq!(expected.len(), SWEEP_ROWS, "{}: the full page", listing.who);
 
     let first = get_json(srv, Some(&listing.token), &listing.path).await;
-    let first_ids = ids_of(&first.json());
+    let first_ids = common::ids_of(&first.json());
     assert_eq!(
         first_ids,
         expected[..DEFAULT_PAGE],
@@ -222,7 +223,7 @@ async fn sweep(srv: &Server, listing: &SweepListing) {
     )
     .await;
     assert_eq!(
-        ids_of(&small),
+        common::ids_of(&small),
         expected[..5],
         "{}: limit sizes the page",
         listing.who
@@ -290,7 +291,7 @@ async fn seed_sweep_engagements(srv: &Server, alice_token: &str, carol: &User) {
     )
     .await;
     for status in carol_statuses.as_array().expect("a listing") {
-        let id = id_of(status);
+        let id = common::id_of(status);
         favourite(srv, alice_token, &id).await;
         let _bookmarked = write_ok(
             srv,

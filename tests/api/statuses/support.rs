@@ -82,15 +82,6 @@ pub(super) fn id_query<S: AsRef<str>>(key: &str, ids: &[S]) -> String {
         .join("&")
 }
 
-/// The `id` of every entity of a batch response, in response order.
-pub(super) fn entity_ids(body: &Value) -> Vec<String> {
-    body.as_array()
-        .expect("the batch is an array")
-        .iter()
-        .map(|status| status["id"].as_str().expect("a status id").to_owned())
-        .collect()
-}
-
 /// The ids of `statuses` as the wire spells them, for an expectation.
 pub(super) fn ids_of(statuses: &[&Status]) -> Vec<String> {
     statuses

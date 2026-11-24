@@ -6,7 +6,7 @@ use serde_json::{Value, json};
 
 use super::support::{
     AS_PUBLIC, BOB, STATUSES, account_statuses, activity, carries_uri, conversation_for,
-    create_note, deliver, entry_for, follow_bob, get, home_timeline, id_of, local, note_object,
+    create_note, deliver, entry_for, follow_bob, get, home_timeline, local, note_object,
     public_timeline, tag_timeline, told_of,
 };
 use crate::{common, remote};
@@ -111,7 +111,7 @@ async fn an_unlisted_remote_note_stays_off_the_public_timeline() {
     let home = home_timeline(&app, &alice_token).await;
     assert!(carries_uri(&home, &uri), "a follower's home carries it");
     let entry = entry_for(&home, &uri);
-    let id = id_of(entry);
+    let id = common::id_of(entry);
     let bob = entry["account"]["id"].as_str().expect("the author id");
     let profile = account_statuses(&app, None, bob).await;
     assert!(
@@ -220,7 +220,7 @@ async fn a_direct_remote_note_reaches_its_recipient_and_no_timeline() {
         json!(peer.handle(BOB)),
         "read back as the mock's actor mirror"
     );
-    let dm_id = id_of(&conversation["last_status"]);
+    let dm_id = common::id_of(&conversation["last_status"]);
     let as_recipient = get(&app, Some(&alice_token), &format!("{STATUSES}/{dm_id}")).await;
     common::assert_answer(&as_recipient, StatusCode::OK, "the recipient reads the DM");
     let anonymous = get(&app, None, &format!("{STATUSES}/{dm_id}")).await;
@@ -355,7 +355,7 @@ async fn a_remote_question_note_lands_a_poll_the_viewer_can_vote_on() {
 
     let public = public_timeline(&app).await;
     let entry = entry_for(&public, &uri);
-    let poll_id = id_of(&entry["poll"]);
+    let poll_id = common::id_of(&entry["poll"]);
     let stand = get(
         &app,
         Some(&alice_token),

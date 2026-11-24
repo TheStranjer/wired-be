@@ -13,7 +13,7 @@ use wired_be::models::{status::Visibility, user};
 use super::resolve_mock::{MockPeer, dead_origin, status_rows_by_uri, stored_notes, zoe_id};
 use super::support::{
     ACCOUNTS_SEARCH, BASE, THROTTLED, V1_SEARCH, V2_SEARCH, accounts_of, assert_all_lists_empty,
-    assert_document, assert_list_empty, fixture, get, listed_ids, statuses_of,
+    assert_document, assert_list_empty, fixture, get, statuses_of,
 };
 use crate::common;
 
@@ -51,7 +51,7 @@ async fn resolve_fetches_an_unknown_actor_by_url() {
     .await;
     common::assert_answer(&flat, StatusCode::OK, "the flat account search");
     assert_eq!(
-        listed_ids(&flat.json_value()),
+        common::ids_of(&flat.json_value()),
         vec![zoe_id(&pool, &url).await],
         "and it answers the same account, as a flat array"
     );
@@ -245,14 +245,14 @@ async fn resolve_is_silent_for_an_unreachable_host() {
     )
     .await;
     let plain = get(&app, Some(&token), &format!("{ACCOUNTS_SEARCH}?q=resolv")).await;
-    let ids = listed_ids(&flagged.json_value());
+    let ids = common::ids_of(&flagged.json_value());
     assert!(
         ids.contains(&known.id.to_string()),
         "the stored search still answers beside the flag: {ids:?}"
     );
     assert_eq!(
         ids,
-        listed_ids(&plain.json_value()),
+        common::ids_of(&plain.json_value()),
         "and a resolve that failed changes nothing about the answer"
     );
 }
@@ -368,7 +368,7 @@ async fn resolve_leaves_an_exact_handle_match_as_it_is() {
         .await;
         common::assert_answer(&found, StatusCode::OK, "the stored handle");
         assert_eq!(
-            listed_ids(&found.json_value()),
+            common::ids_of(&found.json_value()),
             vec![eve.id.to_string()],
             "`resolve=true` is the same answer as without it"
         );

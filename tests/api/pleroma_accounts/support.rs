@@ -236,15 +236,6 @@ pub(super) fn wanted_follows(asks: &[Ask]) -> Vec<Uuid> {
         .collect()
 }
 
-/// The account ids of every entity of a listing response, in response order.
-pub(super) fn listed_ids(body: &Value) -> Vec<String> {
-    body.as_array()
-        .expect("the listing is an array")
-        .iter()
-        .map(|account| account["id"].as_str().expect("an account id").to_owned())
-        .collect()
-}
-
 /// The entity of account `id` in a listing body, however deep in the page the
 /// id's millisecond landed it.
 pub(super) fn listed_entry<'a>(body: &'a Value, id: &Uuid) -> &'a Value {
