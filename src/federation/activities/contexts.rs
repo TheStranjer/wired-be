@@ -287,11 +287,11 @@ mod tests {
             ("EmojiReact", emoji_react_json(&react_ctx)),
             (
                 "Follow",
-                follow_json(&config, activity_uuid(), BOB_AP, ALICE_AP, &published),
+                follow_json(&config, &id, BOB_AP, ALICE_AP, &published),
             ),
             (
                 "Block",
-                block_json(&config, activity_uuid(), ALICE_AP, BOB_AP, &published),
+                block_json(&config, &id, ALICE_AP, BOB_AP, &published),
             ),
             ("Undo", undo_json(&answer)),
             ("Accept", accept_json(&answer)),
