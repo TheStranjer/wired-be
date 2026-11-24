@@ -7,7 +7,10 @@ use url::Url;
 use super::{PROXY_PATH, ProxyError};
 use crate::{
     config::Config,
-    util::hmac::{hmac_sha256, verify_hmac_sha256},
+    util::{
+        hmac::{hmac_sha256, verify_hmac_sha256},
+        url::is_http_url,
+    },
 };
 
 /// Rewrites `remote_url` into a signed proxy link for serving by
@@ -161,10 +164,7 @@ pub fn decode(config: &Config, sig: &str, encoded: &str) -> Result<String, Proxy
         .decode(encoded)
         .map_err(|_err| ProxyError::InvalidSignature)?;
     let url = String::from_utf8(decoded).map_err(|_err| ProxyError::InvalidUrl)?;
-    let Ok(parsed) = Url::parse(&url) else {
-        return Err(ProxyError::InvalidUrl);
-    };
-    if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+    if !is_http_url(&url) {
         return Err(ProxyError::InvalidUrl);
     }
     Ok(url)
