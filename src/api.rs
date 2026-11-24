@@ -99,6 +99,7 @@ pub mod pleroma_settings;
 pub mod polls;
 pub mod push;
 pub mod remote_interaction;
+pub mod report_render;
 pub mod reports;
 pub mod route_inventory;
 pub mod scheduled_statuses;
