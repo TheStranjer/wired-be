@@ -23,6 +23,7 @@ use url::form_urlencoded;
 use uuid::Uuid;
 
 use crate::{
+    config::Config,
     entities::status::Status as StatusEntity,
     error::{AppError, AppResult},
     jobs::{QUEUE_BACKGROUND, deletion},
@@ -43,6 +44,13 @@ use crate::{
     state::AppState,
     util::id::parse_id,
 };
+
+/// The `RESTRICT_UNAUTHENTICATED` area that closes anonymous reads of a
+/// local status.
+const ACTIVITIES_LOCAL: &str = "activities_local";
+/// The `RESTRICT_UNAUTHENTICATED` area that closes anonymous reads of a
+/// remote status.
+const ACTIVITIES_REMOTE: &str = "activities_remote";
 
 /// The keys the accounts batch endpoints read their ids from: Mastodon's
 /// bracketed array plus the single value Pleroma's `List.wrap` accepts.
@@ -210,6 +218,11 @@ pub async fn status_for_viewer_or_404(
     let Some(row) = status::get_by_id(&state.db, id).await? else {
         return Err(AppError::NotFound);
     };
+    // An anonymous read of an area the instance restricts is the same 404 a
+    // hidden status gets, so the gate never confirms the post exists.
+    if viewer.is_none() && anonymous_read_closed(state, &row).await? {
+        return Err(AppError::NotFound);
+    }
     // Rule 7 of the visibility model reads the original of a reblog with
     // the same tests, so a reblog of a status this viewer may not see
     // fails here and is answered the same 404 as the original would be.
@@ -218,6 +231,87 @@ pub async fn status_for_viewer_or_404(
     } else {
         Err(AppError::NotFound)
     }
+}
+
+/// Whether the instance keeps anonymous readers from `row` itself: its
+/// locality's `activities_*` area is listed in `RESTRICT_UNAUTHENTICATED`
+/// ([`Config::restricts`]).
+///
+/// Pleroma's `restrict_unauthenticated_access?` for an activity. A reblog
+/// row's original is not read here; see [`anonymous_read_closed`], which
+/// also checks it. The caller applies this to anonymous requests only.
+#[must_use]
+pub fn anonymous_read_restricted(config: &Config, row: &Status) -> bool {
+    config.restricts(if row.local {
+        ACTIVITIES_LOCAL
+    } else {
+        ACTIVITIES_REMOTE
+    })
+}
+
+/// Whether either `activities_*` area is restricted at all, so a caller can
+/// skip the original lookups when nothing is.
+fn activities_restricted(config: &Config) -> bool {
+    config.restricts(ACTIVITIES_LOCAL) || config.restricts(ACTIVITIES_REMOTE)
+}
+
+/// [`anonymous_read_restricted`] for `row` and, when it is a reblog, the
+/// original it announces (Pleroma checks both the activity and the object).
+/// An original that is gone adds nothing.
+///
+/// # Errors
+///
+/// Any database failure arrives through `?` as [`AppError::Database`].
+pub async fn anonymous_read_closed(state: &AppState, row: &Status) -> AppResult<bool> {
+    if !activities_restricted(&state.config) {
+        return Ok(false);
+    }
+    if anonymous_read_restricted(&state.config, row) {
+        return Ok(true);
+    }
+    let Some(original_id) = row.reblog_of_id else {
+        return Ok(false);
+    };
+    let original = status::get_by_id(&state.db, original_id).await?;
+    Ok(original.is_some_and(|found| anonymous_read_restricted(&state.config, &found)))
+}
+
+/// `rows` without what the instance keeps from an anonymous reader: a
+/// request with a `viewer` (or an instance with no `activities_*` area
+/// restricted) gets them back untouched, in order.
+///
+/// The batch counterpart of the [`status_for_viewer_or_404`] check, for the
+/// listings that narrow a set of rows rather than resolve one: the status
+/// batch, the context arms and the quoters. Reblog originals are read in
+/// one batch.
+///
+/// # Errors
+///
+/// Any database failure arrives through `?` as [`AppError::Database`].
+pub async fn retain_open_to_viewer(
+    state: &AppState,
+    viewer: Option<&User>,
+    rows: Vec<Status>,
+) -> AppResult<Vec<Status>> {
+    if viewer.is_some() || !activities_restricted(&state.config) {
+        return Ok(rows);
+    }
+    let original_ids = distinct(rows.iter().filter_map(|row| row.reblog_of_id));
+    let originals = status::get_many(&state.db, &original_ids).await?;
+    let closed_originals: HashSet<Uuid> = originals
+        .iter()
+        .filter(|original| anonymous_read_restricted(&state.config, original))
+        .map(|original| original.id)
+        .collect();
+    Ok(rows
+        .into_iter()
+        .filter(|row| {
+            !anonymous_read_restricted(&state.config, row)
+                && !row
+                    .reblog_of_id
+                    .is_some_and(|original| closed_originals.contains(&original))
+        })
+        .collect())
 }
 
 /// The decoded pairs of one query string, read the way Pleroma's

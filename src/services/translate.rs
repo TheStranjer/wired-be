@@ -117,11 +117,9 @@ const JSON_MIME: &str = "application/json";
 const FORM_MIME: &str = "application/x-www-form-urlencoded";
 /// Bytes a `GET` provider answer may hold before the read gives up: a language
 /// list is far smaller than this, and an endless body from a hostile server
-/// must not be buffered. The `POST` calls — whose answers this service asks
-/// for, from a URL the operator configured — go through the client's uncapped
-/// read (see [`HttpClient::post_bytes`]).
-///
-/// [`HttpClient::post_bytes`]: crate::http_client::HttpClient::post_bytes
+/// must not be buffered. The `POST` calls cap their answers at
+/// [`DEFAULT_RESPONSE_BYTES`](crate::http_client::DEFAULT_RESPONSE_BYTES),
+/// the same size.
 const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 
 /// One source language and the languages it can be translated into: one row

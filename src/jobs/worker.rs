@@ -26,6 +26,16 @@ const IDLE_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const RESCUE_INTERVAL: Duration = Duration::from_secs(60);
 /// An `executing` job locked for longer than this is considered stuck.
 const STUCK_LOCK_AGE: Duration = Duration::from_mins(10);
+/// Longest a handler may run before it is aborted and its job retried.
+/// Invariant: strictly below [`STUCK_LOCK_AGE`], so the rescuer only ever
+/// re-queues jobs whose worker died, never one whose handler is still running.
+const JOB_TIMEOUT: Duration = Duration::from_mins(8);
+
+/// Compile-time proof of the [`JOB_TIMEOUT`] invariant.
+const _: () = assert!(
+    JOB_TIMEOUT.as_secs() < STUCK_LOCK_AGE.as_secs(),
+    "JOB_TIMEOUT must stay below STUCK_LOCK_AGE"
+);
 
 /// Drains the configured job queues until a shutdown signal arrives.
 ///
@@ -185,7 +195,7 @@ async fn run_job(
     permit: OwnedSemaphorePermit,
 ) {
     debug!(job_id = %job.id, kind = %job.kind, attempts = job.attempts, "running job");
-    let outcome = dispatch_handler(&registry, &state, &job).await;
+    let outcome = dispatch_handler(&registry, &state, &job, JOB_TIMEOUT).await;
     record_outcome(&state.db, job.id, job.attempts, outcome).await;
     drop(permit);
 }
@@ -195,10 +205,14 @@ async fn run_job(
 /// becomes a [`JobError::Retry`]) instead of tearing down the worker. An
 /// unregistered kind is discarded: nothing can run it, and retrying cannot
 /// change that.
+///
+/// A handler still running after `timeout` is aborted and the job retried,
+/// so it releases its worker permit and cannot overlap a rescued re-run.
 async fn dispatch_handler(
     registry: &JobRegistry,
     state: &AppState,
     job: &Job,
+    timeout: Duration,
 ) -> Result<(), JobError> {
     let Some(handler) = registry.get(&job.kind) else {
         return Err(JobError::Discard(format!(
@@ -211,9 +225,18 @@ async fn dispatch_handler(
         max_attempts: job.max_attempts,
     };
     let handle = tokio::spawn(handler(state.clone(), attempt, job.args.clone()));
-    match handle.await {
-        Ok(outcome) => outcome,
-        Err(join_err) => Err(JobError::Retry(format!(
+    let abort = handle.abort_handle();
+    match tokio::time::timeout(timeout, handle).await {
+        Err(_elapsed) => {
+            abort.abort();
+            Err(JobError::Retry(format!(
+                "handler for job kind '{}' exceeded {}s",
+                job.kind,
+                timeout.as_secs()
+            )))
+        }
+        Ok(Ok(outcome)) => outcome,
+        Ok(Err(join_err)) => Err(JobError::Retry(format!(
             "handler for job kind '{}' panicked or was cancelled: {join_err}",
             job.kind
         ))),

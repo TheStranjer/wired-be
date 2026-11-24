@@ -871,12 +871,13 @@ mod tests {
         let waiting = fetch(&pool, running.id).await;
         assert_eq!(waiting.state, "retryable", "the row and its key stand");
 
-        let _backdated =
+        let rewound =
             sqlx::query("UPDATE jobs SET run_at = now() - interval '1 second' WHERE id = $1")
                 .bind(running.id)
                 .execute(&pool)
                 .await
                 .unwrap();
+        assert_eq!(rewound.rows_affected(), 1, "the retry was made due");
         let again = claim_next(&pool, &["scheduled"])
             .await
             .unwrap()

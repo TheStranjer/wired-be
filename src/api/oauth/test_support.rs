@@ -8,7 +8,7 @@
 use chrono::{Duration, Utc};
 use uuid::Uuid;
 
-use super::params::TokenParams;
+use super::params::{ClientCredentials, TokenParams};
 use crate::{
     config::Config, error::AppError, models::oauth_token::OauthToken, state::AppState,
     util::id::new_id,
@@ -22,8 +22,7 @@ pub(super) fn params_with_grant(grant: Option<&str>) -> TokenParams {
         username: None,
         password: None,
         scope: None,
-        client_id: None,
-        client_secret: None,
+        client: ClientCredentials::default(),
         refresh_token: None,
         code: None,
         redirect_uri: None,

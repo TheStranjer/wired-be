@@ -2,13 +2,15 @@
 //! and [`record_remote_totals`] — the wholesale restatement of a mirrored
 //! poll's numbers by the inbound `Question` update.
 
+use std::sync::LazyLock;
+
 use chrono::{DateTime, Utc};
-use sqlx::{PgConnection, PgPool};
+use sqlx::{AssertSqlSafe, PgConnection, PgPool};
 use uuid::Uuid;
 
 use crate::{error::AppResult, util::id::new_id};
 
-use super::{Poll, PollParams};
+use super::{POLL_COLUMNS, Poll, PollParams};
 
 /// The `INSERT` behind [`create`]: the minted id, the status named, and what
 /// [`PollParams`] holds — including the two counters, which a local create
@@ -16,13 +18,16 @@ use super::{Poll, PollParams};
 /// reported numbers — with `inserted_at` stamped by the database's `now()`
 /// (the column has no default) and [`ended_notified`](Poll::ended_notified)
 /// at its default, since a fresh poll has not closed.
-const INSERT_POLL_SQL: &str = "INSERT INTO polls (
+static INSERT_POLL_SQL: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        "INSERT INTO polls (
      id, status_id, expires_at, multiple, hide_totals,
      voters_count, votes_count, inserted_at
 ) VALUES (
      $1, $2, $3, $4, $5, $6, $7, now()
-) RETURNING id, status_id, expires_at, multiple, hide_totals,
-            voters_count, votes_count, ended_notified";
+) RETURNING {POLL_COLUMNS}"
+    )
+});
 
 /// The option rows behind [`create`]: one per title, in the order given, each
 /// with the id minted for it, a `position` counting from zero — `(ord - 1)`
@@ -63,7 +68,7 @@ pub async fn create(
     status_id: Uuid,
     params: &PollParams,
 ) -> AppResult<Poll> {
-    let poll = sqlx::query_as::<_, Poll>(INSERT_POLL_SQL)
+    let poll = sqlx::query_as::<_, Poll>(AssertSqlSafe(INSERT_POLL_SQL.as_str()))
         .bind(new_id())
         .bind(status_id)
         .bind(params.expires_at)

@@ -9,7 +9,7 @@ use super::KIND_DELETE_REMOTE;
 use super::{local::load_account, parse_args, retry};
 use crate::{
     jobs::{AttemptInfo, HandlerFuture, JobError},
-    models::{bookmark, emoji_reaction, favourite, follow, notification, status, user},
+    models::{bookmark, chat, emoji_reaction, favourite, follow, notification, status, user},
     state::AppState,
 };
 
@@ -51,6 +51,9 @@ async fn clear_remote_data(state: &AppState, account: &user::User) -> Result<(),
     let statuses = status::soft_delete_all_for_user(db, id)
         .await
         .map_err(|err| retry(&err))?;
+    let chat_messages = chat::withdraw_all_from_sender(db, id)
+        .await
+        .map_err(|err| retry(&err))?;
     let follows = follow::delete_all_for_user_with_counts(db, id)
         .await
         .map_err(|err| retry(&err))?;
@@ -68,7 +71,7 @@ async fn clear_remote_data(state: &AppState, account: &user::User) -> Result<(),
         .map_err(|err| retry(&err))?;
     debug!(
         account = %account.nickname,
-        statuses, follows, favourites, reactions, bookmarks, notifications,
+        statuses, chat_messages, follows, favourites, reactions, bookmarks, notifications,
         "remote account deletion cleared"
     );
     Ok(())
@@ -81,8 +84,8 @@ mod tests {
 
     use super::super::test_support::{
         Departed, app_state, broken_state, count_where, departed_mirror, fresh_user, has_follow,
-        likes, live_statuses, local_user, post, remote_post, remote_user, run_remote,
-        status_deleted_at,
+        is_blank_tombstone, likes, listed_messages, live_statuses, local_user, post, remote_post,
+        remote_user, run_remote, send_chat, send_chat_own, status_deleted_at,
     };
     use super::super::{KIND_DELETE_REMOTE, job_args};
     use super::*;
@@ -211,6 +214,46 @@ mod tests {
             count_where(&pool, "notifications", "id", bobs_notification.id).await,
             1,
             "carol's notification about bob is nobody else's to clear"
+        );
+    }
+
+    /// The mirror's chat messages are blank tombstones after the sweep and
+    /// drop off the local participant's page, while the local participant's
+    /// own message stays.
+    #[tokio::test]
+    async fn the_remote_handler_withdraws_the_chat_messages_the_mirror_sent() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = remote_user(&pool, "alice").await;
+        let bob = local_user(&pool, "bob").await;
+        let first = send_chat(&pool, &alice, &bob, "alice says one").await;
+        let second = send_chat(&pool, &alice, &bob, "alice says two").await;
+        let reply = send_chat_own(&pool, &bob, &alice, "bob answers").await;
+        let bobs_chat = first.chat_id;
+        assert_eq!(
+            listed_messages(&pool, bobs_chat).await.len(),
+            3,
+            "bob reads all three messages before the sweep"
+        );
+
+        run_remote(&app_state(&pool), alice.id)
+            .await
+            .expect("the remote delete job runs");
+
+        assert_eq!(
+            listed_messages(&pool, bobs_chat).await,
+            vec![reply.message_id],
+            "bob's page keeps only bob's own message"
+        );
+        for gone in [first.message_id, second.message_id] {
+            assert!(
+                is_blank_tombstone(&pool, gone).await,
+                "the mirror's message {gone} is a blank tombstone"
+            );
+        }
+        assert!(
+            !is_blank_tombstone(&pool, reply.message_id).await,
+            "bob's reply is not the mirror's to withdraw"
         );
     }
 

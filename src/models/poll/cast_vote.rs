@@ -2,23 +2,22 @@
 //! deciding with [`fresh_marks`] what the ballot actually adds, inserting
 //! those marks and moving every counter the `Poll` entity reports.
 
-use sqlx::PgPool;
+use std::sync::LazyLock;
+
+use sqlx::{AssertSqlSafe, PgPool};
 use uuid::Uuid;
 
 use crate::error::{AppError, AppResult};
 
-use super::Poll;
+use super::{POLL_COLUMNS, Poll};
 
 /// [`cast_vote`]'s first read: the poll's own row, locked for the rest of
 /// the transaction. Every ballot on one poll takes this lock first, so two
 /// voters (or one voter's two racing requests) move the counters one at a
 /// time, and a poll deleted between the endpoint's reads and this lock is
 /// caught here.
-const LOCK_POLL_SQL: &str = "SELECT id, status_id, expires_at, multiple, hide_totals,
-                                    voters_count, votes_count, ended_notified
-                               FROM polls
-                              WHERE id = $1
-                                FOR UPDATE";
+static LOCK_POLL_SQL: LazyLock<String> =
+    LazyLock::new(|| format!("SELECT {POLL_COLUMNS} FROM polls WHERE id = $1 FOR UPDATE"));
 
 /// [`cast_vote`]'s in-transaction read of the voter's own marks: which
 /// options of the poll that account has already ticked, taken under the
@@ -116,7 +115,7 @@ pub async fn cast_vote(
     option_ids: &[Uuid],
 ) -> AppResult<bool> {
     let mut tx = pool.begin().await?;
-    let locked: Option<Poll> = sqlx::query_as::<_, Poll>(LOCK_POLL_SQL)
+    let locked: Option<Poll> = sqlx::query_as::<_, Poll>(AssertSqlSafe(LOCK_POLL_SQL.as_str()))
         .bind(poll_id)
         .fetch_optional(&mut *tx)
         .await?;

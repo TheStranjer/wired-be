@@ -61,11 +61,14 @@ async fn deliver_for(
         debug!(subscription = %subscription.id, "app-only subscription has nobody to wake");
         return Ok(());
     };
-    let found = notification::get(&state.db, recipient_id, notification_id)
+    let found = notification::get_visible(&state.db, recipient_id, notification_id)
         .await
         .map_err(|err| retry(&err))?;
     let Some(note) = found else {
-        debug!(notification = %notification_id, "notification is gone before delivery");
+        debug!(
+            notification = %notification_id,
+            "notification is gone, dismissed, blocked or muted before delivery"
+        );
         return Ok(());
     };
     if !web_push::alert_enabled(&subscription.alerts, &note.event_type) {
@@ -271,6 +274,74 @@ mod tests {
         let outcome = run(&s.state, s.note.id, off_sub.id).await;
 
         assert_eq!(outcome, Ok(()), "an off flag is a clean skip");
+        assert!(!served(&s.seen), "nothing reached the push service");
+        s.server.abort();
+    }
+
+    #[tokio::test]
+    async fn an_actor_blocked_after_enqueueing_sends_nothing() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let s = setup(&pool, 201).await;
+        let _edge = crate::models::block::block(&pool, TEST_BASE_URL, &s.recipient.user, &s.actor)
+            .await
+            .expect("the block lands after the job was queued");
+
+        let outcome = run(&s.state, s.note.id, s.subscription.id).await;
+
+        assert_eq!(outcome, Ok(()), "a blocked actor retires the job quietly");
+        assert!(!served(&s.seen), "nothing reached the push service");
+        s.server.abort();
+    }
+
+    #[tokio::test]
+    async fn an_actor_muted_after_enqueueing_sends_nothing() {
+        use crate::models::mute::{self, MuteOptions};
+
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let s = setup(&pool, 201).await;
+        let _mute = mute::mute(&pool, &s.recipient.user, &s.actor, MuteOptions::default())
+            .await
+            .expect("the mute lands after the job was queued");
+
+        let outcome = run(&s.state, s.note.id, s.subscription.id).await;
+
+        assert_eq!(outcome, Ok(()), "a muted actor retires the job quietly");
+        assert!(!served(&s.seen), "nothing reached the push service");
+        s.server.abort();
+    }
+
+    #[tokio::test]
+    async fn a_dismissed_notification_sends_nothing() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let s = setup(&pool, 201).await;
+        let _dismissed = notification::dismiss(&pool, s.recipient.user.id, s.note.id)
+            .await
+            .expect("the dismissal runs");
+
+        let outcome = run(&s.state, s.note.id, s.subscription.id).await;
+
+        assert_eq!(outcome, Ok(()), "a dismissed row retires the job quietly");
+        assert!(!served(&s.seen), "nothing reached the push service");
+        s.server.abort();
+    }
+
+    #[tokio::test]
+    async fn a_deactivated_actor_sends_nothing() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let s = setup(&pool, 201).await;
+        let _inactive = sqlx::query("UPDATE users SET is_active = false WHERE id = $1")
+            .bind(s.actor.id)
+            .execute(&pool)
+            .await
+            .expect("the deactivation lands");
+
+        let outcome = run(&s.state, s.note.id, s.subscription.id).await;
+
+        assert_eq!(outcome, Ok(()), "a deactivated actor retires the job");
         assert!(!served(&s.seen), "nothing reached the push service");
         s.server.abort();
     }

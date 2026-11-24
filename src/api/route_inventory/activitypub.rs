@@ -122,16 +122,6 @@ pub(super) const ROWS: &[RouteSpec] = &[
     },
     RouteSpec {
         method: "GET",
-        path: "/frontend_switcher",
-        auth: AuthClass::Public,
-    },
-    RouteSpec {
-        method: "POST",
-        path: "/frontend_switcher",
-        auth: AuthClass::Public,
-    },
-    RouteSpec {
-        method: "GET",
         path: "/api/ap/whoami",
         auth: AuthClass::User,
     },

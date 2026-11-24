@@ -187,6 +187,56 @@ async fn posting_into_an_old_chat_is_refused_after_a_block() {
     );
 }
 
+/// How many rows the `chat_message_references` table holds.
+async fn count_references(pool: &PgPool) -> i64 {
+    let row: (i64,) = sqlx::query_as("SELECT count(*) FROM chat_message_references")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    row.0
+}
+
+/// A post under an `Idempotency-Key` that succeeded before a block is not
+/// replayed afterwards: the same key gets the 403, and no message or
+/// reference row is added.
+#[tokio::test]
+async fn an_idempotent_replay_after_a_block_is_refused() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let (alice, token) = poster(&pool, "alice").await;
+    let bob = common::create_local_user(&pool, "bob").await;
+    let chat = open_chat(&pool, &alice, &bob).await.id.to_string();
+    let app = common::test_app(pool.clone());
+    let body = serde_json::json!({"content": "once"});
+
+    let first = post_message(&app, &token, &chat, body.clone(), Some("replay-key")).await;
+    assert_eq!(
+        first.status,
+        StatusCode::OK,
+        "the first post goes through: {}",
+        first.text()
+    );
+    let messages = count_messages(&pool).await;
+    let references = count_references(&pool).await;
+
+    block_user(&pool, &bob, &alice).await;
+
+    let replay = post_message(&app, &token, &chat, body, Some("replay-key")).await;
+    assert_refused(
+        &replay,
+        "alice, replaying her key after bob blocked her",
+        &messages_path(&chat),
+        StatusCode::FORBIDDEN,
+        "Chat not allowed",
+    );
+    assert_eq!(count_messages(&pool).await, messages, "no new message");
+    assert_eq!(
+        count_references(&pool).await,
+        references,
+        "no new reference"
+    );
+}
+
 /// A recipient who turned `accepts_chat_messages` off after the chat was
 /// opened no longer receives: the flag's 403 and no message row.
 #[tokio::test]

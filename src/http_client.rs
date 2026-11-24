@@ -48,6 +48,10 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const TOTAL_TIMEOUT: Duration = Duration::from_secs(20);
 /// Redirects followed before the response is handed back unanswered.
 const MAX_REDIRECTS: usize = 5;
+/// Response-body cap (1 MiB) for callers that parse what the peer answers,
+/// matching Mastodon's default; callers that read only the status pick a
+/// tighter cap of their own.
+pub const DEFAULT_RESPONSE_BYTES: usize = 1024 * 1024;
 /// First status code [`HttpResponse::error_for_status`] reports as an error.
 const ERROR_STATUS_MIN: u16 = 400;
 /// Product name the instance identifies itself with in `User-Agent`.
@@ -215,30 +219,32 @@ impl HttpClient {
     }
 
     /// Sends `body` with a `POST` to `url`, plus `headers`, and reads the
-    /// full response. Delivery endpoints mostly care about the status; the
-    /// body is buffered because callers routinely log or parse it.
+    /// response, giving up as soon as more than `max_bytes` of body have
+    /// arrived. Delivery endpoints mostly care about the status; the body
+    /// is buffered because callers routinely log or parse it.
     ///
     /// # Errors
     ///
-    /// Same as [`HttpClient::get_limited`], except that the response body
-    /// is read without a size cap, so [`HttpError::TooLarge`] cannot occur.
+    /// Same as [`HttpClient::get_limited`]: an over-long response body is
+    /// [`HttpError::TooLarge`].
     pub async fn post_bytes(
         &self,
         url: &str,
         headers: &[(&str, &str)],
         body: Vec<u8>,
+        max_bytes: usize,
     ) -> Result<HttpResponse, HttpError> {
         let request = self
             .build_request(Method::POST, url, headers)
             .await?
             .body(body);
-        read_body(request.send().await?, usize::MAX).await
+        read_body(request.send().await?, max_bytes).await
     }
 
     /// Sends `method` to `url` with `headers` and reads the full response:
     /// the generic call behind the verbs this client is not otherwise
     /// spelled for — today the media cache's `PURGE` invalidation request
-    /// (see [`crate::api::admin::ops`]).
+    /// (see [`crate::api::admin::ops`]). The body is capped at `max_bytes`.
     ///
     /// # Errors
     ///
@@ -250,9 +256,10 @@ impl HttpClient {
         method: Method,
         url: &str,
         headers: &[(&str, &str)],
+        max_bytes: usize,
     ) -> Result<HttpResponse, HttpError> {
         let request = self.build_request(method, url, headers).await?;
-        read_body(request.send().await?, usize::MAX).await
+        read_body(request.send().await?, max_bytes).await
     }
 
     /// Validates `url` (`http`/`https` only), passes it through the SSRF
@@ -298,17 +305,17 @@ impl HttpClient {
     ///
     /// [`HttpError::Connect`] if the request cannot be signed (`url` is not
     /// a signable http(s) URL, or `private_pem` does not parse), otherwise
-    /// the same as [`HttpClient::get_limited`] — except that the response
-    /// body is read without a size cap, so [`HttpError::TooLarge`] cannot
-    /// occur.
+    /// the same as [`HttpClient::get_limited`], with the response body
+    /// capped at `max_bytes`.
     pub async fn signed_get(
         &self,
         url: &str,
         key_id: &str,
         private_pem: &str,
+        max_bytes: usize,
     ) -> Result<HttpResponse, HttpError> {
         let signed = sign_for_send("GET", url, None, key_id, private_pem)?;
-        self.get_limited(url, &ap_headers(&signed, false), usize::MAX)
+        self.get_limited(url, &ap_headers(&signed, false), max_bytes)
             .await
     }
 
@@ -321,7 +328,8 @@ impl HttpClient {
     ///
     /// Same as [`HttpClient::signed_get`] (with `url` also checked for
     /// signability before anything is sent), then the same as
-    /// [`HttpClient::post_bytes`].
+    /// [`HttpClient::post_bytes`], the response body capped at
+    /// [`DEFAULT_RESPONSE_BYTES`].
     pub async fn signed_post(
         &self,
         url: &str,
@@ -330,8 +338,13 @@ impl HttpClient {
         private_pem: &str,
     ) -> Result<HttpResponse, HttpError> {
         let signed = sign_for_send("POST", url, Some(body), key_id, private_pem)?;
-        self.post_bytes(url, &ap_headers(&signed, true), body.to_vec())
-            .await
+        self.post_bytes(
+            url,
+            &ap_headers(&signed, true),
+            body.to_vec(),
+            DEFAULT_RESPONSE_BYTES,
+        )
+        .await
     }
 }
 

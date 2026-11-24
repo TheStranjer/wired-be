@@ -58,7 +58,7 @@ use crate::{
     state::AppState,
 };
 
-use super::{follow::resolve_actor_or_fetch, render_account};
+use super::{follow::resolve_actor_or_fetch, follow_lists::require_profile_read, render_account};
 
 /// The 400 body message when the `acct` query parameter is absent or blank
 /// (Mastodon's `ParameterMissing` wording).
@@ -79,6 +79,10 @@ const MISSING_ACCT: &str = "Missing parameter: acct";
 ///
 /// [`AppError::NotFound`] for a malformed, unknown, deactivated or (to this
 /// viewer) invisible id;
+/// [`AppError::Forbidden`] ("This API requires an authenticated user") for
+/// an anonymous request while `RESTRICT_UNAUTHENTICATED` closes the
+/// account's profile half (see [`require_profile_read`]; Pleroma's `show`
+/// answers that case 404, this API keeps the 403 `statuses` gives);
 /// [`AppError::Unauthorized`] from the extractor for an invalid token.
 /// Any database failure arrives through `?` as [`AppError::Database`].
 pub(super) async fn show_account(
@@ -87,6 +91,7 @@ pub(super) async fn show_account(
     Path(id): Path<String>,
 ) -> AppResult<Json<Account>> {
     let found = visible_account_or_404(&state, &id, viewer.as_ref()).await?;
+    require_profile_read(&state.config, viewer.as_ref(), &found)?;
     Ok(Json(render_account(&state, viewer.as_ref(), &found).await?))
 }
 
@@ -146,6 +151,9 @@ impl LookupQuery {
 /// [`AppError::BadRequest`] when neither `acct` nor `q` carries a handle;
 /// [`AppError::NotFound`] when it names no live account, stored or
 /// resolvable (unknown, on a domain whose lookup fails, or deactivated);
+/// [`AppError::Forbidden`] for an anonymous request while
+/// `RESTRICT_UNAUTHENTICATED` closes the found account's profile half, as
+/// in [`show_account`];
 /// [`AppError::Unauthorized`] from the extractor for an invalid token.
 /// Any database failure arrives through `?` as [`AppError::Database`].
 pub(super) async fn lookup_account(
@@ -167,6 +175,7 @@ pub(super) async fn lookup_account(
         }
         None => return Err(AppError::NotFound),
     };
+    require_profile_read(&state.config, viewer, &found)?;
     Ok(Json(render_account(&state, viewer, &found).await?))
 }
 

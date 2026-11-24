@@ -468,7 +468,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::services::config_registry::{KEY_INSTANCE, KEY_MEDIA_PROXY, KEY_MRF};
+    use crate::services::config_registry::{KEY_INSTANCE, KEY_MRF};
 
     /// The whitelist refusal names the pair the client sent, and only a
     /// non-delete item without a value trips the second check.
@@ -614,7 +614,10 @@ mod tests {
         );
     }
 
-    /// `need_reboot` reads the stored rows against the registry flags.
+    /// `need_reboot` reads the stored rows against the registry flags:
+    /// no whitelisted key waits for a restart, and a stale row of a key
+    /// that is no longer whitelisted (`:media_proxy`, accepted before the
+    /// key was dropped) raises nothing either.
     #[test]
     fn need_reboot_follows_the_stored_keys() {
         assert!(!rows_need_reboot(&[]), "an empty store reboots nobody");
@@ -623,12 +626,27 @@ mod tests {
             ":instance takes effect live"
         );
         assert!(
-            rows_need_reboot(&[
+            !rows_need_reboot(&[
                 row(KEY_INSTANCE, json!({"name": "Wired"})),
-                row(KEY_MEDIA_PROXY, json!({"enabled": false})),
+                row(":media_proxy", json!({"enabled": false})),
             ]),
-            "the media proxy waits for a restart"
+            "a stale row of a dropped key restarts nothing"
         );
+    }
+
+    /// The two keys no runtime consumer reads are refused as not
+    /// whitelisted, the same 400 as any unknown pair.
+    #[test]
+    fn unread_keys_are_refused_as_not_whitelisted() {
+        for key in [":restrict_unauthenticated", ":media_proxy"] {
+            let refused = validate(&[item(GROUP_PLEROMA, key, Some(json!({})), false)])
+                .expect_err("the key is not whitelisted");
+            assert_eq!(
+                refused.to_string(),
+                format!("Config not allowed: :pleroma/{key}"),
+                "{key} answers the not-whitelisted 400"
+            );
+        }
     }
 
     /// The accumulator: only changed items count, upserted entries
@@ -655,12 +673,9 @@ mod tests {
         );
         assert_eq!(view["db"], json!(["policies"]), "with its stored subkeys");
 
-        let proxy = item(GROUP_PLEROMA, KEY_MEDIA_PROXY, None, true);
-        applied.record(&proxy, &Outcome::Deleted);
-        assert!(
-            applied.need_reboot,
-            "the deleted media proxy changed a restart key"
-        );
+        let deleted = item(GROUP_PLEROMA, KEY_INSTANCE, None, true);
+        applied.record(&deleted, &Outcome::Deleted);
+        assert!(!applied.need_reboot, "no whitelisted key is restart-gated");
         assert_eq!(
             applied.configs.len(),
             1,

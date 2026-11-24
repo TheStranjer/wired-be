@@ -22,6 +22,10 @@ use crate::{
     state::AppState,
 };
 
+/// Most response-body bytes a delivery buffers from the peer's inbox: only
+/// the status and headers matter, so 64 KiB is ample.
+const DELIVERY_RESPONSE_BYTES: usize = 64 * 1024;
+
 /// The [`KIND_DELIVER`] handler, registered by [`crate::serve`]: runs one
 /// delivery attempt and reports its outcome to the worker.
 ///
@@ -80,7 +84,12 @@ async fn deliver(state: AppState, attempt: AttemptInfo, args: Value) -> Result<(
     })?;
     let response = match state
         .http_client
-        .post_bytes(&args.inbox, &delivery_headers(&signed), body)
+        .post_bytes(
+            &args.inbox,
+            &delivery_headers(&signed),
+            body,
+            DELIVERY_RESPONSE_BYTES,
+        )
         .await
     {
         Ok(response) => response,

@@ -13,6 +13,7 @@ use crate::{
     jobs::{AttemptInfo, JobError, scheduled_statuses},
     models::{
         backup, bookmark,
+        chat::{self, ChatMessageReference, NewChatMessage},
         emoji_reaction::{self, NewReaction},
         favourite::{self, Favourite},
         follow,
@@ -25,6 +26,7 @@ use crate::{
         user::{self, Flag, NewUser, User, insert, local_ap_id},
         web_push_subscription::{self, NewSubscription},
     },
+    pagination::{MAX_LIMIT, PageParams},
     state::AppState,
     uploads::UploaderBackend,
 };
@@ -471,4 +473,74 @@ pub(super) async fn push_subscription(pool: &PgPool, owner: &User, endpoint: &st
     )
     .await
     .expect("the subscription fixture registers");
+}
+
+/// Sends `text` from `sender` to `recipient` and answers the sender's
+/// reference and, for a local recipient, the recipient's.
+async fn send_chat_refs(
+    pool: &PgPool,
+    sender: &User,
+    recipient: &User,
+    text: &str,
+) -> (ChatMessageReference, Option<ChatMessageReference>) {
+    let mut conn = pool.begin().await.expect("a transaction begins");
+    let (_message, own, theirs) = chat::add_message(
+        &mut conn,
+        TEST_BASE_URL,
+        sender,
+        recipient,
+        &NewChatMessage::text(text),
+    )
+    .await
+    .expect("the chat message fixture is written");
+    conn.commit().await.expect("the transaction commits");
+    (own, theirs)
+}
+
+/// Sends `text` from `sender` to the local `recipient` and answers the
+/// recipient's reference, whose `chat_id` is the chat `recipient` reads.
+pub(super) async fn send_chat(
+    pool: &PgPool,
+    sender: &User,
+    recipient: &User,
+    text: &str,
+) -> ChatMessageReference {
+    send_chat_refs(pool, sender, recipient, text)
+        .await
+        .1
+        .expect("a local recipient gets a reference")
+}
+
+/// Sends `text` from `sender` to `recipient` and answers the sender's own
+/// reference: the one that exists whether or not the recipient is local.
+pub(super) async fn send_chat_own(
+    pool: &PgPool,
+    sender: &User,
+    recipient: &User,
+    text: &str,
+) -> ChatMessageReference {
+    send_chat_refs(pool, sender, recipient, text).await.0
+}
+
+/// The ids of the messages chat `chat_id` still lists, newest first.
+pub(super) async fn listed_messages(pool: &PgPool, chat_id: Uuid) -> Vec<Uuid> {
+    let page = PageParams::from_query(Some("limit=40"), MAX_LIMIT).expect("the page parses");
+    chat::messages_page(pool, chat_id, page)
+        .await
+        .expect("the chat page reads")
+        .iter()
+        .map(|reference| reference.message_id)
+        .collect()
+}
+
+/// Whether chat message `id` is a tombstone with its text cleared.
+pub(super) async fn is_blank_tombstone(pool: &PgPool, id: Uuid) -> bool {
+    sqlx::query_scalar::<_, bool>(
+        "SELECT deleted_at IS NOT NULL AND content = '' AND raw_text = ''
+           FROM chat_messages WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_one(pool)
+    .await
+    .expect("the chat message reads")
 }
