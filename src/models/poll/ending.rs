@@ -3,12 +3,14 @@
 //! [`voter_ids`] whose ballots the closing tells, and
 //! [`mark_ended_notified`] the flag write that retires a row.
 
-use sqlx::PgPool;
+use std::sync::LazyLock;
+
+use sqlx::{AssertSqlSafe, PgPool};
 use uuid::Uuid;
 
 use crate::error::AppResult;
 
-use super::Poll;
+use super::{POLL_COLUMNS, Poll};
 
 /// [`fetch_ended_unnotified`]: the polls the end-notify sweep has not told
 /// about yet whose deadline fell inside the look-back window — the strict
@@ -19,14 +21,17 @@ use super::Poll;
 /// and the statement cannot drift apart.
 ///
 /// [`make_interval`]: https://www.postgresql.org/docs/current/functions-datetime.html
-const FETCH_ENDED_UNNOTIFIED_SQL: &str = "SELECT id, status_id, expires_at, multiple, hide_totals,
-       voters_count, votes_count, ended_notified
+static FETCH_ENDED_UNNOTIFIED_SQL: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        "SELECT {POLL_COLUMNS}
   FROM polls
  WHERE NOT ended_notified
    AND expires_at IS NOT NULL
    AND expires_at < now()
    AND expires_at >= now() - make_interval(mins => $1)
- ORDER BY id";
+ ORDER BY id"
+    )
+});
 
 /// The polls whose [`expires_at`](Poll::expires_at) ran out within the last
 /// `window_minutes` minutes and that the [`polls.end_notify`] sweep has not
@@ -43,7 +48,7 @@ const FETCH_ENDED_UNNOTIFIED_SQL: &str = "SELECT id, status_id, expires_at, mult
 /// Any database failure (connection, encoding) arrives as
 /// [`AppError::Database`](crate::error::AppError).
 pub async fn fetch_ended_unnotified(pool: &PgPool, window_minutes: i32) -> AppResult<Vec<Poll>> {
-    let rows = sqlx::query_as::<_, Poll>(FETCH_ENDED_UNNOTIFIED_SQL)
+    let rows = sqlx::query_as::<_, Poll>(AssertSqlSafe(FETCH_ENDED_UNNOTIFIED_SQL.as_str()))
         .bind(window_minutes)
         .fetch_all(pool)
         .await?;

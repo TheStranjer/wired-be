@@ -2,14 +2,22 @@
 //! poll's own row ([`get_by_id`]), the batched page reads ([`for_statuses`]
 //! and [`options_for_statuses`]) and one poll's ordered [`options`].
 
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::LazyLock};
 
-use sqlx::PgPool;
+use sqlx::{AssertSqlSafe, PgPool};
 use uuid::Uuid;
 
 use crate::error::AppResult;
 
-use super::{Poll, PollOption};
+use super::{POLL_COLUMNS, Poll, PollOption};
+
+/// [`get_for_status`]: the poll row keyed on its status.
+static GET_FOR_STATUS_SQL: LazyLock<String> =
+    LazyLock::new(|| format!("SELECT {POLL_COLUMNS} FROM polls WHERE status_id = $1"));
+
+/// [`get_by_id`]: the poll row keyed on its own primary key.
+static GET_BY_ID_SQL: LazyLock<String> =
+    LazyLock::new(|| format!("SELECT {POLL_COLUMNS} FROM polls WHERE id = $1"));
 
 /// Fetches the poll of status `status_id`, `None` when that status carries
 /// none (or is not stored at all).
@@ -19,14 +27,10 @@ use super::{Poll, PollOption};
 /// Any database failure (connection, encoding) arrives as
 /// [`AppError::Database`](crate::error::AppError).
 pub async fn get_for_status(pool: &PgPool, status_id: Uuid) -> AppResult<Option<Poll>> {
-    let stored = sqlx::query_as::<_, Poll>(
-        "SELECT id, status_id, expires_at, multiple, hide_totals, voters_count, votes_count,
-                ended_notified
-           FROM polls WHERE status_id = $1",
-    )
-    .bind(status_id)
-    .fetch_optional(pool)
-    .await?;
+    let stored = sqlx::query_as::<_, Poll>(AssertSqlSafe(GET_FOR_STATUS_SQL.as_str()))
+        .bind(status_id)
+        .fetch_optional(pool)
+        .await?;
     Ok(stored)
 }
 
@@ -42,24 +46,18 @@ pub async fn get_for_status(pool: &PgPool, status_id: Uuid) -> AppResult<Option<
 /// Any database failure (connection, encoding) arrives as
 /// [`AppError::Database`](crate::error::AppError).
 pub async fn get_by_id(pool: &PgPool, poll_id: Uuid) -> AppResult<Option<Poll>> {
-    let stored = sqlx::query_as::<_, Poll>(
-        "SELECT id, status_id, expires_at, multiple, hide_totals, voters_count, votes_count,
-                ended_notified
-           FROM polls WHERE id = $1",
-    )
-    .bind(poll_id)
-    .fetch_optional(pool)
-    .await?;
+    let stored = sqlx::query_as::<_, Poll>(AssertSqlSafe(GET_BY_ID_SQL.as_str()))
+        .bind(poll_id)
+        .fetch_optional(pool)
+        .await?;
     Ok(stored)
 }
 
 /// [`for_statuses`]: the polls of a whole batch of statuses in one walk of the
 /// unique key on `status_id`.
-const FOR_STATUSES_SQL: &str = "SELECT id, status_id, expires_at, multiple, hide_totals,
-                                       voters_count, votes_count, ended_notified
-                                FROM polls
-                               WHERE status_id = ANY($1)
-                            ORDER BY status_id";
+static FOR_STATUSES_SQL: LazyLock<String> = LazyLock::new(|| {
+    format!("SELECT {POLL_COLUMNS} FROM polls WHERE status_id = ANY($1) ORDER BY status_id")
+});
 
 /// Fetches the poll of every status in `status_ids`, keyed by status.
 ///
@@ -75,7 +73,7 @@ const FOR_STATUSES_SQL: &str = "SELECT id, status_id, expires_at, multiple, hide
 /// [`AppError::Database`](crate::error::AppError).
 pub async fn for_statuses(pool: &PgPool, status_ids: &[Uuid]) -> AppResult<HashMap<Uuid, Poll>> {
     let status_ids = status_ids.to_vec();
-    let rows = sqlx::query_as::<_, Poll>(FOR_STATUSES_SQL)
+    let rows = sqlx::query_as::<_, Poll>(AssertSqlSafe(FOR_STATUSES_SQL.as_str()))
         .bind(&status_ids)
         .fetch_all(pool)
         .await?;
