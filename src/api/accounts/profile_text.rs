@@ -19,7 +19,7 @@ use crate::{
     state::AppState,
     util::{
         entities::{MentionRef, extract_mentions, linkify_entities},
-        format::text_to_html,
+        format::{text_to_html, text_to_inline_html},
         sanitize::{sanitize_display_name, strip_html},
     },
 };
@@ -53,8 +53,8 @@ const TOO_MANY_FIELDS: &str = "Too many fields";
 /// [`MAX_PROFILE_FIELD_VALUE_CHARS`] characters, counted on the raw text
 /// like Pleroma's `valid_field?`. The stored pair is the raw entry in
 /// `raw_fields` and, in `fields`, the name reduced to plain text by
-/// [`strip_html`] and the value rendered by [`text_to_html`] — bare URLs
-/// become links carrying the standard `rel`. An empty submission is an
+/// [`strip_html`] and the value rendered by [`text_to_inline_html`] — bare
+/// URLs become links carrying the standard `rel`, and there is no `<p>`. An empty submission is an
 /// empty pair: the metadata, cleared.
 ///
 /// # Errors
@@ -80,7 +80,7 @@ pub(crate) fn stored_fields(submitted: Value, max_fields: usize) -> AppResult<(V
         check_field_len("Field value", &value, MAX_PROFILE_FIELD_VALUE_CHARS)?;
         rendered.push(json!({
             "name": strip_html(&name),
-            "value": text_to_html(&value),
+            "value": text_to_inline_html(&value),
         }));
         raw.push(json!({"name": name, "value": value}));
     }
@@ -179,6 +179,37 @@ pub(crate) async fn after_profile_updated(state: &AppState, user: &User) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn field_values_render_inline_without_paragraphs() {
+        let (rendered, raw) = stored_fields(
+            json!([
+                {"name": "site", "value": "https://example.com"},
+                {"name": "pronouns", "value": "a < b"},
+            ]),
+            4,
+        )
+        .unwrap();
+        assert_eq!(
+            rendered,
+            json!([
+                {
+                    "name": "site",
+                    "value": "<a href=\"https://example.com\" rel=\"ugc nofollow noopener noreferrer\">example.com</a>"
+                },
+                {"name": "pronouns", "value": "a &lt; b"},
+            ]),
+            "a URL is a bare anchor and plain text is escaped, neither in a <p>"
+        );
+        assert_eq!(
+            raw,
+            json!([
+                {"name": "site", "value": "https://example.com"},
+                {"name": "pronouns", "value": "a < b"},
+            ]),
+            "the raw pair is the submitted text"
+        );
+    }
 
     #[test]
     fn display_name_limit_is_counted_in_characters() {

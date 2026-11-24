@@ -26,7 +26,7 @@
 //! plain link, and the finished markup is sanitized like every other format.
 
 use markdown::markdown_to_html;
-use plain::{normalize_newlines, plain_to_html};
+use plain::{normalize_newlines, plain_to_html, plain_to_inline_html};
 use urls::{Piece, split_pieces};
 
 use crate::util::sanitize::sanitize_html;
@@ -68,6 +68,16 @@ const HTTPS_SCHEME: &str = "https://";
 #[must_use]
 pub fn text_to_html(text: &str) -> String {
     sanitize_html(&plain_to_html(text))
+}
+
+/// Formats plain text as sanitized inline HTML, with no `<p>` wrapper.
+///
+/// Escaping, URL anchors and sanitizing are [`text_to_html`]'s; newlines
+/// become `<br>` (a blank line, two) instead of paragraphs. It is the
+/// shape Mastodon gives a profile field value.
+#[must_use]
+pub fn text_to_inline_html(text: &str) -> String {
+    sanitize_html(&plain_to_inline_html(text))
 }
 
 /// Formats user content by MIME type into sanitized HTML.

@@ -25,6 +25,27 @@ pub(super) fn plain_to_html(text: &str) -> String {
     out
 }
 
+/// [`text_to_inline_html`] without the sanitizer pass: escape and linkify,
+/// with no `<p>`; a newline is `<br/>` and a blank line is two of them.
+///
+/// [`text_to_inline_html`]: super::text_to_inline_html
+pub(super) fn plain_to_inline_html(text: &str) -> String {
+    let normalized = normalize_newlines(text);
+    let mut out = String::new();
+    for (block_index, block) in split_blocks(&normalized).iter().enumerate() {
+        if block_index > 0 {
+            out.push_str("<br/><br/>");
+        }
+        for (index, line) in block.iter().enumerate() {
+            if index > 0 {
+                out.push_str("<br/>");
+            }
+            push_line_html(line, &mut out);
+        }
+    }
+    out
+}
+
 /// Rewrites `\r\n` and lone `\r` as `\n` so every split below only has to
 /// consider LF.
 pub(super) fn normalize_newlines(text: &str) -> String {
@@ -115,7 +136,7 @@ fn without_scheme(url: &str) -> &str {
 mod tests {
     use super::super::{
         test_support::{anchor, para_with_link},
-        text_to_html,
+        text_to_html, text_to_inline_html,
     };
 
     #[test]
@@ -198,6 +219,31 @@ mod tests {
             "",
             "nor does whitespace-only text"
         );
+    }
+
+    #[test]
+    fn inline_text_has_no_paragraph_wrapper() {
+        assert_eq!(
+            text_to_inline_html("https://example.com"),
+            anchor("https://example.com", "example.com"),
+            "a bare URL is just the anchor"
+        );
+        assert_eq!(
+            text_to_inline_html("a < b & c"),
+            "a &lt; b &amp; c",
+            "plain text is escaped, unwrapped"
+        );
+        assert_eq!(
+            text_to_inline_html("<script>x</script>"),
+            "&lt;script&gt;x&lt;/script&gt;",
+            "markup stays inert"
+        );
+        assert_eq!(
+            text_to_inline_html("one\r\ntwo\n\nthree"),
+            "one<br>two<br><br>three",
+            "newlines are breaks, a blank line is two"
+        );
+        assert_eq!(text_to_inline_html("  \n "), "", "blank text is empty");
     }
 
     #[test]
