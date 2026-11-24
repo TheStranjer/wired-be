@@ -12,6 +12,30 @@ periodic scheduler that keep the instance running (see
 [Running](#running)). There is no frontend and no Redis: PostgreSQL is the
 database and the queue.
 
+## API only
+
+wired-be serves only the Mastodon/Pleroma client API, `ActivityPub`
+(actor, object and collection JSON; content negotiation redirects a browser
+to `FRONTEND_BASE_URL`), `WebFinger`, host-meta and `NodeInfo`. It renders no
+HTML and serves no frontend. Every browser page (login and consent, MFA,
+password reset, remote interaction, invites, permalinks) lives in the
+frontend at `FRONTEND_BASE_URL`. The routes the backend links or redirects to
+there:
+
+| Frontend route | Linked from |
+|---|---|
+| `/oauth/authorize` | browser `GET /oauth/authorize` (302, query kept) |
+| `/oauth/external/register` | external-provider callback, unlinked account |
+| `/oauth/external/consent` | external-provider callback, untrusted app |
+| `/password_reset/{token}` | password-reset letter and admin reset endpoint |
+| `/registration/{token}` | invite letter |
+| `/authorize_interaction?uri=` | the `WebFinger` subscribe template |
+| `/notice/{id}` | browser `GET /notice/{id}` and status permalinks |
+| `/{nickname}` | browser `GET /users/{nickname}` and profile links |
+
+`tests/api/route_inventory.rs` checks that no parameterless `GET` route
+answers `Accept: text/html` with `text/html`.
+
 ## Requirements
 
 - Rust (stable, see `rust-version` in `Cargo.toml`)
@@ -534,7 +558,7 @@ Routes Pleroma has and Wired deliberately does not:
 | `GET /users/:nickname/feed` (and its `.atom`/`.rss` forms) and `GET /tags/:tag` | Atom/RSS syndication, not API. Pleroma serves them from its HTML/XML pipeline; Wired is API-only, so the frontend owns HTML and feeds and these paths fall through to the JSON 404. `GET /users/:nickname` still negotiates the `ActivityPub` actor JSON. |
 | `GET /api/v1/pleroma/admin/frontends` and `POST /api/v1/pleroma/admin/frontends/install` | Pleroma's `FrontendController`: list and install web UI builds into a directory Pleroma then serves. Wired serves no frontend, so an installed build would never be reachable and the installer would only add an outbound download and archive extraction; both routes fall through to the JSON 404. |
 | `GET/POST /frontend_switcher` | Pleroma's `FrontendSwitcherController`: an HTML radio-list of installed frontends whose POST sets a year-long `preferred_frontend` cookie and redirects to `/`. Wired is API-only and serves no frontend at `/`, so the cookie would select nothing; both methods fall through to the JSON 404. |
-| `GET /api/v1/pleroma/preferred_frontend/available` and `PUT /api/v1/pleroma/preferred_frontend` | Pleroma's `FrontendSettingsController`: list the frontends the operator made pickable and store the account's pick in a year-long `preferred_frontend` cookie. Wired serves no frontend, so nothing would read the choice; the `AVAILABLE_FRONTENDS` setting and the `users.preferred_frontend` column are gone, and both routes fall through to the JSON 404 (`x-wired-fallback: 1`). |
+| `GET /api/v1/pleroma/preferred_frontend/available` and `PUT /api/v1/pleroma/preferred_frontend` | Pleroma's `FrontendSettingsController`: list the frontends the operator made pickable and store the account's pick in a year-long `preferred_frontend` cookie. Wired serves no frontend, so nothing would read the choice; both routes fall through to the JSON 404 (`x-wired-fallback: 1`). |
 | `GET /embed/:id` and `GET /notice/:id/embed_player` | Pleroma's `EmbedController.show` and `OStatus.notice_player`: server-rendered HTML pages (a status card and a one-attachment media player) served without `X-Frame-Options` so other sites can iframe them. Wired is API-only and serves no framable page; both paths fall through to the JSON 404 (`x-wired-fallback: 1`). A client that wants an embed renders its own from `GET /api/v1/statuses/:id`. `GET /notice/:id` still negotiates the `ActivityPub` Note JSON. |
 | `GET /registration/:token` | Pleroma's invite-link page, which redirects to its own frontend's registration page. Wired is API-only: the invite letter links straight to `{FRONTEND_BASE_URL}/registration/{token}` (the frontend registers through `POST /api/v1/accounts` with the `token` field), so this path falls through to the JSON 404. |
 | `GET/POST /ostatus_subscribe` | Pleroma's remote-follow login page: it takes a username and password from an anonymous client, with no rate limit and without the second factor the OAuth password grant demands, so it is a credential oracle and an MFA bypass. Wired serves no password form outside the throttled `POST /oauth/token`; remote follow lands on the frontend's `/authorize_interaction` page and follows through `POST /api/v1/accounts/:id/follow` with the user's OAuth token. Both methods fall through to the JSON 404 (`x-wired-fallback: 1`). |

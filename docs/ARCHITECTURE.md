@@ -10,6 +10,17 @@ cite these decisions by number.
    federation, WebFinger/NodeInfo, streaming WebSocket. API-only, no frontend.
    Internals are free to differ from Pleroma; the HTTP behaviour (paths,
    params, JSON shapes, status codes, headers) is what must match.
+   wired-be serves only the Mastodon/Pleroma client API, ActivityPub
+   (actor/object/collection JSON; content negotiation redirects a browser to
+   `FRONTEND_BASE_URL`), WebFinger, host-meta and NodeInfo. It renders no HTML
+   and serves no frontend: every browser page (login/consent, MFA, password
+   reset, remote interaction, invites, permalinks) lives in the frontend at
+   `FRONTEND_BASE_URL`. The frontend routes the backend links to are
+   `/oauth/authorize`, `/oauth/external/register`, `/oauth/external/consent`,
+   `/password_reset/{token}`, `/registration/{token}`,
+   `/authorize_interaction?uri=`, `/notice/{id}` and `/{nickname}`.
+   `tests/api/route_inventory.rs` gates it: no parameterless `GET` route
+   answers `Accept: text/html` with `text/html`.
 
 2. **Stack**: axum 0.8, sqlx 0.9 Postgres, tokio, serde. Runtime-checked
    queries only: `sqlx::query_as::<_, T>("...")` with `#[derive(sqlx::FromRow)]`.

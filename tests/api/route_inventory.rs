@@ -210,3 +210,41 @@ fn inventory_names_no_route_twice() {
         duplicates.join("\n")
     );
 }
+
+/// `GET` rows whose path has no `:name` parameter, so the row can be requested
+/// as written.
+fn parameterless_gets() -> impl Iterator<Item = &'static RouteSpec> {
+    routes().filter(|spec| spec.method == "GET" && !spec.path.contains(':'))
+}
+
+/// The backend renders no HTML (WBE-712): a browser-style `Accept: text/html`
+/// request to any parameterless `GET` row never gets a `text/html` answer.
+///
+/// Browser-facing flows redirect to `FRONTEND_BASE_URL` instead.
+#[tokio::test]
+async fn no_parameterless_get_route_answers_text_html() {
+    let db = common::test_db().await;
+    let app = common::test_app(db.pool().clone());
+    let checked = parameterless_gets().count();
+    let mut problems: Vec<String> = Vec::new();
+    for spec in parameterless_gets() {
+        let response = common::TestRequest::get(spec.path)
+            .header("accept", "text/html")
+            .send(&app)
+            .await;
+        let content_type = response.header("content-type").unwrap_or_default();
+        if content_type.to_ascii_lowercase().contains("text/html") {
+            problems.push(format!(
+                "GET {} answers {} with content-type {content_type}",
+                spec.path, response.status
+            ));
+        }
+    }
+    assert!(checked > 0, "the inventory has parameterless GET rows");
+    assert!(
+        problems.is_empty(),
+        "{} of {checked} routes answer text/html:\n{}",
+        problems.len(),
+        problems.join("\n")
+    );
+}
