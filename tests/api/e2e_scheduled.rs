@@ -160,12 +160,14 @@ async fn unsettled_jobs(pool: &PgPool) -> i64 {
     .expect("the count reads")
 }
 
-/// Moves the schedule's one fire into the past, so the next claim round
-/// finds it due: rows only, the one `UPDATE` the harness contract allows.
+/// Moves the schedule's one fire and the schedule's own moment into the
+/// past, so the next claim round finds the job due and the fire finds the
+/// row due (it refuses a row whose `scheduled_at` has not come): rows only,
+/// the `UPDATE`s the harness contract allows.
 ///
 /// # Panics
 ///
-/// If the update hits anything but exactly one row.
+/// If either update hits anything but exactly one row.
 async fn backdate_publish_jobs(pool: &PgPool) {
     let hit = sqlx::query("UPDATE jobs SET run_at = now() - interval '1 minute' WHERE kind = $1")
         .bind(KIND_PUBLISH)
@@ -177,6 +179,12 @@ async fn backdate_publish_jobs(pool: &PgPool) {
         1,
         "the parked schedule queued exactly one fire"
     );
+    let due =
+        sqlx::query("UPDATE scheduled_statuses SET scheduled_at = now() - interval '1 minute'")
+            .execute(pool)
+            .await
+            .expect("the schedule backdate runs");
+    assert_eq!(due.rows_affected(), 1, "the one parked schedule is now due");
 }
 
 /// `POST /api/v1/media` with the `MP3` part as `token`, and the entity id

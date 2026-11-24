@@ -33,6 +33,12 @@
 //! owe; the unscoped [`get_by_id`] and [`delete`] stay the worker's, since a
 //! fire knows the row by id alone and has no account to compare against.
 //!
+//! The publishers claim a row before firing it: [`lock_due`] takes the due
+//! row `FOR UPDATE SKIP LOCKED` on a transaction's connection and
+//! [`delete_on`] removes it on the same one, so the per-row job and the sweep
+//! never both post one schedule; [`fetch_due_ids`] is the sweep's id-only
+//! walk.
+//!
 //! [`scheduled_at`]: ScheduledStatus::scheduled_at
 //! [`PageParams`]: crate::pagination::PageParams
 
@@ -53,12 +59,13 @@ mod test_support;
 
 pub use limits_due::{
     count_pending_for_user, count_pending_for_user_between, count_pending_for_user_between_conn,
-    count_pending_for_user_conn, fetch_due, lock_user, reserved_media_ids, utc_day_bounds,
+    count_pending_for_user_conn, fetch_due, fetch_due_ids, lock_user, reserved_media_ids,
+    utc_day_bounds,
 };
 pub use pages::page_for_user;
 pub use rows::{
-    delete, delete_all_for_user, delete_owned, get_by_id, get_owned, insert, insert_conn,
-    reschedule,
+    delete, delete_all_for_user, delete_on, delete_owned, get_by_id, get_owned, insert,
+    insert_conn, lock_due, reschedule,
 };
 
 /// One row of `scheduled_statuses`: a create-status request waiting for its
