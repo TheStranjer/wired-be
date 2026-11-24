@@ -146,8 +146,8 @@ pub(super) fn expected_pleroma(vapid_key: &str) -> Value {
                 "activities": { "local": false, "remote": false },
             },
             "markup": {
-                "allow_inline_images": false,
-                "allow_headings": false,
+                "allow_inline_images": true,
+                "allow_headings": true,
                 "allow_tables": false,
                 "allow_fonts": false,
             },

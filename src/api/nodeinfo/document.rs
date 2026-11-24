@@ -4,10 +4,12 @@
 use serde::Serialize;
 
 use super::{
-    PLEROMA_COMPATIBILITY_VERSION, PROTOCOLS, REL_20, REL_21, REPOSITORY_URL, SOFTWARE_NAME,
-    SchemaVersion, metadata::Metadata, usage::Usage,
+    PROTOCOLS, REL_20, REL_21, SOFTWARE_NAME, SchemaVersion, metadata::Metadata, usage::Usage,
 };
-use crate::config::{Config, Toggle};
+use crate::{
+    config::{Config, Toggle},
+    services::instance_meta::{PLEROMA_COMPATIBILITY_VERSION, SOURCE_URL},
+};
 
 /// The discovery document of `/.well-known/nodeinfo`.
 #[derive(Debug, Serialize)]
@@ -118,8 +120,8 @@ impl Software {
                 "{} (compatible; Pleroma {PLEROMA_COMPATIBILITY_VERSION})",
                 env!("CARGO_PKG_VERSION")
             ),
-            repository: with_links.then_some(REPOSITORY_URL),
-            homepage: with_links.then_some(REPOSITORY_URL),
+            repository: with_links.then_some(SOURCE_URL),
+            homepage: with_links.then_some(SOURCE_URL),
         }
     }
 }
@@ -147,9 +149,9 @@ impl Services {
 mod tests {
     use serde_json::{Value, json};
 
-    use super::super::{metadata::Federation, usage::UserCounts};
+    use super::super::usage::UserCounts;
     use super::*;
-    use crate::services::instance_meta;
+    use crate::services::instance_meta::{self, Federation};
 
     /// The empty-usage document for `version`, built on the test config.
     fn document(version: SchemaVersion) -> Value {
@@ -305,8 +307,13 @@ mod tests {
         );
         assert_eq!(
             metadata["markup"],
-            json!({"allow_inline_images": true, "allow_headings": false, "allow_tables": false}),
-            "Pleroma's shipped markup"
+            json!({
+                "allow_inline_images": true,
+                "allow_headings": true,
+                "allow_tables": false,
+                "allow_fonts": false,
+            }),
+            "what the sanitizer lets through"
         );
         assert_eq!(
             metadata["features"],
