@@ -270,15 +270,15 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::federation::mrf::{
-        MrfConfig,
-        simple::{PUBLIC_ADDRESS, followers_collection},
+    use crate::federation::{
+        mrf::{MrfConfig, simple::followers_collection},
+        vocab::AS_PUBLIC,
     };
 
     /// The author the fixtures post as.
     const ALICE: &str = "https://peer.example/users/alice";
     /// The public address, full `ActivityStreams` spelling.
-    const PUBLIC: &str = PUBLIC_ADDRESS;
+    const PUBLIC: &str = AS_PUBLIC;
     /// The author's followers collection, the `/followers` convention.
     const FOLLOWERS: &str = "https://peer.example/users/alice/followers";
     /// The note a fixture `Create` announces.

@@ -103,11 +103,6 @@ const FLAG_TYPE: &str = "Flag";
 /// The `type`s of an actor document: an embedded `object` of one of these
 /// stands for its own `id`'s host.
 const ACTOR_TYPES: [&str; 5] = ["Person", "Service", "Group", "Organization", "Application"];
-/// The public address as this policy writes it back: the full
-/// `ActivityStreams` iri, the spelling every reader accepts
-/// ([`PUBLIC_RECIPIENTS`](crate::federation::note_parser::PUBLIC_RECIPIENTS)
-/// covers the two shorthands it may arrive as).
-pub(super) const PUBLIC_ADDRESS: &str = "https://www.w3.org/ns/activitystreams#Public";
 /// The addressing properties the note rules rewrite.
 pub(super) const ADDRESS_FIELDS: [&str; 2] = ["to", "cc"];
 /// The actor-document field each removal list strips, beside its list.

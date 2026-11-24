@@ -5,10 +5,10 @@
 //! The shared rows, addressing and publisher hand stand in the module root;
 //! the like twin is [`super::likes`].
 
-use super::{followers_address, queue_activity, status_action, withdrawal};
+use super::{queue_activity, status_action, withdrawal};
 use crate::{
     federation::activities::{EmojiReactContext, emoji_react_json},
-    models::emoji_reaction::EmojiReaction,
+    models::{emoji_reaction::EmojiReaction, user::followers_address},
     state::AppState,
 };
 

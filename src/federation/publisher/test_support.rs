@@ -19,7 +19,7 @@ use crate::{
 };
 
 /// The full spelling of the public address.
-pub(super) const PUBLIC: &str = "https://www.w3.org/ns/activitystreams#Public";
+pub(super) const PUBLIC: &str = crate::federation::vocab::AS_PUBLIC;
 /// The activity id every fixture carries.
 pub(super) const ACTIVITY_ID: &str = "https://test.example/activities/1";
 

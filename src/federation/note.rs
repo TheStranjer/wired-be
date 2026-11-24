@@ -66,11 +66,6 @@ pub(crate) use tags::attachment_json;
 /// references from its `@context`, relative to the instance origin — the
 /// address Pleroma serves its `priv/static/schemas/litepub-0.1.jsonld` at.
 pub const LITEPUB_SCHEMA_PATH: &str = "/schemas/litepub-0.1.jsonld";
-/// The `ActivityStreams` public addressing collection, the one recipient
-/// that means "everyone".
-const AS_PUBLIC: &str = "https://www.w3.org/ns/activitystreams#Public";
-/// The `ActivityStreams` core vocabulary, first entry of every `@context`.
-pub(crate) const AS_VOCABULARY: &str = "https://www.w3.org/ns/activitystreams";
 /// The `security` vocabulary that defines an actor's `publicKey`, second
 /// entry of an actor document's `@context`.
 pub(crate) const SECURITY_VOCABULARY: &str = "https://w3id.org/security/v1";

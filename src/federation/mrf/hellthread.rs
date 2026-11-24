@@ -45,7 +45,7 @@ use crate::federation::{
         },
         single_block,
     },
-    note_parser::PUBLIC_RECIPIENTS,
+    vocab::is_public_address,
 };
 
 /// The key of this policy's parameters inside the `mrf` instance setting,
@@ -68,12 +68,6 @@ fn mentioned_recipients(activity: &Value) -> usize {
         .flat_map(|field| activity.get(*field).map_or_else(Vec::new, json::references))
         .filter(|address| !is_public_address(address) && !is_followers_collection(address))
         .count()
-}
-
-/// Whether an addressing entry is the public address in any of the
-/// [`PUBLIC_RECIPIENTS`] spellings.
-fn is_public_address(address: &str) -> bool {
-    PUBLIC_RECIPIENTS.contains(&address)
 }
 
 /// Whether an addressing entry names a followers collection, by the
@@ -180,15 +174,15 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::federation::mrf::{
-        MrfConfig,
-        simple::{PUBLIC_ADDRESS, followers_collection},
+    use crate::federation::{
+        mrf::{MrfConfig, simple::followers_collection},
+        vocab::AS_PUBLIC,
     };
 
     /// The author the fixtures post as.
     const ALICE: &str = "https://peer.example/users/alice";
     /// The public address, full `ActivityStreams` spelling.
-    const PUBLIC: &str = PUBLIC_ADDRESS;
+    const PUBLIC: &str = AS_PUBLIC;
     /// The note a fixture `Create` announces.
     const NOTE: &str = "https://peer.example/objects/1";
 

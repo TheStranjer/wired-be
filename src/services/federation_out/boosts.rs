@@ -96,11 +96,11 @@ fn address_line<'a>(document: &'a Value, name: &str) -> Vec<&'a str> {
 mod tests {
     use serde_json::json;
 
-    use super::super::PUBLIC;
     use super::*;
 
     use crate::{
         config::TEST_BASE_URL,
+        federation::vocab::AS_PUBLIC,
         models::{
             emoji_reaction::{self, NewReaction},
             favourite,
@@ -151,7 +151,7 @@ mod tests {
         );
         assert_eq!(
             activity["to"],
-            json!([PUBLIC]),
+            json!([AS_PUBLIC]),
             "a public boost addresses the world"
         );
         assert_eq!(
@@ -204,7 +204,7 @@ mod tests {
         );
         assert_eq!(
             activity["cc"],
-            json!([bob.ap_id, PUBLIC]),
+            json!([bob.ap_id, AS_PUBLIC]),
             "the author and the public address ride cc"
         );
     }
@@ -243,7 +243,7 @@ mod tests {
                 !activity[line]
                     .as_array()
                     .expect("the line is an array")
-                    .contains(&json!(PUBLIC)),
+                    .contains(&json!(AS_PUBLIC)),
                 "no public address in {line}"
             );
         }
@@ -285,7 +285,7 @@ mod tests {
         );
         assert_eq!(
             activity["cc"],
-            json!([bob.ap_id, PUBLIC]),
+            json!([bob.ap_id, AS_PUBLIC]),
             "and its cc line, public address included"
         );
     }
@@ -370,7 +370,7 @@ mod tests {
         );
         assert_eq!(
             activity["to"],
-            json!([PUBLIC]),
+            json!([AS_PUBLIC]),
             "the boost's to line repeats"
         );
         assert_eq!(

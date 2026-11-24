@@ -144,9 +144,9 @@
 //! The children hold the arms — `blocks`, `boosts`, `chat_admin_deletes`,
 //! `chats`, `collections`, `follow_requests`, `follows`, `likes`, `moves`,
 //! `notes`, `polls`, `profile`, `reactions`, `reports`, `statuses` and
-//! `withdrawals` — while this root keeps the plumbing they share: `PUBLIC`,
+//! `withdrawals` — while this root keeps the plumbing they share:
 //! `StatusAction` and `status_action`, the row readers `load_status` and
-//! `load_user`, the followers address, the two publisher hands
+//! `load_user`, the two publisher hands
 //! `queue_activity` and `publish_only_to`, and the `withdrawal` builder. The
 //! fixtures every child's tests build on stand in the test-only
 //! `test_support` child.
@@ -204,10 +204,6 @@ pub use reactions::after_reaction_changed;
 pub use reports::after_report_created;
 pub use statuses::{after_status_created, after_status_edited};
 pub use withdrawals::after_status_deleted;
-
-/// The `ActivityStreams` public address, the `to` entry of a profile
-/// `Update` and an account `Delete`.
-const PUBLIC: &str = "https://www.w3.org/ns/activitystreams#Public";
 
 /// The local actor, the acted-on status and its author: the three rows
 /// every interaction document is built from.
@@ -267,18 +263,6 @@ async fn load_status(state: &AppState, id: Uuid) -> Option<Status> {
             warn!(%err, %id, "federation hook could not read a status row");
             None
         })
-}
-
-/// The address naming the actor's followers collection: the stored
-/// `followers_url`, which is what [`publisher::publish`] expands, with the
-/// `{ap_id}/followers` construction behind a row that carries none.
-///
-/// [`publisher::publish`]: crate::federation::publisher::publish
-fn followers_address(actor: &User) -> String {
-    actor
-        .followers_url
-        .clone()
-        .unwrap_or_else(|| format!("{}/followers", actor.ap_id))
 }
 
 /// Hand one built activity to the publisher's background fan-out: the

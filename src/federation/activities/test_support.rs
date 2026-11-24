@@ -5,7 +5,7 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 use super::*;
-use crate::util::time::parse_time;
+use crate::{federation::vocab::AS_PUBLIC, util::time::parse_time};
 
 /// The instance origin of [`Config::for_tests`].
 pub(super) const BASE: &str = "https://test.example";

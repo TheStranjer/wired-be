@@ -12,16 +12,17 @@ use uuid::Uuid;
 
 use crate::{
     config::Config,
+    federation::vocab::{AS_PUBLIC, AS_VOCABULARY},
     models::{
         status::{Status, Visibility},
-        user::{User, followers},
+        user::{User, followers_address},
     },
     util::{id::activity_ap_id, time::mastodon_time},
 };
 
 use super::{
-    AS_PUBLIC, AS_VOCABULARY, LANGUAGE_UNDETERMINED, LITEPUB_SCHEMA_PATH, TYPE_ANNOUNCE,
-    TYPE_CREATE, TYPE_DELETE, TYPE_NOTE, TYPE_TOMBSTONE, TYPE_UPDATE,
+    LANGUAGE_UNDETERMINED, LITEPUB_SCHEMA_PATH, TYPE_ANNOUNCE, TYPE_CREATE, TYPE_DELETE, TYPE_NOTE,
+    TYPE_TOMBSTONE, TYPE_UPDATE,
 };
 
 /// The `@context` of every document this module and the
@@ -240,10 +241,7 @@ pub fn announce_activity_json(
     if reblog.visibility == Visibility::Local {
         return None;
     }
-    let followers_addr = author
-        .followers_url
-        .clone()
-        .unwrap_or_else(|| followers(&author.ap_id));
+    let followers_addr = followers_address(author);
     let (to, cc) = boost_addressing(reblog.visibility, &followers_addr, original_author_ap_id);
     Some(json!({
         "@context": json_ld_context(config),

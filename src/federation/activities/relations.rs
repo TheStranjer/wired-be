@@ -200,8 +200,10 @@ pub fn flag_json(ctx: &FlagContext<'_>) -> Value {
 
 #[cfg(test)]
 mod tests {
+    use crate::federation::vocab::AS_PUBLIC;
+
     use super::super::{
-        AS_PUBLIC, accept_json,
+        accept_json,
         test_support::{
             ACTIVITY_ID, ACTIVITY_KEYS, ALICE_AP, BASE, BOB_AP, FEATURED, FOLLOWERS, INSTANCE_AP,
             NO_CC, PUBLISHED, STATUS_URI, activity_uuid, config, expected_context, follow_of_bob,

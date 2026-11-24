@@ -5,12 +5,15 @@
 //! `cc`; the followers address, the row readers and the publisher hand are
 //! the root's. List membership is private: it is never announced.
 
-use super::{PUBLIC, followers_address, load_status, load_user, queue_activity};
+use super::{load_status, load_user, queue_activity};
 use crate::{
-    federation::activities::{TargetedActivityContext, add_json, remove_json},
+    federation::{
+        activities::{TargetedActivityContext, add_json, remove_json},
+        vocab::AS_PUBLIC,
+    },
     models::{
         pinned_status::PinnedStatus,
-        user::{User, featured},
+        user::{User, featured, followers_address},
     },
     state::AppState,
     util::id::new_id,
@@ -41,7 +44,7 @@ pub async fn after_pin_changed(state: &AppState, pinned: &PinnedStatus, pinning:
     };
     let followers = followers_address(&actor);
     let featured_collection = featured_address(&actor);
-    let to = [PUBLIC];
+    let to = [AS_PUBLIC];
     let cc = [followers.as_str()];
     let ctx = TargetedActivityContext {
         config: &state.config,
@@ -143,7 +146,7 @@ mod tests {
             alice.featured_url.expect("the fixture has a collection"),
             "the target is the actor's own featured collection"
         );
-        assert_eq!(activity["to"], json!([PUBLIC]));
+        assert_eq!(activity["to"], json!([AS_PUBLIC]));
         assert_eq!(
             activity["cc"],
             json!([format!("{}/followers", alice.ap_id)]),
@@ -193,7 +196,7 @@ mod tests {
             activity["target"],
             alice.featured_url.expect("the fixture has a collection")
         );
-        assert_eq!(activity["to"], json!([PUBLIC]));
+        assert_eq!(activity["to"], json!([AS_PUBLIC]));
         assert_eq!(
             activity["cc"],
             json!([format!("{}/followers", alice.ap_id)])

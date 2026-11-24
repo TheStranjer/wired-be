@@ -75,10 +75,6 @@ pub use relations::{
     move_json, reject_json, remove_json,
 };
 
-/// The `ActivityStreams` public addressing collection: the `cc` entry of a
-/// publicly-addressed interaction, and the `to` the C2S route keeps on the
-/// relation documents it serves.
-pub const AS_PUBLIC: &str = "https://www.w3.org/ns/activitystreams#Public";
 /// The activity type of a favourite.
 const TYPE_LIKE: &str = "Like";
 /// The activity type of an emoji reaction.

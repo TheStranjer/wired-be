@@ -81,13 +81,12 @@ pub fn undo_json(answer: &AnsweredActivity<'_>) -> Value {
 
 #[cfg(test)]
 mod tests {
-    use super::super::{
-        AS_PUBLIC,
-        test_support::{
-            ACTIVITY_ID, ACTIVITY_KEYS, ALICE_AP, AUTHOR_TO, BASE, BOB_AP, EMOJI_URL, FOLLOWERS,
-            FOLLOWERS_CC, PUBLIC_CC, PUBLISHED, STATUS_URI, activity_uuid, config,
-            expected_context, follow_of_bob, json_keys, published, stored_id,
-        },
+    use crate::federation::vocab::AS_PUBLIC;
+
+    use super::super::test_support::{
+        ACTIVITY_ID, ACTIVITY_KEYS, ALICE_AP, AUTHOR_TO, BASE, BOB_AP, EMOJI_URL, FOLLOWERS,
+        FOLLOWERS_CC, PUBLIC_CC, PUBLISHED, STATUS_URI, activity_uuid, config, expected_context,
+        follow_of_bob, json_keys, published, stored_id,
     };
     use super::*;
 

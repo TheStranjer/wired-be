@@ -75,4 +75,5 @@ pub mod policy;
 pub mod publisher;
 pub mod remote_actor;
 pub mod signature;
+pub mod vocab;
 pub mod webfinger_client;
