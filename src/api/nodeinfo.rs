@@ -13,8 +13,9 @@
 //! The document reports what this instance is: software identity (name
 //! `"wired"` — this server is Wired — with Pleroma named in the version's
 //! compatibility comment as the interface it replicates), federation
-//! protocols, registration state, live usage counters read from the
-//! database, and the
+//! protocols, registration state, usage counters served from the cached
+//! [`instance::stats`] the instance document
+//! shares, and the
 //! Pleroma-compatible `metadata` block. Where the ticket's shape and
 //! Pleroma 2.10.2's defaults meet, the ticket wins; values Pleroma reads
 //! from its runtime config take this instance's [`Config`] where it has an
@@ -43,9 +44,10 @@ use axum::{
 use self::{
     document::{Discovery, NodeInfo},
     metadata::Metadata,
-    usage::{Usage, read_local_post_count, read_staff_accounts, read_user_counts},
+    usage::{Usage, read_staff_accounts},
 };
 use crate::{
+    api::instance,
     error::{AppError, AppResult},
     federation::mrf,
     services::{instance_meta::Federation, runtime_config::RuntimeConfig},
@@ -114,14 +116,13 @@ async fn nodeinfo(
     let config = RuntimeConfig::new(&state.db, &state.config)
         .effective_config()
         .await?;
-    let users = read_user_counts(&state.db).await?;
-    let local_posts = read_local_post_count(&state.db).await?;
+    let counters = instance::stats(&state).await?;
     let staff_accounts = read_staff_accounts(&state.db).await?;
     let federation = federation_block(&state).await;
     let document = NodeInfo::build(
         version,
         &config,
-        Usage { users, local_posts },
+        Usage::from(&counters),
         Metadata::build(&config, staff_accounts, federation),
     );
     document_response(version, &document)

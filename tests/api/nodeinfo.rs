@@ -440,6 +440,49 @@ async fn usage_counts_local_users_and_posts() {
     }
 }
 
+/// The usage block is served from the same cached counters as
+/// `/api/v1/instance`: a second call inside the window does not see a new
+/// account or post, and `localPosts`/`users.total` equal that document's
+/// `status_count`/`user_count`. The window's expiry is tested with an
+/// injected clock in `src/api/instance/stats.rs`.
+#[tokio::test]
+async fn usage_is_the_cached_instance_stats() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let alice = common::create_local_user(&pool, "alice").await;
+    let _post = common::create_status(&pool, &alice, "first", Visibility::Public).await;
+    let app = common::test_app(pool.clone());
+
+    let first = get_document(&app, "/nodeinfo/2.0").await;
+    assert_eq!(
+        first["usage"]["users"]["total"], 1,
+        "the first read is live"
+    );
+    assert_eq!(first["usage"]["localPosts"], 1, "and counts the post");
+
+    let _bob = common::create_local_user(&pool, "bob").await;
+    let _late = common::create_status(&pool, &alice, "late", Visibility::Public).await;
+
+    let second = get_document(&app, "/nodeinfo/2.0").await;
+    assert_eq!(
+        second["usage"], first["usage"],
+        "the open window does not see the new account or post"
+    );
+
+    let instance = common::TestRequest::get("/api/v1/instance")
+        .send(&app)
+        .await
+        .json_value();
+    assert_eq!(
+        instance["stats"]["user_count"], first["usage"]["users"]["total"],
+        "one source for the user count"
+    );
+    assert_eq!(
+        instance["stats"]["status_count"], first["usage"]["localPosts"],
+        "one source for the post count"
+    );
+}
+
 /// The staff list holds the actor ids of the local admin and moderator
 /// accounts — and only theirs, ordered by id.
 #[tokio::test]
