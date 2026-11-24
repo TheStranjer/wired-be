@@ -97,10 +97,6 @@ pub const MAX_ATTEMPTS: i32 = 7;
 /// The media type a delivery POST carries and asks for.
 const ACTIVITY_JSON: &str = "application/activity+json";
 
-/// The key fragment appended to an actor id to form its `keyId`, the
-/// convention both Mastodon and Pleroma use.
-const KEY_ID_SUFFIX: &str = "#main-key";
-
 /// The prefix of a delivery's deduplication key.
 const UNIQUE_KEY_PREFIX: &str = "deliver";
 
