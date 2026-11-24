@@ -31,8 +31,8 @@
 //! - `DELETE /api/pleroma/accounts/mfa/totp` — `password`; clears the
 //!   secret, the backup codes and `enabled`, answers `{}`.
 //!
-//! The password is checked with [`verify_password`] against the stored
-//! hash; accounts without one (remote mirrors, bot-created rows) simply
+//! The password is checked with [`User::password_matches`] against the
+//! stored hash; accounts without one (remote mirrors, bot-created rows) simply
 //! fail the check. Secrets and codes never reach a log line or an error
 //! message.
 
@@ -54,7 +54,7 @@ use crate::{
     models::user::{User, mfa},
     oauth::scopes::{READ_SECURITY, WRITE_SECURITY},
     state::AppState,
-    util::{password::verify_password, totp},
+    util::totp,
 };
 
 /// 422 body when TOTP is already confirmed and setup is requested again
@@ -273,11 +273,7 @@ async fn disable_totp(
 ///
 /// [`AppError::Unprocessable`] with [`INVALID_PASSWORD`].
 fn require_password(user: &User, password: &str) -> AppResult<()> {
-    let matched = user
-        .password_hash
-        .as_deref()
-        .is_some_and(|hash| verify_password(password, hash));
-    if matched {
+    if user.password_matches(password) {
         Ok(())
     } else {
         Err(AppError::Unprocessable(INVALID_PASSWORD.to_owned()))
