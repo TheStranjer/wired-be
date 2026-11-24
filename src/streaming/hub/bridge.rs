@@ -5,7 +5,7 @@
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value, json};
+use serde_json::{Map, Value};
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -43,8 +43,10 @@ impl From<sqlx::Error> for BridgeError {
 
 /// The JSON envelope `NOTIFY` carries: a [`StreamEvent`]'s `streams`,
 /// `event`, `audience`, `render` and `local_only`, with its `payload`
-/// either inline (the JSON string itself, or `null`) or replaced by a
-/// `{"ref": "<uuid>"}` object naming a `stream_event_payloads` row.
+/// either inline (the JSON string itself, or `null`) or, in the form older
+/// versions wrote and this one still reads, replaced by a
+/// `{"ref": "<uuid>"}` object naming a `stream_event_payloads` row. An
+/// envelope over the `NOTIFY` cap travels as an [`EnvelopeRef`] instead.
 /// `render` and `local_only` default when absent, so envelopes written
 /// before those fields existed still parse.
 #[derive(Debug, Deserialize, Serialize)]
@@ -128,36 +130,94 @@ fn reference_id(object: &Map<String, Value>) -> Result<Uuid, BridgeError> {
         .map_err(|err| BridgeError::Malformed(format!("reference is not a uuid: {err}")))
 }
 
-/// Bridges one event to the other instances over `NOTIFY`, spilling an
-/// oversized payload into [`store_payload`] first and sending only a
-/// reference.
+/// The minimal `NOTIFY` text for an envelope too big to ride the channel:
+/// the publishing process and the id of the `stream_event_payloads` row
+/// that holds the whole inline [`Envelope`] JSON.
+#[derive(Debug, Deserialize, Serialize)]
+pub(super) struct EnvelopeRef {
+    /// The id of the process that published the envelope.
+    pub(super) process: Uuid,
+    /// The `stream_event_payloads` row holding the inline envelope JSON.
+    pub(super) envelope_ref: Uuid,
+}
+
+impl EnvelopeRef {
+    /// The envelope stored under this reference; `None` when the row is
+    /// already gone (the [`KIND_CLEANUP`](super::KIND_CLEANUP) sweep ran
+    /// before this process read it).
+    async fn fetch(&self, db: &PgPool) -> Result<Option<Envelope>, BridgeError> {
+        let Some(text) = fetch_payload(db, self.envelope_ref).await? else {
+            return Ok(None);
+        };
+        let envelope = serde_json::from_str(&text).map_err(BridgeError::Json)?;
+        Ok(Some(envelope))
+    }
+}
+
+/// What one inbound `NOTIFY` text parses into: the slim reference form
+/// that [`bridge_publish`] writes for an oversized envelope, or a whole
+/// [`Envelope`] (the inline form, which may itself carry the older
+/// `{"ref"}` payload reference).
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub(super) enum Inbound {
+    /// An envelope stored in `stream_event_payloads`.
+    Referenced(EnvelopeRef),
+    /// An envelope carried whole in the notification.
+    Whole(Envelope),
+}
+
+impl Inbound {
+    /// The id of the process that published this notification.
+    pub(super) const fn process(&self) -> Uuid {
+        match self {
+            Self::Referenced(reference) => reference.process,
+            Self::Whole(envelope) => envelope.process,
+        }
+    }
+
+    /// The whole envelope, read out of `db` when it was sent by
+    /// reference; `None` when that row is already gone.
+    pub(super) async fn into_envelope(self, db: &PgPool) -> Result<Option<Envelope>, BridgeError> {
+        match self {
+            Self::Referenced(reference) => reference.fetch(db).await,
+            Self::Whole(envelope) => Ok(Some(envelope)),
+        }
+    }
+}
+
+/// Bridges one event to the other instances over `NOTIFY`.
 pub(super) async fn bridge_publish(
     db: &PgPool,
     process: Uuid,
     event: &StreamEvent,
 ) -> Result<(), BridgeError> {
-    let envelope = Envelope::inline(process, event);
-    let inline_text = serde_json::to_string(&envelope).map_err(BridgeError::Json)?;
-    if inline_text.len() <= MAX_NOTIFY_BYTES {
-        return notify(db, &inline_text).await;
-    }
-    // Past the cap the payload must leave the envelope; an envelope
-    // without one cannot shrink, and is this event's only copy of the
-    // truth, so it is refused rather than truncated.
-    let Some(payload) = event.payload.as_deref() else {
-        return Err(BridgeError::Malformed(format!(
-            "envelope is {} bytes over with no payload to externalize",
-            inline_text.len() - MAX_NOTIFY_BYTES
-        )));
-    };
-    let reference = Uuid::now_v7();
-    store_payload(db, reference, payload).await?;
-    let referenced = Envelope {
-        payload: json!({ "ref": reference }),
-        ..envelope
-    };
-    let text = serde_json::to_string(&referenced).map_err(BridgeError::Json)?;
+    let text = notification_text(db, process, event).await?;
     notify(db, &text).await
+}
+
+/// The text to `NOTIFY` for `event`: the inline envelope JSON when it
+/// fits [`MAX_NOTIFY_BYTES`], otherwise a minimal [`EnvelopeRef`] after
+/// storing the whole inline envelope JSON through [`store_payload`].
+/// `streams` and `audience` grow with the recipients, so the whole
+/// envelope, not just its payload, is what spills.
+async fn notification_text(
+    db: &PgPool,
+    process: Uuid,
+    event: &StreamEvent,
+) -> Result<String, BridgeError> {
+    let inline_text =
+        serde_json::to_string(&Envelope::inline(process, event)).map_err(BridgeError::Json)?;
+    if inline_text.len() <= MAX_NOTIFY_BYTES {
+        return Ok(inline_text);
+    }
+    let envelope_ref = Uuid::now_v7();
+    store_payload(db, envelope_ref, &inline_text).await?;
+    serde_json::to_string(&EnvelopeRef {
+        process,
+        envelope_ref,
+    })
+    .map_err(BridgeError::Json)
 }
 
 /// Fires `NOTIFY wired_events` with `text` as its payload. The
@@ -199,6 +259,7 @@ pub(super) async fn fetch_payload(db: &PgPool, id: Uuid) -> Result<Option<String
 mod tests {
     use std::sync::Arc;
 
+    use serde_json::json;
     use tokio::sync::broadcast;
 
     use super::*;
@@ -377,26 +438,165 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn an_envelope_that_cannot_shrink_is_refused_not_truncated() {
-        // Over the cap, but with no payload to externalize: the only copy
-        // of the event's data is the envelope itself.
-        let fat = StreamEvent {
-            streams: vec!["s".repeat(MAX_NOTIFY_BYTES + 10)],
+    /// An event addressed to `count` local users: one `user:{uuid}`
+    /// stream each plus the same ids as its [`Audience::Users`], with
+    /// `payload` as its entity.
+    fn many_recipients(count: usize, payload: Option<String>) -> StreamEvent {
+        let users: Vec<Uuid> = (0..count).map(|_| Uuid::now_v7()).collect();
+        StreamEvent {
+            streams: users.iter().map(|id| format!("user:{id}")).collect(),
             event: "update".to_owned(),
-            payload: None,
-            audience: Audience::Public,
-            render: None,
+            payload,
+            audience: Audience::Users(users),
+            render: Some(RenderSpec::Status(Uuid::now_v7())),
             local_only: false,
-        };
+        }
+    }
 
-        let err = bridge_publish(&lazy_pool(), Uuid::now_v7(), &fat)
+    /// Number of rows in `stream_event_payloads`.
+    async fn payload_rows(db: &PgPool) -> i64 {
+        sqlx::query_scalar("SELECT count(*) FROM stream_event_payloads")
+            .fetch_one(db)
             .await
-            .unwrap_err();
+            .unwrap()
+    }
+
+    /// Asserts that the `NOTIFY` text for `event` stays under the cap,
+    /// spills exactly one row, and that another hub's [`Hub::ingest`] of
+    /// the text re-broadcasts an event equal to `event`.
+    async fn assert_spilled_event_crosses(event: StreamEvent) {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let inline = serde_json::to_string(&Envelope::inline(Uuid::now_v7(), &event)).unwrap();
+        assert!(
+            inline.len() > MAX_NOTIFY_BYTES,
+            "the fixture really is over the cap: {} bytes",
+            inline.len()
+        );
+
+        let text = notification_text(&pool, Uuid::now_v7(), &event)
+            .await
+            .unwrap();
 
         assert!(
-            matches!(err, BridgeError::Malformed(_)),
-            "the oversized payloadless envelope reports why it cannot bridge: {err}"
+            text.len() <= MAX_NOTIFY_BYTES && text.contains(r#""envelope_ref":"#),
+            "the notification is the minimal reference: {text}"
+        );
+        assert_eq!(payload_rows(&pool).await, 1, "the envelope spilled once");
+
+        let hub = Hub::new(&pool);
+        let mut rx = hub.subscribe();
+        hub.ingest(&text).await;
+        let delivered = rx.recv().await.unwrap();
+        assert_eq!(
+            &*delivered, &event,
+            "the far hub re-broadcasts the whole original event"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_envelope_oversized_by_recipients_spills_whole_and_crosses() {
+        assert_spilled_event_crosses(many_recipients(300, None)).await;
+    }
+
+    #[tokio::test]
+    async fn an_announcement_with_a_large_payload_spills_whole_and_crosses() {
+        let payload = format!(r#"{{"content":"{}"}}"#, "x".repeat(2 * MAX_NOTIFY_BYTES));
+        assert_spilled_event_crosses(many_recipients(300, Some(payload))).await;
+    }
+
+    #[tokio::test]
+    async fn bridge_publish_sends_an_oversized_event_without_error() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+
+        bridge_publish(&pool, Uuid::now_v7(), &many_recipients(300, None))
+            .await
+            .expect("an envelope over the cap is bridged, not refused");
+
+        assert_eq!(payload_rows(&pool).await, 1, "the envelope spilled once");
+    }
+
+    #[tokio::test]
+    async fn a_small_event_goes_inline_without_a_row() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let process = Uuid::now_v7();
+        let event = update_event(r#"{"id":"7"}"#);
+
+        let text = notification_text(&pool, process, &event).await.unwrap();
+
+        assert_eq!(
+            text,
+            serde_json::to_string(&Envelope::inline(process, &event)).unwrap(),
+            "the notification is the inline envelope"
+        );
+        assert_eq!(payload_rows(&pool).await, 0, "no row is written");
+    }
+
+    #[tokio::test]
+    async fn an_expired_envelope_reference_drops_the_event() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let hub = Hub::new(&pool);
+        let mut rx = hub.subscribe();
+        let text = notification_text(&pool, Uuid::now_v7(), &many_recipients(300, None))
+            .await
+            .unwrap();
+        // The cleanup sweep took the row before this instance read it.
+        let _result = sqlx::query("DELETE FROM stream_event_payloads")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        hub.ingest(&text).await;
+
+        assert!(
+            matches!(rx.try_recv(), Err(broadcast::error::TryRecvError::Empty)),
+            "an envelope that is already gone is dropped without a broadcast"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_envelope_reference_from_this_process_is_dropped() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let hub = Hub::new(&pool);
+        let mut rx = hub.subscribe();
+        let text = notification_text(&pool, hub.process, &many_recipients(300, None))
+            .await
+            .unwrap();
+
+        hub.ingest(&text).await;
+
+        assert!(
+            matches!(rx.try_recv(), Err(broadcast::error::TryRecvError::Empty)),
+            "the origin already served its local subscribers"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_legacy_payload_reference_is_still_ingested() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let hub = Hub::new(&pool);
+        let mut rx = hub.subscribe();
+        let event = update_event(r#"{"id":"legacy"}"#);
+        let reference = Uuid::now_v7();
+        store_payload(&pool, reference, event.payload.as_deref().unwrap())
+            .await
+            .unwrap();
+        let legacy = Envelope {
+            payload: json!({ "ref": reference.to_string() }),
+            ..Envelope::inline(Uuid::now_v7(), &event)
+        };
+
+        hub.ingest(&serde_json::to_string(&legacy).unwrap()).await;
+
+        let delivered = rx.recv().await.unwrap();
+        assert_eq!(
+            &*delivered, &event,
+            "the older payload-only reference form still delivers"
         );
     }
 
