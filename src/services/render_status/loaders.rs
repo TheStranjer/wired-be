@@ -92,6 +92,28 @@ pub(super) async fn load_quotes(
     Ok((quoted, visible_quotes))
 }
 
+/// The ids among `parent_ids` — the `in_reply_to_id`s the page names —
+/// this viewer may see: [`status::get_many`] loads the parents, then one
+/// [`status_visibility::filter_visible`] decides which stand. A parent that
+/// is gone (a tombstone, or never stored) is simply absent, so its replies
+/// render `pleroma.parent_visible` false. [`ViewerMode::Admin`] runs no
+/// filter, like [`load_quotes`]: every stored parent is admitted. An empty
+/// list asks the database nothing.
+pub(super) async fn load_visible_parents(
+    pool: &PgPool,
+    parent_ids: &[Uuid],
+    mode: ViewerMode<'_>,
+) -> AppResult<HashSet<Uuid>> {
+    let parents = load_statuses_by_id(pool, parent_ids).await?;
+    let visible = load_visible_quotes(pool, &parents, mode).await?;
+    debug!(
+        parents = parents.len(),
+        visible = visible.len(),
+        "replied-to statuses batch-loaded; the visible ones set parent_visible"
+    );
+    Ok(visible)
+}
+
 /// [`user::get_many`] keyed by id — one query for every author and
 /// replied-to author on the page.
 pub(super) async fn load_users(pool: &PgPool, ids: &[Uuid]) -> AppResult<HashMap<Uuid, User>> {

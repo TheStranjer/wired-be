@@ -149,4 +149,13 @@ pub struct StatusSource<'a> {
     /// `None` for a row the batch found no poll on, and for a preview that
     /// has stored nothing. Feeds the entity's [`poll`](Status::poll) key.
     pub poll: Option<Poll>,
+    /// Whether the viewer may see the status this row replies to: `true`
+    /// for a root post, and for a reply whose parent the batch's one
+    /// [`filter_visible`](crate::models::status_visibility::filter_visible)
+    /// read over the page's parents admitted; `false` for a reply whose
+    /// parent is hidden from the viewer or gone. Feeds
+    /// [`pleroma.parent_visible`](PleromaMetadata::parent_visible). It
+    /// rides [`JsonBool`] because a third plain `bool` in this struct would
+    /// trip the denied `struct_excessive_bools`.
+    pub parent_visible: JsonBool,
 }
