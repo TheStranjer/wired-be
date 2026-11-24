@@ -99,7 +99,9 @@ fn assign(node: &mut Value, path: &[&str], value: Value) {
         if rest.is_empty() {
             array.push(value);
         } else {
-            array.push(Value::Object(Map::new()));
+            if !continues_last_element(array, rest) {
+                array.push(Value::Object(Map::new()));
+            }
             if let Some(element) = array.last_mut() {
                 assign(element, rest, value);
             }
@@ -112,6 +114,23 @@ fn assign(node: &mut Value, path: &[&str], value: Value) {
         let slot = map.entry(segment.to_owned()).or_insert(Value::Null);
         assign(slot, rest, value);
     }
+}
+
+/// Whether the pair `rest` (the path after an append marker) belongs to the
+/// array's last element rather than to a new one, as Rack decides it:
+/// `a[][x]=1&a[][y]=2` is one element carrying both keys, and a key the
+/// last element already holds (`a[][x]=1&a[][x]=2`) opens the next.
+fn continues_last_element(array: &[Value], rest: &[&str]) -> bool {
+    let Some(&name) = rest.first() else {
+        return false;
+    };
+    if name.is_empty() {
+        return false;
+    }
+    array
+        .last()
+        .and_then(Value::as_object)
+        .is_some_and(|last| !last.contains_key(name))
 }
 
 /// Makes `node` an array: kept as is, created when empty, an existing lone
@@ -243,6 +262,16 @@ mod tests {
             parsed("a[][b]=1&a[][b]=2"),
             json!({"a": [{"b": "1"}, {"b": "2"}]}),
             "an append in the middle opens a new element"
+        );
+        assert_eq!(
+            parsed("a[][id]=1&a[][description]=d&a[][id]=2"),
+            json!({"a": [{"id": "1", "description": "d"}, {"id": "2"}]}),
+            "a key the last element lacks joins it, one it has opens the next"
+        );
+        assert_eq!(
+            parsed("a[]=x&a[][b]=1"),
+            json!({"a": ["x", {"b": "1"}]}),
+            "a scalar element is never continued"
         );
         assert_eq!(
             parsed("a[b][]=x&a[b][]=y"),

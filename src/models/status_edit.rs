@@ -37,6 +37,8 @@ use crate::{
     util::id::new_id,
 };
 
+pub mod media_attributes;
+
 /// The live row [`update_status`] edits, locked: `FOR UPDATE` serializes two
 /// concurrent edits of one status, so each transaction snapshots exactly
 /// the state the previous one left.
@@ -194,6 +196,11 @@ pub struct EditParams {
     /// local edit is; `Some(time)` stamps the author's clock instead, so a
     /// later remote edit compares against the same clock.
     pub edited_at: Option<DateTime<Utc>>,
+    /// New alt text and focal points for attachments the post wears once
+    /// the edit lands; an entry naming any other attachment fails the
+    /// whole edit with [`media_attributes::UNKNOWN_ATTRIBUTE_MEDIA`], and one that alters
+    /// something counts as a change to the version.
+    pub media_attributes: Vec<media_attributes::MediaAttributeChange>,
 }
 
 /// Snapshots the current state of `status` as a revision row on `conn`.
@@ -282,7 +289,15 @@ pub async fn update_status(
         Some(submitted) => Some(resolve_media(&mut tx, status_id, row.user_id, submitted).await?),
         None => None,
     };
-    let changed = edit_changes_a_version(&row, &params, new_media.as_ref(), &current_media);
+    let final_media = new_media.as_deref().unwrap_or(&current_media);
+    let attributes = media_attributes::plan(&mut tx, final_media, &params.media_attributes).await?;
+    let changed = edit_changes_a_version(
+        &row,
+        &params,
+        new_media.as_ref(),
+        &current_media,
+        !attributes.is_empty(),
+    );
     if changed {
         record_revision(&mut tx, &row).await?;
     }
@@ -294,6 +309,7 @@ pub async fn update_status(
     if let Some(kept) = &new_media {
         replace_media(&mut tx, status_id, kept).await?;
     }
+    media_attributes::write(&mut tx, &attributes).await?;
     tx.commit().await?;
     Ok(Some(updated))
 }
@@ -303,13 +319,18 @@ pub async fn update_status(
 /// sensitive flag, media set — actually differs from what the post carries
 /// now. `new_media` is `None` when the edit says nothing about media, and
 /// the current set is [`media_ids_of`]'s answer for the post as it stands.
+/// `attributes_changed` is whether a `media_attributes` entry alters the
+/// description or focal point of an attachment: alt text is part of what a
+/// version shows.
 fn edit_changes_a_version(
     row: &Status,
     params: &EditParams,
     new_media: Option<&Vec<Uuid>>,
     current_media: &[Uuid],
+    attributes_changed: bool,
 ) -> bool {
-    let media_changed = new_media.is_some_and(|kept| kept.as_slice() != current_media);
+    let media_changed =
+        attributes_changed || new_media.is_some_and(|kept| kept.as_slice() != current_media);
     row.content != params.content
         || row.raw_text != params.raw_text
         || row.spoiler_text != params.spoiler_text
@@ -491,6 +512,7 @@ mod tests {
             hashtags: Vec::new(),
             media_ids: None,
             edited_at: None,
+            media_attributes: Vec::new(),
         }
     }
 

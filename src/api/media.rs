@@ -107,7 +107,7 @@ pub(crate) use self::upload::{UploadParams, store_upload};
 mod analyze;
 #[cfg(test)]
 mod test_support;
-mod update;
+pub mod update;
 pub mod upload;
 
 /// The form field the file is read from (Pleroma's required `:file`).
@@ -120,7 +120,7 @@ const MISSING_FILE: &str = "Missing parameter: file";
 const BLANK_FILE: &str = "Validation failed: File can't be blank";
 /// 422 body for a focal point that is not `"x,y"` with both axes in
 /// `[-1.0, 1.0]` (Mastodon's changeset wording again).
-const FOCUS_INVALID: &str = "Validation failed: Focus is invalid";
+pub(crate) const FOCUS_INVALID: &str = "Validation failed: Focus is invalid";
 /// 422 body for bytes
 /// [`detect_media_type`](analyze::detect_media_type) cannot name an
 /// accepted media type for.
@@ -150,7 +150,7 @@ const THUMBNAIL_MAX_EDGE: u32 = 400;
 ///
 /// [`AppError::Unprocessable`] with [`DESCRIPTION_TOO_LONG`] when `text` has
 /// more characters (not bytes) than the configured limit.
-fn check_description(config: &Config, text: &str) -> AppResult<()> {
+pub(crate) fn check_description(config: &Config, text: &str) -> AppResult<()> {
     if text.chars().count() > config.max_media_description {
         return Err(AppError::Unprocessable(DESCRIPTION_TOO_LONG.to_owned()));
     }

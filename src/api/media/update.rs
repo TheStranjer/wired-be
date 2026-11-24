@@ -234,7 +234,7 @@ async fn store_preview(state: &AppState, user_id: Uuid, file: UploadedFile) -> A
 /// [`AppError::Unprocessable`] with `invalid` for anything else, including a
 /// missing comma, a non-numeric or non-finite axis, or an axis outside the
 /// range.
-pub(super) fn parse_focus(text: &str, invalid: &str) -> AppResult<(f32, f32)> {
+pub fn parse_focus(text: &str, invalid: &str) -> AppResult<(f32, f32)> {
     let Some((x, y)) = text.split_once(',') else {
         return Err(invalid_focus(invalid));
     };

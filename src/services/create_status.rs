@@ -137,6 +137,7 @@ pub mod create_media;
 pub mod create_poll;
 pub mod create_render;
 pub mod edit;
+pub mod edit_media;
 pub mod idempotency;
 pub mod params;
 pub mod preview;
