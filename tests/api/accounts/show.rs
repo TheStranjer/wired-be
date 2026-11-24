@@ -6,7 +6,7 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 use wired_be::models::{status::Visibility, user::Flag};
 
-use super::support::{BASE, INVALID_TOKEN, NOT_FOUND, assert_identity, show};
+use super::support::{BASE, INVALID_TOKEN, NO_SCOPE, NOT_FOUND, assert_identity, show};
 use crate::common;
 
 /// `GET /api/v1/accounts/{id}` for one's own id is still the plain account:
@@ -419,4 +419,40 @@ async fn show_a_deactivated_account_is_a_record_not_found() {
         "deactivated accounts are not served"
     );
     assert_eq!(response.text(), NOT_FOUND, "like any other miss");
+}
+
+/// A user token without `read:accounts` may not read an account: 403 with
+/// Pleroma's wording, while `read` and anonymous requests answer 200.
+#[tokio::test]
+async fn show_requires_read_accounts_on_a_presented_user_token() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let alice = common::create_local_user(&pool, "alice").await;
+    let narrow = common::create_app_and_token(&pool, &alice, "write:statuses").await;
+    let broad = common::create_app_and_token(&pool, &alice, "read").await;
+    let app = common::test_app(pool);
+    let path = format!("/api/v1/accounts/{}", alice.id);
+
+    let refused = common::TestRequest::get(&path)
+        .bearer(&narrow)
+        .send(&app)
+        .await;
+    assert_eq!(
+        refused.status,
+        StatusCode::FORBIDDEN,
+        "write:statuses is not read:accounts"
+    );
+    assert_eq!(refused.text(), NO_SCOPE, "Pleroma's wording");
+
+    let allowed = common::TestRequest::get(&path)
+        .bearer(&broad)
+        .send(&app)
+        .await;
+    assert_eq!(
+        allowed.status,
+        StatusCode::OK,
+        "`read` covers read:accounts"
+    );
+    let anonymous = show(&app, &alice.id.to_string()).await;
+    assert_eq!(anonymous.status, StatusCode::OK, "anonymous still proceeds");
 }
