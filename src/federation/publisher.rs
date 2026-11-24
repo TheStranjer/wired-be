@@ -28,11 +28,15 @@
 //!   instance, [`best_inbox`](super::delivery::best_inbox)) and their personal inbox otherwise — this is
 //!   the sender-side expansion of the collection;
 //! - every other address is looked up by `ap_id`, and a REMOTE user it
-//!   finds contributes their *personal* inbox: a directly addressed peer
-//!   gets the activity at the endpoint that names them (mentions and direct
-//!   recipients; unknown addresses are skipped, deactivated or suspended
-//!   mirrors and local rows are not delivery targets, and neither the actor
-//!   nor this instance's own actor ever receives a copy);
+//!   finds contributes an inbox that depends on the audience: when the
+//!   activity addresses the public or the actor's followers collection, the
+//!   recipient (a mention, a boosted author, a reply target) is reached at
+//!   their shared inbox when they publish one, so a host that also holds
+//!   followers is delivered to once; when it names actors alone (a direct
+//!   message), each is reached at their *personal* inbox. Unknown addresses
+//!   are skipped, deactivated or suspended mirrors and local rows are not
+//!   delivery targets, and neither the actor nor this instance's own actor
+//!   ever receives a copy;
 //! - relay inboxes ([`relay_inboxes`](crate::models::instance::relay_inboxes),
 //!   the `inbox` of every relay this instance follows and that has
 //!   accepted the follow) join the set only for `Create`, `Announce`,
@@ -167,7 +171,9 @@ type OutgoingFilter = fn(AppState, Value) -> BoxFuture<'static, MrfDecision>;
 /// of the activity's `to`, `cc`, `bto`, `bcc` and `audience` fields (or
 /// [`PublishOpts::only_to`], when set), with the actor's followers
 /// collection expanded to their remote followers' shared-or-personal
-/// inboxes, every other resolved remote recipient at their personal inbox,
+/// inboxes, every other resolved remote recipient at their shared inbox for a
+/// public or followers-addressed activity and at their personal inbox for a
+/// direct one,
 /// relay inboxes for post-lifecycle activities (`Create`, `Announce`,
 /// `Update`, `Delete`, `Undo`, `Move`) whose `to` names the public address
 /// — unlisted posts, likes and the rest never reach relays — and never when

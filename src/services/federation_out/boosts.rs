@@ -164,11 +164,8 @@ mod tests {
         run_publishes(&state, &pool).await;
         assert_eq!(
             delivered_inboxes(&pool).await,
-            vec![
-                "https://remote.example/inbox",
-                "https://remote.example/users/bob/inbox",
-            ],
-            "the boosted author's inbox plus the remote followers'"
+            vec!["https://remote.example/inbox"],
+            "the boosted author and the remote followers share one host, hence one delivery"
         );
     }
 

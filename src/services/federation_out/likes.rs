@@ -135,11 +135,8 @@ mod tests {
         run_publishes(&state, &pool).await;
         assert_eq!(
             delivered_inboxes(&pool).await,
-            vec![
-                "https://remote.example/inbox",
-                "https://remote.example/users/bob/inbox",
-            ],
-            "the followers' shared inbox (once) and the author's personal inbox"
+            vec!["https://remote.example/inbox"],
+            "the followers and the author share one host, hence one delivery"
         );
     }
 
@@ -197,10 +194,7 @@ mod tests {
         run_publishes(&state, &pool).await;
         assert_eq!(
             delivered_inboxes(&pool).await,
-            vec![
-                "https://remote.example/inbox",
-                "https://remote.example/users/bob/inbox",
-            ],
+            vec!["https://remote.example/inbox"],
             "exactly the inboxes that heard the like hear the withdrawal"
         );
     }
@@ -363,8 +357,8 @@ mod tests {
         run_publishes(&state, &pool).await;
         assert_eq!(
             delivered_inboxes(&pool).await,
-            vec!["https://remote.example/users/bob/inbox"],
-            "the author is reached; the unexpandable collection names nobody"
+            vec!["https://remote.example/inbox"],
+            "the author is reached at their shared inbox; the unexpandable collection names nobody"
         );
     }
 }
