@@ -12,7 +12,10 @@ use std::{
 use tracing::debug;
 use zip::{CompressionMethod, ZipWriter, write::SimpleFileOptions};
 
-use crate::error::{AppError, AppResult, io_error};
+use crate::{
+    error::{AppError, AppResult, io_error},
+    uploads,
+};
 
 use super::{
     ACCEPTED_EMOJI_TYPES, ARCHIVE_ENTRY_TOO_LARGE, ARCHIVE_TOO_LARGE, ARCHIVE_TOO_MANY_FILES,
@@ -112,7 +115,7 @@ fn path_traversal(file: &str) -> bool {
 /// bytes like the file routes do — never from the name or a
 /// `content-type` the archive's author claimed.
 fn is_emoji_image(bytes: &[u8]) -> bool {
-    infer::get(bytes).is_some_and(|kind| ACCEPTED_EMOJI_TYPES.contains(&kind.mime_type()))
+    uploads::sniff_allowed(bytes, &ACCEPTED_EMOJI_TYPES).is_ok()
 }
 
 /// Installs a pack archive the way Pleroma's `SafeZip.unzip_data` must:

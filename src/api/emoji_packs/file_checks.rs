@@ -5,12 +5,13 @@
 use serde::Deserialize;
 use serde_json::Value;
 
-use super::{ACCEPTED_EMOJI_TYPES, MAX_EMOJI_FILE_BYTES, UNSUPPORTED_FILE_TYPE};
+use super::{ACCEPTED_EMOJI_TYPES, MAX_EMOJI_FILE_BYTES};
 use crate::{
     error::{AppError, AppResult},
     extract::flex,
     services::emoji_packs,
     state::AppState,
+    uploads,
 };
 
 /// The body parameters of `POST /packs/files`. `file` is the URL spelling
@@ -174,20 +175,15 @@ pub(super) fn rename_miss(shortcode: &str, err: AppError) -> AppError {
 
 /// The media type of emoji file bytes, read from the bytes themselves —
 /// never from the `content-type` the client or the remote server claimed:
-/// the [`infer`] match when its type is one of [`ACCEPTED_EMOJI_TYPES`].
+/// the match of [`uploads::sniff_allowed`] when its type is one of
+/// [`ACCEPTED_EMOJI_TYPES`].
 ///
 /// # Errors
 ///
-/// [`AppError::Unprocessable`] with [`UNSUPPORTED_FILE_TYPE`] for bytes no
+/// [`AppError::Unprocessable`] with `Unsupported file type` for bytes no
 /// matcher names and for media an emoji file may not be.
 pub(super) fn detect_emoji_type(bytes: &[u8]) -> AppResult<&'static str> {
-    let Some(media_type) = infer::get(bytes)
-        .map(|kind| kind.mime_type())
-        .filter(|media_type| ACCEPTED_EMOJI_TYPES.contains(media_type))
-    else {
-        return Err(AppError::Unprocessable(UNSUPPORTED_FILE_TYPE.to_owned()));
-    };
-    Ok(media_type)
+    uploads::sniff_allowed(bytes, &ACCEPTED_EMOJI_TYPES)
 }
 
 /// The extension the detected type gets in the default
@@ -228,7 +224,10 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::{api::emoji_packs::file_writes::fetch_refused, http_client::HttpError};
+    use crate::{
+        api::emoji_packs::{UNSUPPORTED_FILE_TYPE, file_writes::fetch_refused},
+        http_client::HttpError,
+    };
 
     #[test]
     fn shortcodes_follow_the_pinned_pattern() {

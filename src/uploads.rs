@@ -31,6 +31,7 @@ use uuid::Uuid;
 use crate::{
     config::Config,
     error::{AppError, AppResult, io_error},
+    state::AppState,
     util::media_type::essence,
 };
 
@@ -306,6 +307,55 @@ fn random_hex() -> String {
     rand::rngs::OsRng.fill_bytes(&mut bytes);
     let number = u64::from_be_bytes(bytes);
     format!("{number:016x}")
+}
+
+/// The 422 body of [`sniff_allowed`] for bytes that are not one of the
+/// allowed types.
+const UNSUPPORTED_FILE_TYPE: &str = "Unsupported file type";
+
+/// The media type of `bytes`, read from the magic bytes and not from any
+/// `content-type` a client claimed, when it is one of `allowed` (MIME types as
+/// [`infer`] spells them, e.g. `image/png`).
+///
+/// # Errors
+///
+/// [`AppError::Unprocessable`] with `Unsupported file type` for bytes no
+/// matcher names and for a type outside `allowed`.
+pub fn sniff_allowed(bytes: &[u8], allowed: &[&str]) -> AppResult<&'static str> {
+    infer::get(bytes)
+        .map(|kind| kind.mime_type())
+        .filter(|mime| allowed.contains(mime))
+        .ok_or_else(|| AppError::Unprocessable(UNSUPPORTED_FILE_TYPE.to_owned()))
+}
+
+/// The media type of `bytes` when [`infer`] names any image type for them;
+/// `None` for anything else, including bytes no matcher can name.
+#[must_use]
+pub fn sniff_image(bytes: &[u8]) -> Option<&'static str> {
+    infer::get(bytes)
+        .filter(|kind| matches!(kind.matcher_type(), infer::MatcherType::Image))
+        .map(|kind| kind.mime_type())
+}
+
+/// Stores `bytes` under a fresh [`media_key`] in `owner`'s namespace and
+/// returns the file's public URL.
+///
+/// # Errors
+///
+/// [`AppError::Internal`] when the filesystem rejects the write and
+/// [`AppError::BadRequest`] from the key guard (unreachable for a generated
+/// key), both from [`UploaderBackend::put`].
+pub async fn store_public(
+    state: &AppState,
+    owner: Uuid,
+    bytes: Bytes,
+    filename: Option<&str>,
+    content_type: &str,
+) -> AppResult<String> {
+    let key = media_key(owner, filename, content_type);
+    state.uploader.put(&key, bytes, content_type).await?;
+    debug!(%owner, %key, %content_type, "stored public upload");
+    Ok(state.uploader.public_url(&key))
 }
 
 /// Whether `c` may appear in a media key: the URL- and path-safe subset of
@@ -746,6 +796,63 @@ mod tests {
                 "{content_type} must be an attachment"
             );
         }
+    }
+
+    /// A PNG signature, enough for the magic-byte match.
+    const PNG_BYTES: &[u8] = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01";
+    /// A PDF header: a named type that is not an image.
+    const PDF_BYTES: &[u8] = b"%PDF-1.4\n1 0 obj\n<<>>\nendobj\n%%EOF\n";
+
+    #[test]
+    fn sniff_allowed_accepts_a_listed_type() {
+        assert_eq!(
+            sniff_allowed(PNG_BYTES, &["image/png", "image/gif"]).unwrap(),
+            "image/png"
+        );
+    }
+
+    #[test]
+    fn sniff_allowed_refuses_unlisted_and_unnamed_bytes() {
+        for (bytes, allowed) in [
+            (PDF_BYTES, &["image/png"][..]),
+            (PNG_BYTES, &["image/gif"][..]),
+            (PNG_BYTES, &[][..]),
+            (b"just text".as_slice(), &["image/png"][..]),
+            (b"".as_slice(), &["image/png"][..]),
+        ] {
+            let err = sniff_allowed(bytes, allowed).unwrap_err();
+            assert!(
+                matches!(err, AppError::Unprocessable(_)),
+                "{bytes:?} is a 422, got {err}"
+            );
+            assert_eq!(err.to_string(), "Unsupported file type");
+        }
+    }
+
+    #[test]
+    fn sniff_image_names_any_image_and_nothing_else() {
+        assert_eq!(sniff_image(PNG_BYTES), Some("image/png"));
+        assert_eq!(sniff_image(PDF_BYTES), None);
+        assert_eq!(sniff_image(b""), None);
+    }
+
+    #[tokio::test]
+    async fn store_public_writes_the_file_and_returns_its_url() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut config = Config::for_tests();
+        config.uploads_dir = dir.path().to_path_buf();
+        config.media_base_url = "https://test.example/media".to_owned();
+        let state = AppState::lazy_for_tests(config);
+        let owner = Uuid::now_v7();
+        let body = Bytes::from_static(PNG_BYTES);
+        let url = store_public(&state, owner, body.clone(), Some("a.png"), "image/png")
+            .await
+            .unwrap();
+        let prefix = format!("https://test.example/media/{owner}/");
+        let key = url.strip_prefix("https://test.example/media/").unwrap();
+        assert!(url.starts_with(&prefix), "{url}");
+        assert_eq!(key_extension(key), Some("png"), "{url}");
+        assert_eq!(state.uploader.read(key).await.unwrap(), body);
     }
 
     #[test]

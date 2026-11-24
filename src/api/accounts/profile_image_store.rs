@@ -10,14 +10,7 @@ use bytes::Bytes;
 use tracing::{debug, warn};
 use uuid::Uuid;
 
-use crate::{
-    config::Config,
-    error::{AppError, AppResult},
-    state::AppState,
-    uploads,
-};
-
-use super::profile_images::UNSUPPORTED_FILE_TYPE;
+use crate::{config::Config, error::AppResult, state::AppState, uploads};
 
 /// The media types a profile image may be, as the MIME types [`infer`]
 /// reads from the bytes: the four the ticket names (Pleroma accepts these
@@ -30,16 +23,11 @@ const ACCEPTED_IMAGE_TYPES: [&str; 4] = ["image/png", "image/jpeg", "image/gif",
 ///
 /// # Errors
 ///
-/// [`AppError::Unprocessable`] with [`UNSUPPORTED_FILE_TYPE`] for bytes no
-/// matcher names, and for the media types a profile image may not be.
+/// [`AppError::Unprocessable`](crate::error::AppError::Unprocessable) with
+/// `Unsupported file type` for bytes no matcher names, and for the media
+/// types a profile image may not be (see [`uploads::sniff_allowed`]).
 pub(super) fn detect_image_type(bytes: &[u8]) -> AppResult<&'static str> {
-    let Some(mime) = infer::get(bytes)
-        .map(|kind| kind.mime_type())
-        .filter(|mime| ACCEPTED_IMAGE_TYPES.contains(mime))
-    else {
-        return Err(AppError::Unprocessable(UNSUPPORTED_FILE_TYPE.to_owned()));
-    };
-    Ok(mime)
+    uploads::sniff_allowed(bytes, &ACCEPTED_IMAGE_TYPES)
 }
 
 /// Stores one profile image: a fresh [`media_key`](uploads::media_key) under
@@ -49,9 +37,10 @@ pub(super) fn detect_image_type(bytes: &[u8]) -> AppResult<&'static str> {
 ///
 /// # Errors
 ///
-/// [`AppError::Internal`] when the filesystem rejects the write and
-/// [`AppError::BadRequest`] from the key guard (unreachable for a generated
-/// key), both from [`UploaderBackend::put`](uploads::UploaderBackend::put).
+/// As [`uploads::store_public`]'s: [`AppError::Internal`] when the
+/// filesystem rejects the write.
+///
+/// [`AppError::Internal`]: crate::error::AppError::Internal
 pub(super) async fn store_image(
     state: &AppState,
     user_id: Uuid,
@@ -59,15 +48,7 @@ pub(super) async fn store_image(
     filename: Option<&str>,
     content_type: &str,
 ) -> AppResult<String> {
-    let key = uploads::media_key(user_id, filename, content_type);
-    state.uploader.put(&key, bytes, content_type).await?;
-    debug!(
-        user = %user_id,
-        %key,
-        %content_type,
-        "stored profile image"
-    );
-    Ok(state.uploader.public_url(&key))
+    uploads::store_public(state, user_id, bytes, filename, content_type).await
 }
 
 /// Removes the files the profile-image writes replaced, run after the row
@@ -109,7 +90,7 @@ fn own_media_key(config: &Config, stored_url: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use crate::api::accounts::{
-        profile_images::{AVATAR_FIELD, resolve_images},
+        profile_images::{AVATAR_FIELD, UNSUPPORTED_FILE_TYPE, resolve_images},
         test_support::{BMP, GIF, JPEG, PDF, PNG, TEXT, WEBP, no_params, part},
     };
 
