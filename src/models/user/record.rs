@@ -318,6 +318,17 @@ impl User {
         }
         AccountStatus::Active
     }
+
+    /// The URL a mention of this account links to: the stored
+    /// [`profile_url`](User::profile_url) that Pleroma's
+    /// `Formatter.mention_from_user` prefers as `user.uri`, or the actor id
+    /// every row is guaranteed to carry.
+    #[must_use]
+    pub fn mention_url(&self) -> String {
+        self.profile_url
+            .clone()
+            .unwrap_or_else(|| self.ap_id.clone())
+    }
 }
 
 #[cfg(test)]
