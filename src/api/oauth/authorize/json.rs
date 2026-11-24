@@ -30,10 +30,7 @@
 
 use axum::{
     Json,
-    http::{
-        HeaderMap, StatusCode,
-        header::{ACCEPT, CONTENT_TYPE},
-    },
+    http::{HeaderMap, StatusCode, header::CONTENT_TYPE},
     response::{IntoResponse, Response},
 };
 use serde::Deserialize;
@@ -46,6 +43,7 @@ use super::{
     require_registered_redirect, with_query_params,
 };
 use crate::{
+    api::oauth::json_media::is_json_media_type,
     auth::{self, AuthContext},
     error::{AppError, AppResult},
     extract::into_params,
@@ -58,8 +56,6 @@ use crate::{
     state::AppState,
 };
 
-/// The one media type a JSON request or `Accept` header names.
-const JSON_MEDIA_TYPE: &str = "application/json";
 /// `error` of a request that is malformed or names an unsupported flow.
 const INVALID_REQUEST_CODE: &str = "invalid_request";
 /// `error` of a `client_id` that names no application.
@@ -188,27 +184,6 @@ struct ApprovalRequest {
     /// The user's verdict.
     #[serde(default)]
     approve: Option<bool>,
-}
-
-/// Whether `value` names `application/json`: its media type (parameters
-/// dropped) compared case-insensitively, exactly.
-fn is_json_media_type(value: &str) -> bool {
-    value
-        .split(';')
-        .next()
-        .is_some_and(|media| media.trim().eq_ignore_ascii_case(JSON_MEDIA_TYPE))
-}
-
-/// Whether the `Accept` header lists exactly `application/json`: what
-/// asks `GET /oauth/authorize` for the app info instead of the redirect
-/// to the frontend.
-pub(super) fn wants_json(headers: &HeaderMap) -> bool {
-    headers
-        .get_all(ACCEPT)
-        .iter()
-        .filter_map(|value| value.to_str().ok())
-        .flat_map(|value| value.split(','))
-        .any(is_json_media_type)
 }
 
 /// Whether a `POST` is the frontend's JSON approval rather than the
@@ -394,10 +369,11 @@ fn redirect_with(delivery: &Delivery<'_>, first: (&str, &str)) -> String {
 
 #[cfg(test)]
 mod tests {
-    use axum::http::HeaderValue;
+    use axum::http::{HeaderValue, header::ACCEPT};
 
     use super::super::{INVALID_REDIRECT_URI, UNSUPPORTED_RESPONSE_TYPE};
     use super::*;
+    use crate::api::oauth::json_media::wants_json;
 
     /// Headers holding one `name: value` pair.
     fn headers_with(name: axum::http::HeaderName, value: &'static str) -> HeaderMap {

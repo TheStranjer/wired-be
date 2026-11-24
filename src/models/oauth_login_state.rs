@@ -13,9 +13,10 @@
 use std::{fmt, time::Duration};
 
 use chrono::{DateTime, Utc};
-use serde_json::Value;
+use serde_json::{Value, json};
 use sqlx::PgPool;
 use tracing::debug;
+use uuid::Uuid;
 
 use crate::{
     error::AppResult,
@@ -77,6 +78,12 @@ const DELETE_SQL: &str = "DELETE FROM oauth_login_states WHERE state = $1";
 /// leaving the stored authorize parameters beside it.
 const SET_PENDING_SQL: &str = "UPDATE oauth_login_states
      SET params = jsonb_set(params, '{pending}', $2::jsonb, true)
+  WHERE state = $1 AND valid_until > now()";
+
+/// [`set_confirmation`]: the one-time consent token and the linked user's
+/// id under the `confirmation` key, beside the stored authorize parameters.
+const SET_CONFIRMATION_SQL: &str = "UPDATE oauth_login_states
+     SET params = jsonb_set(params, '{confirmation}', $2::jsonb, true)
   WHERE state = $1 AND valid_until > now()";
 
 /// Stores `params` under a fresh state for `provider` and returns the row,
@@ -180,11 +187,104 @@ pub async fn set_pending(pool: &PgPool, state: &str, pending: &Value) -> AppResu
     Ok(written > 0)
 }
 
+/// Parks a linked login for consent, answering whether a live row took it.
+///
+/// `confirm_token` and the id of the linked `user_id` go under the
+/// `confirmation` key of the state's parameters, replacing an earlier pair.
+/// The consent endpoints read the pair back and only act for the holder of
+/// the token.
+///
+/// # Errors
+///
+/// Any database failure (connection, encoding) arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn set_confirmation(
+    pool: &PgPool,
+    state: &str,
+    confirm_token: &str,
+    user_id: Uuid,
+) -> AppResult<bool> {
+    let confirmation = json!({ "token": confirm_token, "user_id": user_id });
+    let written = sqlx::query(SET_CONFIRMATION_SQL)
+        .bind(state)
+        .bind(confirmation)
+        .execute(pool)
+        .await
+        .map(|outcome| outcome.rows_affected())?;
+    Ok(written > 0)
+}
+
 #[cfg(test)]
 mod tests {
-    use serde_json::json;
-
     use super::*;
+
+    /// [`set_confirmation`] adds the `confirmation` key beside the stored
+    /// parameters, replaces an earlier one, and refuses an unknown or
+    /// expired state.
+    #[tokio::test]
+    async fn set_confirmation_stores_the_token_and_the_user() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let issued = create(&pool, "github", &params())
+            .await
+            .expect("the insert runs");
+        let user_id = Uuid::now_v7();
+        assert!(
+            set_confirmation(&pool, &issued.state, "first-token", user_id)
+                .await
+                .expect("the write runs"),
+            "the live row took the write"
+        );
+        let found = get_live(&pool, &issued.state)
+            .await
+            .expect("the lookup runs")
+            .expect("the state is live");
+        assert_eq!(
+            found.params.get("confirmation"),
+            Some(&json!({"token": "first-token", "user_id": user_id})),
+            "the pair is under `confirmation`: {found:?}"
+        );
+        assert_eq!(
+            found.params.get("client_id"),
+            Some(&json!("client-id")),
+            "the authorize parameters are untouched"
+        );
+
+        assert!(
+            set_confirmation(&pool, &issued.state, "second-token", user_id)
+                .await
+                .expect("the write runs"),
+            "a second write replaces the first"
+        );
+        let replaced = get_live(&pool, &issued.state)
+            .await
+            .expect("the lookup runs")
+            .expect("the state is live");
+        assert_eq!(
+            replaced.params["confirmation"]["token"],
+            json!("second-token"),
+            "the newest token stands"
+        );
+
+        assert!(
+            !set_confirmation(&pool, "never-issued", "t", user_id)
+                .await
+                .expect("the write reaches the database"),
+            "an unknown state takes no write"
+        );
+        let rewound = sqlx::query("UPDATE oauth_login_states SET valid_until = now() - interval '1 second' WHERE state = $1")
+            .bind(&issued.state)
+            .execute(&pool)
+            .await
+            .expect("the rewind runs");
+        assert_eq!(rewound.rows_affected(), 1, "the rewind hit the row");
+        assert!(
+            !set_confirmation(&pool, &issued.state, "t", user_id)
+                .await
+                .expect("the write reaches the database"),
+            "an expired state takes no write"
+        );
+    }
 
     /// The parameters a test issues a state for.
     fn params() -> Value {
