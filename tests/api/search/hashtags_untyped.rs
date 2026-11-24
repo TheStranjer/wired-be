@@ -64,6 +64,43 @@ async fn hashtag_search_prefix_matches_v1_names_and_v2_tag_entities() {
     );
 }
 
+/// The hashtag list pages by `offset`: the second page of two is the next
+/// two names in order, the page past the end is empty, and an offset page
+/// never repeats the first one.
+#[tokio::test]
+async fn hashtag_search_pages_by_offset() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let app = common::test_app(pool.clone());
+    let (_viewer, token) = fixture(&pool, "finder", "read").await;
+    for name in ["#cat1", "#cat2", "#cat3", "#cat4", "#cat5"] {
+        let _tag = hashtag::find_or_create(&pool, name)
+            .await
+            .expect("the tag fixture stores")
+            .expect("the name is usable");
+    }
+
+    for (offset, want) in [
+        (0, json!(["cat1", "cat2"])),
+        (2, json!(["cat3", "cat4"])),
+        (4, json!(["cat5"])),
+        (6, json!([])),
+    ] {
+        let page = get(
+            &app,
+            Some(&token),
+            &format!("{V1_SEARCH}?q=cat&type=hashtags&limit=2&offset={offset}"),
+        )
+        .await;
+        common::assert_answer(&page, StatusCode::OK, "a hashtag page");
+        assert_eq!(
+            page.json_value()["hashtags"],
+            want,
+            "offset {offset} answers its own page of the name-ordered list"
+        );
+    }
+}
+
 /// With no `type`, one authenticated search fills all three lists at once
 /// from the one query.
 #[tokio::test]
