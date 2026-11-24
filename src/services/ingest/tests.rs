@@ -688,3 +688,100 @@ async fn a_public_note_addressing_a_local_user_in_cc_links_them_once() {
         "cc alone links her too"
     );
 }
+
+/// `bob`'s public note named `n`, answering the object id `parent` that no
+/// stored status has: the reply the backfill is queued for.
+fn orphan_reply(n: &str, parent: &str) -> Value {
+    let mut object = note(n);
+    object["inReplyTo"] = json!(format!("https://remote.example/objects/{parent}"));
+    object
+}
+
+/// The `depth` args of every `federator.backfill` job queued for `status_id`.
+async fn queued_backfill_depths(pool: &PgPool, status_id: Uuid) -> Vec<Value> {
+    sqlx::query_scalar::<_, Value>("SELECT args->'depth' FROM jobs WHERE unique_key = $1")
+        .bind(backfill_key(status_id))
+        .fetch_all(pool)
+        .await
+        .expect("the job read")
+}
+
+#[tokio::test]
+async fn the_backfill_job_is_queued_at_the_depth_the_note_was_ingested_at() {
+    let db = crate::test_db::test_db().await.expect("test database slot");
+    let pool = db.pool().clone();
+    let state = app_state(&pool);
+    let bob = author(&pool).await;
+
+    let IngestOutcome::Created(row) = ingest_note_at_depth(
+        &state,
+        &bob,
+        &orphan_reply("ingest-depth-3", "ingest-depth-4"),
+        3,
+    )
+    .await
+    .expect("the reply ingests") else {
+        panic!("a first-seen note is created");
+    };
+
+    assert_eq!(
+        queued_backfill_depths(&pool, row.id).await,
+        vec![json!(3)],
+        "the job carries the depth, not zero"
+    );
+}
+
+#[tokio::test]
+async fn ingest_note_queues_the_backfill_at_depth_zero() {
+    let db = crate::test_db::test_db().await.expect("test database slot");
+    let pool = db.pool().clone();
+    let state = app_state(&pool);
+    let bob = author(&pool).await;
+
+    let IngestOutcome::Created(row) =
+        ingest_note(&state, &bob, &orphan_reply("ingest-depth-0", "ingest-up"))
+            .await
+            .expect("the reply ingests")
+    else {
+        panic!("a first-seen note is created");
+    };
+
+    assert_eq!(
+        queued_backfill_depths(&pool, row.id).await,
+        vec![json!(0)],
+        "a delivered reply starts the walk at zero"
+    );
+}
+
+#[tokio::test]
+async fn enqueue_backfill_queues_nothing_at_or_past_the_depth_limit() {
+    let db = crate::test_db::test_db().await.expect("test database slot");
+    let pool = db.pool().clone();
+    let mut config = Config::for_tests();
+    config.fetch.limits.thread_fetch_depth = 2;
+    let state = state_with_config(&pool, config);
+    let bob = author(&pool).await;
+
+    for (name, depth, queued) in [
+        ("ingest-limit-below", 1, vec![json!(1)]),
+        ("ingest-limit-at", 2, Vec::new()),
+        ("ingest-limit-past", 9, Vec::new()),
+    ] {
+        let IngestOutcome::Created(row) =
+            ingest_note_at_depth(&state, &bob, &orphan_reply(name, "ingest-up"), depth)
+                .await
+                .expect("the reply ingests")
+        else {
+            panic!("a first-seen note is created");
+        };
+        assert!(
+            row.in_reply_to_ap_id.is_some(),
+            "{name} keeps its deferred parent"
+        );
+        assert_eq!(
+            queued_backfill_depths(&pool, row.id).await,
+            queued,
+            "{name}: depth {depth} against a limit of 2"
+        );
+    }
+}

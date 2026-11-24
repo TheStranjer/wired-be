@@ -35,9 +35,10 @@
 //! On top of the resolver sits `federator.backfill`: when ingest stores a
 //! remote answer to an object this instance does not have, the row keeps
 //! the parent id in `in_reply_to_ap_id` and this job walks up the chain —
-//! [`resolve_status`] for the parent, [`link_backfilled_reply`] to close
-//! the link and step `replies_count`, then the parent's own job at
-//! `depth + 1` — until the thread is linked or `THREAD_FETCH_DEPTH`
+//! [`resolve_status_at_depth`] for the parent, [`link_backfilled_reply`] to
+//! close the link and step `replies_count`. The parent's own job is queued
+//! by its ingest at `depth + 1`, so the depth rides in the job args from the
+//! first reply on — until the thread is linked or `THREAD_FETCH_DEPTH`
 //! ancestors are reached. A parent that turns out to be gone (404 or 410)
 //! completes the job quietly: threads legitimately start mid-air.
 //!
@@ -66,7 +67,7 @@ use crate::{federation::fetch_actor::FetchError as ActorError, http_client::Http
 pub use self::{
     backfill::{BACKFILL_MAX_ATTEMPTS, backfill_key, handle, handle_backfill},
     fetch::fetch_object_json,
-    resolve::{resolve_status, resolve_status_as_actor},
+    resolve::{resolve_status, resolve_status_as_actor, resolve_status_at_depth},
 };
 
 /// The [`JobRegistry`](crate::jobs::JobRegistry) key of the thread-backfill
