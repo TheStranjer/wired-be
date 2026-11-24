@@ -34,6 +34,8 @@ const INVALID_TOKEN: &str = "The access token is invalid";
 const USER_REQUIRED: &str = "This API requires an authenticated user";
 /// The 403 body for a valid token whose user is not an admin.
 const NOT_ADMIN: &str = "User is not an admin.";
+/// The 403 body for a valid token whose user is neither admin nor moderator.
+const NOT_STAFF: &str = "User is not a staff member.";
 /// The 403 body of a token that grants neither `admin:read` nor
 /// `admin:read:chats`.
 const NO_ADMIN_READ: &str = "Insufficient permissions: admin:read.";
@@ -74,6 +76,18 @@ const MESSAGE_KEYS: [&str; 9] = [
 async fn admin(pool: &PgPool, nickname: &str, scopes: &str) -> (User, String) {
     let created = common::create_local_user_with(pool, nickname, |user| NewUser {
         is_admin: Flag::new(true),
+        ..user
+    })
+    .await;
+    let token = common::create_app_and_token(pool, &created, scopes).await;
+    (created, token)
+}
+
+/// A local moderator (not an admin) named `nickname` with a bearer token
+/// granting `scopes`.
+async fn moderator(pool: &PgPool, nickname: &str, scopes: &str) -> (User, String) {
+    let created = common::create_local_user_with(pool, nickname, |user| NewUser {
+        is_moderator: Flag::new(true),
         ..user
     })
     .await;
