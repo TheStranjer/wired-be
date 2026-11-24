@@ -3,6 +3,7 @@
 
 mod backfill;
 mod fetch;
+mod quote_backfill;
 mod resolve;
 
 use std::{
@@ -75,6 +76,8 @@ struct Peer {
     last_accept: Arc<Mutex<Option<String>>>,
     /// Which fixture objects answer which other fixture object.
     parents: Arc<Mutex<HashMap<String, String>>>,
+    /// Which fixture objects quote which url (`quoteUrl`).
+    quotes: Arc<Mutex<HashMap<String, String>>>,
 }
 
 /// A mock peer at `base`: nothing fetched yet, no thread shape.
@@ -84,6 +87,7 @@ fn peer_at(base: &str) -> Peer {
         hits: Arc::new(AtomicUsize::new(0)),
         last_accept: Arc::new(Mutex::new(None)),
         parents: Arc::new(Mutex::new(HashMap::new())),
+        quotes: Arc::new(Mutex::new(HashMap::new())),
     }
 }
 
@@ -121,6 +125,9 @@ fn note_document(peer: &Peer, name: &str) -> Value {
     });
     if let Some(answered) = parent {
         document["inReplyTo"] = json!(format!("{}/objects/{answered}", peer.base));
+    }
+    if let Some(quoted) = peer.quotes.lock().unwrap().get(name) {
+        document["quoteUrl"] = json!(quoted);
     }
     document
 }

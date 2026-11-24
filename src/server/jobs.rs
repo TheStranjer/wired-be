@@ -92,5 +92,9 @@ pub fn job_registry() -> JobRegistry {
         federation::fetch_object::KIND_BACKFILL,
         federation::fetch_object::handle,
     );
+    registry.register(
+        federation::fetch_object::KIND_QUOTE_BACKFILL,
+        federation::fetch_object::handle_quote,
+    );
     registry
 }

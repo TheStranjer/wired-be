@@ -67,7 +67,11 @@ pub(super) async fn resolve_reply(
 
 /// Step 4, quote arm: `quote_uri` resolves locally only — a stored, live
 /// status with that `uri` becomes the quote, an unknown or tombstoned one
-/// leaves it unfilled. This ticket never fetches the quoted object.
+/// leaves it unfilled.
+///
+/// This arm never fetches: inbox handling stays fast, and the
+/// `federator.quote_backfill` job queued after the write fetches an unknown
+/// quoted object (step 12 of the [parent module](crate::services::ingest)).
 pub(super) async fn resolve_quote(
     state: &AppState,
     quote_uri: Option<&str>,

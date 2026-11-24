@@ -35,9 +35,10 @@
 //!    stored status shares the object's `context`, that status's
 //!    conversation — a thread joins itself together before its root ever
 //!    arrives; with neither, [`status::insert`] makes the new row its own
-//!    conversation. The quote `uri` resolves locally only: a stored, live
+//!    conversation. The quote `uri` resolves locally here: a stored, live
 //!    original becomes `quote_of_id`, anything else leaves the quote
-//!    unfilled (this ticket does not fetch objects);
+//!    unlinked with its `quote_uri` kept, to be linked after the write
+//!    (steps 11 and 12);
 //! 5. mentions: each `Mention` tag `href` maps to a stored user by
 //!    `ap_id`; an unknown one is fetched through
 //!    [`get_or_fetch_by_ap_id`] under `MENTION_LOOKUP_TIMEOUT`, at most
@@ -74,9 +75,17 @@
 //! 11. a created row that carries an unresolved `in_reply_to_ap_id` gets a
 //!     [`federator.backfill`] job on the `background` queue (deduped per
 //!     status id), so the thread closes on its own once the parent is
-//!     fetchable — see [`crate::federation::fetch_object`].
+//!     fetchable — see [`crate::federation::fetch_object`];
+//! 12. a created row whose quote stayed unlinked gets a
+//!     [`federator.quote_backfill`] job (deduped per status id) that
+//!     fetches the quoted object and links it; and, the other way round,
+//!     the new row's own `uri` links every stored quote that was waiting
+//!     for it (`quote_uri`, written in the status's transaction). An object
+//!     fetched *for* a quote queues neither a quote nor a reply backfill of
+//!     its own, so a quote chain costs one fetch.
 //!
 //! [`federator.backfill`]: crate::federation::fetch_object::KIND_BACKFILL
+//! [`federator.quote_backfill`]: crate::federation::fetch_object::KIND_QUOTE_BACKFILL
 //! Database failures are [`FederationError::Transient`]: the dispatcher
 //! releases the dedupe row and the retry folds the activity again — safe
 //! because the whole write is one transaction and a status committed
@@ -103,7 +112,10 @@ use uuid::Uuid;
 use crate::{
     federation::{
         dispatch::FederationError,
-        fetch_object::{BACKFILL_MAX_ATTEMPTS, KIND_BACKFILL, backfill_key},
+        fetch_object::{
+            BACKFILL_MAX_ATTEMPTS, KIND_BACKFILL, KIND_QUOTE_BACKFILL, QUOTE_BACKFILL_MAX_ATTEMPTS,
+            backfill_key, quote_backfill_key,
+        },
         note_parser::{self, ParsedNote},
     },
     jobs::QUEUE_BACKGROUND,
@@ -158,6 +170,29 @@ pub enum IngestOutcome {
     /// Nothing was written; the reason is static and rides the
     /// dispatcher's debug log.
     Ignored(&'static str),
+}
+
+/// Where an ingestion sits in the fetch walks that led to it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct IngestDepth {
+    /// Links above the reply that started the thread walk; the
+    /// `federator.backfill` job of the new row is queued at this depth.
+    pub backfill: i64,
+    /// Whether an unlinked quote of the new row queues a
+    /// `federator.quote_backfill` job. Off for an object fetched *for* a
+    /// quote, so a quote chain costs one fetch.
+    pub follow_quotes: bool,
+}
+
+impl IngestDepth {
+    /// A thread-walk depth, with quotes followed.
+    #[must_use]
+    pub const fn walk(backfill: i64) -> Self {
+        Self {
+            backfill,
+            follow_quotes: true,
+        }
+    }
 }
 
 /// The reply facts [`ingest_note`] resolved against stored statuses.
@@ -218,7 +253,22 @@ pub async fn ingest_note_at_depth(
     object: &Value,
     backfill_depth: i64,
 ) -> Result<IngestOutcome, FederationError> {
-    ingest_note_inner(state, author, object, None, backfill_depth).await
+    ingest_note_with(state, author, object, IngestDepth::walk(backfill_depth)).await
+}
+
+/// [`ingest_note`] under an explicit [`IngestDepth`]: how deep in a thread
+/// walk the object sits and whether its own quote may be fetched.
+///
+/// # Errors
+///
+/// As [`ingest_note`].
+pub async fn ingest_note_with(
+    state: &AppState,
+    author: &User,
+    object: &Value,
+    depth: IngestDepth,
+) -> Result<IngestOutcome, FederationError> {
+    ingest_note_inner(state, author, object, None, depth).await
 }
 
 /// [`ingest_note`] for a delivery to a personal inbox: `owner` is the local
@@ -242,18 +292,18 @@ pub async fn ingest_note_delivered(
     object: &Value,
     owner: Option<&User>,
 ) -> Result<IngestOutcome, FederationError> {
-    ingest_note_inner(state, author, object, owner, 0).await
+    ingest_note_inner(state, author, object, owner, IngestDepth::walk(0)).await
 }
 
 /// The fold itself, shared by [`ingest_note_delivered`] and
-/// [`ingest_note_at_depth`]: `backfill_depth` is the depth the new row's
-/// backfill job is queued at.
+/// [`ingest_note_with`]: `depth` is where the new row's backfill jobs are
+/// queued.
 async fn ingest_note_inner(
     state: &AppState,
     author: &User,
     object: &Value,
     owner: Option<&User>,
-    backfill_depth: i64,
+    depth: IngestDepth,
 ) -> Result<IngestOutcome, FederationError> {
     let parsed = note_parser::parse_note(object, author, Utc::now()).map_err(|err| {
         FederationError::Permanent(format!("the object is not ingestable: {err}"))
@@ -291,7 +341,10 @@ async fn ingest_note_inner(
     let new = build_new_status(&parsed, &reply, quote_of_id, &mentioned);
     let row = write_ingested(state, &new, &parsed).await?;
     after_status_created(state, &row).await;
-    enqueue_backfill(state, &row, backfill_depth).await;
+    enqueue_backfill(state, &row, depth.backfill).await;
+    if depth.follow_quotes {
+        enqueue_quote_backfill(state, &row, parsed.quote_uri.as_deref()).await;
+    }
     debug!(
         status = %row.id,
         visibility = %row.visibility,
@@ -339,6 +392,38 @@ async fn enqueue_backfill(state: &AppState, row: &Status, depth: i64) {
     };
     if let Err(err) = job::enqueue(&state.db, new_job).await {
         debug!(status = %row.id, %err, "the backfill enqueue failed");
+    }
+}
+
+/// Step 12: a created row whose quote is still unlinked gets the
+/// [`federator.quote_backfill`] job that fetches the quoted object.
+///
+/// A row without a quote reference, or one whose quote already links, has
+/// nothing to fetch. Like [`enqueue_backfill`], a refused enqueue is logged
+/// and swallowed — the row is committed, and the quoted object's own
+/// arrival still links the quote — and the unique key keeps a redelivered
+/// `Create` from queueing the work twice.
+///
+/// [`federator.quote_backfill`]: crate::federation::fetch_object::KIND_QUOTE_BACKFILL
+async fn enqueue_quote_backfill(state: &AppState, row: &Status, quote_uri: Option<&str>) {
+    let Some(quote_uri) = quote_uri else {
+        return;
+    };
+    if row.quote_of_id.is_some() {
+        return;
+    }
+    let unique_key = quote_backfill_key(row.id);
+    debug!(status = %row.id, quoted = %quote_uri, "queueing the fetch of an unlinked quote");
+    let new_job = NewJob {
+        queue: QUEUE_BACKGROUND,
+        kind: KIND_QUOTE_BACKFILL,
+        args: json!({ "status_id": row.id.to_string() }),
+        run_at: None,
+        max_attempts: Some(QUOTE_BACKFILL_MAX_ATTEMPTS),
+        unique_key: Some(&unique_key),
+    };
+    if let Err(err) = job::enqueue(&state.db, new_job).await {
+        debug!(status = %row.id, %err, "the quote backfill enqueue failed");
     }
 }
 
