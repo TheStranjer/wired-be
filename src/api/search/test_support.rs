@@ -23,11 +23,13 @@ use sqlx::PgPool;
 use tokio::{net::TcpListener, task::JoinHandle};
 
 use crate::{
-    config::{Config, TEST_BASE_URL},
+    config::Config,
     http_client::HttpClient,
-    models::user::{NewUser, User, insert, local_ap_id},
+    models::user::{NewUser, User, insert},
     state::AppState,
 };
+
+pub(super) use crate::test_fixtures::local_user;
 
 use super::params::SearchParams;
 /// The parsed parameters of `query`.
@@ -50,16 +52,6 @@ pub(super) fn test_state(pool: &PgPool) -> AppState {
         http_client: HttpClient::new_for_tests(TEST_UA),
         ..AppState::for_tests(pool.clone(), Config::for_tests())
     }
-}
-
-/// A local user named `nickname`, inserted straight.
-pub(super) async fn local_user(pool: &PgPool, nickname: &str) -> User {
-    insert(
-        pool,
-        &NewUser::local(nickname, &local_ap_id(TEST_BASE_URL, nickname)),
-    )
-    .await
-    .expect("the fixture local user inserts")
 }
 
 /// A stored remote mirror of `nickname` on `host`, the shape decision 7

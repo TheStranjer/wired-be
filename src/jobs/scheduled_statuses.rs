@@ -347,23 +347,14 @@ mod tests {
             media_attachment::{self, NewMediaAttachment},
             scheduled_status::NewScheduledStatus,
             status::{Status, Visibility},
-            user::{NewUser, User, insert, local_ap_id},
+            user::User,
         },
+        test_fixtures::local_user,
     };
 
     /// Test state over `pool` with the fixed test config.
     fn app_state(pool: &PgPool) -> AppState {
         AppState::for_tests(pool.clone(), Config::for_tests())
-    }
-
-    /// Inserts a local user named `nickname`.
-    async fn local_user(pool: &PgPool, nickname: &str) -> User {
-        insert(
-            pool,
-            &NewUser::local(nickname, &local_ap_id(TEST_BASE_URL, nickname)),
-        )
-        .await
-        .expect("the local fixture inserts")
     }
 
     /// A schedule for `who`, due `when`, with `params` stored as given.

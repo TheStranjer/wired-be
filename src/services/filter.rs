@@ -244,9 +244,9 @@ mod tests {
             filter::NewFilter,
             media_attachment::{self, NewMediaAttachment},
             status::{self, NewStatus, Status as StatusRow, Visibility},
-            user::{self, NewUser, local_ap_id},
         },
         services::render_status::{ViewerMode, render_statuses},
+        test_fixtures::local_user as person,
     };
 
     /// The instance origin the fixtures post under.
@@ -266,16 +266,6 @@ mod tests {
     /// collaborators the renderer behind these fixtures never touches.
     fn state(pool: &PgPool) -> AppState {
         AppState::for_tests(pool.clone(), Config::for_tests())
-    }
-
-    /// Inserts a local user named `nickname`.
-    async fn person(pool: &PgPool, nickname: &str) -> User {
-        user::insert(
-            pool,
-            &NewUser::local(nickname, &local_ap_id(BASE, nickname)),
-        )
-        .await
-        .expect("the fixture user inserts")
     }
 
     /// Inserts `text` as `author`'s local public status.

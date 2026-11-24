@@ -148,7 +148,7 @@ mod tests {
             mute::{self, MuteOptions},
             user::{Flag, NewUser, insert},
         },
-        test_fixtures::{local_new, local_user as user},
+        test_fixtures::{local_new, local_user as user, remote_new},
     };
 
     /// The instance origin the fixtures pretend to serve.
@@ -171,15 +171,11 @@ mod tests {
     /// pool the way an admin flag would leave it: suggested and active, but
     /// not local.
     async fn suggested_remote(pool: &PgPool, nickname: &str) -> User {
-        let ap_id = format!("https://remote.example/users/{nickname}");
         insert(
             pool,
             &NewUser {
-                nickname: format!("{nickname}@remote.example"),
-                ap_id,
-                domain: Some("remote.example".to_owned()),
                 is_suggested: Flag::new(true),
-                ..NewUser::default()
+                ..remote_new(nickname)
             },
         )
         .await

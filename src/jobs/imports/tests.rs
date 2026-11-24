@@ -9,7 +9,8 @@ use super::*;
 use crate::{
     config::{Config, TEST_BASE_URL},
     models::job::Job,
-    models::user::{self, NewUser, insert, local_ap_id},
+    models::user::{self, NewUser, insert},
+    test_fixtures::local_user,
 };
 
 /// A handle that neither the database nor a fast-failing `WebFinger`
@@ -29,16 +30,6 @@ async fn broken_state() -> AppState {
         .expect("a lazy pool needs no database");
     pool.close().await;
     app_state(&pool)
-}
-
-/// Inserts a local user named `nickname`.
-async fn local_user(pool: &PgPool, nickname: &str) -> User {
-    insert(
-        pool,
-        &NewUser::local(nickname, &local_ap_id(TEST_BASE_URL, nickname)),
-    )
-    .await
-    .expect("the local fixture inserts")
 }
 
 /// Inserts a mirror of `nickname` on `host`: the shape of a remote

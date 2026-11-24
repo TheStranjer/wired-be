@@ -115,9 +115,10 @@ mod tests {
     use crate::{
         models::{
             status::{NewStatus, Visibility},
-            user::{NewUser, User, insert as insert_user},
+            user::User,
         },
         services::create_status::test_support::{BASE, created, posted, state, user},
+        test_fixtures::remote_user,
     };
     /// The `after_status_created` hook pushes Mastodon's `update` with the
     /// render hint onto the hub the moment the row is written — the create
@@ -182,21 +183,6 @@ mod tests {
         )
         .await
         .expect("the direct fixture inserts")
-    }
-
-    /// A mirror of the remote actor `nickname@remote.example`.
-    async fn remote_user(pool: &PgPool, nickname: &str) -> User {
-        insert_user(
-            pool,
-            &NewUser {
-                nickname: format!("{nickname}@remote.example"),
-                ap_id: format!("https://remote.example/users/{nickname}"),
-                domain: Some("remote.example".to_owned()),
-                ..NewUser::default()
-            },
-        )
-        .await
-        .expect("the remote fixture inserts")
     }
 
     /// `reader`'s OWN participation id in the thread `status_id` was recorded

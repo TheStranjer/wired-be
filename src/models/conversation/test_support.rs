@@ -10,11 +10,15 @@ use crate::{
     config::TEST_BASE_URL,
     models::{
         status::{self, NewStatus, Status, Visibility},
-        user::{self, NewUser, User},
+        user::User,
     },
     pagination::PageParams,
     test_db::TestDb,
 };
+
+// A fresh local account named `nickname`, and a mirror of the remote actor
+// `nickname@remote.example`.
+pub(super) use crate::test_fixtures::{local_user as local, remote_user as remote};
 
 use super::{Participation, participate_for_status};
 
@@ -25,31 +29,6 @@ pub(super) async fn slot() -> (TestDb, PgPool) {
         .expect("a migrated test database slot");
     let pool = db.pool().clone();
     (db, pool)
-}
-
-/// A fresh local account named `nickname`.
-pub(super) async fn local(pool: &PgPool, nickname: &str) -> User {
-    user::insert(
-        pool,
-        &NewUser::local(nickname, &format!("https://test.example/users/{nickname}")),
-    )
-    .await
-    .expect("the local fixture inserts")
-}
-
-/// A mirror of the remote actor `carol@remote.example`.
-pub(super) async fn remote(pool: &PgPool, nickname: &str) -> User {
-    user::insert(
-        pool,
-        &NewUser {
-            nickname: format!("{nickname}@remote.example"),
-            ap_id: format!("https://remote.example/users/{nickname}"),
-            domain: Some("remote.example".to_owned()),
-            ..NewUser::default()
-        },
-    )
-    .await
-    .expect("the remote fixture inserts")
 }
 
 /// `author`'s `direct` status mentioning everyone in `mentioned`,

@@ -8,13 +8,13 @@ use uuid::Uuid;
 use crate::{
     config::TEST_BASE_URL,
     error::AppError,
-    models::user::{self, NewUser, User, insert as insert_user},
+    models::user::{self, User},
     pagination::PageParams,
 };
 
 use super::{Counter, NewStatus, Status, get_by_id_including_deleted, insert};
 
-pub(super) use crate::test_fixtures::local_user as user;
+pub(super) use crate::test_fixtures::{local_user as user, remote_user};
 
 /// The instance origin the fixtures pretend to serve.
 pub(super) const BASE: &str = TEST_BASE_URL;
@@ -95,23 +95,6 @@ pub(super) fn sqlstate_of(err: AppError) -> String {
         return db_err.code().unwrap_or_default().into_owned();
     }
     String::new()
-}
-
-/// A remote mirror of `nickname` on `remote.example`, whose posts the
-/// federation-shaped fixtures insert.
-pub(super) async fn remote_user(pool: &PgPool, nickname: &str) -> User {
-    let ap_id = format!("https://remote.example/users/{nickname}");
-    insert_user(
-        pool,
-        &NewUser {
-            nickname: format!("{nickname}@remote.example"),
-            ap_id,
-            domain: Some("remote.example".to_owned()),
-            ..NewUser::default()
-        },
-    )
-    .await
-    .expect("fixture remote user inserts")
 }
 
 /// A [`NewStatus`] mirroring the remote post `uri`, by `author`.

@@ -193,6 +193,7 @@ mod tests {
     use crate::{
         federation::note::{litepub_context_json, test_support::undefined_terms},
         models::user::{DEFAULT_SCOPE, Flag},
+        test_fixtures::json_keys,
         util::time::parse_time,
     };
 
@@ -316,18 +317,6 @@ mod tests {
     /// The document `user` renders on the test instance.
     fn render(user: &User) -> Value {
         actor_json(user, &Config::for_tests())
-    }
-
-    /// The rendered object's keys, sorted, for exact key-set assertions.
-    fn json_keys(value: &Value) -> Vec<&str> {
-        let mut keys: Vec<&str> = value
-            .as_object()
-            .unwrap()
-            .keys()
-            .map(String::as_str)
-            .collect();
-        keys.sort_unstable();
-        keys
     }
 
     #[test]

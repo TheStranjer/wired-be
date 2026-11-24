@@ -7,7 +7,7 @@ use crate::{
         follow,
         list::{self, ListChanges},
         status::Visibility,
-        user::{Flag, NewUser, User, insert as insert_user, local_ap_id},
+        user::{Flag, NewUser, User, insert as insert_user},
     },
     services::timeline::{
         TimelineSource,
@@ -16,6 +16,7 @@ use crate::{
             timeline,
         },
     },
+    test_fixtures::local_new,
 };
 
 /// Inserts a locked local user named `nickname`, so a follow of them
@@ -25,7 +26,7 @@ async fn locked_local(pool: &sqlx::PgPool, nickname: &str) -> User {
         pool,
         &NewUser {
             locked: Flag::new(true),
-            ..NewUser::local(nickname, &local_ap_id(BASE, nickname))
+            ..local_new(nickname)
         },
     )
     .await

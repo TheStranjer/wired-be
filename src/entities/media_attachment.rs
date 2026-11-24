@@ -202,6 +202,7 @@ mod tests {
 
     use super::*;
     use crate::config::{TEST_BASE_URL, TEST_DATABASE_URL};
+    use crate::test_fixtures::json_keys;
     use crate::util::time::parse_time;
 
     /// The hyphenated lowercase id every fixture row carries.
@@ -264,18 +265,6 @@ mod tests {
     /// `row` rendered to a JSON value; these structs always serialize.
     fn render(row: &AttachmentRow) -> Value {
         serde_json::to_value(MediaAttachment::from_model(row, &Config::for_tests())).unwrap()
-    }
-
-    /// The rendered object's keys, sorted, for exact key-set assertions.
-    fn json_keys(value: &Value) -> Vec<&str> {
-        let mut keys: Vec<&str> = value
-            .as_object()
-            .unwrap()
-            .keys()
-            .map(String::as_str)
-            .collect();
-        keys.sort_unstable();
-        keys
     }
 
     #[test]

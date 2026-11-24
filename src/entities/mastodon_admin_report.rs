@@ -189,33 +189,19 @@ impl MastodonAdminReport {
 #[cfg(test)]
 mod tests {
     use chrono::{DateTime, Utc};
-    use serde_json::{Value, json};
-    use sqlx::PgPool;
+    use serde_json::json;
     use uuid::Uuid;
 
     use super::*;
     use crate::{
-        config::TEST_BASE_URL,
-        models::{
-            report::{Category, ReportState},
-            user::{NewUser, insert, local_ap_id},
-        },
+        models::report::{Category, ReportState},
+        test_fixtures::{json_keys, local_user as user},
         util::time::parse_time,
     };
 
     /// 2024-01-31T12:34:56.789Z, the instant every fixture row carries.
     fn stamped() -> DateTime<Utc> {
         parse_time("2024-01-31T12:34:56.789Z").expect("the fixture instant")
-    }
-
-    /// A local, unlocked user named `nickname`.
-    async fn user(pool: &PgPool, nickname: &str) -> User {
-        insert(
-            pool,
-            &NewUser::local(nickname, &local_ap_id(TEST_BASE_URL, nickname)),
-        )
-        .await
-        .expect("the fixture user inserts")
     }
 
     /// The report row the entity tests render: filed by `reporter` about
@@ -249,18 +235,6 @@ mod tests {
             inserted_at: stamped(),
             updated_at: stamped(),
         }
-    }
-
-    /// The entity's keys, sorted, for exact key-set assertions.
-    fn json_keys(value: &Value) -> Vec<&str> {
-        let mut keys: Vec<&str> = value
-            .as_object()
-            .expect("reports render objects")
-            .keys()
-            .map(String::as_str)
-            .collect();
-        keys.sort_unstable();
-        keys
     }
 
     /// The unassigned, unacted entity renders the ticket's fourteen keys,

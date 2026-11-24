@@ -15,9 +15,12 @@ use crate::{
     config::Config,
     federation::mrf,
     jobs::{AttemptInfo, JobError},
-    models::user::{Flag, NewUser, User, insert, local_ap_id},
+    models::user::{Flag, NewUser, User, insert},
     state::AppState,
 };
+
+// The local account fixture, for the rows a remote actor's activity points at.
+pub(super) use crate::test_fixtures::local_user;
 
 /// Every `(label, activity id)` a fake handler ran for. Handlers are
 /// `fn` pointers that cannot capture a counter, so the fakes record
@@ -69,17 +72,6 @@ pub(super) async fn signer(pool: &PgPool) -> User {
     )
     .await
     .expect("the remote fixture inserts")
-}
-
-/// The local account fixture, for the rows a remote actor's activity
-/// points at.
-pub(super) async fn local_user(pool: &PgPool, nickname: &str) -> User {
-    insert(
-        pool,
-        &NewUser::local(nickname, &local_ap_id("https://test.example", nickname)),
-    )
-    .await
-    .expect("the local fixture inserts")
 }
 
 /// The args shape an inbox route writes.

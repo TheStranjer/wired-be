@@ -17,7 +17,7 @@ use crate::{
 
 use super::{Follow, FollowPageEntry, get};
 
-pub(super) use crate::test_fixtures::{local_new, local_user};
+pub(super) use crate::test_fixtures::{local_new, local_user, remote_new};
 
 /// The `ActivityPub` path segment a local follower's `ap_id` is built
 /// under, as [`follow`](super::follow) must write it (decision 6).
@@ -40,15 +40,11 @@ pub(super) async fn locked_user(pool: &PgPool, nickname: &str) -> User {
 /// Inserts a mirror of `nickname` on `remote.example` whose fetch reported
 /// seven followers, so a test can see whether a counter was touched.
 pub(super) async fn remote_user(pool: &PgPool, nickname: &str) -> User {
-    let ap_id = format!("https://remote.example/users/{nickname}");
     insert(
         pool,
         &NewUser {
-            nickname: format!("{nickname}@remote.example"),
-            ap_id,
-            domain: Some("remote.example".to_owned()),
             followers_count: 7,
-            ..NewUser::default()
+            ..remote_new(nickname)
         },
     )
     .await

@@ -19,10 +19,13 @@ use crate::{
     models::{
         media_attachment::{self, NewMediaAttachment},
         status::{self, NewStatus},
-        user::{NewUser, User, insert as insert_user, local_ap_id},
+        user::User,
     },
     state::AppState,
 };
+
+// A local user named `nickname`.
+pub(super) use crate::test_fixtures::local_user as user;
 
 /// The instance origin the fixtures post under.
 pub(super) const BASE: &str = TEST_BASE_URL;
@@ -31,16 +34,6 @@ pub(super) const BASE: &str = TEST_BASE_URL;
 /// collaborators the service never touches.
 pub(super) fn state(pool: &PgPool) -> AppState {
     AppState::for_tests(pool.clone(), Config::for_tests())
-}
-
-/// A local user named `nickname`.
-pub(super) async fn user(pool: &PgPool, nickname: &str) -> User {
-    insert_user(
-        pool,
-        &NewUser::local(nickname, &local_ap_id(BASE, nickname)),
-    )
-    .await
-    .expect("the fixture user inserts")
 }
 
 /// A body carrying `text` as its only parameter.

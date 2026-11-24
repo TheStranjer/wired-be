@@ -15,10 +15,13 @@ use crate::{
     models::{
         bookmark, favourite,
         status::{NewStatus, Status, Visibility, insert},
-        user::{NewUser, User, insert as insert_user, local_ap_id},
+        user::User,
     },
     state::AppState,
 };
+
+// A local user named `nickname`.
+pub(super) use crate::test_fixtures::local_user as user;
 
 /// The instance origin the fixtures post under.
 const BASE: &str = TEST_BASE_URL;
@@ -51,16 +54,6 @@ pub(super) fn uploads_state(pool: &PgPool) -> (tempfile::TempDir, AppState) {
     config.uploads_dir = dir.path().to_path_buf();
     let state = state_with_config(pool, config);
     (dir, state)
-}
-
-/// A local user named `nickname`.
-pub(super) async fn user(pool: &PgPool, nickname: &str) -> User {
-    insert_user(
-        pool,
-        &NewUser::local(nickname, &local_ap_id(BASE, nickname)),
-    )
-    .await
-    .expect("the fixture user inserts")
 }
 
 /// A post of `text` by `author`, visible to `visibility`.

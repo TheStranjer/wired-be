@@ -115,6 +115,7 @@ mod tests {
             report::{Category, ReportState},
             user::Flag,
         },
+        test_fixtures::json_keys,
         util::time::parse_time,
     };
 
@@ -268,18 +269,6 @@ mod tests {
             None,
         ))
         .expect("an entity serializes")
-    }
-
-    /// The rendered object's keys, sorted, for exact key-set assertions.
-    fn json_keys(value: &Value) -> Vec<&str> {
-        let mut keys: Vec<&str> = value
-            .as_object()
-            .expect("reports render objects")
-            .keys()
-            .map(String::as_str)
-            .collect();
-        keys.sort_unstable();
-        keys
     }
 
     #[test]

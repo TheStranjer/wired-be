@@ -112,9 +112,8 @@ pub struct Relationship {
 
 #[cfg(test)]
 mod tests {
-    use serde_json::Value;
-
     use super::*;
+    use crate::test_fixtures::json_keys;
 
     /// Every JSON key the entity must emit, sorted: the ticket's field list
     /// is the key set, and `Value` maps are content-compared, not
@@ -139,18 +138,6 @@ mod tests {
     /// The target id every fixture relationship is about.
     fn target_id() -> Uuid {
         Uuid::parse_str("01934567-89ab-7cde-f012-3456789abcde").unwrap()
-    }
-
-    /// The rendered object's keys, sorted, for exact key-set assertions.
-    fn json_keys(value: &Value) -> Vec<&str> {
-        let mut keys: Vec<&str> = value
-            .as_object()
-            .unwrap()
-            .keys()
-            .map(String::as_str)
-            .collect();
-        keys.sort_unstable();
-        keys
     }
 
     #[test]

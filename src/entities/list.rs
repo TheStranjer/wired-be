@@ -55,6 +55,7 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
+    use crate::test_fixtures::json_keys;
 
     /// The list id, as a client sees it.
     const LIST_ID: &str = "01934567-89ab-7cde-f012-3456789abcde";
@@ -79,18 +80,6 @@ mod tests {
     /// `row` rendered as a JSON value; entities always serialize.
     fn render(row: &ListRow) -> Value {
         serde_json::to_value(List::from_row(row)).expect("an entity serializes")
-    }
-
-    /// The rendered object's keys, sorted, for exact key-set assertions.
-    fn json_keys(value: &Value) -> Vec<&str> {
-        let mut keys: Vec<&str> = value
-            .as_object()
-            .expect("lists render objects")
-            .keys()
-            .map(String::as_str)
-            .collect();
-        keys.sort_unstable();
-        keys
     }
 
     #[test]

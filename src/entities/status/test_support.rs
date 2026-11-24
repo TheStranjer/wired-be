@@ -11,7 +11,7 @@
 //! embeds.
 
 use chrono::{DateTime, Utc};
-use serde_json::{Value, json};
+use serde_json::json;
 use uuid::Uuid;
 
 use crate::{
@@ -26,6 +26,9 @@ use crate::{
 };
 
 mod parts;
+
+// The rendered object's keys, sorted, for exact key-set assertions.
+pub(super) use crate::test_fixtures::json_keys;
 
 pub(super) use self::parts::{Parts, render, render_nested};
 
@@ -261,16 +264,4 @@ pub(super) fn hashtag(name: &str) -> Hashtag {
         name: name.to_owned(),
         inserted_at: stamped(),
     }
-}
-
-/// The rendered object's keys, sorted, for exact key-set assertions.
-pub(super) fn json_keys(value: &Value) -> Vec<&str> {
-    let mut keys: Vec<&str> = value
-        .as_object()
-        .unwrap()
-        .keys()
-        .map(String::as_str)
-        .collect();
-    keys.sort_unstable();
-    keys
 }

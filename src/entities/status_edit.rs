@@ -117,6 +117,7 @@ mod tests {
         models::{
             media_attachment::MediaAttachment as AttachmentRow, user::Flag, user::User, user::mfa,
         },
+        test_fixtures::json_keys,
         util::time::parse_time,
     };
 
@@ -248,18 +249,6 @@ mod tests {
             media,
         }))
         .expect("the entity serializes")
-    }
-
-    /// The rendered object's keys, sorted, for exact key-set assertions.
-    fn json_keys(value: &Value) -> Vec<&str> {
-        let mut keys: Vec<&str> = value
-            .as_object()
-            .expect("the entity is an object")
-            .keys()
-            .map(String::as_str)
-            .collect();
-        keys.sort_unstable();
-        keys
     }
 
     #[test]

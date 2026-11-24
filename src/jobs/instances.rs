@@ -229,10 +229,10 @@ mod tests {
 
     use super::*;
     use crate::{
-        config::{Config, TEST_BASE_URL},
+        config::Config,
         http_client::HttpClient,
         jobs::{QUEUE_BACKGROUND, scheduler::periodic_jobs},
-        models::user::{NewUser, insert, local_ap_id},
+        test_fixtures::local_user,
     };
 
     /// `User-Agent` of the probe client the tests run.
@@ -452,17 +452,6 @@ mod tests {
         format!("http://{addr}")
     }
 
-    /// Inserts a local user named `nickname`: a row outside the ledger a
-    /// test checks the sweep leaves alone.
-    async fn user(pool: &PgPool, nickname: &str) {
-        let _created = insert(
-            pool,
-            &NewUser::local(nickname, &local_ap_id(TEST_BASE_URL, nickname)),
-        )
-        .await
-        .expect("the local fixture inserts");
-    }
-
     /// How many `users` rows exist.
     async fn user_count(pool: &PgPool) -> i64 {
         sqlx::query_scalar::<_, i64>("SELECT count(*) FROM users")
@@ -506,7 +495,7 @@ mod tests {
         marked_ago(&pool, "back.example", 2 * DAY).await;
         marked_ago(&pool, "quiet.example", YOUNGER).await;
         instance::touch(&pool, "clean.example").await.unwrap();
-        user(&pool, "alice").await;
+        let _alice = local_user(&pool, "alice").await;
         let quiet_before = row(&pool, "quiet.example").await;
         let clean_before = row(&pool, "clean.example").await;
         let users_before = user_count(&pool).await;
