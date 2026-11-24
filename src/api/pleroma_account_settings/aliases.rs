@@ -5,6 +5,7 @@ use axum::{Json, extract::State};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tracing::debug;
+use uuid::Uuid;
 
 use super::{looks_like_ap_id, success_body};
 use crate::{
@@ -15,6 +16,7 @@ use crate::{
     federation::fetch_actor::{get_or_fetch_by_acct, get_or_fetch_by_ap_id},
     models::user::{self, User, get_by_ap_id},
     oauth::scopes::{READ_ACCOUNTS, WRITE_ACCOUNTS},
+    services::federation_out,
     state::AppState,
 };
 
@@ -92,8 +94,24 @@ pub(super) async fn add_alias(
     if !aliases.contains(&target.ap_id) {
         aliases.push(target.ap_id.clone());
         user::set_also_known_as(&state.db, auth.0.id, &aliases).await?;
+        announce_aliases(&state, auth.0.id).await?;
     }
     Ok(success_body())
+}
+
+/// Publishes the account's profile `Update` after its alias list changed,
+/// so peers learn the new `alsoKnownAs` (a `Move` is refused unless the
+/// target lists the origin). The row is re-read so the document carries
+/// what was just stored.
+///
+/// # Errors
+///
+/// Any database failure arrives through `?` as [`AppError::Database`].
+async fn announce_aliases(state: &AppState, account_id: Uuid) -> AppResult<()> {
+    if let Some(updated) = user::get_by_id(&state.db, account_id).await? {
+        federation_out::after_profile_updated(state, &updated).await;
+    }
+    Ok(())
 }
 
 /// `DELETE /api/pleroma/aliases` — drop an alias. Both spellings a
@@ -121,6 +139,7 @@ pub(super) async fn delete_alias(
     let kept = dropped_aliases(&state, &params.alias, stored).await?;
     if kept.len() != stored.len() {
         user::set_also_known_as(&state.db, auth.0.id, &kept).await?;
+        announce_aliases(&state, auth.0.id).await?;
     }
     Ok(success_body())
 }

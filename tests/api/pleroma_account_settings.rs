@@ -29,4 +29,5 @@ mod departures;
 mod mastodon_move;
 mod move_follows;
 mod moves;
+mod refetch;
 mod support;
