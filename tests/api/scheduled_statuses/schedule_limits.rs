@@ -252,3 +252,48 @@ async fn a_pending_schedule_reserves_its_media_without_writing_the_rows() {
     );
     assert_eq!(post_count(&pool).await, 0, "and nothing posted");
 }
+
+/// An immediate create may not take an upload a pending schedule reserves:
+/// the same 422 `Media not found` as any other unclaimable id, nothing is
+/// posted, and the reservation is left standing for its own fire.
+#[tokio::test]
+async fn an_immediate_create_cannot_take_a_reserved_upload() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let (alice, token) = writer(&pool, "alice").await;
+    let app = common::test_app(pool.clone());
+    let reserved = upload(&pool, &alice).await;
+
+    let parked = schedule(
+        &app,
+        &token,
+        json!({
+            "status": "tomorrow's picture",
+            "media_ids": [reserved.id.to_string()],
+            "scheduled_at": in_minutes(60),
+        }),
+    )
+    .await;
+    common::assert_answer(&parked, StatusCode::OK, "the schedule reserving the upload");
+
+    let refused = schedule(
+        &app,
+        &token,
+        json!({"status": "now's picture", "media_ids": [reserved.id.to_string()]}),
+    )
+    .await;
+
+    common::assert_answer(
+        &refused,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "an immediate create of a reserved upload",
+    );
+    common::assert_error(&refused, MEDIA_NOT_FOUND, "the reservation's refusal");
+    assert_eq!(post_count(&pool).await, 0, "nothing was posted");
+    assert_eq!(scheduled_count(&pool).await, 1, "the reservation stands");
+    let row = media_attachment::get_by_id(&pool, reserved.id)
+        .await
+        .expect("the attachment reads")
+        .expect("the fixture upload is stored");
+    assert_eq!(row.status_id, None, "and the upload is still unclaimed");
+}

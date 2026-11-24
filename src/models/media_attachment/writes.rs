@@ -1,12 +1,12 @@
 //! Writing media attachments: claiming them for a status, updating their
 //! metadata and deleting them.
 
-use sqlx::{Executor, PgPool, Postgres};
+use sqlx::{AssertSqlSafe, Executor, PgPool, Postgres};
 use uuid::Uuid;
 
 #[cfg(doc)]
 use super::reads::get_own_unattached;
-use super::{MediaAttachment, MediaMetadata};
+use super::{MediaAttachment, MediaMetadata, claimable_predicate};
 use crate::error::AppResult;
 
 /// The 422 wording for a media id the endpoint refuses.
@@ -16,26 +16,43 @@ use crate::error::AppResult;
 /// which of the three a foreign id was.
 pub const MEDIA_NOT_FOUND: &str = "Media not found";
 
-/// The [`attach_to_status`] write: every id in `ids` whose row `user_id`
-/// owns and no status has claimed takes the position its id holds in the
-/// list. The ordinality is one-based, the column counts from zero, and an id
-/// submitted twice claims its row once — at its first position.
-const ATTACH_SQL: &str = "UPDATE media_attachments m
+/// The [`attach_to_status`] write, as SQL text.
+///
+/// Every id in `ids` that [`claimable_predicate`] lets `$3` claim takes the
+/// position its id holds in the list (`$4` is the schedule replaying
+/// itself, if any). The ordinality is one-based, the column counts from
+/// zero, and an id submitted twice claims its row once — at its first
+/// position.
+fn attach_sql() -> String {
+    format!(
+        "UPDATE media_attachments m
       SET status_id = $2, position = v.position, updated_at = now()
      FROM (
         SELECT id, (MIN(ord) - 1)::int AS position
           FROM UNNEST($1::uuid[]) WITH ORDINALITY AS t(id, ord)
          GROUP BY id
      ) v
-    WHERE m.id = v.id AND m.user_id = $3 AND m.status_id IS NULL";
+    WHERE m.id = v.id AND {}",
+        claimable_predicate("$3", "NULL", "$4")
+    )
+}
 
-/// Attaches every row `ids` names that user `user_id` owns and that no
-/// status has claimed yet to `status_id`, each one at the position its id
-/// holds in `ids`, reporting how many rows went.
+/// Attaches the rows `ids` names that `user_id` may claim to `status_id`,
+/// reporting how many went.
+///
+/// A row is claimable under the one rule [`claimable_ids`](super::claimable_ids)
+/// reads too: the user's own upload that no status holds and no pending
+/// schedule reserves. Each row takes the position its id holds in `ids`.
+///
+/// `own_schedule` is the pending schedule that is itself creating this
+/// status: its row still stands while it publishes, and the reservation it
+/// holds on its own uploads must not block it. Every other caller passes
+/// `None`.
 ///
 /// This is the ownership gate for posting media: rows belonging to
 /// another user (or with no user at all), rows already attached to any
-/// status and ids with no row are all left untouched, so a client can
+/// status, rows another pending schedule reserves and ids with no row are
+/// all left untouched, so a client can
 /// neither steal foreign media nor move media between statuses behind a
 /// status's back. Callers that must reject foreign ids outright compare
 /// the count against `ids.len()` — see [`crate::models::status::insert_conn`],
@@ -55,15 +72,18 @@ pub async fn attach_to_status<'e, E>(
     ids: &[Uuid],
     status_id: Uuid,
     user_id: Uuid,
+    own_schedule: Option<Uuid>,
 ) -> AppResult<u64>
 where
     E: Executor<'e, Database = Postgres>,
 {
     let ids = ids.to_vec();
-    let updated = sqlx::query(ATTACH_SQL)
+    // The statement is assembled from constants only; every value is bound.
+    let updated = sqlx::query(AssertSqlSafe(attach_sql()))
         .bind(&ids)
         .bind(status_id)
         .bind(user_id)
+        .bind(own_schedule)
         .execute(executor)
         .await?;
     Ok(updated.rows_affected())
@@ -161,7 +181,68 @@ mod tests {
         test_support::{BASE, create_status, create_user, fetch, new_upload},
     };
     use super::*;
-    use crate::{error::AppError, util::id::new_id};
+    use crate::{
+        error::AppError,
+        models::scheduled_status::{self, NewScheduledStatus, ScheduledStatus},
+        util::id::new_id,
+    };
+
+    /// An upload a pending schedule reserves is out of every other create's
+    /// reach, and the schedule itself — named as `own_schedule` while it
+    /// publishes — still claims it.
+    #[tokio::test]
+    async fn attach_to_status_respects_schedule_reservations() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = create_user(&pool, "alice").await;
+        let reserved = insert(&pool, &new_upload(alice.id)).await.unwrap();
+        let free = insert(&pool, &new_upload(alice.id)).await.unwrap();
+        let schedule: ScheduledStatus = scheduled_status::insert(
+            &pool,
+            &NewScheduledStatus {
+                user_id: alice.id,
+                scheduled_at: chrono::Utc::now() + chrono::TimeDelta::hours(1),
+                params: serde_json::json!({
+                    "status": "later",
+                    "media_ids": [reserved.id.to_string()],
+                }),
+            },
+        )
+        .await
+        .unwrap();
+        let posted = create_status(&pool, &alice).await;
+
+        let others = attach_to_status(&pool, &[reserved.id, free.id], posted.id, alice.id, None)
+            .await
+            .unwrap();
+        assert_eq!(others, 1, "only the unreserved upload went");
+        assert!(
+            fetch(&pool, reserved.id).await.status_id.is_none(),
+            "the reserved upload stayed unclaimed"
+        );
+
+        let stranger = new_id();
+        let wrong = attach_to_status(&pool, &[reserved.id], posted.id, alice.id, Some(stranger))
+            .await
+            .unwrap();
+        assert_eq!(wrong, 0, "another schedule's id is no key to the row");
+
+        let own = attach_to_status(
+            &pool,
+            &[reserved.id],
+            posted.id,
+            alice.id,
+            Some(schedule.id),
+        )
+        .await
+        .unwrap();
+        assert_eq!(own, 1, "the reserving schedule claims its own upload");
+        assert_eq!(
+            fetch(&pool, reserved.id).await.status_id,
+            Some(posted.id),
+            "and the row now names the status"
+        );
+    }
 
     #[tokio::test]
     async fn attach_to_status_only_attaches_own_unattached_media() {
@@ -201,7 +282,7 @@ mod tests {
             mine_remote.id,
             new_id(),
         ];
-        let attached = attach_to_status(&pool, &ids, posted.id, alice.id)
+        let attached = attach_to_status(&pool, &ids, posted.id, alice.id, None)
             .await
             .unwrap();
         assert_eq!(attached, 2, "only alice's two unattached rows went");
@@ -230,11 +311,11 @@ mod tests {
             "ownerless (remote) media cannot be attached"
         );
 
-        let again = attach_to_status(&pool, &[mine1.id, mine2.id], posted.id, alice.id)
+        let again = attach_to_status(&pool, &[mine1.id, mine2.id], posted.id, alice.id, None)
             .await
             .unwrap();
         assert_eq!(again, 0, "a double attach is ignored");
-        let empty = attach_to_status(&pool, &[], posted.id, alice.id)
+        let empty = attach_to_status(&pool, &[], posted.id, alice.id, None)
             .await
             .unwrap();
         assert_eq!(empty, 0, "no ids attach nothing");
@@ -253,10 +334,15 @@ mod tests {
         let third = insert(&pool, &new_upload(alice.id)).await.unwrap();
         let posted = create_status(&pool, &alice).await;
 
-        let attached =
-            attach_to_status(&pool, &[third.id, first.id, third.id], posted.id, alice.id)
-                .await
-                .unwrap();
+        let attached = attach_to_status(
+            &pool,
+            &[third.id, first.id, third.id],
+            posted.id,
+            alice.id,
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!(attached, 2, "the repeated id claims its row once");
         assert_eq!(fetch(&pool, third.id).await.position, 0);
         assert_eq!(fetch(&pool, first.id).await.position, 1);
@@ -309,7 +395,7 @@ mod tests {
         );
 
         let unattached = insert(&pool, &new_upload(alice.id)).await.unwrap();
-        let attach_err = attach_to_status(&pool, &[unattached.id], new_id(), alice.id)
+        let attach_err = attach_to_status(&pool, &[unattached.id], new_id(), alice.id, None)
             .await
             .expect_err("attaching to an unknown status is not possible");
         let AppError::Database(SqlxError::Database(attach_db_err)) = attach_err else {
