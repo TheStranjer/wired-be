@@ -7,7 +7,7 @@ use axum::{
     http::HeaderMap,
 };
 
-use super::common_filters;
+use super::{common_filters, ensure_open};
 use crate::{
     api::helpers::{QueryPairs, normalize_tag, push_tag, timeline_response},
     auth::MaybeAuthUser,
@@ -25,7 +25,9 @@ use crate::{
 /// (Pleroma's `read:statuses` scopes plug with
 /// `fallback: :proceed_unauthenticated`): a presented user token must grant
 /// the scope, an app-only token and no token at all both read anonymously,
-/// and an invalid token is the extractor's 401.
+/// and an invalid token is the extractor's 401. An anonymous read is then
+/// subject to the same `RESTRICT_UNAUTHENTICATED` gate as the public
+/// timeline ([`ensure_open`], keyed on `local`).
 ///
 /// The `Link` header's path is the request's own [`OriginalUri`], not the
 /// `Uri` the router hands a nested handler: axum strips the `/api/v1`
@@ -34,7 +36,8 @@ use crate::{
 /// # Errors
 ///
 /// [`AppError::Forbidden`] from [`MaybeAuthUser::require_user_scope`] when
-/// the presented user token lacks `read:statuses`; [`AppError::NotFound`]
+/// the presented user token lacks `read:statuses`, and from [`ensure_open`]
+/// when the instance restricts this unauthenticated read; [`AppError::NotFound`]
 /// for a path tag that normalizes to nothing; [`AppError::BadRequest`] from
 /// [`PageParams`] for a malformed cursor. Any database failure arrives
 /// through `?` as [`AppError::Database`], and [`set_link_header`](crate::pagination::set_link_header) reports a
@@ -47,8 +50,10 @@ pub(super) async fn tag_timeline(
     OriginalUri(uri): OriginalUri,
 ) -> AppResult<(HeaderMap, Json<Vec<StatusEntity>>)> {
     auth.require_user_scope(READ_STATUSES)?;
+    let params = TagParams::parse(uri.query());
+    ensure_open(&state.config, auth.0.is_some(), params.filters.local_only)?;
     let tag = normalize_tag(&raw_tag).ok_or(AppError::NotFound)?;
-    let query = TagParams::parse(uri.query()).into_timeline(tag, auth.0, page);
+    let query = params.into_timeline(tag, auth.0, page);
     timeline_response(&state, &query, &uri).await
 }
 
