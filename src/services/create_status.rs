@@ -106,6 +106,10 @@
 //! step resolves it to the live, viewable original before the write, the
 //! row stores that original's id as `quote_of_id`, and the counter bump
 //! comes from [`status::insert`](crate::models::status::insert) itself.
+//! The stored and federated `content` of a quote also ends with the
+//! `<p class="quote-inline">RE: <a …>…</a></p>` fallback of
+//! [`quote_fallback`], for servers that cannot show the quote; `raw_text`
+//! never carries it, and an edit renders it again once.
 //!
 //! [`Status`]: crate::entities::status::Status
 //! [`Poll`]: crate::entities::poll::Poll
@@ -140,6 +144,7 @@ pub mod edit;
 pub mod idempotency;
 pub mod params;
 pub mod preview;
+pub mod quote_fallback;
 pub mod reply;
 pub mod reply_thread;
 #[cfg(test)]

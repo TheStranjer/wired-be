@@ -18,6 +18,7 @@ use super::{
     CreateStatusParams, RenderedFields,
     create::quote_target,
     params::CheckedPoll,
+    quote_fallback::fallback_paragraph,
     reply::{
         apply_conversation_reply, inherited_mentions, inherited_visibility, merged_mentions,
         parent_mentioned_ids, reply_parent, reply_participation,
@@ -233,10 +234,22 @@ pub(crate) async fn prepared_new_status(
     )?;
     let parent = reply_parent(state, user, params).await?;
     let participation = reply_participation(state, user, params).await?;
-    let quote_of_id = quote_target(state, user, params.quote_id.as_deref()).await?;
+    let quoted = quote_target(state, user, params.quote_id.as_deref()).await?;
     let (entities, found) =
         render_status_fields_with_mentions(state, checked.text, checked.content_type).await?;
-    let mut new = new_status(user, app, &checked, &entities, quote_of_id);
+    let mut new = new_status(
+        user,
+        app,
+        &checked,
+        &entities,
+        quoted.as_ref().map(|original| original.id),
+    );
+    let fallback = quoted
+        .as_ref()
+        .and_then(|original| fallback_paragraph(&new.raw_text, original));
+    if let Some(paragraph) = fallback {
+        new.content.push_str(&paragraph);
+    }
     if let Some(parent) = parent {
         let inherited = inherited_mentions(
             parent.user_id,
