@@ -24,8 +24,7 @@ use serde_json::Value;
 use tracing::debug;
 
 use crate::{
-    error::AppError,
-    jobs::{AttemptInfo, HandlerFuture, JobError, scheduler::PeriodicJob},
+    jobs::{AttemptInfo, HandlerFuture, retry, scheduler::PeriodicJob},
     models::{poll, status},
     services::{federation_out, notify},
     state::AppState,
@@ -57,12 +56,10 @@ pub const fn end_notify_job() -> PeriodicJob {
     }
 }
 
-/// Lifts a database failure into the queue's retry arm; the sweep's work is
+/// The job name in the retry text of a failed pass; the sweep's work is
 /// guarded by the poll's `ended_notified` flag and the tellings by the
 /// service's own deduplication, so another pass costs nothing but the wait.
-fn retry(err: &AppError) -> JobError {
-    JobError::Retry(format!("poll end-notify pass failed: {err}"))
-}
+const PASS_JOB: &str = "poll end-notify pass";
 
 /// The [`JobRegistry`](super::JobRegistry) handler for [`KIND_END_NOTIFY`]:
 /// tell every poll that closed inside [`NOTIFY_WINDOW_MINUTES`] minutes and
@@ -81,16 +78,16 @@ pub fn handle_end_notify(state: AppState, _attempt: AttemptInfo, _args: Value) -
     Box::pin(async move {
         let ended = poll::fetch_ended_unnotified(&state.db, NOTIFY_WINDOW_MINUTES)
             .await
-            .map_err(|err| retry(&err))?;
+            .map_err(|err| retry(PASS_JOB, &err))?;
         for row in &ended {
             notify::on_poll_ended(&state, row)
                 .await
-                .map_err(|err| retry(&err))?;
+                .map_err(|err| retry(PASS_JOB, &err))?;
             // Remote copies learn the poll closed: the debounced `Update`
             // of a local question (a no-op for a mirror or a gone row).
             let posted = status::get_by_id(&state.db, row.status_id)
                 .await
-                .map_err(|err| retry(&err))?;
+                .map_err(|err| retry(PASS_JOB, &err))?;
             if let Some(posted) = posted {
                 federation_out::after_local_poll_changed(&state, &posted).await;
             }
@@ -99,7 +96,7 @@ pub fn handle_end_notify(state: AppState, _attempt: AttemptInfo, _args: Value) -
             // harmless; the count itself is the flag write's concern.
             let _retired = poll::mark_ended_notified(&state.db, row.id)
                 .await
-                .map_err(|err| retry(&err))?;
+                .map_err(|err| retry(PASS_JOB, &err))?;
         }
         let count = ended.len();
         if count > 0 {
@@ -119,7 +116,7 @@ mod tests {
     use super::*;
     use crate::{
         config::{Config, TEST_BASE_URL},
-        jobs::QUEUE_BACKGROUND,
+        jobs::{JobError, QUEUE_BACKGROUND},
         models::{
             notification::TYPE_POLL,
             poll::PollParams,

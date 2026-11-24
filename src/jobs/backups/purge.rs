@@ -8,10 +8,9 @@ use chrono::Utc;
 use serde_json::Value;
 use tracing::{debug, info, warn};
 
-use super::run::retry;
 use crate::{
     error::AppError,
-    jobs::{AttemptInfo, HandlerFuture},
+    jobs::{AttemptInfo, HandlerFuture, retry},
     models::backup,
     state::AppState,
 };
@@ -42,7 +41,7 @@ pub fn handle_purge(state: AppState, _attempt: AttemptInfo, _args: Value) -> Han
         }
         let rows = backup::expired(&state.db, Utc::now(), state.config.backup_validity_days)
             .await
-            .map_err(|err| retry("purge read", &err))?;
+            .map_err(|err| retry("backup purge read", &err))?;
         let mut purged = 0_usize;
         for row in rows {
             if let Some(key) = row.storage_key.as_deref()
@@ -52,7 +51,7 @@ pub fn handle_purge(state: AppState, _attempt: AttemptInfo, _args: Value) -> Han
             }
             let _swept = backup::delete(&state.db, row.id)
                 .await
-                .map_err(|err| retry("row delete", &err))?;
+                .map_err(|err| retry("backup row delete", &err))?;
             purged += 1;
         }
         info!(purged, "expired account backups purged");

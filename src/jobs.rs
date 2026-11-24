@@ -39,6 +39,7 @@ mod worker;
 
 use std::{error::Error, fmt, future::Future, pin::Pin, time::Duration};
 
+use serde::de::DeserializeOwned;
 use serde_json::Value;
 
 pub use self::{
@@ -97,6 +98,21 @@ impl fmt::Display for JobError {
 
 impl Error for JobError {}
 
+/// Reads a claimed job's `args` payload as a `T`; arguments this shape
+/// cannot deserialize are permanent — [`JobError::Discard`], never retried.
+/// `job` names the job in the discard text
+/// (`"<job> job arguments are unusable: <cause>"`).
+pub(crate) fn parse_args<T: DeserializeOwned>(args: &Value, job: &str) -> Result<T, JobError> {
+    serde_json::from_value(args.clone())
+        .map_err(|err| JobError::Discard(format!("{job} job arguments are unusable: {err}")))
+}
+
+/// Lifts a transient failure into the queue's retry arm, naming the `job`
+/// (or the step of it) that hit it: `"<job> failed: <err>"`.
+pub(crate) fn retry(job: &str, err: &dyn fmt::Display) -> JobError {
+    JobError::Retry(format!("{job} failed: {err}"))
+}
+
 /// What a handler is told about the claim it is running, beside the job's
 /// arguments.
 ///
@@ -154,6 +170,52 @@ mod tests {
             DEFAULT_JOB_QUEUES,
             constants.join(","),
             "the documented default is exactly the six queue constants"
+        );
+    }
+
+    /// A one-field arguments shape for the helper tests.
+    #[derive(Debug, serde::Deserialize, PartialEq, Eq)]
+    struct SampleArgs {
+        /// The only field.
+        id: u32,
+    }
+
+    #[test]
+    fn parse_args_reads_a_valid_object() {
+        let parsed = parse_args::<SampleArgs>(&serde_json::json!({ "id": 7 }), "sample")
+            .expect("a well-formed object parses");
+        assert_eq!(parsed, SampleArgs { id: 7 }, "the struct comes back whole");
+    }
+
+    #[test]
+    fn parse_args_discards_a_missing_field_and_names_the_job() {
+        let err = parse_args::<SampleArgs>(&serde_json::json!({}), "sample")
+            .expect_err("a payload without the field is unusable");
+        let JobError::Discard(detail) = &err else {
+            panic!("unusable arguments must discard, not {err:?}");
+        };
+        assert!(
+            detail.starts_with("sample job arguments are unusable: ") && detail.contains("id"),
+            "the discard names the job and the missing field: {detail}"
+        );
+    }
+
+    #[test]
+    fn parse_args_discards_a_payload_of_the_wrong_type() {
+        let err = parse_args::<SampleArgs>(&serde_json::json!("nope"), "sample")
+            .expect_err("a string is not an arguments object");
+        assert!(
+            matches!(err, JobError::Discard(_)),
+            "a wrong-typed payload is permanent too"
+        );
+    }
+
+    #[test]
+    fn retry_names_the_job_and_the_cause() {
+        assert_eq!(
+            retry("sample pass", &"disk full"),
+            JobError::Retry("sample pass failed: disk full".to_owned()),
+            "the retry text is `<job> failed: <err>`"
         );
     }
 

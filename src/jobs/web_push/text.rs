@@ -3,9 +3,9 @@
 
 use sqlx::PgPool;
 
-use super::retry;
+use super::PASS_JOB;
 use crate::{
-    jobs::JobError,
+    jobs::{JobError, retry},
     models::{
         notification::Notification,
         status,
@@ -39,7 +39,7 @@ pub(super) async fn body_text(
     };
     let Some(row) = status::get_by_id(pool, status_id)
         .await
-        .map_err(|err| retry(&err))?
+        .map_err(|err| retry(PASS_JOB, &err))?
     else {
         return Ok(String::new());
     };

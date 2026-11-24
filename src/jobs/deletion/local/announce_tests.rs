@@ -51,7 +51,7 @@ async fn a_failed_announcement_retries_and_keeps_every_follow_row() {
     let err = crate::services::federation_out::after_account_deleted(&broken, &alice)
         .await
         .expect_err("a closed pool cannot read the recipients");
-    match retry(&err) {
+    match retry(PASS_JOB, &err) {
         JobError::Retry(detail) => assert!(
             detail.starts_with("account delete pass failed"),
             "the retry states what failed: {detail}"

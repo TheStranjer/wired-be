@@ -35,7 +35,10 @@ use uuid::Uuid;
 
 use crate::{
     error::AppError,
-    jobs::{AttemptInfo, HandlerFuture, JobError, QUEUE_SCHEDULED, scheduler::PeriodicJob},
+    jobs::{
+        AttemptInfo, HandlerFuture, JobError, QUEUE_SCHEDULED, parse_args, retry,
+        scheduler::PeriodicJob,
+    },
     models::{
         job::{NewJob, cancel_pending, enqueue},
         scheduled_status::{self, ScheduledStatus},
@@ -171,24 +174,12 @@ pub async fn reschedule(state: &AppState, row: &ScheduledStatus) {
     schedule(state, row).await;
 }
 
-/// Reads [`PublishArgs`] out of a claimed job's payload; arguments this
-/// shape cannot deserialize are permanent — the job is discarded, never
-/// retried.
-fn parse_args(args: &Value) -> Result<Uuid, JobError> {
-    serde_json::from_value::<PublishArgs>(args.clone())
-        .map(|parsed| parsed.scheduled_id)
-        .map_err(|err| {
-            JobError::Discard(format!(
-                "scheduled status publish job arguments are unusable: {err}"
-            ))
-        })
-}
+/// The job name in the discard text of unusable [`PublishArgs`].
+const PUBLISH_JOB: &str = "scheduled status publish";
 
-/// Lifts a database failure into the queue's retry arm; the row survives
-/// every retryable failure, so another pass costs nothing but the wait.
-fn retry(err: &AppError) -> JobError {
-    JobError::Retry(format!("scheduled status publication failed: {err}"))
-}
+/// The job name in the retry text of a failed pass; the row survives every
+/// retryable failure, so another pass costs nothing but the wait.
+const PASS_JOB: &str = "scheduled status publication";
 
 /// The [`JobRegistry`](super::JobRegistry) handler for [`KIND_PUBLISH`]:
 /// publish the scheduled row the arguments name, if it is still stored.
@@ -198,14 +189,14 @@ fn retry(err: &AppError) -> JobError {
 /// [`JobError::Discard`]; a database failure is a [`JobError::Retry`].
 pub fn handle_publish(state: AppState, _attempt: AttemptInfo, args: Value) -> HandlerFuture {
     Box::pin(async move {
-        let scheduled_id = parse_args(&args)?;
+        let scheduled_id = parse_args::<PublishArgs>(&args, PUBLISH_JOB)?.scheduled_id;
         match scheduled_status::get_by_id(&state.db, scheduled_id).await {
             Ok(Some(row)) => publish_one(&state, &row).await,
             Ok(None) => {
                 debug!(scheduled = %scheduled_id, "scheduled status is already gone");
                 Ok(())
             }
-            Err(err) => Err(retry(&err)),
+            Err(err) => Err(retry(PASS_JOB, &err)),
         }
     })
 }
@@ -242,7 +233,7 @@ async fn publish_one(state: &AppState, row: &ScheduledStatus) -> Result<(), JobE
     let author = match user::get_by_id(&state.db, row.user_id).await {
         Ok(Some(author)) => author,
         Ok(None) => return drop_row(state, row, "the scheduling account is gone").await,
-        Err(err) => return Err(retry(&err)),
+        Err(err) => return Err(retry(PASS_JOB, &err)),
     };
     if author.deleted_at.is_some()
         || matches!(
@@ -280,7 +271,7 @@ async fn publish_params(
     match create_status(state, author, None, params).await {
         Ok(created) => {
             if let Err(err) = scheduled_status::delete(&state.db, row.id).await {
-                return Err(retry(&err));
+                return Err(retry(PASS_JOB, &err));
             }
             debug!(scheduled = %row.id, status = %created.id, "scheduled status published");
             Ok(())
@@ -291,7 +282,7 @@ async fn publish_params(
             | AppError::Forbidden(_)
             | AppError::Gone),
         ) => drop_row(state, row, &refusal.to_string()).await,
-        Err(err) => Err(retry(&err)),
+        Err(err) => Err(retry(PASS_JOB, &err)),
     }
 }
 
@@ -310,7 +301,7 @@ async fn drop_row(state: &AppState, row: &ScheduledStatus, reason: &str) -> Resu
             warn!(scheduled = %row.id, deleted, "scheduled status dropped unpublished: {reason}");
             Ok(())
         }
-        Err(err) => Err(retry(&err)),
+        Err(err) => Err(retry(PASS_JOB, &err)),
     }
 }
 
@@ -331,7 +322,7 @@ pub fn handle_sweep(state: AppState, _attempt: AttemptInfo, _args: Value) -> Han
             let batch = match scheduled_status::fetch_due(&state.db, Utc::now(), SWEEP_BATCH).await
             {
                 Ok(rows) => rows,
-                Err(err) => return Err(retry(&err)),
+                Err(err) => return Err(retry(PASS_JOB, &err)),
             };
             let count = i64::try_from(batch.len()).unwrap_or(SWEEP_BATCH);
             publish_batch(&state, &batch).await?;
