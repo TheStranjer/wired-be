@@ -67,11 +67,9 @@ async fn five_wrong_codes_burn_the_api_challenge() {
     )
     .await;
     assert_invalid_code(&late, "the right code after the cap");
-    assert!(
-        oauth_token::list_for_user(&pool, fix.user.id)
-            .await
-            .expect("the lookup reaches the database")
-            .is_empty(),
+    assert_eq!(
+        token_count(&pool, fix.user.id).await,
+        0,
         "and no token was issued"
     );
 }

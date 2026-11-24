@@ -1,7 +1,8 @@
-//! Issuing and reading access tokens: [`create_token`] mints a pair,
-//! [`get_valid_token`] resolves a presented credential to its live owner,
-//! the by-id read returns a row as stored, and [`consume_refresh_token`]
-//! redeems a refresh token exactly once.
+//! Issuing and reading access tokens: [`create_token`] mints a pair, the
+//! by-id read returns a row as stored, and [`consume_refresh_token`]
+//! redeems a refresh token exactly once. Resolving a presented credential
+//! is [`get_with_app`](super::get_with_app) plus the validity rule in
+//! `crate::auth`.
 
 use std::time::Duration;
 
@@ -11,7 +12,6 @@ use uuid::Uuid;
 use super::{DEFAULT_TOKEN_TTL, NewToken, OauthToken};
 use crate::{
     error::AppResult,
-    models::user::{self, User},
     util::{
         id::new_id,
         token::{CREDENTIAL_BYTES, random_token},
@@ -59,63 +59,6 @@ where
         .fetch_one(executor)
         .await?;
     Ok(token)
-}
-
-/// Join row for [`get_valid_token`]: every [`OauthToken`] column plus
-/// the owning user's `is_active` flag, which a `LEFT JOIN` leaves `NULL`
-/// for user-unbound rows.
-#[derive(sqlx::FromRow)]
-struct ValidTokenRow {
-    /// The token row itself, flattened over the `t.*` columns.
-    #[sqlx(flatten)]
-    token: OauthToken,
-    /// `users.is_active` of the joined user; `None` for app-only tokens.
-    user_is_active: Option<bool>,
-}
-
-/// Looks up the access token `token` and, when it is still valid,
-/// returns it with its user (`None` for an app-only token).
-///
-/// A token is valid when its row exists, `valid_until` lies in the
-/// future, and — for user-bound tokens — the joined user is still
-/// active. Anything else (unknown token, expired, deactivated user) is
-/// `None`; a suspended account's bearer tokens stop working the moment
-/// the flag flips.
-///
-/// # Errors
-///
-/// Any database failure (connection, encoding) arrives as
-/// [`AppError::Database`](crate::error::AppError).
-pub async fn get_valid_token(
-    pool: &PgPool,
-    token: &str,
-) -> AppResult<Option<(OauthToken, Option<User>)>> {
-    let row = sqlx::query_as::<_, ValidTokenRow>(
-        "SELECT t.*, u.is_active AS user_is_active
-           FROM oauth_tokens t
-           LEFT JOIN users u ON u.id = t.user_id
-          WHERE t.token = $1 AND t.valid_until > now()",
-    )
-    .bind(token)
-    .fetch_optional(pool)
-    .await?;
-    let Some(ValidTokenRow {
-        token: found,
-        user_is_active,
-    }) = row
-    else {
-        return Ok(None);
-    };
-    // An app-only token (NULL user_id) answers NULL for the joined flag
-    // and passes; a user-bound one needs a live, active user.
-    if found.user_id.is_some() && !user_is_active.unwrap_or_default() {
-        return Ok(None);
-    }
-    let user = match found.user_id {
-        Some(user_id) => user::get_by_id(pool, user_id).await?,
-        None => None,
-    };
-    Ok(Some((found, user)))
 }
 
 /// The `SELECT` behind [`get_by_id`]: the token row verbatim by primary
@@ -193,11 +136,11 @@ mod tests {
     use chrono::Utc;
 
     use super::super::test_support::*;
-    use super::super::{REFRESH_GRACE, list_for_user};
+    use super::super::{REFRESH_GRACE, get_with_app};
     use super::*;
 
     #[tokio::test]
-    async fn create_token_round_trips_and_validates() {
+    async fn create_token_round_trips() {
         let db = crate::test_db::test_db().await.expect("test database slot");
         let pool = db.pool().clone();
         let alice = insert_user(&pool, "alice").await;
@@ -244,20 +187,14 @@ mod tests {
             "the database stamps both timestamps"
         );
 
-        let (found, user) = get_valid_token(&pool, &token.token)
+        let (found, found_app) = get_with_app(&pool, &token.token)
             .await
             .unwrap()
-            .expect("a fresh token is valid");
+            .expect("a fresh token is found by its text");
         assert_eq!(found.id, token.id, "the token is found by its text");
         assert_eq!(found.token, token.token, "the secret round trips");
-        assert_eq!(
-            user.map(|loaded| loaded.id),
-            Some(alice.id),
-            "the owning user is loaded with it"
-        );
-        let listed = list_for_user(&pool, alice.id).await.unwrap();
-        assert_eq!(listed.len(), 1, "the user's list holds the token");
-        assert_eq!(listed.first().map(|t| t.id), Some(token.id), "same row");
+        assert_eq!(found.user_id, Some(alice.id), "stored with its owner");
+        assert_eq!(found_app.id, app.id, "and its issuing app");
     }
 
     #[tokio::test]
@@ -308,39 +245,30 @@ mod tests {
             .expect("an expired row is still the row behind the id");
         assert_eq!(stale.token, created.token, "no validity filter applies");
         assert!(
-            get_valid_token(&pool, &created.token)
-                .await
-                .unwrap()
-                .is_none(),
-            "the validity read, by contrast, refuses it"
-        );
-        assert!(
             get_by_id(&pool, new_id()).await.unwrap().is_none(),
             "an unknown id names no token"
         );
     }
 
     #[tokio::test]
-    async fn app_only_tokens_validate_without_a_user() {
+    async fn app_only_tokens_store_no_user() {
         let db = crate::test_db::test_db().await.expect("test database slot");
         let pool = db.pool().clone();
         let app = insert_app(&pool, "Machine").await;
         let token = create_token(&pool, &new_token(None, app.id)).await.unwrap();
-        let (found, user) = get_valid_token(&pool, &token.token)
+        assert!(
+            token.user_id.is_none(),
+            "a client_credentials token names no user"
+        );
+        let (found, _app) = get_with_app(&pool, &token.token)
             .await
             .unwrap()
-            .expect("a client_credentials token is valid on its own");
+            .expect("an app-only token is found on its own");
         assert_eq!(found.id, token.id, "the row comes back");
-        assert!(user.is_none(), "there is no user to load");
-        let nobody = new_id();
-        assert!(
-            list_for_user(&pool, nobody).await.unwrap().is_empty(),
-            "an app-only token belongs to no user's list"
-        );
     }
 
     #[tokio::test]
-    async fn expired_tokens_are_not_returned() {
+    async fn a_lapsed_pair_is_redeemable_within_the_grace_window() {
         let db = crate::test_db::test_db().await.expect("test database slot");
         let pool = db.pool().clone();
         let alice = insert_user(&pool, "carol").await;
@@ -349,13 +277,6 @@ mod tests {
             .await
             .unwrap();
         expire_token(&pool, token.id).await;
-        assert!(
-            get_valid_token(&pool, &token.token)
-                .await
-                .unwrap()
-                .is_none(),
-            "a token past valid_until is refused"
-        );
         let redeemed = consume_refresh_token(&pool, &token.refresh_token, app.id, REFRESH_GRACE)
             .await
             .unwrap()
@@ -505,32 +426,6 @@ mod tests {
             rows_with_refresh_token(&pool, &token.refresh_token).await,
             1,
             "a rollback puts the pair back"
-        );
-    }
-
-    #[tokio::test]
-    async fn deactivated_users_tokens_are_not_returned() {
-        let db = crate::test_db::test_db().await.expect("test database slot");
-        let pool = db.pool().clone();
-        let dave = insert_user(&pool, "dave").await;
-        let app = insert_app(&pool, "Suspension").await;
-        let token = create_token(&pool, &new_token(Some(dave.id), app.id))
-            .await
-            .unwrap();
-        assert!(
-            get_valid_token(&pool, &token.token)
-                .await
-                .unwrap()
-                .is_some(),
-            "freshly issued, the token works"
-        );
-        deactivate_user(&pool, dave.id).await;
-        assert!(
-            get_valid_token(&pool, &token.token)
-                .await
-                .unwrap()
-                .is_none(),
-            "a suspended user's bearer token stops working"
         );
     }
 }
