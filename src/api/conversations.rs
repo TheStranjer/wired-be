@@ -78,7 +78,7 @@ use uuid::Uuid;
 
 use crate::{
     api::{
-        helpers::{capped_distinct_ids, distinct, distinct_ids},
+        helpers::{capped_distinct_ids, distinct, distinct_ids, keyed_json, render_visible},
         notifications_v2::{StringList, names_of},
     },
     auth::AuthUser,
@@ -92,7 +92,6 @@ use crate::{
     extract::{ApiBody, ApiParams},
     models::{
         conversation::{self, Participation},
-        status::{self, Status as StatusRow},
         status_visibility,
         user::{self, User},
     },
@@ -309,12 +308,7 @@ async fn list_statuses(
     auth.require(READ_STATUSES)?;
     let row = owned_participation(&state, auth.0.id, &id).await?;
     let fetched = conversation::page_direct_statuses(&state.db, row.conversation_id, page).await?;
-    let mut visible: Vec<StatusRow> = Vec::new();
-    for status in &fetched {
-        if status_visibility::can_view(&state.db, status, Some(&auth.0)).await? {
-            visible.push(status.clone());
-        }
-    }
+    let visible = status_visibility::filter_visible(&state.db, fetched, Some(&auth.0)).await?;
     debug!(
         conversation = %row.id,
         count = visible.len(),
@@ -577,25 +571,7 @@ async fn visible_statuses(
     if ids.is_empty() {
         return Ok(HashMap::new());
     }
-    let rows = status::get_many(&state.db, ids).await?;
-    let mut visible: Vec<StatusRow> = Vec::new();
-    for row in rows {
-        if status_visibility::can_view(&state.db, &row, viewer).await? {
-            visible.push(row);
-        }
-    }
-    let rendered = render_statuses(state, ViewerMode::User(viewer), &visible).await?;
-    let mut statuses = HashMap::new();
-    for entity in rendered {
-        let Some(id) = parse_id(&entity.id) else {
-            continue;
-        };
-        let value = serde_json::to_value(entity).map_err(|err| {
-            AppError::Internal(format!("status entity failed to serialize: {err}"))
-        })?;
-        let _first = statuses.insert(id, value);
-    }
-    Ok(statuses)
+    keyed_json(render_visible(state, viewer, ids).await?)
 }
 
 #[cfg(test)]

@@ -45,6 +45,10 @@ use crate::{
     util::id::parse_id,
 };
 
+mod visible;
+
+pub use visible::{keyed_json, render_visible};
+
 /// The `RESTRICT_UNAUTHENTICATED` area that closes anonymous reads of a
 /// local status.
 const ACTIVITIES_LOCAL: &str = "activities_local";
