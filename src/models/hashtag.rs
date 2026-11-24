@@ -10,11 +10,11 @@
 //!
 //! Unlike [`crate::models::mention`] this edge carries no position: the
 //! Status entity's `tags` array orders by name, so
-//! [`for_statuses`] sorts on the column and [`link_to_status`] only has to
-//! keep pairs unique. [`upsert_many`] is the idempotent, case-insensitive
-//! write: re-using a tag points at the row that already holds it, and names
-//! that are blank or, once normalized, longer than the 100-character
-//! extraction bound are ignored rather than stored.
+//! [`for_statuses`] sorts on the column and [`link_names_conn`] only has to
+//! keep pairs unique. The tag upsert (`tags::upsert_many`) is the idempotent,
+//! case-insensitive write: re-using a tag points at the row that already
+//! holds it, and names that are blank or, once normalized, longer than the
+//! 100-character extraction bound are ignored rather than stored.
 //!
 //! Nothing here extracts tags from text: [`crate::models::status::insert`]
 //! upserts and links what its caller computed —
@@ -56,17 +56,15 @@ mod usage;
 #[cfg(test)]
 mod test_support;
 
-pub use links::{
-    for_statuses, link_names_conn, link_to_status, replace_for_status, replace_names_conn,
-};
+pub use links::{for_statuses, link_names_conn, replace_names_conn};
 pub use search::search_prefix;
-pub use tags::{find_or_create, get_by_name, upsert_many};
+pub use tags::{find_or_create, get_by_name};
 pub use usage::day_counts;
 
 /// One row of `hashtags`: one tag name, shared by every status that uses it.
 #[derive(Clone, Debug, PartialEq, Eq, sqlx::FromRow)]
 pub struct Hashtag {
-    /// `UUIDv7` primary key, minted by [`upsert_many`] (decision 4).
+    /// `UUIDv7` primary key, minted by the tag upsert (decision 4).
     pub id: Uuid,
     /// The tag name as stored: lowercase, without the leading `#`.
     pub name: String,
