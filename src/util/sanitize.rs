@@ -28,7 +28,7 @@ use ammonia::Builder;
 
 /// The tags [`sanitize_html`] keeps; every other element is replaced by its
 /// children.
-const ALLOWED_TAGS: [&str; 23] = [
+const ALLOWED_TAGS: [&str; 26] = [
     "p",
     "br",
     "a",
@@ -52,6 +52,9 @@ const ALLOWED_TAGS: [&str; 23] = [
     "h4",
     "h5",
     "img",
+    "ruby",
+    "rt",
+    "rp",
 ];
 
 /// Attributes kept on `a`. `rel` is deliberately absent: it is not user-set,
@@ -420,6 +423,28 @@ mod tests {
             "the block allowlist round-trips"
         );
         assert_eq!(sanitize_html("<h6>x</h6>"), "x", "h6 is not on the list");
+    }
+
+    #[test]
+    fn keeps_ruby_annotations_without_attributes() {
+        let misskey = "<ruby>漢字<rp>(</rp><rt>かんじ</rt><rp>)</rp></ruby>";
+        assert_eq!(
+            sanitize_html(misskey),
+            misskey,
+            "the Misskey ruby fragment survives"
+        );
+        assert_eq!(
+            sanitize_html(
+                r#"<ruby class="x" style="color:red" onclick="a()">漢字<rp>(</rp><rt lang="ja">かんじ</rt><rp>)</rp></ruby>"#
+            ),
+            misskey,
+            "attributes on ruby elements are stripped"
+        );
+        assert_eq!(
+            strip_html(misskey),
+            "漢字(かんじ)",
+            "the plain-text form keeps the rp parentheses"
+        );
     }
 
     #[test]
