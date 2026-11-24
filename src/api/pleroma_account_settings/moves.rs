@@ -19,6 +19,7 @@ use crate::{
     entities::relationship::Relationship,
     error::{AppError, AppResult},
     extract::ApiBody,
+    federation::fetch_actor::{FetchError, refresh_user},
     models::{
         follow,
         user::{self, User},
@@ -72,7 +73,9 @@ impl fmt::Debug for MoveParams {
 /// `target_account`. The gates run in Pleroma's order (password, target
 /// resolution, alias precondition, cooldown), all before any state
 /// changes; the first one that refuses answers, and only a fully gated
-/// move marks the account moved and transfers its followers.
+/// move marks the account moved and transfers its followers. A remote
+/// target is refetched first (see [`refreshed_target`]), so an alias added
+/// after this instance cached it still counts.
 ///
 /// # Errors
 ///
@@ -91,7 +94,8 @@ pub(super) async fn move_account(
     if !password_accepted(&auth.0, &params.password) {
         return Ok(error_body(INVALID_PASSWORD));
     }
-    let target = resolve_move_target(&state, &params.target_account).await?;
+    let cached = resolve_move_target(&state, &params.target_account).await?;
+    let target = refreshed_target(&state, cached).await?;
     if !target_lists_origin(&target, &auth.0) {
         return Ok(error_body(MOVE_ALIAS_REQUIRED));
     }
@@ -139,7 +143,8 @@ pub(super) async fn move_by_id(
     if !password_accepted(&auth.0, &params.password) {
         return Err(AppError::Unprocessable(INVALID_PASSWORD.to_owned()));
     }
-    let target = resolve_move_target_by_id(&state, &params.to_account).await?;
+    let cached = resolve_move_target_by_id(&state, &params.to_account).await?;
+    let target = refreshed_target(&state, cached).await?;
     if !target_lists_origin(&target, &auth.0) {
         return Err(AppError::Unprocessable(MOVE_ALIAS_REQUIRED.to_owned()));
     }
@@ -176,6 +181,34 @@ pub(super) async fn resolve_move_target(state: &AppState, acct: &str) -> AppResu
         debug!(%err, acct, "move target could not be resolved");
         AppError::NotFoundMessage(TARGET_NOT_FOUND.to_owned())
     })
+}
+
+/// The target as its home instance serves it right now: a remote mirror
+/// is force-refetched past the 24-hour window (Mastodon's
+/// `AccountMigration` resolves with `skip_cache` for the same reason — a
+/// mirror taken before the alias was added lacks it). A local target is
+/// returned as stored. A transient refresh failure falls back to the
+/// cached row; a target that is gone or unknown to its host is the
+/// endpoint's "Target account not found." 404.
+///
+/// # Errors
+///
+/// [`AppError::NotFoundMessage`] when the refetch says the actor is gone
+/// or does not exist.
+async fn refreshed_target(state: &AppState, cached: User) -> AppResult<User> {
+    if cached.local.get() {
+        return Ok(cached);
+    }
+    match refresh_user(state, &cached).await {
+        Ok(fresh) => Ok(fresh),
+        Err(FetchError::Gone | FetchError::NotFound) => {
+            Err(AppError::NotFoundMessage(TARGET_NOT_FOUND.to_owned()))
+        }
+        Err(err) => {
+            debug!(%err, target = %cached.ap_id, "target refresh failed; using the cached mirror");
+            Ok(cached)
+        }
+    }
 }
 
 /// The `ActivityPub.move` precondition: the target must have listed the
