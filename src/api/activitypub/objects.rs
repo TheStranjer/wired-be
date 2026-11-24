@@ -82,11 +82,15 @@ async fn publicly_replyable(state: &AppState, raw_id: &str) -> AppResult<Status>
         .await?
         .filter(|row| row.local)
         .ok_or_else(missing)?;
-    if status_visibility::can_view(&state.db, &object, None).await? {
-        Ok(object)
-    } else {
-        Err(missing())
-    }
+    status_visibility::require_visible(&state.db, object, None)
+        .await
+        .map_err(|err| {
+            if matches!(err, AppError::NotFound) {
+                AppError::RouteNotFound
+            } else {
+                err
+            }
+        })
 }
 
 /// `GET /objects/{uuid}` — the status document with the `ActivityPub`

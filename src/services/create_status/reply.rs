@@ -96,15 +96,7 @@ pub(super) async fn reply_parent(
     else {
         return Ok(None);
     };
-    let Some(id) = parse_id(text) else {
-        return Err(AppError::NotFound);
-    };
-    let Some(row) = status::get_by_id(&state.db, id).await? else {
-        return Err(AppError::NotFound);
-    };
-    if !status_visibility::can_view(&state.db, &row, Some(poster)).await? {
-        return Err(AppError::NotFound);
-    }
+    let row = status_visibility::get_visible(&state.db, text, Some(poster)).await?;
     let Some(original_id) = row.reblog_of_id else {
         return Ok(Some(row));
     };

@@ -260,11 +260,8 @@ async fn poll_for_viewer_or_404(
     let Some(posted) = status::get_by_id(&state.db, poll.status_id).await? else {
         return Err(AppError::NotFound);
     };
-    if status_visibility::can_view(&state.db, &posted, viewer).await? {
-        Ok((poll, posted))
-    } else {
-        Err(AppError::NotFound)
-    }
+    let posted = status_visibility::require_visible(&state.db, posted, viewer).await?;
+    Ok((poll, posted))
 }
 
 /// Reads the poll `poll` apart and renders it as the [`Poll`] entity for

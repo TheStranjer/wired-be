@@ -220,25 +220,16 @@ pub async fn status_for_viewer_or_404(
     viewer: Option<&User>,
     id_str: &str,
 ) -> AppResult<Status> {
-    let Some(id) = parse_id(id_str) else {
-        return Err(AppError::NotFound);
-    };
-    let Some(row) = status::get_by_id(&state.db, id).await? else {
-        return Err(AppError::NotFound);
-    };
+    // Rule 7 of the visibility model reads the original of a reblog with
+    // the same tests, so a reblog of a status this viewer may not see
+    // fails here and is answered the same 404 as the original would be.
+    let row = status_visibility::get_visible(&state.db, id_str, viewer).await?;
     // An anonymous read of an area the instance restricts is the same 404 a
     // hidden status gets, so the gate never confirms the post exists.
     if viewer.is_none() && anonymous_read_closed(state, &row).await? {
         return Err(AppError::NotFound);
     }
-    // Rule 7 of the visibility model reads the original of a reblog with
-    // the same tests, so a reblog of a status this viewer may not see
-    // fails here and is answered the same 404 as the original would be.
-    if status_visibility::can_view(&state.db, &row, viewer).await? {
-        Ok(row)
-    } else {
-        Err(AppError::NotFound)
-    }
+    Ok(row)
 }
 
 /// Whether the instance keeps anonymous readers from `row` itself: its

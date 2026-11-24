@@ -71,12 +71,13 @@ use sqlx::{PgPool, Postgres, QueryBuilder};
 use uuid::Uuid;
 
 use crate::{
-    error::AppResult,
+    error::{AppError, AppResult},
     models::{
         block, follow, mention,
         status::{self, Status, Visibility},
         user::User,
     },
+    util::id::parse_id,
 };
 
 /// The active-author predicate every status read appends, over statuses
@@ -129,6 +130,46 @@ pub async fn can_view(pool: &PgPool, status: &Status, viewer: Option<&User>) -> 
         };
         current = original;
     }
+}
+
+/// The visible-or-404 gate for a status already in hand: `status` back when
+/// `viewer` may see it per [`can_view`], [`AppError::NotFound`] when not.
+///
+/// The one place a hidden status turns into the 404 that never reveals a
+/// private post exists.
+///
+/// # Errors
+///
+/// [`AppError::NotFound`] as described; any database failure arrives as
+/// [`AppError::Database`].
+pub async fn require_visible(
+    pool: &PgPool,
+    status: Status,
+    viewer: Option<&User>,
+) -> AppResult<Status> {
+    if can_view(pool, &status, viewer).await? {
+        Ok(status)
+    } else {
+        Err(AppError::NotFound)
+    }
+}
+
+/// Resolves client-supplied status id text to the live row `viewer` may see:
+/// [`parse_id`], [`status::get_by_id`], then [`require_visible`].
+///
+/// A malformed id, an unknown id, a tombstone and a hidden status are all
+/// the same [`AppError::NotFound`].
+///
+/// # Errors
+///
+/// [`AppError::NotFound`] as described; any database failure arrives as
+/// [`AppError::Database`].
+pub async fn get_visible(pool: &PgPool, id_text: &str, viewer: Option<&User>) -> AppResult<Status> {
+    let id = parse_id(id_text).ok_or(AppError::NotFound)?;
+    let row = status::get_by_id(pool, id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    require_visible(pool, row, viewer).await
 }
 
 /// Rules 1 to 6 for the one status in hand: not a tombstone, the author's
