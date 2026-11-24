@@ -17,6 +17,7 @@ use crate::{
     http_client::HttpClient,
     models::user::{User, get_by_ap_id},
     state::AppState,
+    util::url::same_origin,
 };
 
 use super::{
@@ -56,33 +57,105 @@ pub async fn fetch_actor_json(
     url: &str,
     signer: Option<&Signer>,
 ) -> Result<Value, FetchError> {
-    let (document, served) = fetch_document(http, url, signer, MAX_BODY_BYTES).await?;
+    let rules = ContainmentRules {
+        max_bytes: MAX_BODY_BYTES,
+        cross_host: CrossHost::Allow,
+    };
+    fetch_contained_document(http, url, signer, rules, |_url| Ok(())).await
+}
+
+/// What distinguishes one fetcher's containment from the other's: the body
+/// cap and the cross-host rule. Bundled to keep
+/// [`fetch_contained_document`] within the argument limit.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ContainmentRules {
+    /// Cap on one fetched document body, in bytes.
+    pub(crate) max_bytes: usize,
+    /// Whether a claimed id may name another authority.
+    pub(crate) cross_host: CrossHost,
+}
+
+/// Whether a document may claim an `id` on another authority
+/// (`host:port`) than the URL it was fetched from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CrossHost {
+    /// The claimed id is followed wherever it points (actor documents).
+    Allow,
+    /// A claimed id on another authority is refused without a request
+    /// (object documents).
+    Deny,
+}
+
+/// Fetches `url` and returns the document contained as the [module
+/// docs](super) describe: the fetch may not be redirected to another host,
+/// and the document's `id` must name the URL that served it, or name a
+/// document fetched once more at that `id`, without a redirect, that names
+/// itself. This is the only implementation of that refetch-once rule; the
+/// actor and object fetchers differ only in `rules` (the body cap, and with
+/// [`CrossHost::Deny`] a claimed id on another authority is
+/// [`FetchError::Invalid`] before any second request) and in `before_fetch`,
+/// which runs with the URL ahead of every `GET` and may refuse it (the
+/// object fetcher spends its fetch budget there).
+///
+/// # Errors
+///
+/// Those of [`fetch_actor_json`], plus whatever `before_fetch` returns and
+/// a claimed id refused under [`CrossHost::Deny`].
+pub(crate) async fn fetch_contained_document(
+    http: &HttpClient,
+    url: &str,
+    signer: Option<&Signer>,
+    rules: ContainmentRules,
+    mut before_fetch: impl FnMut(&str) -> Result<(), FetchError>,
+) -> Result<Value, FetchError> {
+    let ContainmentRules {
+        max_bytes,
+        cross_host,
+    } = rules;
+    before_fetch(url)?;
+    let (document, served) = fetch_document(http, url, signer, max_bytes).await?;
     ensure_same_host(url, &served)?;
     let claimed = document_id(&document)?;
     if names_served_url(url, &served, claimed) {
         return Ok(document);
     }
+    if cross_host == CrossHost::Deny && !same_authority(url, claimed) {
+        return Err(FetchError::Invalid(format!(
+            "the document fetched from `{url}` names `{claimed}`, a different origin"
+        )));
+    }
     // The document names a different id than the URL that served it:
     // follow the claim exactly once, without a redirect, and accept only a
     // document that names itself.
-    let (refetched, refetched_from) = fetch_document(http, claimed, signer, MAX_BODY_BYTES).await?;
+    before_fetch(claimed)?;
+    let (refetched, refetched_from) = fetch_document(http, claimed, signer, max_bytes).await?;
     ensure_not_redirected(claimed, &refetched_from)?;
     let refetched_id = document_id(&refetched)?;
     if refetched_id != claimed {
         return Err(FetchError::Invalid(format!(
-            "the actor `{claimed}` identifies itself as `{refetched_id}`"
+            "the document `{claimed}` identifies itself as `{refetched_id}`"
         )));
     }
     Ok(refetched)
 }
 
+/// Whether two absolute URLs name the same origin: the scheme-less
+/// authority (`host:port`) compared on the parsed URL. An unparsable side
+/// matches nothing.
+fn same_authority(left: &str, right: &str) -> bool {
+    let (Ok(parsed_left), Ok(parsed_right)) = (Url::parse(left), Url::parse(right)) else {
+        return false;
+    };
+    same_origin(&parsed_left, &parsed_right)
+}
+
 /// `GET`s `url` once and reads the document it answers, applying the
 /// status, size, content-type and JSON rules of [`fetch_actor_json`] with
-/// the body cap at `max_bytes`. Shared with the object fetcher (see
-/// [`crate::federation::fetch_object`]), which caps at its own 2 MiB and
-/// folds the error into its own vocabulary. Returns the document with the
-/// final URL that served it, so callers can contain redirects.
-pub(crate) async fn fetch_document(
+/// the body cap at `max_bytes` (the object fetcher, see
+/// [`crate::federation::fetch_object`], caps at its own 2 MiB through
+/// [`fetch_contained_document`]). Returns the document with the final URL
+/// that served it, so callers can contain redirects.
+async fn fetch_document(
     http: &HttpClient,
     url: &str,
     signer: Option<&Signer>,
@@ -156,7 +229,7 @@ fn document_id(document: &Value) -> Result<&str, FetchError> {
     document
         .get("id")
         .and_then(Value::as_str)
-        .ok_or_else(|| FetchError::Invalid("the actor document carries no string `id`".to_owned()))
+        .ok_or_else(|| FetchError::Invalid("the document carries no string `id`".to_owned()))
 }
 
 /// Dereferences `ap_id`, runs the actor document through the instance's
@@ -204,7 +277,10 @@ pub(super) async fn fetch_and_store(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, atomic::Ordering};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
 
     use axum::{
         Router,
@@ -214,6 +290,7 @@ mod tests {
         routing::get,
     };
     use serde_json::json;
+    use tokio::task::JoinHandle;
 
     use super::*;
     use crate::{
@@ -718,6 +795,136 @@ mod tests {
             "the original URL and the claim each answered once"
         );
         server.abort();
+    }
+
+    /// The actor body cap under `cross_host`.
+    const fn rules(cross_host: CrossHost) -> ContainmentRules {
+        ContainmentRules {
+            max_bytes: MAX_BODY_BYTES,
+            cross_host,
+        }
+    }
+
+    /// Two peers on separate loopback ports: `home` serves `/users/alice`
+    /// claiming `/moved/alice` on `other`, which serves that document
+    /// naming itself. Returns the servers, `home`'s URL for the document
+    /// and the hit counters of `home` and `other`.
+    async fn cross_authority_claim() -> (
+        [JoinHandle<()>; 2],
+        String,
+        Arc<AtomicUsize>,
+        Arc<AtomicUsize>,
+    ) {
+        let home = bind().await;
+        let other = bind().await;
+        let home_base = origin(&home);
+        let other_base = origin(&other);
+        let home_peer = peer_at(&other_base);
+        let other_peer = peer_at(&other_base);
+        let home_hits = Arc::clone(&home_peer.hits);
+        let other_hits = Arc::clone(&other_peer.hits);
+        let home_server = spawn(
+            home,
+            Router::new()
+                .route("/users/alice", get(moved_actor))
+                .with_state(home_peer),
+        );
+        let other_server = spawn(
+            other,
+            Router::new()
+                .route("/moved/alice", get(moved_home_actor))
+                .with_state(other_peer),
+        );
+        (
+            [home_server, other_server],
+            format!("{home_base}/users/alice"),
+            home_hits,
+            other_hits,
+        )
+    }
+
+    #[tokio::test]
+    async fn deny_rejects_a_cross_authority_claim_without_a_second_request() {
+        let (servers, url, home_hits, other_hits) = cross_authority_claim().await;
+        let mut asked = Vec::new();
+
+        let error =
+            fetch_contained_document(&client(), &url, None, rules(CrossHost::Deny), |target| {
+                asked.push(target.to_owned());
+                Ok(())
+            })
+            .await
+            .unwrap_err();
+
+        let detail = invalid_detail(error);
+        assert!(
+            detail.contains("different origin"),
+            "the foreign claim is refused on the spot: {detail}"
+        );
+        assert_eq!(home_hits.load(Ordering::SeqCst), 1, "one request to home");
+        assert_eq!(
+            other_hits.load(Ordering::SeqCst),
+            0,
+            "the claim is not asked"
+        );
+        assert_eq!(asked, [url], "only the first GET reached before_fetch");
+        for server in servers {
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn allow_follows_a_cross_authority_claim_once() {
+        let (servers, url, home_hits, other_hits) = cross_authority_claim().await;
+        let mut asked = Vec::new();
+
+        let document =
+            fetch_contained_document(&client(), &url, None, rules(CrossHost::Allow), |target| {
+                asked.push(target.to_owned());
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        assert!(
+            document["id"]
+                .as_str()
+                .is_some_and(|id| id.ends_with("/moved/alice")),
+            "the document is re-anchored to the claimed id"
+        );
+        assert_eq!(home_hits.load(Ordering::SeqCst), 1, "one request to home");
+        assert_eq!(other_hits.load(Ordering::SeqCst), 1, "the claim asked once");
+        assert_eq!(asked.len(), 2, "before_fetch ran ahead of both GETs");
+        for server in servers {
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn a_refusing_before_fetch_stops_the_refetch() {
+        let (servers, url, home_hits, other_hits) = cross_authority_claim().await;
+        let mut calls = 0_usize;
+
+        let error =
+            fetch_contained_document(&client(), &url, None, rules(CrossHost::Allow), |target| {
+                calls += 1;
+                (calls == 1)
+                    .then_some(())
+                    .ok_or_else(|| FetchError::Invalid(format!("budget spent at `{target}`")))
+            })
+            .await
+            .unwrap_err();
+
+        let detail = invalid_detail(error);
+        assert!(
+            detail.contains("budget spent"),
+            "the refusal comes back as returned: {detail}"
+        );
+        assert_eq!(home_hits.load(Ordering::SeqCst), 1, "the first GET ran");
+        assert_eq!(other_hits.load(Ordering::SeqCst), 0, "the second did not");
+        for server in servers {
+            server.abort();
+        }
     }
 
     #[tokio::test]
