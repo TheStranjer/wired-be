@@ -51,6 +51,7 @@ use crate::{
     oauth::scopes::PUSH,
     services::vapid,
     state::AppState,
+    util::url::is_http_url,
 };
 
 /// Longest accepted push endpoint URL, in characters (Mastodon caps
@@ -407,9 +408,7 @@ fn valid_endpoint(params: &SubscriptionParams) -> AppResult<String> {
             "Endpoint is too long (maximum is {MAX_ENDPOINT_CHARS} characters)"
         )));
     }
-    let callable =
-        url::Url::parse(endpoint).is_ok_and(|url| matches!(url.scheme(), "http" | "https"));
-    if !callable {
+    if !is_http_url(endpoint) {
         return Err(validation_failed("Endpoint must be a valid URL"));
     }
     Ok(endpoint.to_owned())
