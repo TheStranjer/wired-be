@@ -30,7 +30,10 @@ use crate::{
         relationship::RelationshipMap,
         tag::Tag,
     },
-    models::status::Status as StatusRow,
+    models::{
+        hashtag::Hashtag, media_attachment::MediaAttachment as AttachmentRow,
+        status::Status as StatusRow,
+    },
     services::rich_media::stored_card_json,
     util::sanitize::strip_html,
 };
@@ -203,6 +206,7 @@ impl Status {
             quote,
             reblog,
             poll,
+            parent_visible,
         } = source;
         Self {
             id: row.id.to_string(),
@@ -214,16 +218,10 @@ impl Status {
             visibility: row.visibility.as_str().to_owned(),
             sensitive: JsonBool(row.sensitive),
             spoiler_text: row.spoiler_text.clone(),
-            media_attachments: media
-                .iter()
-                .map(|attachment| MediaAttachment::from_model(attachment, config))
-                .collect(),
+            media_attachments: media_entities(media, config),
             application: application_block(row),
             mentions: mentions.iter().map(Mention::from_user).collect(),
-            tags: tags
-                .iter()
-                .map(|tag| Tag::from_hashtag(&config.base_url, tag))
-                .collect(),
+            tags: tag_entities(tags, config),
             emojis: Vec::new(),
             reblogs_count: row.reblogs_count,
             favourites_count: row.favourites_count,
@@ -253,10 +251,27 @@ impl Status {
                     bookmark_folder,
                     direct_participation,
                     quote,
+                    parent_visible,
                 },
             ),
         }
     }
+}
+
+/// The `media_attachments` key: one entity per stored attachment, in the
+/// order the batch loaded them (`position` order).
+fn media_entities(media: &[AttachmentRow], config: &Config) -> Vec<MediaAttachment> {
+    media
+        .iter()
+        .map(|attachment| MediaAttachment::from_model(attachment, config))
+        .collect()
+}
+
+/// The `tags` key: one entity per hashtag, in the batch's name order.
+fn tag_entities(tags: &[Hashtag], config: &Config) -> Vec<Tag> {
+    tags.iter()
+        .map(|tag| Tag::from_hashtag(&config.base_url, tag))
+        .collect()
 }
 
 /// The `content` key: the row's sanitized HTML, or the empty string for

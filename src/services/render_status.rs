@@ -164,6 +164,8 @@ mod page_ids;
 #[cfg(test)]
 mod engagement_tests;
 #[cfg(test)]
+mod parent_visible_tests;
+#[cfg(test)]
 mod pins_threads_tests;
 #[cfg(test)]
 mod polls_cards_tests;

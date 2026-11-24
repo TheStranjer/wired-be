@@ -95,6 +95,7 @@ pub async fn preview_status(
             quote: None,
             reblog: None,
             poll: None,
+            parent_visible: JsonBool(true),
         },
         Some(user),
         None,
