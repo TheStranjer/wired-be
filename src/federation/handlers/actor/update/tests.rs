@@ -74,6 +74,38 @@ async fn an_update_folds_the_new_profile_into_the_mirror() {
     );
 }
 
+/// An `Update` that turns a `Person` into a `Service` flips the bot flag
+/// on, and one that turns it back flips it off again.
+#[tokio::test]
+async fn an_update_follows_the_actor_type_into_and_out_of_bot() {
+    let db = crate::test_db::test_db().await.expect("test database slot");
+    let pool = db.pool().clone();
+    let state = app_state(&pool);
+    let alice = mirror(&pool).await;
+    let alice_id = alice.id;
+    assert!(!alice.bot.get(), "the fixture mirrors a human");
+
+    let mut document = person();
+    document["type"] = json!("Service");
+    let turned_on = update_actor(
+        state.clone(),
+        view("Update", "bot-on", ALICE, document),
+        alice,
+    )
+    .await;
+    assert_handled(&turned_on);
+    let stored = fresh_user(&pool, alice_id).await;
+    assert_eq!(stored.actor_type, "Service", "the type moved");
+    assert!(stored.bot.get(), "a Service is a bot");
+
+    let human = person();
+    let turned_off = update_actor(state, view("Update", "bot-off", ALICE, human), stored).await;
+    assert_handled(&turned_off);
+    let back = fresh_user(&pool, alice_id).await;
+    assert_eq!(back.actor_type, "Person", "the type moved back");
+    assert!(!back.bot.get(), "a Person is not a bot");
+}
+
 /// The MRF actor stage on the inbound half of the mirror: an `Update`
 /// whose profile the domain lists strip lands without the fields they
 /// name — the same rewrite a fetch folds, applied to what a peer
