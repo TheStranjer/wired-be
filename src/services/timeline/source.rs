@@ -99,19 +99,20 @@ pub enum TimelineSource {
 
 impl TimelineSource {
     /// The filter context this timeline's page is rendered in, or `None`
-    /// where the v1 filter contexts do not reach: [`Self::Home`] is the
-    /// `home` context, [`Self::Public`] and [`Self::Hashtag`] the `public`
-    /// one and [`Self::Account`] the `account` one — the mapping the
-    /// filter ticket gives its endpoints. [`Self::Direct`] and
-    /// [`Self::List`] name no v1 context, and the two Pleroma extensions
-    /// built on them are unfiltered pages.
+    /// where the v1 filter contexts do not reach: [`Self::Home`] and
+    /// [`Self::List`] are the `home` context (Mastodon's "Home and lists",
+    /// where `FeedManager#filter` runs `filter_from_home` for `:list` feeds
+    /// too), [`Self::Public`] and [`Self::Hashtag`] the `public` one and
+    /// [`Self::Account`] the `account` one. [`Self::Direct`] names no v1
+    /// context, and the Pleroma extension built on it is an unfiltered
+    /// page.
     #[must_use]
     pub const fn filter_context(&self) -> Option<FilterContext> {
         match self {
-            Self::Home => Some(FilterContext::Home),
+            Self::Home | Self::List { .. } => Some(FilterContext::Home),
             Self::Public | Self::Hashtag { .. } => Some(FilterContext::Public),
             Self::Account { .. } => Some(FilterContext::Account),
-            Self::Direct | Self::List { .. } => None,
+            Self::Direct => None,
         }
     }
 }
@@ -146,9 +147,9 @@ mod tests {
     use super::*;
 
     /// The filter-context map the filter ticket gives the timeline routes:
-    /// `Home` is `home`, `Public` and `Hashtag` are `public`, `Account` is
-    /// `account`, and the two sources no v1 context names — `Direct` and
-    /// `List` — answer `None` (unfiltered pages).
+    /// `Home` and `List` are `home`, `Public` and `Hashtag` are `public`,
+    /// `Account` is `account`, and `Direct`, which no v1 context names,
+    /// answers `None` (an unfiltered page).
     #[test]
     fn sources_map_to_the_filter_contexts_the_endpoints_render_in() {
         assert_eq!(
@@ -181,7 +182,7 @@ mod tests {
                 list_id: Uuid::now_v7()
             }
             .filter_context(),
-            None
+            Some(FilterContext::Home)
         );
     }
 }
