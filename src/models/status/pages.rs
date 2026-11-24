@@ -7,7 +7,7 @@
 use sqlx::{PgPool, Postgres, QueryBuilder};
 use uuid::Uuid;
 
-use crate::{error::AppResult, pagination::PageParams};
+use crate::{error::AppResult, models::status_visibility, pagination::PageParams};
 
 use super::{Status, StatusVisibilityCounts};
 
@@ -17,12 +17,6 @@ use super::{Status, StatusVisibilityCounts};
 /// the `LIMIT` on `s.id`.
 const OUTBOX_PAGE_SQL: &str = "SELECT s.* FROM statuses s WHERE s.user_id = ";
 
-/// The visibility arms of the two `ActivityPub` listing reads: a row the
-/// fediverse may be shown is `public` or `unlisted` — `private`, `direct`
-/// and Pleroma's never-federated `local` belong to nobody's outbox or
-/// public replies collection — and a tombstone is no post at all.
-const AP_VISIBLE: &str = " AND s.deleted_at IS NULL AND s.visibility IN ('public', 'unlisted')";
-
 /// [`backup_page`]: the head of the backup archive statement, up to (and
 /// including) the placeholder [`backup_page`] pushes the author's id into;
 /// the function then appends [`BACKUP_VISIBLE`], the `after` cursor, the
@@ -30,8 +24,8 @@ const AP_VISIBLE: &str = " AND s.deleted_at IS NULL AND s.visibility IN ('public
 const BACKUP_PAGE_SQL: &str = "SELECT s.* FROM statuses s WHERE s.user_id = ";
 
 /// The row filter of [`backup_page`]: every live status an account
-/// authored that this instance federates. Unlike [`AP_VISIBLE`]'s two
-/// public arms the backup is the account's own export, so `private` and
+/// authored that this instance federates. Unlike the anonymous clause of
+/// [`status_visibility`] the backup is the account's own export, so `private` and
 /// `direct` ride along too; only Pleroma's never-federated `local` stays
 /// out (it has no `Create` to carry — [`note_json`] refuses it) and no
 /// tombstone is anyone's post any more.
@@ -42,21 +36,22 @@ const BACKUP_VISIBLE: &str = " AND s.deleted_at IS NULL \
 
 /// [`public_replies_page`]: the head of the replies statement, up to (and
 /// including) the placeholder the object id is pushed into; the function
-/// then appends [`AP_VISIBLE`], the cursor, the ordering and the `LIMIT`.
+/// then appends the anonymous [`status_visibility`] clause, the cursor, the
+/// ordering and the `LIMIT`.
 const REPLIES_PAGE_SQL: &str = "SELECT s.* FROM statuses s WHERE s.in_reply_to_id = ";
 
-/// [`public_replies_count`]: the same live `public`/`unlisted` answers
-/// [`public_replies_page`] pages through, counted rather than listed; the
-/// `count(*)` `bigint` arrives as the `i64` the JSON number carries.
-const PUBLIC_REPLIES_COUNT_SQL: &str = "SELECT count(*) FROM statuses s
-      WHERE s.in_reply_to_id = $1
-        AND s.deleted_at IS NULL
-        AND s.visibility IN ('public', 'unlisted')";
+/// [`public_replies_count`]: the head of the count statement, up to (and
+/// including) the placeholder the object id is pushed into; the function
+/// then appends the same anonymous [`status_visibility`] clause
+/// [`public_replies_page`] pages through. The `count(*)` `bigint` arrives
+/// as the `i64` the JSON number carries.
+const REPLIES_COUNT_SQL: &str = "SELECT count(*) FROM statuses s WHERE s.in_reply_to_id = ";
 
 /// The `user_id`'s outbox page: their publicly visible rows, newest first.
 ///
-/// Live `public` and `unlisted` rows — posts, replies and reblogs alike —
-/// with `page`'s cursors and `limit` applied on the status id
+/// The rows an anonymous viewer may see ([`status_visibility`]'s clause):
+/// live `public` and `unlisted` posts, replies and reblogs — a reblog only
+/// while its original is visible too — with `page`'s cursors and `limit` applied on the status id
 /// (decision 4). This is the read behind
 /// `GET /users/{nickname}/outbox?page=true` (Pleroma's
 /// `ActivityPubController.outbox`, fed by `fetch_user_activities`); who may
@@ -74,7 +69,8 @@ pub async fn outbox_page(
     let mut builder = QueryBuilder::<Postgres>::new(OUTBOX_PAGE_SQL);
     // The builder's push methods hand back `&mut Self` for chaining; binding
     // it keeps the statement from having an unused result (decision 14).
-    let _bound: &mut _ = builder.push_bind(user_id).push(AP_VISIBLE);
+    let _bound: &mut _ = builder.push_bind(user_id);
+    status_visibility::push_visibility_clause(&mut builder, None, "s");
     page.apply_keyset(&mut builder, "s.id");
     let rows = builder.build_query_as::<Status>().fetch_all(pool).await?;
     Ok(page.finish(rows))
@@ -126,11 +122,11 @@ pub async fn backup_page(
 /// Any database failure (connection, encoding) arrives as
 /// [`AppError::Database`](crate::error::AppError).
 pub async fn public_replies_count(pool: &PgPool, object_id: Uuid) -> AppResult<i64> {
-    let row = sqlx::query_scalar::<_, i64>(PUBLIC_REPLIES_COUNT_SQL)
-        .bind(object_id)
-        .fetch_one(pool)
-        .await?;
-    Ok(row)
+    let mut builder = QueryBuilder::<Postgres>::new(REPLIES_COUNT_SQL);
+    let _bound: &mut _ = builder.push_bind(object_id);
+    status_visibility::push_visibility_clause(&mut builder, None, "s");
+    let count = builder.build_query_scalar::<i64>().fetch_one(pool).await?;
+    Ok(count)
 }
 
 /// The start of [`status_visibility_counts`]' statement: the four
@@ -210,7 +206,8 @@ pub async fn public_replies_page(
     limit: i64,
 ) -> AppResult<Vec<Status>> {
     let mut builder = QueryBuilder::<Postgres>::new(REPLIES_PAGE_SQL);
-    let _bound: &mut _ = builder.push_bind(object_id).push(AP_VISIBLE);
+    let _bound: &mut _ = builder.push_bind(object_id);
+    status_visibility::push_visibility_clause(&mut builder, None, "s");
     // A `max_id` page is read from the cursor backwards — the newest rows
     // below it come off the index first — and flipped, so the answer keeps
     // the oldest-first order every replies page is served in.
