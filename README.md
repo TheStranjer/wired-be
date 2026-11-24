@@ -37,7 +37,7 @@ below.
 |---|---|---|---|
 | `DATABASE_URL` | yes | | PostgreSQL URL, e.g. `postgres://user:pass@localhost:5432/wired` |
 | `BASE_URL` | yes | | Public origin of this instance, e.g. `https://social.example` (http(s) with a host, no path or query; trailing slash stripped) |
-| `FRONTEND_BASE_URL` | no | `BASE_URL` | Origin the frontend pages are served from; the source of browser redirects such as `/notice/{id}` and `/oauth/authorize` (the consent screen; no trailing slash; the default-asset URLs do not use it, see "Default assets" below) |
+| `FRONTEND_BASE_URL` | no | `BASE_URL` | Origin the frontend pages are served from; the source of browser redirects such as `/notice/{id}` and `/oauth/authorize` (the consent screen) and of the password-reset link `{FRONTEND_BASE_URL}/password_reset/{token}` in the reset letter and the admin reset endpoint (the frontend then calls `GET`/`POST /api/v1/pleroma/password_reset`, which answer JSON only) (no trailing slash; the default-asset URLs do not use it, see "Default assets" below) |
 | `BIND_ADDR` | no | `127.0.0.1:4000` | Address the HTTP server listens on |
 | `INSTANCE_NAME` | no | `Wired` | Instance display name |
 | `INSTANCE_DESCRIPTION` | no | `A Wired instance, compatible with Pleroma clients` | Short instance description |

@@ -353,7 +353,7 @@ mod tests {
             !shown_body.contains("hunter2"),
             "the plaintext never reaches a log line: {shown_body}"
         );
-        let issued = PasswordResetLink::new("https://test.example", "a-token-text");
+        let issued = PasswordResetLink::new(&crate::config::Config::for_tests(), "a-token-text");
         let shown_link = format!("{issued:?}");
         assert!(
             !shown_link.contains("a-token-text"),
@@ -363,7 +363,7 @@ mod tests {
             serde_json::to_value(&issued).expect("the answer serializes"),
             json!({
                 "token": "a-token-text",
-                "link": "https://test.example/api/v1/pleroma/password_reset/a-token-text",
+                "link": "https://test.example/password_reset/a-token-text",
             }),
             "the wire answer carries both where Debug withholds them"
         );

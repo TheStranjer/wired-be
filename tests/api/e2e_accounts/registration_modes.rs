@@ -272,17 +272,28 @@ async fn emailed_reset_token_sets_a_new_password(pool: &PgPool) {
     assert_eq!(addressed.len(), 1, "one letter, to the account that asked");
     let path = letter_path(&addressed, "password_reset");
 
-    // Step 3: the page the link names renders the form.
-    let page = common::api_get(&world.app, None, &path).await;
-    common::assert_answer(&page, StatusCode::OK, "the reset page");
+    // Step 3: the link names the frontend's reset screen, which checks the
+    // token with the JSON endpoint.
     assert!(
-        page.text().contains("<form"),
-        "the live token renders its form: {}",
+        path.starts_with("/password_reset/"),
+        "the link is the frontend's reset screen: {path}"
+    );
+    let token = path.rsplit('/').next().unwrap_or_default().to_owned();
+    let page = common::api_get(
+        &world.app,
+        None,
+        &format!("/api/v1/pleroma/password_reset/{token}"),
+    )
+    .await;
+    common::assert_answer(&page, StatusCode::OK, "the token check");
+    assert_eq!(
+        page.json_value(),
+        json!({"nickname": "forgetful"}),
+        "the live token names its account: {}",
         page.text()
     );
 
-    // Step 4: the completion form sets the new password.
-    let token = path.rsplit('/').next().unwrap_or_default().to_owned();
+    // Step 4: the completion call sets the new password.
     let done = common::TestRequest::post("/api/v1/pleroma/password_reset")
         .form(&[
             ("data[token]", token.as_str()),
@@ -291,12 +302,7 @@ async fn emailed_reset_token_sets_a_new_password(pool: &PgPool) {
         ])
         .send(&world.app)
         .await;
-    common::assert_answer(&done, StatusCode::OK, "the reset completion");
-    assert!(
-        done.text().contains("Password changed!"),
-        "Pleroma's success page: {}",
-        done.text()
-    );
+    common::assert_answer(&done, StatusCode::NO_CONTENT, "the reset completion");
 
     // Step 5: every credential the old password opened is gone, the old
     // password opens nothing, and the new one logs in.
