@@ -121,6 +121,11 @@ mod ap_objects;
 /// decided by `can_view` for the signer: blocked signers get the 404.
 mod ap_public_reads;
 
+/// Quote consent (FEP-044f): a remote `QuoteRequest`, the `Accept` it
+/// queues and the `QuoteAuthorization` served at
+/// `GET /quote_authorizations/{uuid}`.
+mod quote_authorizations;
+
 /// Announcements over HTTP (`/api/v1/announcements`).
 mod announcements;
 

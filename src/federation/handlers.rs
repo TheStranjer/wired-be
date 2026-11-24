@@ -10,7 +10,8 @@
 //! remote account, [`misc`] for the `Block` (+`Undo`), `Flag`, `Add`,
 //! `Remove` and `Move` that ride beside them, [`interactions`] for the
 //! `Like`, `EmojiReact` and `Announce` (and their `Undo`s) that land on a
-//! status, [`follow`] for the `Follow`, `Accept`, `Reject` and `Undo` of a
+//! status, [`quotes`] for the `QuoteRequest` a remote account sends to quote
+//! a local post, [`follow`] for the `Follow`, `Accept`, `Reject` and `Undo` of a
 //! `Follow` that carry the follow handshake across the wire, with the
 //! create and note tickets adding their files in turn.
 //!
@@ -35,6 +36,7 @@ pub mod follow;
 pub mod interactions;
 pub mod misc;
 pub mod note;
+pub mod quotes;
 #[cfg(test)]
 mod test_support;
 pub mod vote;
@@ -59,6 +61,7 @@ pub fn registry() -> Handlers {
     create::register(&mut handlers);
     chat::register(&mut handlers);
     vote::register(&mut handlers);
+    quotes::register(&mut handlers);
     // Last, because its `Delete` fallback answers for every object the
     // earlier `register_delete_fallback` calls left unrouted: it hands the
     // actor's own id back to the actor handler and folds the rest.
