@@ -58,6 +58,9 @@ pub use self::{error::ActorError, parse::parse_actor, upsert::upsert_remote_user
 /// string it sees; the ticket fixes a closed set instead, so a document of
 /// an unknown kind is rejected rather than half-mirrored).
 const ACTOR_TYPES: [&str; 5] = ["Person", "Service", "Group", "Organization", "Application"];
+/// Actor `type`s that mark a bot: Mastodon's `Account#bot?` is `actor_type`
+/// in `%w(Application Service)`. `Group` stays a group, not a bot.
+const BOT_ACTOR_TYPES: [&str; 2] = ["Service", "Application"];
 /// The `type` an `attachment` entry must carry to be stored as a profile
 /// field (Mastodon's profile metadata, Pleroma's
 /// `Enum.filter(..., & &1["type"] == "PropertyValue")`).
@@ -113,6 +116,10 @@ pub struct NewRemoteUser {
     pub domain: String,
     /// The validated actor `type`.
     pub actor_type: String,
+    /// Whether the actor is a bot: its `type` is `Service` or `Application`,
+    /// Mastodon's `Account#bot?` rule. Re-derived on every fetch, so an
+    /// actor changing back to `Person` clears the flag.
+    pub bot: Flag,
     /// Display name as sent; empty when absent.
     pub name: String,
     /// Profile note as sanitized HTML: the `summary` run through

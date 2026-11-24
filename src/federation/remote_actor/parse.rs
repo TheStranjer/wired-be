@@ -5,8 +5,8 @@ use serde_json::Value;
 use url::Url;
 
 use super::{
-    ACTOR_TYPES, ActorError, MAX_REMOTE_BIO_CHARS, MAX_REMOTE_NAME_CHARS, MAX_USERNAME_CHARS,
-    NewRemoteUser,
+    ACTOR_TYPES, ActorError, BOT_ACTOR_TYPES, MAX_REMOTE_BIO_CHARS, MAX_REMOTE_NAME_CHARS,
+    MAX_USERNAME_CHARS, NewRemoteUser,
     fields::{
         bool_field, optional_http_url, parse_accepts_chat_messages, parse_also_known_as,
         parse_emojis, parse_fields, parse_media_url, parse_published, required_http_url,
@@ -50,12 +50,14 @@ pub fn parse_actor(json: &Value) -> Result<NewRemoteUser, ActorError> {
     let summary = truncate_chars(&summary, MAX_REMOTE_BIO_CHARS);
     let name = string_field(json, "name");
     let emojis = parse_emojis(json, &domain);
+    let actor_type = parse_actor_type(json)?;
     Ok(NewRemoteUser {
+        bot: Flag::new(BOT_ACTOR_TYPES.contains(&actor_type.as_str())),
         nickname: format!("{username}@{domain}"),
         ap_id,
         local: Flag::new(false),
         domain,
-        actor_type: parse_actor_type(json)?,
+        actor_type,
         name: truncate_chars(&name, MAX_REMOTE_NAME_CHARS).to_owned(),
         bio: sanitize_html(summary),
         raw_bio: strip_html(summary),

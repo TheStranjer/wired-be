@@ -271,6 +271,21 @@ mod tests {
     }
 
     #[test]
+    fn a_remote_service_account_renders_as_a_bot() {
+        let config = Config::for_tests();
+        let mut dave = base_user("dave@misskey.test", "https://misskey.test/users/dave");
+        dave.actor_type = "Service".to_owned();
+        dave.bot = Flag::new(true);
+        let value = render(&dave, &config);
+        assert_eq!(value["bot"], true, "a remote Service renders bot: true");
+        assert_eq!(value["group"], false, "and is not a group");
+
+        dave.actor_type = "Person".to_owned();
+        dave.bot = Flag::new(false);
+        assert_eq!(render(&dave, &config)["bot"], false, "a Person is no bot");
+    }
+
+    #[test]
     fn timestamps_render_in_the_mastodon_formats() {
         let config = Config::for_tests();
         let mut alice = base_user("alice", &format!("{BASE}/users/alice"));

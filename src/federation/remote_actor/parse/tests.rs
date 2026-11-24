@@ -492,6 +492,32 @@ fn every_supported_actor_type_round_trips() {
     }
 }
 
+/// Mastodon's `Account#bot?`: `Service` and `Application` are bots, every
+/// other kind (`Group` included) is not.
+#[test]
+fn only_service_and_application_actors_are_bots() {
+    for (kind, bot) in [
+        ("Person", false),
+        ("Service", true),
+        ("Application", true),
+        ("Group", false),
+        ("Organization", false),
+    ] {
+        let mut document = fixture(MASTODON);
+        document["type"] = json!(kind);
+        let parsed = parse_actor(&document).unwrap();
+        assert_eq!(parsed.bot.get(), bot, "{kind} bot flag");
+    }
+}
+
+#[test]
+fn an_actor_without_a_type_is_not_a_bot() {
+    let mut document = fixture(MASTODON);
+    let _removed = document.as_object_mut().unwrap().remove("type");
+    let parsed = parse_actor(&document).unwrap();
+    assert!(!parsed.bot.get(), "the Person default is no bot");
+}
+
 #[test]
 fn the_summary_is_sanitized_and_the_source_kept() {
     let mut document = fixture(MASTODON);

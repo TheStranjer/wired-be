@@ -12,9 +12,9 @@ use crate::{
 
 /// The upsert behind [`upsert_remote_user`]: insert keyed by a fresh
 /// `UUIDv7`, or, when `ap_id` already has a row, overwrite exactly the
-/// profile, key, endpoint and `alsoKnownAs` columns the actor document
-/// describes plus
-/// `last_fetched_at` and `updated_at`. `local`, `bot`, the login columns,
+/// profile, key, endpoint, `alsoKnownAs` and `bot` columns the actor
+/// document describes plus
+/// `last_fetched_at` and `updated_at`. `local`, the login columns,
 /// the moderation roles and the denormalised counters are deliberately not
 /// touched: re-fetching a remote actor must not undo anything this instance
 /// knows beyond the document itself.
@@ -22,14 +22,16 @@ const UPSERT_SQL: &str = "INSERT INTO users (
      id, nickname, ap_id, local, domain, actor_type, name, bio, raw_bio,
      avatar_url, banner_url, profile_url, locked, discoverable, fields,
      inbox, shared_inbox, outbox, followers_url, following_url,
-     featured_url, public_key, also_known_as, public_key_id, last_fetched_at
+     featured_url, public_key, also_known_as, public_key_id, bot,
+     last_fetched_at
  ) VALUES (
      $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15,
-     $16, $17, $18, $19, $20, $21, $22, $23, $24, now()
+     $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, now()
  ) ON CONFLICT (ap_id) DO UPDATE SET
      nickname = EXCLUDED.nickname,
      domain = EXCLUDED.domain,
      actor_type = EXCLUDED.actor_type,
+     bot = EXCLUDED.bot,
      name = EXCLUDED.name,
      bio = EXCLUDED.bio,
      raw_bio = EXCLUDED.raw_bio,
@@ -163,6 +165,7 @@ pub async fn upsert_remote_user(pool: &PgPool, new: NewRemoteUser) -> Result<Use
         .bind(new.public_key.as_str())
         .bind(&new.also_known_as)
         .bind(new.public_key_id.as_deref())
+        .bind(new.bot)
         .fetch_one(&mut *tx)
         .await?;
     tx.commit().await?;
@@ -629,6 +632,41 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(rows, 0, "and the instance record was skipped");
+    }
+
+    /// The `bot` column follows the document's `type` on every fetch.
+    ///
+    /// `Service` and `Application` store `true`, `Person` stores `false`,
+    /// and a later `Person` document clears the flag again.
+    #[tokio::test]
+    async fn an_upsert_derives_bot_from_the_actor_type() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let mut document = fixture(MASTODON);
+        let person = upsert_remote_user(&pool, parse_actor(&document).unwrap())
+            .await
+            .unwrap();
+        assert!(!person.bot.get(), "a Person is not a bot");
+
+        for kind in ["Service", "Application"] {
+            document["type"] = json!(kind);
+            let stored = upsert_remote_user(&pool, parse_actor(&document).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(stored.id, person.id, "the same row is updated");
+            assert!(stored.bot.get(), "a {kind} is a bot");
+        }
+
+        document["type"] = json!("Person");
+        let back = upsert_remote_user(&pool, parse_actor(&document).unwrap())
+            .await
+            .unwrap();
+        assert!(!back.bot.get(), "back to Person clears the flag");
+        document["type"] = json!("Group");
+        let group = upsert_remote_user(&pool, parse_actor(&document).unwrap())
+            .await
+            .unwrap();
+        assert!(!group.bot.get(), "a Group is not a bot");
     }
 
     /// A fetched actor's `Emoji` tags land in `custom_emojis`.
