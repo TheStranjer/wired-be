@@ -21,10 +21,7 @@
 //! route's `content_type_for_key` reads back when it serves a file, which is
 //! why [`media_key`] picks the extension from the upload's content type.
 
-use std::{
-    io,
-    path::{Path, PathBuf},
-};
+use std::{io, path::PathBuf};
 
 use bytes::Bytes;
 use rand::RngCore as _;
@@ -33,7 +30,7 @@ use uuid::Uuid;
 
 use crate::{
     config::Config,
-    error::{AppError, AppResult},
+    error::{AppError, AppResult, io_error},
     util::media_type::essence,
 };
 
@@ -227,12 +224,6 @@ impl LocalUploader {
     fn path_for(&self, key: &str) -> PathBuf {
         self.dir.join(key)
     }
-}
-
-/// Wraps a filesystem failure, keeping the operation and path for the log:
-/// [`AppError::Internal`] never sends its detail to a client.
-fn io_error(operation: &str, path: &Path, err: &io::Error) -> AppError {
-    AppError::Internal(format!("{operation} {} failed: {err}", path.display()))
 }
 
 /// The backend for an instance's configuration: the local filesystem under

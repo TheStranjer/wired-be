@@ -12,14 +12,14 @@ use std::{
 use tracing::debug;
 use zip::{CompressionMethod, ZipWriter, write::SimpleFileOptions};
 
-use crate::error::{AppError, AppResult};
+use crate::error::{AppError, AppResult, io_error};
 
 use super::{
     ACCEPTED_EMOJI_TYPES, ARCHIVE_ENTRY_TOO_LARGE, ARCHIVE_TOO_LARGE, ARCHIVE_TOO_MANY_FILES,
     ARCHIVE_UNREADABLE, ARCHIVE_UNSAFE_PATH, MAX_PACK_ARCHIVE_BYTES, MAX_PACK_ARCHIVE_ENTRIES,
     MAX_PACK_EXTRACTED_BYTES, PACK_FILE, file_name_valid,
     files::create_parent,
-    names::{io_error, not_shared, pack_dir},
+    names::{not_shared, pack_dir},
     packs::load_pack,
 };
 
