@@ -73,7 +73,6 @@
 //! relay is subscribed to hear, and the reason a `local` status must
 //! never reach here by mistake).
 
-use chrono::{DateTime, Utc};
 use futures::future::BoxFuture;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -276,49 +275,13 @@ pub async fn publish_in_background(
         "activity": activity,
         "extra_inboxes": extra_inboxes,
     });
-    enqueue_publish(state, args, unique_key, None).await
-}
-
-/// [`publish_in_background`] for a debounced, delayed fan-out: the job is
-/// deduplicated under `unique_key` and not due before `run_at`, and it
-/// carries no extra inboxes.
-///
-/// A poll tally's `Update` uses it: it waits a few minutes so a burst of
-/// votes becomes one fan-out.
-///
-/// # Errors
-///
-/// Any database failure inserting the job row arrives as
-/// [`AppError::Database`](crate::error::AppError).
-pub async fn publish_in_background_at(
-    state: &AppState,
-    actor_id: Uuid,
-    activity: &Value,
-    unique_key: &str,
-    run_at: DateTime<Utc>,
-) -> AppResult<()> {
-    let args = json!({
-        "actor_id": actor_id,
-        "activity": activity,
-        "extra_inboxes": Vec::<String>::new(),
-    });
-    enqueue_publish(state, args, Some(unique_key), Some(run_at)).await
-}
-
-/// Inserts the [`KIND_PUBLISH`] job row both background entry points share.
-async fn enqueue_publish(
-    state: &AppState,
-    args: Value,
-    unique_key: Option<&str>,
-    run_at: Option<DateTime<Utc>>,
-) -> AppResult<()> {
     let _job = enqueue(
         &state.db,
         NewJob {
             queue: QUEUE_FEDERATOR_OUTGOING,
             kind: KIND_PUBLISH,
             args,
-            run_at,
+            run_at: None,
             max_attempts: None,
             unique_key,
         },

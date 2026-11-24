@@ -78,10 +78,13 @@
 //!   [`crate::federation::handlers::vote`] folds on the way in), addressed
 //!   to the poll's author alone and delivered to their inbox. A poll on a
 //!   local status sends no answer;
-//! - [`after_local_poll_changed`]: the `Update` of a LOCAL poll's
-//!   `Question` with its current tally, queued three minutes ahead under
-//!   the key `poll-update:{status id}` after a vote (local or federated)
-//!   and when the poll closes;
+//! - [`after_local_poll_changed`] / [`after_local_poll_closed`]: the
+//!   `Update` of a LOCAL poll's `Question`, queued as a
+//!   `polls.publish_update` job naming the status, three minutes ahead
+//!   after a vote (local or federated) and at once when the poll closes,
+//!   under the key `poll-update:{status id}`. The document is rendered when
+//!   the job runs ([`handle_publish_update`]), so it carries the tally as
+//!   of then;
 //! - [`after_chat_message_created`] / [`after_chat_message_deleted`]: the
 //!   `Create{ChatMessage}` a local account's message to a REMOTE
 //!   counterpart is, delivered to that counterpart's inbox alone, and the
@@ -203,7 +206,10 @@ pub use follow_requests::{after_follow_request_resolved, after_follower_removed}
 pub use follows::{FollowAnswer, accept_follow, after_follow_changed, reject_follow};
 pub use likes::after_favourite_changed;
 pub use moves::after_account_moved;
-pub use polls::{after_local_poll_changed, after_poll_vote};
+pub use polls::{
+    KIND_PUBLISH_UPDATE, after_local_poll_changed, after_local_poll_closed, after_poll_vote,
+    handle_publish_update,
+};
 pub use profile::{after_account_deleted, after_account_disabled, after_profile_updated};
 pub use reactions::after_reaction_changed;
 pub use reports::after_report_created;

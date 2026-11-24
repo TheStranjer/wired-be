@@ -394,11 +394,25 @@ async fn a_vote_on_a_local_poll_queues_only_a_question_update() {
         (1, 1),
         "the ballot counted"
     );
-    let queued = published(&pool).await;
+    assert!(published(&pool).await.is_empty(), "no answer is published");
+    let queued = sqlx::query_as::<_, (Value, Option<String>)>(
+        "SELECT args, unique_key FROM jobs WHERE kind = $1",
+    )
+    .bind(wired_be::services::federation_out::KIND_PUBLISH_UPDATE)
+    .fetch_all(&pool)
+    .await
+    .expect("the update jobs read");
     assert_eq!(queued.len(), 1, "one job: the tally's Update");
-    assert_eq!(queued[0]["type"], "Update", "an Update, not an answer");
-    assert_eq!(queued[0]["object"]["type"], "Question", "of the question");
-    assert_eq!(queued[0]["object"]["votersCount"], 1, "with the new tally");
+    assert_eq!(
+        queued[0].0,
+        json!({ "status_id": stand.status_id }),
+        "naming the status, with no document rendered"
+    );
+    assert_eq!(
+        queued[0].1.as_deref(),
+        Some(format!("poll-update:{}", stand.status_id).as_str()),
+        "under the per-status key"
+    );
     assert_eq!(delivery_count(&pool).await, 0, "and no delivery job yet");
 }
 

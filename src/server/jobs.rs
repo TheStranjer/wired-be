@@ -85,6 +85,10 @@ pub fn job_registry() -> JobRegistry {
         federation::publisher::handle,
     );
     registry.register(
+        services::federation_out::KIND_PUBLISH_UPDATE,
+        services::federation_out::handle_publish_update,
+    );
+    registry.register(
         federation::dispatch::KIND_CLEANUP_RECEIVED,
         federation::dispatch::handle_cleanup_received,
     );
