@@ -227,6 +227,64 @@ fn parses_a_pleroma_style_actor() {
 }
 
 #[test]
+fn parse_actor_records_the_public_key_id() {
+    let document = fixture(MASTODON);
+    assert_eq!(
+        parse_actor(&document).unwrap().public_key_id.as_deref(),
+        Some("https://mastodon.example/users/alice#main-key"),
+        "a fragment key id is kept whole"
+    );
+
+    let array = fixture(PLEROMA);
+    assert_eq!(
+        parse_actor(&array).unwrap().public_key_id.as_deref(),
+        Some("https://pleroma.example/users/bob.the-bot#main-key"),
+        "an array publicKey is read from its first element"
+    );
+
+    let mut path_style = fixture(MASTODON);
+    path_style["publicKey"]["id"] = json!("https://mastodon.example/users/alice/main-key");
+    assert_eq!(
+        parse_actor(&path_style).unwrap().public_key_id.as_deref(),
+        Some("https://mastodon.example/users/alice/main-key"),
+        "a GoToSocial path-style key id is kept"
+    );
+
+    let mut reference = fixture(MASTODON);
+    reference["publicKey"]["id"] = json!({"id": "https://mastodon.example/keys/1"});
+    assert_eq!(
+        parse_actor(&reference).unwrap().public_key_id.as_deref(),
+        Some("https://mastodon.example/keys/1"),
+        "a reference object spelling resolves through value_or_id"
+    );
+}
+
+#[test]
+fn parse_actor_drops_a_public_key_id_it_cannot_trust() {
+    let mut missing = fixture(MASTODON);
+    remove(&mut missing["publicKey"], "id");
+    assert_eq!(
+        parse_actor(&missing).unwrap().public_key_id,
+        None,
+        "no key id is no key id, and the parse still succeeds"
+    );
+
+    for (case, key_id) in [
+        ("another host", "https://evil.example/users/alice#main-key"),
+        ("not a URL", "main-key"),
+        ("not http(s)", "mailto:alice@mastodon.example"),
+    ] {
+        let mut document = fixture(MASTODON);
+        document["publicKey"]["id"] = json!(key_id);
+        assert_eq!(
+            parse_actor(&document).unwrap().public_key_id,
+            None,
+            "{case} is dropped"
+        );
+    }
+}
+
+#[test]
 fn a_minimal_actor_gets_the_documented_defaults() {
     let document = json!({
         "id": "https://remote.example/users/carol",

@@ -22,10 +22,10 @@ const UPSERT_SQL: &str = "INSERT INTO users (
      id, nickname, ap_id, local, domain, actor_type, name, bio, raw_bio,
      avatar_url, banner_url, profile_url, locked, discoverable, fields,
      inbox, shared_inbox, outbox, followers_url, following_url,
-     featured_url, public_key, also_known_as, last_fetched_at
+     featured_url, public_key, also_known_as, public_key_id, last_fetched_at
  ) VALUES (
      $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15,
-     $16, $17, $18, $19, $20, $21, $22, $23, now()
+     $16, $17, $18, $19, $20, $21, $22, $23, $24, now()
  ) ON CONFLICT (ap_id) DO UPDATE SET
      nickname = EXCLUDED.nickname,
      domain = EXCLUDED.domain,
@@ -47,6 +47,7 @@ const UPSERT_SQL: &str = "INSERT INTO users (
      featured_url = EXCLUDED.featured_url,
      public_key = EXCLUDED.public_key,
      also_known_as = EXCLUDED.also_known_as,
+     public_key_id = EXCLUDED.public_key_id,
      last_fetched_at = now(),
      updated_at = now()
  RETURNING *";
@@ -68,6 +69,14 @@ const NICKNAME_HOLDER_SQL: &str = "SELECT ap_id, COALESCE(NOT local AND domain =
 const RENAME_HOLDER_SQL: &str = "UPDATE users
      SET nickname = (id::text || '.' || nickname::text)::citext, updated_at = now()
      WHERE ap_id = $1";
+
+/// Frees a key id another row holds before this actor claims it.
+///
+/// The unique index on `public_key_id` would otherwise fail the whole upsert
+/// when a host re-homes a key id onto a different actor. The latest document
+/// wins; the loser's next fetch stores its own id again.
+const RELEASE_KEY_ID_SQL: &str =
+    "UPDATE users SET public_key_id = NULL WHERE public_key_id = $1 AND ap_id <> $2";
 
 /// Stores `new` as this instance's mirror of the actor, exactly once per
 /// actor id (decision 7).
@@ -118,6 +127,13 @@ pub async fn upsert_remote_user(pool: &PgPool, new: NewRemoteUser) -> Result<Use
             .execute(&mut *tx)
             .await?;
     }
+    if let Some(key_id) = new.public_key_id.as_deref() {
+        let _released = sqlx::query(RELEASE_KEY_ID_SQL)
+            .bind(key_id)
+            .bind(new.ap_id.as_str())
+            .execute(&mut *tx)
+            .await?;
+    }
     let user = sqlx::query_as::<_, User>(UPSERT_SQL)
         .bind(new_id())
         .bind(new.nickname.as_str())
@@ -142,6 +158,7 @@ pub async fn upsert_remote_user(pool: &PgPool, new: NewRemoteUser) -> Result<Use
         .bind(new.featured_url.as_deref())
         .bind(new.public_key.as_str())
         .bind(&new.also_known_as)
+        .bind(new.public_key_id.as_deref())
         .fetch_one(&mut *tx)
         .await?;
     tx.commit().await?;
@@ -166,8 +183,8 @@ mod tests {
             test_support::{MASTODON, PLEROMA, fixture},
         },
         models::user::{
-            CountDelta, Flag, NewUser, get_by_ap_id, get_by_id, get_by_nickname, insert,
-            update_counts,
+            CountDelta, Flag, NewUser, get_by_ap_id, get_by_id, get_by_nickname,
+            get_by_public_key_id, insert, update_counts,
         },
     };
 
@@ -267,6 +284,36 @@ mod tests {
             .unwrap()
             .expect("the handle finds the mirror");
         assert_eq!(by_nickname.id, first.id, "one row, both lookups");
+    }
+
+    #[tokio::test]
+    async fn upsert_stores_the_public_key_id_and_rehomes_it() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = upsert_remote_user(&pool, parse_actor(&fixture(MASTODON)).unwrap())
+            .await
+            .unwrap();
+        let found = get_by_public_key_id(&pool, "https://mastodon.example/users/alice#main-key")
+            .await
+            .unwrap()
+            .expect("the mirror is found by its key id");
+        assert_eq!(found.id, alice.id, "the key id names the stored actor");
+
+        // A second actor on the same host claiming the same key id takes
+        // it over instead of failing the unique index.
+        let mut other = fixture(MASTODON);
+        other["id"] = json!("https://mastodon.example/users/carol");
+        other["preferredUsername"] = json!("carol");
+        other["inbox"] = json!("https://mastodon.example/users/carol/inbox");
+        other["publicKey"]["owner"] = json!("https://mastodon.example/users/carol");
+        let carol = upsert_remote_user(&pool, parse_actor(&other).unwrap())
+            .await
+            .unwrap();
+        let moved = get_by_public_key_id(&pool, "https://mastodon.example/users/alice#main-key")
+            .await
+            .unwrap()
+            .expect("the key id still resolves");
+        assert_eq!(moved.id, carol.id, "the latest document holds the key id");
     }
 
     #[tokio::test]

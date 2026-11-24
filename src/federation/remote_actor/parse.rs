@@ -18,7 +18,7 @@ use crate::{
     models::user::{DEFAULT_ACTOR_TYPE, Flag},
     util::{
         sanitize::{sanitize_html, strip_html},
-        url::{host_with_port, is_http_url, parse_http_url},
+        url::{host_with_port, http_host, is_http_url, parse_http_url},
     },
 };
 
@@ -43,6 +43,7 @@ pub fn parse_actor(json: &Value) -> Result<NewRemoteUser, ActorError> {
     let username = parse_preferred_username(json)?;
     let inbox = required_http_url(json, "inbox")?;
     let public_key = parse_public_key(json, &ap_id)?;
+    let public_key_id = parse_public_key_id(json, &ap_id);
     let summary = string_field(json, "summary");
     let summary = truncate_chars(&summary, MAX_REMOTE_BIO_CHARS);
     let name = string_field(json, "name");
@@ -75,6 +76,7 @@ pub fn parse_actor(json: &Value) -> Result<NewRemoteUser, ActorError> {
         following_url: optional_http_url(json, "following"),
         featured_url: optional_http_url(json, "featured"),
         public_key,
+        public_key_id,
         also_known_as: parse_also_known_as(json),
         moved_to: optional_http_url(json, "movedTo"),
         accepts_chat_messages: parse_accepts_chat_messages(json),
@@ -187,6 +189,23 @@ fn parse_public_key(json: &Value, id: &str) -> Result<String, ActorError> {
         .filter(|pem| !pem.is_empty())
         .map(str::to_owned)
         .ok_or_else(|| ActorError::Invalid("`publicKey.publicKeyPem` is missing".to_owned()))
+}
+
+/// The `publicKey.id`, kept only when it is an `http(s)` URL on the actor's host.
+///
+/// The id may be a string or a reference object, read from the first element
+/// of an array `publicKey`. It is optional and never fatal: a missing,
+/// malformed or foreign-host id is dropped, and the signer is then found by
+/// the actor URL the `keyId` strips to.
+fn parse_public_key_id(json: &Value, id: &str) -> Option<String> {
+    let key_id = json
+        .get("publicKey")
+        .and_then(|public_key| as_array(public_key).first())
+        .and_then(|key| key.get("id"))
+        .and_then(value_or_id)
+        .filter(|key_id| is_http_url(key_id))?;
+    let actor_host = http_host(id)?;
+    (http_host(&key_id)? == actor_host).then_some(key_id)
 }
 
 #[cfg(test)]
