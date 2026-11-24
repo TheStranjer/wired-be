@@ -18,7 +18,7 @@ use crate::{
 use super::{
     ReblogPageEntry, Status, Visibility,
     counters::{count_new_post, uncount_deleted},
-    delete::clear_pins,
+    delete::{clear_pins, tombstone_set},
 };
 
 /// The `INSERT` behind [`create_reblog`]: a reblog row is decision 6's
@@ -48,14 +48,11 @@ const LIVE_REBLOG_SQL: &str = "SELECT * FROM statuses
 /// which is what the write hook reports and the counter steps run on; a
 /// pair that never reblogged (or already withdrew) matches nothing, which
 /// is what makes the write idempotent.
-const TOMBSTONE_REBLOG_SQL: &str = "UPDATE statuses
-      SET content = '',
-          raw_text = '',
-          spoiler_text = '',
-          deleted_at = now(),
-          updated_at = now()
-     WHERE user_id = $1 AND reblog_of_id = $2 AND deleted_at IS NULL
-   RETURNING *";
+pub(super) const TOMBSTONE_REBLOG_SQL: &str = concat!(
+    "UPDATE statuses ",
+    tombstone_set!(),
+    " WHERE user_id = $1 AND reblog_of_id = $2 AND deleted_at IS NULL RETURNING *"
+);
 
 /// [`reblogged_status_ids`]: which of a batch of originals the viewer has
 /// a live reblog of. Only the ids that *have* a row come back; the caller's
