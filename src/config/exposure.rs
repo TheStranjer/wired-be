@@ -147,15 +147,27 @@ where
 }
 
 /// Reads the two VAPID overrides, each trimmed, a blank standing for
-/// unset (the generated pair then stays in charge).
-pub(crate) fn vapid_settings<F>(lookup: &F) -> VapidConfig
+/// unset (the generated pair then stays in charge). A public key without a
+/// private one is refused: the instance would advertise a key it cannot
+/// sign for.
+///
+/// # Errors
+///
+/// Returns [`ConfigError::VapidPublicWithoutPrivate`] when
+/// `VAPID_PUBLIC_KEY` is set and `VAPID_PRIVATE_KEY` is not.
+pub(crate) fn vapid_settings<F>(lookup: &F) -> Result<VapidConfig, ConfigError>
 where
     F: Fn(&str) -> Option<String>,
 {
-    VapidConfig {
-        private_key: trimmed(lookup, VAPID_PRIVATE_KEY_VAR),
-        public_key: trimmed(lookup, VAPID_PUBLIC_KEY_VAR),
+    let private_key = trimmed(lookup, VAPID_PRIVATE_KEY_VAR);
+    let public_key = trimmed(lookup, VAPID_PUBLIC_KEY_VAR);
+    if public_key.is_some() && private_key.is_none() {
+        return Err(ConfigError::VapidPublicWithoutPrivate(VAPID_PUBLIC_KEY_VAR));
     }
+    Ok(VapidConfig {
+        private_key,
+        public_key,
+    })
 }
 
 /// Reads the three settings that configure status translation
@@ -302,6 +314,37 @@ mod tests {
                 "`{value}` selects its provider"
             );
         }
+    }
+
+    #[test]
+    fn a_public_vapid_key_without_a_private_one_is_an_error() {
+        let err = try_config_with(&[(VAPID_PUBLIC_KEY_VAR, "some-public-key")]).unwrap_err();
+        assert_eq!(
+            err,
+            ConfigError::VapidPublicWithoutPrivate(VAPID_PUBLIC_KEY_VAR),
+            "error variant"
+        );
+        assert!(err.source().is_none(), "no source");
+        assert!(
+            err.to_string().starts_with("invalid VAPID_PUBLIC_KEY: "),
+            "message names the variable: {err}"
+        );
+    }
+
+    #[test]
+    fn vapid_overrides_accept_a_private_key_alone_or_a_pair_and_blank_counts_as_unset() {
+        let private_only = config_with(&[(VAPID_PRIVATE_KEY_VAR, " pem ")]);
+        assert_eq!(private_only.vapid.private_key.as_deref(), Some("pem"));
+        assert_eq!(private_only.vapid.public_key, None);
+
+        let pair = config_with(&[
+            (VAPID_PRIVATE_KEY_VAR, "pem"),
+            (VAPID_PUBLIC_KEY_VAR, "pub"),
+        ]);
+        assert_eq!(pair.vapid.public_key.as_deref(), Some("pub"));
+
+        let blank_public = config_with(&[(VAPID_PUBLIC_KEY_VAR, "   ")]);
+        assert_eq!(blank_public.vapid, VapidConfig::default(), "blank is unset");
     }
 
     #[test]
