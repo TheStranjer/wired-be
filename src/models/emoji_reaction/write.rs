@@ -10,17 +10,19 @@ use crate::{
     util::id::{new_activity_ap_id, new_id},
 };
 
-/// [`react`]: the write, idempotent on `(user_id, status_id, emoji)`. A pair
-/// that already reacted keeps its row — id, `ap_id`, `inserted_at` and so its
-/// place in the roll-up's order — and only picks up the `url` the caller
-/// brings, which is how a repeat reaction to a custom emoji whose image was
-/// replaced shows the new image without becoming a new reaction. `COALESCE`
-/// keeps the stored URL when the caller brought none.
+/// [`react_in_domain`]: the write, idempotent on `(user_id, status_id, emoji,
+/// emoji_domain)` — the unique index `emoji_reactions_user_status_emoji_key`,
+/// which reads a NULL domain as the empty string. A pair that already reacted
+/// keeps its row — id, `ap_id`, `inserted_at` and so its place in the roll-up's
+/// order — and only picks up the `url` the caller brings, which is how a repeat
+/// reaction to a custom emoji whose image was replaced shows the new image
+/// without becoming a new reaction. `COALESCE` keeps the stored URL when the
+/// caller brought none.
 const REACT_SQL: &str = "INSERT INTO emoji_reactions (
-     id, user_id, status_id, emoji, url, ap_id
+     id, user_id, status_id, emoji, url, ap_id, emoji_domain
 ) VALUES (
-     $1, $2, $3, $4, $5, $6
-) ON CONFLICT (user_id, status_id, emoji) DO UPDATE SET
+     $1, $2, $3, $4, $5, $6, $7
+) ON CONFLICT (user_id, status_id, emoji, (COALESCE(emoji_domain, ''))) DO UPDATE SET
      url = COALESCE(EXCLUDED.url, emoji_reactions.url)
 RETURNING *";
 
@@ -53,6 +55,35 @@ pub async fn react(
     react_with_ap_id(pool, reaction, &new_activity_ap_id(base_url)).await
 }
 
+/// [`react_with_ap_id`] for the custom emoji of another instance: the same
+/// idempotent write, with the emoji's origin `domain` recorded beside it.
+///
+/// `domain` is the `custom_emojis` domain of the emoji, so `:misskeycat:` of
+/// `misskey.test` and a local `:misskeycat:` are two different reactions of
+/// one account. `None` is [`react_with_ap_id`] itself.
+///
+/// # Errors
+///
+/// Those of [`react`].
+pub async fn react_in_domain(
+    pool: &PgPool,
+    reaction: &NewReaction<'_>,
+    ap_id: &str,
+    domain: Option<&str>,
+) -> AppResult<EmojiReaction> {
+    let row = sqlx::query_as::<_, EmojiReaction>(REACT_SQL)
+        .bind(new_id())
+        .bind(reaction.user_id)
+        .bind(reaction.status_id)
+        .bind(reaction.emoji)
+        .bind(reaction.url)
+        .bind(ap_id)
+        .bind(domain)
+        .fetch_one(pool)
+        .await?;
+    Ok(row)
+}
+
 /// [`react`]'s write under an explicit `ap_id`: the federation mirror's
 /// door, where the row stands for the delivered `EmojiReact` activity.
 ///
@@ -69,16 +100,7 @@ pub async fn react_with_ap_id(
     reaction: &NewReaction<'_>,
     ap_id: &str,
 ) -> AppResult<EmojiReaction> {
-    let row = sqlx::query_as::<_, EmojiReaction>(REACT_SQL)
-        .bind(new_id())
-        .bind(reaction.user_id)
-        .bind(reaction.status_id)
-        .bind(reaction.emoji)
-        .bind(reaction.url)
-        .bind(ap_id)
-        .fetch_one(pool)
-        .await?;
-    Ok(row)
+    react_in_domain(pool, reaction, ap_id, None).await
 }
 
 /// The `SELECT` behind [`get_by_ap_id`]: the reaction of one account whose
@@ -112,8 +134,8 @@ pub async fn get_by_ap_id(
 #[cfg(test)]
 mod tests {
     use super::super::test_support::{
-        ACTIVITY_PREFIX, BASE, CAT, CAT_URL, HEART, THUMBS, instant, names, post, post_by,
-        react_with, rollup, stamp, stored, summary, user,
+        ACTIVITY_PREFIX, BASE, CAT, CAT_URL, HEART, REMOTE_CAT, REMOTE_DOMAIN, THUMBS, instant,
+        names, post, post_by, react_remote, react_with, rollup, stamp, stored, summary, user,
     };
     use super::*;
 
@@ -294,6 +316,34 @@ mod tests {
                 .expect("the activity-id read runs")
                 .is_none(),
             "and another account quoting it names none of its own"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_remote_emoji_is_idempotent_and_apart_from_its_local_twin() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = user(&pool, "alice").await;
+        let status_id = post_by(&pool, "bob").await;
+
+        let first = react_remote(&pool, &alice, status_id).await;
+        assert_eq!(
+            first.emoji_domain.as_deref(),
+            Some(REMOTE_DOMAIN),
+            "the origin is stored with the reaction"
+        );
+        let again = react_remote(&pool, &alice, status_id).await;
+        assert_eq!(
+            again.id, first.id,
+            "repeating the remote reaction is one row"
+        );
+        assert_eq!(again.ap_id, first.ap_id, "that keeps its activity id");
+
+        react_with(&pool, &alice, status_id, REMOTE_CAT, Some(CAT_URL)).await;
+        assert_eq!(
+            stored(&pool).await.len(),
+            2,
+            "the same text with no domain is a second, local reaction"
         );
     }
 

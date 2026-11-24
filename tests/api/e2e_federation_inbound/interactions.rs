@@ -1,5 +1,6 @@
 //! Inbound likes, reactions and announces, and their undos, end to end.
 
+use axum::http::StatusCode;
 use serde_json::json;
 
 use super::support::{
@@ -206,5 +207,84 @@ async fn a_remote_announce_and_its_undo_boost_the_public_timeline() {
     assert!(
         told_of(&app, &alice_token, "reblog").await.is_empty(),
         "and cleared the telling"
+    );
+}
+
+/// Scenario: joining a remote custom reaction. A delivered `EmojiReact` with an
+/// `Emoji` tag is named `shortcode@domain` in the reactions read, and the local
+/// author reacting with that name lands in the same entry.
+#[tokio::test]
+async fn a_remote_custom_reaction_is_named_for_its_instance_and_can_be_joined() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let (app, state) = remote::app_and_state(pool.clone());
+    let peer = remote::MockPeer::start().await;
+    let (_alice, alice_token) = local(&pool, "ei-custom-alice").await;
+    let posted = post_status(&app, &alice_token, json!({"status": "react to me"})).await;
+    let id = common::id_of(&posted);
+    let actor = peer.actor(BOB);
+    let image = "https://misskey.test/files/misskeycat.png";
+
+    let react = {
+        let mut react = activity(
+            &peer,
+            "EmojiReact",
+            "custom-react-1",
+            &actor,
+            json!(uri_of(&posted)),
+        );
+        merge(
+            &mut react,
+            json!({
+                "content": ":misskeycat:",
+                "tag": [{
+                    "type": "Emoji",
+                    "name": ":misskeycat:",
+                    "icon": {"type": "Image", "url": image},
+                }],
+            }),
+        );
+        react
+    };
+    deliver(&app, &state, &peer, BOB, &react).await;
+
+    let domain =
+        sqlx::query_scalar::<_, Option<String>>("SELECT emoji_domain FROM emoji_reactions")
+            .fetch_one(&pool)
+            .await
+            .expect("the reaction was stored")
+            .expect("a remote custom emoji records its domain");
+    let name = format!("misskeycat@{domain}");
+    let remembered = sqlx::query_scalar::<_, i64>(
+        "SELECT count(*) FROM custom_emojis WHERE shortcode = 'misskeycat' AND domain = $1",
+    )
+    .bind(&domain)
+    .fetch_one(&pool)
+    .await
+    .expect("the emoji table reads");
+    assert_eq!(remembered, 1, "the reaction taught this instance the emoji");
+
+    let path = format!("{REACTIONS}/{id}/reactions");
+    let reactions = list(&app, Some(&alice_token), &path).await;
+    assert_eq!(reactions.len(), 1, "one reaction landed");
+    assert_eq!(reactions[0]["name"], json!(name), "named as Pleroma does");
+    assert_eq!(reactions[0]["url"], json!(image), "with the remote image");
+
+    let joined = common::TestRequest::put(&format!("{path}/{name}"))
+        .bearer(&alice_token)
+        .send(&app)
+        .await;
+    common::assert_answer(&joined, StatusCode::OK, "the author joins the reaction");
+    let joined_reactions = list(&app, Some(&alice_token), &path).await;
+    assert_eq!(
+        joined_reactions.len(),
+        1,
+        "the two reactors share one entry"
+    );
+    assert_eq!(joined_reactions[0]["count"], json!(2), "counted together");
+    assert_eq!(
+        joined_reactions[0]["me"],
+        json!(true),
+        "and the author is one"
     );
 }

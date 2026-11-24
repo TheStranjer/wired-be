@@ -7,12 +7,14 @@ use uuid::Uuid;
 use super::EmojiReaction;
 use crate::error::AppResult;
 
-/// [`unreact`]: one account's one emoji on one status; a pair that never
-/// reacted (or already withdrew) deletes nothing, so withdrawal is idempotent.
-/// `RETURNING *` hands the caller the row that went, which is what the write
-/// hook reports.
+/// [`unreact_in_domain`]: one account's one emoji on one status; a pair that
+/// never reacted (or already withdrew) deletes nothing, so withdrawal is
+/// idempotent. The emoji is its text *and* its origin domain (`$4`, `NULL` for
+/// a unicode or local emoji). `RETURNING *` hands the caller the row that
+/// went, which is what the write hook reports.
 const UNREACT_SQL: &str = "DELETE FROM emoji_reactions
       WHERE user_id = $1 AND status_id = $2 AND emoji = $3
+        AND emoji_domain IS NOT DISTINCT FROM $4
    RETURNING *";
 
 /// Removes `user_id`'s reaction `emoji` from `status_id`, reporting the row
@@ -33,10 +35,29 @@ pub async fn unreact(
     status_id: Uuid,
     emoji: &str,
 ) -> AppResult<Option<EmojiReaction>> {
+    unreact_in_domain(pool, user_id, status_id, emoji, None).await
+}
+
+/// [`unreact`] for the custom emoji of another instance: removes the reaction
+/// `emoji` of origin `domain` (`None`: a unicode or local emoji, which is what
+/// [`unreact`] withdraws).
+///
+/// # Errors
+///
+/// Any database failure (connection, encoding) arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn unreact_in_domain(
+    pool: &PgPool,
+    user_id: Uuid,
+    status_id: Uuid,
+    emoji: &str,
+    domain: Option<&str>,
+) -> AppResult<Option<EmojiReaction>> {
     let removed = sqlx::query_as::<_, EmojiReaction>(UNREACT_SQL)
         .bind(user_id)
         .bind(status_id)
         .bind(emoji)
+        .bind(domain)
         .fetch_optional(pool)
         .await?;
     Ok(removed)
@@ -76,7 +97,8 @@ mod tests {
         NewReaction,
         read::reactors,
         test_support::{
-            BASE, CAT, CAT_URL, HEART, THUMBS, post, post_by, react_with, stored, user,
+            BASE, CAT, CAT_URL, HEART, REMOTE_CAT, REMOTE_DOMAIN, THUMBS, post, post_by,
+            react_remote, react_with, stored, user,
         },
         write::react,
     };
@@ -111,6 +133,34 @@ mod tests {
                 .expect("an unreacted emoji runs")
                 .is_none(),
             "and an emoji that was never reacted with is no error either"
+        );
+        assert!(stored(&pool).await.is_empty(), "the table is empty again");
+    }
+
+    #[tokio::test]
+    async fn unreacting_a_remote_emoji_needs_its_domain() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = user(&pool, "alice").await;
+        let status_id = post_by(&pool, "bob").await;
+        let _row = react_remote(&pool, &alice, status_id).await;
+
+        assert!(
+            unreact(&pool, alice.id, status_id, REMOTE_CAT)
+                .await
+                .expect("the local withdrawal runs")
+                .is_none(),
+            "the local emoji of that text is not the remote one"
+        );
+        let removed =
+            unreact_in_domain(&pool, alice.id, status_id, REMOTE_CAT, Some(REMOTE_DOMAIN))
+                .await
+                .expect("the remote withdrawal runs")
+                .expect("the remote reaction was there");
+        assert_eq!(
+            removed.emoji_domain.as_deref(),
+            Some(REMOTE_DOMAIN),
+            "the row that went names its origin"
         );
         assert!(stored(&pool).await.is_empty(), "the table is empty again");
     }
@@ -187,7 +237,7 @@ mod tests {
             .expect("the sweep runs");
 
         assert_eq!(removed, 2, "both of alice's reactions went");
-        let left = reactors(&pool, status, None)
+        let left = reactors(&pool, status, None, None)
             .await
             .expect("the reactors read");
         assert_eq!(left.len(), 1, "only the custom emoji is left");

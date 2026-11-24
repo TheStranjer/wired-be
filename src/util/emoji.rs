@@ -64,6 +64,59 @@ pub fn shortcode(text: &str) -> Option<&str> {
     is_shortcode_body(inner).then_some(inner)
 }
 
+/// The `(shortcode, domain)` of a remote custom emoji spelled
+/// `shortcode@domain`, with or without the surrounding colons; `None` for any
+/// other text.
+///
+/// This is Pleroma's `:shortcode@domain:` reaction shape
+/// (`@emoji_regex ~r/:[A-Za-z0-9_-]+(@.+)?:/`). The colons come both or not at
+/// all, the shortcode is [`shortcode`]'s character set, and the domain is a
+/// dotted host name of letters, digits, `-` and `.` with an optional numeric
+/// `:port`, so it is returned lowercased the way stored domains are.
+#[must_use]
+pub fn remote_shortcode(text: &str) -> Option<(&str, String)> {
+    let inner = match (text.strip_prefix(':'), text.ends_with(':')) {
+        (Some(rest), true) => rest.strip_suffix(':')?,
+        (None, false) => text,
+        _ => return None,
+    };
+    let (code, domain) = inner.split_once('@')?;
+    let code_ok = !code.is_empty() && code.chars().all(is_shortcode_char);
+    let domain_ok = is_domain(domain);
+    (code_ok && domain_ok).then(|| (code, domain.to_ascii_lowercase()))
+}
+
+/// Whether `domain` is a plausible host name with an optional `:port`:
+/// non-empty labels of ASCII letters, digits and `-`, separated by single dots.
+fn is_domain(domain: &str) -> bool {
+    let (host, port) = domain
+        .split_once(':')
+        .map_or((domain, None), |(host, port)| (host, Some(port)));
+    let port_ok = port
+        .is_none_or(|digits| !digits.is_empty() && digits.chars().all(|ch| ch.is_ascii_digit()));
+    port_ok
+        && host.split('.').all(|label| {
+            !label.is_empty()
+                && label
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || ch == '-')
+        })
+}
+
+/// The name a reaction goes by on the API: `shortcode@domain` for a custom
+/// emoji of another instance (Pleroma's spelling), the stored text otherwise.
+///
+/// `emoji` is the stored spelling and `domain` the emoji's origin, `None` for
+/// a unicode or local emoji. Text that is not a `:shortcode:` keeps its own
+/// spelling whatever `domain` says.
+#[must_use]
+pub fn display_name(emoji: &str, domain: Option<&str>) -> String {
+    match (domain, shortcode(emoji)) {
+        (Some(domain), Some(code)) => format!("{code}@{domain}"),
+        _ => emoji.to_owned(),
+    }
+}
+
 /// Whether `ch` may appear between the colons of a shortcode.
 #[must_use]
 pub const fn is_shortcode_char(ch: char) -> bool {
@@ -270,6 +323,83 @@ mod tests {
         ] {
             assert!(shortcodes_in(text).is_empty(), "{text:?} has no token");
         }
+    }
+
+    #[test]
+    fn a_remote_shortcode_reads_with_or_without_colons() {
+        for text in [
+            "misskeycat@misskey.test",
+            ":misskeycat@misskey.test:",
+            "misskeycat@Misskey.Test",
+        ] {
+            assert_eq!(
+                remote_shortcode(text),
+                Some(("misskeycat", "misskey.test".to_owned())),
+                "{text}"
+            );
+        }
+        assert_eq!(
+            remote_shortcode("cat@127.0.0.1:8080"),
+            Some(("cat", "127.0.0.1:8080".to_owned())),
+            "a port rides along"
+        );
+        assert_eq!(
+            remote_shortcode(":cat@127.0.0.1:8080:"),
+            Some(("cat", "127.0.0.1:8080".to_owned())),
+            "inside colons too"
+        );
+        assert_eq!(
+            remote_shortcode(":blob-cat+1@a-b.example.org:"),
+            Some(("blob-cat+1", "a-b.example.org".to_owned())),
+            "the shortcode set and a multi-label domain"
+        );
+    }
+
+    #[test]
+    fn a_non_remote_spelling_is_rejected() {
+        for text in [
+            "",
+            ":",
+            ":cat:",
+            "cat",
+            "@misskey.test",
+            "cat@",
+            ":cat@misskey.test",
+            "cat@misskey.test:",
+            ":cat@:",
+            "cat@mis skey.test",
+            "cat@misskey..test",
+            "cat@.test",
+            "cat@misskey.test.",
+            "c.at@misskey.test",
+            "cat@a@b",
+            "cat@misskey.test:",
+            "cat@misskey.test:80a",
+            "cat@misskey.test:8:0",
+            "🐱@misskey.test",
+        ] {
+            assert_eq!(remote_shortcode(text), None, "{text:?} is not remote");
+        }
+    }
+
+    #[test]
+    fn a_remote_emoji_is_named_shortcode_at_domain() {
+        assert_eq!(
+            display_name(":misskeycat:", Some("misskey.test")),
+            "misskeycat@misskey.test",
+            "Pleroma's name for a remote custom reaction"
+        );
+        assert_eq!(
+            display_name(":cat:", None),
+            ":cat:",
+            "a local one keeps its stored name"
+        );
+        assert_eq!(display_name("👍", None), "👍", "so does a unicode one");
+        assert_eq!(
+            display_name("👍", Some("misskey.test")),
+            "👍",
+            "a domain cannot rename text that is no shortcode"
+        );
     }
 
     #[test]

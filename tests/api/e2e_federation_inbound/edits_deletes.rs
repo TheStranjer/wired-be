@@ -55,7 +55,17 @@ async fn a_remote_custom_emoji_reaction_carries_its_image_url() {
     )
     .await;
     assert_eq!(reactions.len(), 1, "one reaction landed");
-    assert_eq!(reactions[0]["name"], json!(":ralph:"), "as the shortcode");
+    let domain =
+        sqlx::query_scalar::<_, Option<String>>("SELECT emoji_domain FROM emoji_reactions")
+            .fetch_one(&pool)
+            .await
+            .expect("the reaction was stored")
+            .expect("a remote custom emoji records its domain");
+    assert_eq!(
+        reactions[0]["name"],
+        json!(format!("ralph@{domain}")),
+        "as shortcode@domain, the reactor's instance"
+    );
     assert_eq!(
         reactions[0]["url"],
         json!("https://remote.example/emoji/ralph.png"),

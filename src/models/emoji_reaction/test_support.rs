@@ -4,7 +4,11 @@ use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use super::{NewReaction, ReactionSummary, read::for_statuses, write::react};
+use super::{
+    NewReaction, ReactionSummary,
+    read::for_statuses,
+    write::{react, react_in_domain},
+};
 use crate::{
     config::TEST_BASE_URL,
     models::{
@@ -28,6 +32,13 @@ pub(super) const HEART: &str = "❤️";
 pub(super) const CAT: &str = ":cat:";
 /// The image URL stored beside [`CAT`].
 pub(super) const CAT_URL: &str = "https://test.example/emoji/cats/cat.png";
+
+/// The stored spelling of a remote custom emoji.
+pub(super) const REMOTE_CAT: &str = ":misskeycat:";
+/// The instance [`REMOTE_CAT`] belongs to.
+pub(super) const REMOTE_DOMAIN: &str = "misskey.test";
+/// The image URL stored beside [`REMOTE_CAT`].
+pub(super) const REMOTE_CAT_URL: &str = "https://misskey.test/files/misskeycat.png";
 
 /// A public post by `author`, as its id.
 pub(super) async fn post(pool: &PgPool, author: &User) -> Uuid {
@@ -68,6 +79,28 @@ pub(super) async fn react_with(
         "the fixture row is the emoji asked for"
     );
     assert_eq!(stored_row.user_id, reactor.id, "and the reactor's own");
+}
+
+/// Reacts to `status_id` as `reactor` with [`REMOTE_CAT`] of
+/// [`REMOTE_DOMAIN`], and answers the stored row.
+pub(super) async fn react_remote(
+    pool: &PgPool,
+    reactor: &User,
+    status_id: Uuid,
+) -> super::EmojiReaction {
+    react_in_domain(
+        pool,
+        &NewReaction {
+            user_id: reactor.id,
+            status_id,
+            emoji: REMOTE_CAT,
+            url: Some(REMOTE_CAT_URL),
+        },
+        &format!("https://{REMOTE_DOMAIN}/activities/{}", Uuid::now_v7()),
+        Some(REMOTE_DOMAIN),
+    )
+    .await
+    .expect("the remote fixture reaction stores")
 }
 
 /// Every stored reaction as `(user, status, emoji, url)` ordered by row id,
