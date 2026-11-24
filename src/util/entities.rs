@@ -21,7 +21,13 @@ use std::sync::LazyLock;
 
 use regex::{Captures, Regex};
 
-use crate::{models::hashtag::normalize_name, util::sanitize::escape_html};
+use crate::{
+    models::hashtag::normalize_name,
+    util::{
+        format::urls::{is_url_byte, scheme_len},
+        sanitize::escape_html,
+    },
+};
 
 /// The mention pattern: a leading start-of-text, whitespace or one of `(`,
 /// `[`, `{`, then `@` and a nickname of `[A-Za-z0-9_.-]` whose last character
@@ -44,12 +50,6 @@ const HASHTAG_PATTERN: &str = r"(?<lead>^|[^\p{L}\p{N}])#(?<tag>[\p{L}\p{N}_]+)"
 /// a longer word is cut to this many characters. Also the ceiling a stored
 /// hashtag name may hold (`src/models/hashtag.rs` ignores longer names).
 pub(crate) const MAX_HASHTAG_LEN: usize = 100;
-
-/// The `http://` scheme text, as bytes, for [`has_http_scheme`].
-const HTTP_SCHEME: &[u8] = b"http://";
-
-/// The `https://` scheme text, as bytes, for [`has_http_scheme`].
-const HTTPS_SCHEME: &[u8] = b"https://";
 
 /// The close tag whose end bounds an anchor region in [`linkify_entities`].
 const ANCHOR_CLOSE: &str = "</a>";
@@ -354,52 +354,8 @@ fn inside_url(text: &str, at: usize) -> bool {
         }
         start -= 1;
     }
-    has_http_scheme(bytes.get(start..at).unwrap_or_default())
-}
-
-/// Whether a byte run begins with the case-insensitive `http(s)://` scheme.
-fn has_http_scheme(candidate: &[u8]) -> bool {
-    candidate
-        .get(..HTTP_SCHEME.len())
-        .is_some_and(|head| head.eq_ignore_ascii_case(HTTP_SCHEME))
-        || candidate
-            .get(..HTTPS_SCHEME.len())
-            .is_some_and(|head| head.eq_ignore_ascii_case(HTTPS_SCHEME))
-}
-
-/// Whether byte `b` may continue a bare URL: the same RFC 3986 set
-/// [`crate::util::format`]'s scanner uses, so whatever it would linkify
-/// counts as a URL here too.
-const fn is_url_byte(b: u8) -> bool {
-    matches!(
-        b,
-        b'a'..=b'z'
-            | b'A'..=b'Z'
-            | b'0'..=b'9'
-            | b'-'
-            | b'.'
-            | b'_'
-            | b'~'
-            | b'%'
-            | b':'
-            | b'/'
-            | b'?'
-            | b'#'
-            | b'['
-            | b']'
-            | b'@'
-            | b'!'
-            | b'$'
-            | b'&'
-            | b'\''
-            | b'('
-            | b')'
-            | b'*'
-            | b'+'
-            | b','
-            | b';'
-            | b'='
-    )
+    text.get(start..at)
+        .is_some_and(|candidate| scheme_len(candidate, 0).is_some())
 }
 
 /// The byte range of the first `<a` tag through `</a>` in `text`: an `<a`
@@ -593,6 +549,14 @@ mod tests {
             extract_mentions("https://example.com/ @user"),
             vec![mention("user", None)],
             "once the URL run breaks at whitespace the mention is real"
+        );
+    }
+
+    #[test]
+    fn mentions_inside_uppercase_scheme_urls_are_ignored() {
+        assert!(
+            extract_mentions("HTTPS://x.example/@bob").is_empty(),
+            "the scheme check is case-insensitive"
         );
     }
 
