@@ -32,9 +32,9 @@
 //! with the message instead.
 //!
 //! Every dynamic value on the pages goes through
-//! [`escape_html`]: the nickname and the round-tripped token are
-//! client-influenced text and must never break out of their attribute or
-//! element.
+//! [`escape_html`](crate::util::sanitize::escape_html): the nickname and
+//! the round-tripped token are client-influenced text and must never break
+//! out of their attribute or element.
 
 use std::{fmt, time::Duration};
 
@@ -58,7 +58,7 @@ use crate::{
         user::{self, User},
     },
     state::AppState,
-    util::{password::hash_password, sanitize::escape_html},
+    util::{password::hash_password, sanitize::push_escaped},
 };
 
 /// The path the emailed link names and the reset form posts to, under the
@@ -423,11 +423,6 @@ fn push_error(out: &mut String, message: &str) {
     out.push_str("<p class=\"error\" role=\"alert\">");
     push_escaped(out, message);
     out.push_str("</p>\n");
-}
-
-/// Appends `text` with the unsafe HTML characters escaped.
-fn push_escaped(out: &mut String, text: &str) {
-    out.push_str(&escape_html(text));
 }
 
 #[cfg(test)]

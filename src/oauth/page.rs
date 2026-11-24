@@ -7,11 +7,11 @@
 //! `{FRONTEND_BASE_URL}/oauth/authorize`, and `GET /oauth/authorize` only
 //! redirects there. What stays here is plain `String` pushes with no
 //! template engine, and every dynamic value goes through
-//! [`escape_html`], so a state, token or URI that holds markup cannot
+//! [`push_escaped`], so a state, token or URI that holds markup cannot
 //! break out of its attribute or element. The pages are self-contained:
 //! inline CSS, no scripts, no external assets.
 
-use crate::util::sanitize::escape_html;
+use crate::util::sanitize::push_escaped;
 
 /// The page's `lang` attribute.
 const DEFAULT_LANG: &str = "en";
@@ -84,11 +84,6 @@ pub(crate) fn push_hidden(out: &mut String, name: &str, value: &str) {
     out.push_str("\" value=\"");
     push_escaped(out, value);
     out.push_str("\">\n");
-}
-
-/// Appends `value` HTML-escaped.
-pub(crate) fn push_escaped(out: &mut String, value: &str) {
-    out.push_str(&escape_html(value));
 }
 
 #[cfg(test)]

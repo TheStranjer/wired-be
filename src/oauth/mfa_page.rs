@@ -12,7 +12,10 @@
 
 use url::form_urlencoded;
 
-use crate::oauth::page::{push_error, push_escaped, push_field, push_head, push_hidden, push_tail};
+use crate::{
+    oauth::page::{push_error, push_field, push_head, push_hidden, push_tail},
+    util::sanitize::push_escaped,
+};
 
 /// Where the form posts.
 const FORM_ACTION: &str = "/oauth/mfa/verify";
