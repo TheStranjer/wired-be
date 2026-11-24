@@ -277,6 +277,14 @@ impl<'a> Parts<'a> {
         }
     }
 
+    /// Sets [`quote`](Self::quote) to `slot` as it stands.
+    pub(in crate::entities::status) fn quoting_slot(self, slot: QuoteSlot) -> Self {
+        Self {
+            quote: Some(slot),
+            ..self
+        }
+    }
+
     /// Sets [`quote`](Self::quote) to the nested reference a quoted
     /// status carries to its own quote.
     pub(in crate::entities::status) fn quoting_linked(self) -> Self {

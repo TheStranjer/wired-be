@@ -181,6 +181,7 @@ pub(super) fn note_context(visibility: Visibility) -> NoteContext {
         emojis: Vec::new(),
         poll: None,
         quote_uri: None,
+        quote_authorization: None,
         config: Config::for_tests(),
     }
 }

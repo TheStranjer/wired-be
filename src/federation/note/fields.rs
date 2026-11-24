@@ -44,6 +44,11 @@ pub fn note_json(ctx: &NoteContext) -> Option<Value> {
     if let Some(quote_uri) = &ctx.quote_uri {
         fields.push(("quoteUrl", json!(quote_uri)));
         fields.push(("quoteUri", json!(quote_uri)));
+        fields.push(("_misskey_quote", json!(quote_uri)));
+        fields.push(("quote", json!(quote_uri)));
+        if let Some(authorization) = &ctx.quote_authorization {
+            fields.push(("quoteAuthorization", json!(authorization)));
+        }
     }
     if let Some(policy) = interaction_policy_json(ctx.status.visibility, &ctx.author) {
         fields.push(("interactionPolicy", policy));
@@ -199,6 +204,8 @@ mod tests {
 
     /// The quoted post's object id on a peer instance.
     const QUOTE_URI: &str = "https://remote.example/objects/quoted-post";
+    /// The authorization the quoted post's author granted.
+    const AUTHORIZATION_URI: &str = "https://remote.example/quote_authorizations/1";
 
     #[test]
     fn a_public_note_renders_the_golden_object() {
@@ -422,16 +429,54 @@ mod tests {
     }
 
     #[test]
-    fn a_quote_carries_both_quote_reference_spellings() {
+    fn a_quote_carries_every_quote_reference_spelling() {
         let mut ctx = note_context(Visibility::Public);
         ctx.quote_uri = Some(QUOTE_URI.to_owned());
         let document = note_json(&ctx).expect("a quote federates");
-        assert_eq!(document["quoteUrl"], QUOTE_URI, "Mastodon's key");
-        assert_eq!(document["quoteUri"], QUOTE_URI, "and Fedibird's");
+        assert_eq!(document["quoteUrl"], QUOTE_URI, "Mastodon's legacy key");
+        assert_eq!(document["quoteUri"], QUOTE_URI, "Fedibird's");
+        assert_eq!(document["_misskey_quote"], QUOTE_URI, "Misskey's");
+        assert_eq!(document["quote"], QUOTE_URI, "FEP-044f's");
         let mut keys: Vec<&str> = NOTE_KEYS.to_vec();
-        keys.extend(["quoteUri", "quoteUrl"]);
+        keys.extend(["_misskey_quote", "quote", "quoteUri", "quoteUrl"]);
         keys.sort_unstable();
-        assert_eq!(json_keys(&document), keys, "exactly two keys more");
+        assert_eq!(json_keys(&document), keys, "exactly four keys more");
+    }
+
+    #[test]
+    fn a_granted_quote_names_its_authorization() {
+        let mut ctx = note_context(Visibility::Public);
+        ctx.quote_uri = Some(QUOTE_URI.to_owned());
+        assert!(
+            note_json(&ctx)
+                .expect("a quote federates")
+                .get("quoteAuthorization")
+                .is_none(),
+            "an unanswered quote names no authorization"
+        );
+
+        ctx.quote_authorization = Some(AUTHORIZATION_URI.to_owned());
+        let document = note_json(&ctx).expect("a granted quote federates");
+
+        assert_eq!(
+            document["quoteAuthorization"], AUTHORIZATION_URI,
+            "the grant rides on the note"
+        );
+        assert!(
+            undefined_terms(&document).is_empty(),
+            "the served schema defines the new terms"
+        );
+    }
+
+    #[test]
+    fn an_authorization_without_a_quote_is_not_rendered() {
+        let mut ctx = note_context(Visibility::Public);
+        ctx.quote_authorization = Some(AUTHORIZATION_URI.to_owned());
+        let document = note_json(&ctx).expect("the note renders");
+        assert!(
+            document.get("quoteAuthorization").is_none(),
+            "only a quote carries a grant"
+        );
     }
 
     #[test]

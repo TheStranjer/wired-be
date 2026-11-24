@@ -34,8 +34,8 @@ use super::{
     ViewerMode,
     loaders::{
         load_bookmarks, load_direct_participations, load_favourites, load_media, load_mentions,
-        load_pins, load_quotes, load_reactions, load_reblogs, load_statuses_by_id, load_tags,
-        load_thread_mutes, load_users, load_visible_parents,
+        load_pins, load_quote_denials, load_quotes, load_reactions, load_reblogs,
+        load_statuses_by_id, load_tags, load_thread_mutes, load_users, load_visible_parents,
     },
     loaders_emojis::{load_row_emojis, rendered_rows},
     loaders_polls_cards::{load_cards, load_poll_options, load_poll_votes, load_polls},
@@ -75,6 +75,11 @@ pub(super) struct Batch<'a> {
     /// with `pleroma.quote_visible` false while `quote_id` still names
     /// it.
     visible_quotes: HashSet<Uuid>,
+    /// The page's quoting rows whose quoted author refused or revoked the
+    /// quote, keyed by the quoting row's own id. Such a quote renders its
+    /// `rejected` or `revoked` state in place of whatever the quoted post's
+    /// visibility would say.
+    quote_denials: HashMap<Uuid, QuoteSlot>,
     /// Which of the statuses the page (and its nested rows) reply to this
     /// viewer may see — one
     /// [`filter_visible`](crate::models::status_visibility::filter_visible)
@@ -178,6 +183,14 @@ impl<'a> Batch<'a> {
         let originals = load_statuses_by_id(pool, &reblog_ids).await?;
         let quote_ids = distinct(rows.iter().copied().filter_map(|row| row.quote_of_id));
         let (quoted, visible_quotes) = load_quotes(pool, &quote_ids, mode).await?;
+        let quoting_ids = distinct(
+            rows.iter()
+                .copied()
+                .chain(originals.values())
+                .filter(|row| row.quote_of_id.is_some())
+                .map(|row| row.id),
+        );
+        let quote_denials = load_quote_denials(pool, &quoting_ids).await?;
         let ids = PageIds::of(rows, &originals, &quoted);
         let visible_parents = load_visible_parents(pool, &ids.parents, mode).await?;
         let polls = load_polls(pool, &ids.rendered).await?;
@@ -205,6 +218,7 @@ impl<'a> Batch<'a> {
             originals,
             quoted,
             visible_quotes,
+            quote_denials,
             visible_parents,
             media: load_media(pool, &ids.rendered).await?,
             mentions: load_mentions(pool, &ids.rendered).await?,
@@ -273,7 +287,11 @@ impl<'a> Batch<'a> {
     /// `pleroma.quote_visible` false while `quote_id` still names the
     /// target.
     fn render_quote(&self, row: &StatusRow) -> Option<QuoteSlot> {
-        let quoted = self.quoted.get(&row.quote_of_id?);
+        let quoted_id = row.quote_of_id?;
+        if let Some(denied) = self.quote_denials.get(&row.id) {
+            return Some(denied.clone());
+        }
+        let quoted = self.quoted.get(&quoted_id);
         let Some(quoted) = quoted else {
             return Some(QuoteSlot::Deleted);
         };

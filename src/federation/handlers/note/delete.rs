@@ -8,7 +8,7 @@ use super::delete_note;
 use crate::{
     federation::{
         dispatch::{ActivityView, FederationError, Outcome},
-        handlers::{actor, chat::withdraw_chat_message},
+        handlers::{actor, chat::withdraw_chat_message, quote_answers},
         json,
     },
     models::{
@@ -21,7 +21,8 @@ use crate::{
 };
 
 /// The body of [`delete_note`]: the sender's own id back to the actor
-/// handler, a stored chat message's id (Pleroma's bare-id or an embedded
+/// handler, the id of a quote authorization the sender granted to
+/// [`quote_answers`], a stored chat message's id (Pleroma's bare-id or an embedded
 /// `Tombstone` `Delete`) to the chat withdrawal, everything else folded as a
 /// status withdrawal.
 pub(super) async fn apply_delete(
@@ -34,6 +35,9 @@ pub(super) async fn apply_delete(
     };
     if object_id == view.actor {
         return actor::delete_actor(state, view, signer).await;
+    }
+    if let Some(outcome) = quote_answers::fold_revocation(&state, object_id, &signer).await? {
+        return Ok(outcome);
     }
     let chat_message = chat::message_by_ap_id(&state.db, object_id)
         .await
