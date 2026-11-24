@@ -4,6 +4,7 @@
 
 mod attempts;
 mod authorize_flow;
+mod concurrent_recovery;
 mod password_grant;
 
 use crate::common;
