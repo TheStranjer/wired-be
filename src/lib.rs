@@ -56,8 +56,7 @@ use crate::{
 /// `/.well-known/nodeinfo` and `/nodeinfo/{version}` ([`api::nodeinfo`]),
 /// `/oauth` ([`api::oauth`]), the `/oauth` provider-login paths
 /// ([`api::oauth_external`]), `POST /auth/password` ([`api::password_reset`],
-/// Pleroma routes the reset request outside `/api`), and the `MongooseIM`
-/// auth endpoints ([`api::misc`]) — are merged at the
+/// Pleroma routes the reset request outside `/api`) — are merged at the
 /// top level, together with the HTML helper pages of
 /// [`api::html_pages`] (`/mailer/unsubscribe/{token}`), the
 /// remote-interaction page of [`api::remote_interaction`]
@@ -89,7 +88,6 @@ pub fn app(state: AppState) -> Router {
             .merge(media_files::router())
             .merge(media_proxy::router())
             .merge(api::emoji_packs::files_router())
-            .merge(api::misc::router())
             .merge(api::html_pages::router())
             .merge(api::remote_interaction::router())
             .merge(api::admin::apps_docs::public_router())

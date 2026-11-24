@@ -102,9 +102,6 @@ pub(crate) struct RestSettings {
     pub(crate) avatar_limit_bytes: usize,
     /// Maximum banner/background image size in bytes (`BANNER_LIMIT_BYTES`).
     pub(crate) banner_limit_bytes: usize,
-    /// Whether the `MongooseIM` auth endpoints are served
-    /// (`MONGOOSEIM_ENABLED`).
-    pub(crate) mongooseim_enabled: Toggle,
     /// Whether a captcha provider is configured (`CAPTCHA_ENABLED`).
     pub(crate) captcha_enabled: Toggle,
     /// Whether the healthcheck endpoint reports pool data
@@ -139,7 +136,7 @@ where
     F: Fn(&str) -> Option<String>,
 {
     let (upload_limits, avatar_limit_bytes, banner_limit_bytes) = upload_settings(lookup)?;
-    let (mongooseim_enabled, captcha_enabled, healthcheck_enabled) = misc_toggles(lookup)?;
+    let (captcha_enabled, healthcheck_enabled) = misc_toggles(lookup)?;
     let (job_concurrency, job_queues, purge_deleted_statuses_days) = job_worker(lookup)?;
     let (backup_validity_days, backup_limit_days, backup_purge) = backup_settings(lookup)?;
     let fetch = fetch_settings(lookup)?;
@@ -147,7 +144,6 @@ where
         upload_limits,
         avatar_limit_bytes,
         banner_limit_bytes,
-        mongooseim_enabled,
         captcha_enabled,
         healthcheck_enabled,
         job_concurrency,

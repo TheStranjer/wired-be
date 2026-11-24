@@ -32,9 +32,6 @@
 //! providers are configured to answer to; and pack images
 //! live at `/emoji/{pack}/{file}`, the address
 //! [`crate::services::emoji_packs`] stores in `custom_emojis`.
-//! [`misc::router`] joins that list at the root: the `MongooseIM` auth
-//! endpoints live at `/…`, the addresses `MongooseIM`'s `extauth` http
-//! contract fixes.
 //! [`html_pages::router`] joins it at the root too: the shared HTML helper
 //! pages live at the top-level path Pleroma routes them on,
 //! `/mailer/unsubscribe/{token}`.

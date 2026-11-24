@@ -190,10 +190,6 @@ pub struct Config {
     /// answers 403 `{"error":"Account deletion is disabled"}` (see
     /// [`crate::api::pleroma_account_settings`]).
     pub allow_account_deletion: Toggle,
-    /// Whether the `MongooseIM` auth endpoints (`GET /user_exists`,
-    /// `GET /check_password`) are served, from `MONGOOSEIM_ENABLED`. See
-    /// [`crate::api::misc`].
-    pub mongooseim_enabled: Toggle,
     /// Whether a captcha provider is configured, from `CAPTCHA_ENABLED`.
     /// While no captcha implementation exists, a set toggle makes
     /// `GET /api/v1/pleroma/captcha` answer 501; see [`crate::api::misc`].

@@ -1,12 +1,8 @@
-//! `MongooseIM` auth endpoints and the small unauthenticated utility
-//! endpoints (`docs/ARCHITECTURE.md` decision 1, WBE-166).
+//! The small unauthenticated utility endpoints (`docs/ARCHITECTURE.md`
+//! decision 1, WBE-166).
 //!
-//! Three mount points, one module each side of the shared handlers:
+//! Two mount points, one module each side of the shared handlers:
 //!
-//! - [`router`], merged by [`crate::app`]: the `MongooseIM` auth endpoints
-//!   `GET /user_exists` and `GET /check_password` (Pleroma's
-//!   `lib/pleroma/web/mongoose_im/mongoose_im_controller.ex`, served at
-//!   the root for an `extauth` HTTP backend).
 //! - [`util_router`], nested at `/pleroma` by [`crate::api::v1`]:
 //!   `GET /api/v1/pleroma/captcha` and `GET /api/v1/pleroma/healthcheck`
 //!   (Pleroma's `lib/pleroma/web/pleroma_api/controllers/util_controller.ex`).
@@ -15,44 +11,34 @@
 //!   `UtilController.frontend_configurations/2`, reading its document from
 //!   [`instance_setting`].
 //!
-//! The three toggles gate the first four endpoints: with
-//! `MONGOOSEIM_ENABLED` off both auth endpoints are absent, and with
-//! `CAPTCHA_ENABLED` / `HEALTHCHECK_ENABLED` off so are the captcha and
-//! healthcheck answers — each disabled case is the app-wide fallback's
+//! `CAPTCHA_ENABLED` / `HEALTHCHECK_ENABLED` gate the captcha and
+//! healthcheck answers: when off, each is the app-wide fallback's
 //! 404 `{"error":"Not found"}` ([`AppError::RouteNotFound`]), not Pleroma's
 //! behavior of routing the path to some fallback. Where the ticket's shape
 //! differs from Pleroma's controller the ticket wins, and the difference is
-//! documented at the handler: `check_password` answers *every* failed
-//! credential (unknown user included, where Pleroma splits 403 and 404)
-//! with 403 `false`, and the disabled healthcheck answers 404 `Not found`
-//! (Pleroma: 503 "Healthcheck disabled").
+//! documented at the handler: the disabled healthcheck answers 404
+//! `Not found` (Pleroma: 503 "Healthcheck disabled").
 //!
-//! None of the endpoints authenticates: `MongooseIM` is a trusted internal
-//! caller (its controller runs on the `:api` pipeline, unauthenticated),
-//! and the utility endpoints serve public data.
+//! None of the endpoints authenticates: they serve public data.
 
 use std::time::Duration;
 
 use axum::{
     Json, Router,
-    extract::{Query, State},
+    extract::State,
     http::StatusCode,
     response::{IntoResponse as _, Response},
     routing::get,
 };
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use serde_json::{Value, json};
 use sqlx::PgPool;
 use tracing::warn;
 
 use crate::{
     error::{AppError, AppResult},
-    models::{
-        instance_setting,
-        user::{User, get_by_nickname},
-    },
+    models::instance_setting,
     state::AppState,
-    util::password::verify_password,
 };
 
 /// Seconds the healthcheck's `SELECT 1` probe may take before the database
@@ -70,17 +56,6 @@ const CAPTCHA_NOT_IMPLEMENTED: &str = "Captcha is not implemented";
 /// runtime config key).
 const FRONTEND_CONFIGURATIONS_KEY: &str = "frontend_configurations";
 
-/// The root-level router, merged by [`crate::app`]: the two `MongooseIM`
-/// auth endpoints.
-///
-/// Both live outside `/api`, at addresses fixed by the `MongooseIM`
-/// `extauth` http contract.
-pub fn router() -> Router<AppState> {
-    Router::new()
-        .route("/user_exists", get(user_exists))
-        .route("/check_password", get(check_password))
-}
-
 /// The `/api/v1/pleroma` utility router ([`crate::api::v1`] nests it at
 /// `/pleroma`): Pleroma's `UtilController` endpoints this ticket serves.
 pub fn util_router() -> Router<AppState> {
@@ -93,79 +68,6 @@ pub fn util_router() -> Router<AppState> {
 /// [`crate::api::pleroma`].
 pub fn frontend_configurations_router() -> Router<AppState> {
     Router::new().route("/frontend_configurations", get(frontend_configurations))
-}
-
-/// The query of `GET /user_exists`: `MongooseIM` sends the handle under
-/// `user`. It is optional here because its absence is the 404 `false`
-/// answer, which the type cannot express.
-#[derive(Debug, Deserialize)]
-struct UserQuery {
-    /// The nickname to look up.
-    user: Option<String>,
-}
-
-/// The query of `GET /check_password`: handle under `user`, credential
-/// under `pass` (`MongooseIM`'s `extauth` http parameter names). Both are
-/// optional: a request missing either is the failed-credential answer.
-#[derive(Debug, Deserialize)]
-struct PasswordQuery {
-    /// The nickname to authenticate.
-    user: Option<String>,
-    /// The password to verify against the stored hash.
-    pass: Option<String>,
-}
-
-/// `GET /user_exists?user=<nick>` — the `MongooseIM` lookup: 200 with JSON
-/// `true` when `user` names a local, active account, 404 with JSON `false`
-/// for everything else (unknown nickname, remote mirror, deactivated
-/// account, missing parameter). Disabled by
-/// [`mongooseim_enabled`](crate::config::Config::mongooseim_enabled): then the endpoint
-/// is the standard fallback 404.
-///
-/// # Errors
-///
-/// [`AppError::RouteNotFound`] when disabled; [`AppError::Database`] on a
-/// lookup failure. A failed *credential* is a `false` body, not an error.
-async fn user_exists(
-    State(state): State<AppState>,
-    Query(query): Query<UserQuery>,
-) -> AppResult<Response> {
-    require_mongooseim(&state)?;
-    let exists = match query.user.as_deref() {
-        Some(nickname) => local_active_user_exists(&state.db, nickname).await?,
-        None => false,
-    };
-    Ok(json_bool(exists, StatusCode::NOT_FOUND))
-}
-
-/// `GET /check_password?user=<nick>&pass=<password>` — the `MongooseIM`
-/// credential check: 200 with JSON `true` when the password verifies for
-/// the local, *active* user named by `user`, 403 with JSON `false`
-/// otherwise (wrong password, unknown nickname, deactivated account,
-/// missing parameter). Disabled by
-/// [`mongooseim_enabled`](crate::config::Config::mongooseim_enabled): then the endpoint
-/// is the standard fallback 404.
-///
-/// Unlike Pleroma's controller — which answers an unknown user 404 and a
-/// wrong password 403 — the ticket fails every bad credential with 403,
-/// so `MongooseIM` sees one uniform denial.
-///
-/// # Errors
-///
-/// [`AppError::RouteNotFound`] when disabled; [`AppError::Database`] on a
-/// lookup failure.
-async fn check_password(
-    State(state): State<AppState>,
-    Query(query): Query<PasswordQuery>,
-) -> AppResult<Response> {
-    require_mongooseim(&state)?;
-    let valid = match (query.user.as_deref(), query.pass.as_deref()) {
-        (Some(nickname), Some(password)) => {
-            valid_credentials(&state.db, nickname, password).await?
-        }
-        _ => false,
-    };
-    Ok(json_bool(valid, StatusCode::FORBIDDEN))
 }
 
 /// `GET /api/v1/pleroma/captcha` — the captcha handshake (Pleroma's
@@ -223,65 +125,6 @@ async fn healthcheck(State(state): State<AppState>) -> Response {
 async fn frontend_configurations(State(state): State<AppState>) -> AppResult<Json<Value>> {
     let configured = instance_setting::get(&state.db, FRONTEND_CONFIGURATIONS_KEY).await?;
     Ok(Json(configured.unwrap_or_else(|| json!({}))))
-}
-
-/// The `MongooseIM` gate: unless [`mongooseim_enabled`](crate::config::Config::mongooseim_enabled)
-/// is set, the auth endpoints do not exist — the standard fallback 404,
-/// which is what an unconfigured instance answers an unknown path with.
-///
-/// # Errors
-///
-/// [`AppError::RouteNotFound`] when the endpoints are disabled.
-fn require_mongooseim(state: &AppState) -> AppResult<()> {
-    if state.config.mongooseim_enabled.get() {
-        Ok(())
-    } else {
-        Err(AppError::RouteNotFound)
-    }
-}
-
-/// Whether `nickname` names a local, active user: exactly Pleroma's
-/// `Repo.get_by(User, nickname: username, local: true, is_active: true)`,
-/// with the citext comparison [`get_by_nickname`] runs.
-///
-/// # Errors
-///
-/// [`AppError::Database`] when the lookup fails.
-async fn local_active_user_exists(pool: &PgPool, nickname: &str) -> AppResult<bool> {
-    Ok(get_by_nickname(pool, nickname)
-        .await?
-        .as_ref()
-        .is_some_and(User::is_local_active))
-}
-
-/// Whether `password` is the credential of the local, active user named
-/// `nickname`: the row is looked up by *nickname* only — `MongooseIM`
-/// authenticates handles, not emails, so unlike the login path this never
-/// matches on `email` — must be local and active, must carry a hash, and
-/// [`verify_password`] must accept that hash.
-///
-/// # Errors
-///
-/// [`AppError::Database`] when the lookup fails.
-async fn valid_credentials(pool: &PgPool, nickname: &str, password: &str) -> AppResult<bool> {
-    let Some(found) = get_by_nickname(pool, nickname).await? else {
-        return Ok(false);
-    };
-    if !found.is_local_active() {
-        return Ok(false);
-    }
-    let Some(stored) = found.password_hash.as_deref() else {
-        return Ok(false);
-    };
-    Ok(verify_password(password, stored))
-}
-
-/// The `MongooseIM` answer: JSON `true` under 200, JSON `false` under
-/// `false_status` — 404 for [`user_exists`], 403 for [`check_password`],
-/// the codes the ticket fixes for each endpoint's negative case.
-fn json_bool(value: bool, false_status: StatusCode) -> Response {
-    let status = if value { StatusCode::OK } else { false_status };
-    (status, Json(value)).into_response()
 }
 
 /// Whether the database answers `SELECT 1` within
@@ -407,29 +250,6 @@ mod tests {
             body, r#"{"pool_size":10,"active":2,"idle":8,"memory_used":0.0,"healthy":true}"#,
             "the exact healthcheck body, in order"
         );
-    }
-
-    /// [`json_bool`] pairs the ticket's two bodies with the two status
-    /// shapes each endpoint owes for a `false` answer.
-    #[tokio::test]
-    async fn json_bool_pairs_the_answer_with_its_negative_status() {
-        use http_body_util::BodyExt as _;
-
-        for (value, status, body) in [
-            (true, StatusCode::OK, "true"),
-            (false, StatusCode::NOT_FOUND, "false"),
-            (false, StatusCode::FORBIDDEN, "false"),
-        ] {
-            let response = json_bool(value, status);
-            assert_eq!(response.status(), status, "status of {body}");
-            assert_eq!(
-                response.headers().get("content-type").unwrap(),
-                "application/json",
-                "the answer is JSON"
-            );
-            let bytes = response.into_body().collect().await.unwrap().to_bytes();
-            assert_eq!(bytes, body, "body of {value}");
-        }
     }
 
     /// The pool counts come from `size()` and `num_idle()`, with `active`

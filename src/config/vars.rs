@@ -129,9 +129,6 @@ pub const ACCOUNT_ACTIVATION_REQUIRED_VAR: &str = "ACCOUNT_ACTIVATION_REQUIRED";
 /// Environment variable holding whether accounts may delete their own
 /// account through `POST /api/pleroma/delete_account`.
 pub const ALLOW_ACCOUNT_DELETION_VAR: &str = "ALLOW_ACCOUNT_DELETION";
-/// Environment variable holding whether the `MongooseIM` auth endpoints
-/// (`GET /user_exists`, `GET /check_password`) are served.
-pub const MONGOOSEIM_ENABLED_VAR: &str = "MONGOOSEIM_ENABLED";
 /// Environment variable holding whether a captcha provider is configured
 /// for `GET /api/v1/pleroma/captcha`.
 pub const CAPTCHA_ENABLED_VAR: &str = "CAPTCHA_ENABLED";
