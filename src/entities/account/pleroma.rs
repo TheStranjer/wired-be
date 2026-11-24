@@ -504,6 +504,20 @@ mod tests {
     }
 
     #[test]
+    fn a_remote_actors_federated_birthday_renders_for_strangers() {
+        let config = Config::for_tests();
+        let mut remote = alice_with_pleroma_profile();
+        remote.local = Flag::new(false);
+        remote.birthday = chrono::NaiveDate::from_ymd_opt(1990, 5, 15);
+        remote.show_birthday = Flag::new(true);
+        let other = pleroma_of(&render_for(Some(&mallory()), &remote, &config));
+        assert_eq!(
+            other["birthday"], "1990-05-15",
+            "a mirror with a shown birthday renders pleroma.birthday"
+        );
+    }
+
+    #[test]
     fn unset_profile_columns_render_their_empty_shapes() {
         let config = Config::for_tests();
         let mut alice = base_user("alice", &format!("{BASE}/users/alice"));

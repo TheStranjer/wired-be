@@ -9,8 +9,8 @@ use super::{
     MAX_USERNAME_CHARS, NewRemoteUser,
     fields::{
         bool_field, optional_http_url, parse_accepts_chat_messages, parse_also_known_as,
-        parse_emojis, parse_fields, parse_media_url, parse_published, required_http_url,
-        string_field,
+        parse_birthday, parse_emojis, parse_fields, parse_media_url, parse_published,
+        required_http_url, string_field,
     },
     truncate_chars,
 };
@@ -87,6 +87,7 @@ pub fn parse_actor(json: &Value) -> Result<NewRemoteUser, ActorError> {
         moved_to: optional_http_url(json, "movedTo"),
         accepts_chat_messages: parse_accepts_chat_messages(json),
         published: parse_published(json),
+        birthday: parse_birthday(json),
     })
 }
 

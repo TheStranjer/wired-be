@@ -766,3 +766,45 @@ fn only_the_first_hundred_tags_are_examined_for_emojis() {
     let parsed = parse_actor(&document).unwrap();
     assert_eq!(parsed.emojis.len(), MAX_REMOTE_EMOJIS, "the cap");
 }
+
+#[test]
+fn vcard_bday_is_read_as_a_date() {
+    let mut document = fixture(PLEROMA);
+    assert_eq!(
+        parse_actor(&document).unwrap().birthday,
+        None,
+        "the fixture carries no birthday"
+    );
+    document["vcard:bday"] = json!("1990-05-15");
+    assert_eq!(
+        parse_actor(&document).unwrap().birthday,
+        chrono::NaiveDate::from_ymd_opt(1990, 5, 15),
+        "a plain date"
+    );
+    document["vcard:bday"] = json!("1990-05-15T23:30:00-05:00");
+    assert_eq!(
+        parse_actor(&document).unwrap().birthday,
+        chrono::NaiveDate::from_ymd_opt(1990, 5, 15),
+        "a datetime keeps the date it is written with"
+    );
+}
+
+#[test]
+fn an_invalid_or_absent_vcard_bday_is_ignored() {
+    let mut document = fixture(PLEROMA);
+    for bad in [
+        json!("yesterday"),
+        json!("1990-13-45"),
+        json!(7),
+        Value::Null,
+    ] {
+        document["vcard:bday"] = bad.clone();
+        assert_eq!(
+            parse_actor(&document).unwrap().birthday,
+            None,
+            "{bad} is dropped, not rejected"
+        );
+    }
+    remove(&mut document, "vcard:bday");
+    assert_eq!(parse_actor(&document).unwrap().birthday, None, "absent");
+}

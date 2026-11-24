@@ -46,7 +46,7 @@ mod parse;
 mod test_support;
 mod upsert;
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use serde_json::Value;
 
 use crate::{federation::note_parser::RemoteEmoji, models::user::Flag};
@@ -175,4 +175,9 @@ pub struct NewRemoteUser {
     /// The actor's `published` creation time (no column yet;
     /// unparseable or absent is `None`).
     pub published: Option<DateTime<Utc>>,
+    /// The `vcard:bday` date, when the document carries a valid one.
+    ///
+    /// Stored by the upsert on every fetch with `show_birthday` set to
+    /// whether it is present, so an `Update` without it clears the birthday.
+    pub birthday: Option<NaiveDate>,
 }
