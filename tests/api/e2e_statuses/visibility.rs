@@ -5,7 +5,7 @@ use axum::http::StatusCode;
 use serde_json::json;
 use wired_be::{
     config::TEST_BASE_URL,
-    util::entities::{hashtag_html, mention_html},
+    util::entities::{hashtag_link_html, mention_html},
 };
 
 use super::support::{
@@ -321,7 +321,7 @@ async fn a_hashtag_post_links_its_tag_for_the_open_audience() {
         json!({"status": "tagged #E2ETag for the matrix"}),
     )
     .await;
-    let tag = hashtag_html(TEST_BASE_URL, "e2etag");
+    let tag = hashtag_link_html(TEST_BASE_URL, "e2etag", "E2ETag");
     let shape = Shape {
         id: common::id_of(&created),
         visibility: "public",

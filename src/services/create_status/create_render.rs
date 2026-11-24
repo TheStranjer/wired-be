@@ -25,7 +25,7 @@ mod tests {
             CreateStatusParams,
             test_support::{BASE, created, posted, state, stored, user},
         },
-        util::entities::{hashtag_html, mention_html},
+        util::entities::{hashtag_html, hashtag_link_html, mention_html},
     };
     use tokio::{net::TcpListener, task::JoinHandle};
     #[tokio::test]
@@ -49,11 +49,12 @@ mod tests {
             format!(
                 "<p>hi {} and @nobody, see {} {} #123</p>",
                 mention_html(&bob.ap_id, "BOB"),
-                hashtag_html(BASE, "rust"),
+                hashtag_link_html(BASE, "rust", "Rust"),
                 hashtag_html(BASE, "rust"),
             ),
             "the known mention becomes its h-card in the written case, the \
-             unknown one stays text, the tag links in both spellings and the \
+             unknown one stays text, the tag links under its folded name but reads \
+             as written, and the \
              digits-only one is no tag"
         );
         assert_eq!(

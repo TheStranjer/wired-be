@@ -11,7 +11,7 @@ use wired_be::{
     config::TEST_BASE_URL,
     models::status,
     util::{
-        entities::{hashtag_html, mention_html},
+        entities::{hashtag_link_html, mention_html},
         time::parse_time,
     },
 };
@@ -76,7 +76,7 @@ async fn a_preview_answers_the_entity_and_writes_nothing() {
         format!(
             "<p>hello {} and @nobody, see {}</p>",
             mention_html(&bob.ap_id, "bob"),
-            hashtag_html(TEST_BASE_URL, "rust"),
+            hashtag_link_html(TEST_BASE_URL, "rust", "Rust"),
         ),
         "the same render a create stores, the unknown name still plain text"
     );

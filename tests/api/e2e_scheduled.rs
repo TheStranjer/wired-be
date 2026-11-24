@@ -42,7 +42,7 @@ use wired_be::{
     models::user::User,
     state::AppState,
     util::{
-        entities::{hashtag_html, mention_html},
+        entities::{hashtag_link_html, mention_html},
         time::mastodon_time,
     },
 };
@@ -85,7 +85,7 @@ fn rendered(text: &str, bob: &User) -> String {
             &format!(
                 "{} see {}",
                 mention_html(&bob.ap_id, "bob"),
-                hashtag_html(TEST_BASE_URL, "rust")
+                hashtag_link_html(TEST_BASE_URL, "rust", "Rust")
             )
         )
     )

@@ -122,7 +122,8 @@ pub struct NoteContext {
     /// already name them — the fediverse requires an answer to reach its
     /// parent's author.
     pub mentions: Vec<User>,
-    /// The status's hashtags, as stored names (lowercase, no `#`).
+    /// The status's hashtags, as stored names (lowercase, no `#`); the
+    /// casing the author wrote is read back from the text at render time.
     pub hashtags: Vec<String>,
     /// The media attachments, in position order.
     pub attachments: Vec<MediaAttachment>,

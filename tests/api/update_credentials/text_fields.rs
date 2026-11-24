@@ -5,7 +5,7 @@ use axum::http::StatusCode;
 use serde_json::json;
 use wired_be::{
     models::user::User,
-    util::entities::{hashtag_html, mention_html},
+    util::entities::{hashtag_link_html, mention_html},
 };
 
 use super::support::{
@@ -189,8 +189,8 @@ async fn note_links_urls_hashtags_and_local_mentions() {
         "the bare URL is linkified: {note}"
     );
     assert!(
-        note.contains(&hashtag_html(BASE, "rust")),
-        "the hashtag links lowercased: {note}"
+        note.contains(&hashtag_link_html(BASE, "rust", "Rust")),
+        "the hashtag links lowercased but reads as written: {note}"
     );
 }
 

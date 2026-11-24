@@ -207,16 +207,26 @@ pub fn mention_html(profile_url: &str, nickname: &str) -> String {
 /// The `a` markup a hashtag becomes, as Pleroma renders it.
 ///
 /// A `mention hashtag` link to `{base_url}/tags/{tag}` with `rel="tag ugc"`
-/// and the tag in an inner span. All three insertions are HTML-escaped (a
-/// tag found by [`extract_hashtags`] can hold none of the escaped characters
-/// anyway).
+/// and the tag in an inner span; the link text is the tag itself. See
+/// [`hashtag_link_html`] for a link text that differs from the tag.
 #[must_use]
 pub fn hashtag_html(base_url: &str, tag: &str) -> String {
+    hashtag_link_html(base_url, tag, tag)
+}
+
+/// The `a` markup a hashtag becomes, with the author's own spelling shown.
+///
+/// Links to `{base_url}/tags/{href_tag}` (the normalized tag) while the
+/// visible text is `display_text`, the word as written. All three insertions
+/// are HTML-escaped (a tag found by [`extract_hashtags`] can hold none of the
+/// escaped characters anyway).
+#[must_use]
+pub fn hashtag_link_html(base_url: &str, href_tag: &str, display_text: &str) -> String {
     format!(
         r#"<a class="mention hashtag" href="{}/tags/{}" rel="tag ugc">#<span>{}</span></a>"#,
         escape_html(base_url),
-        escape_html(tag),
-        escape_html(tag)
+        escape_html(href_tag),
+        escape_html(display_text)
     )
 }
 
@@ -270,14 +280,15 @@ fn replace_hashtags(text: &str, base_url: &str) -> String {
         return text.to_owned();
     };
     re.replace_all(text, |caps: &Captures<'_>| {
-        let tag = caps.name("tag").and_then(|w| normalized_tag(w.as_str()));
-        tag.map_or_else(
+        let word = caps.name("tag").map(|w| w.as_str());
+        let spelled = word.and_then(|w| normalized_tag(w).map(|tag| (tag, written_word(w))));
+        spelled.map_or_else(
             || whole_owned(caps),
-            |tag| {
+            |(tag, written)| {
                 format!(
                     "{}{}",
                     caps.name("lead").map_or("", |m| m.as_str()),
-                    hashtag_html(base_url, &tag)
+                    hashtag_link_html(base_url, &tag, &written)
                 )
             },
         )
@@ -321,6 +332,36 @@ fn replace_mentions(text: &str, mentions: MentionResolver<'_>) -> String {
 /// they do not linkify.
 fn whole_owned(caps: &Captures<'_>) -> String {
     caps.get(0).map_or(String::new(), |m| m.as_str().to_owned())
+}
+
+/// The matched hashtag word as the author wrote it, cut to the same
+/// [`MAX_HASHTAG_LEN`] characters the stored tag keeps.
+fn written_word(word: &str) -> String {
+    word.chars().take(MAX_HASHTAG_LEN).collect()
+}
+
+/// Every accepted hashtag in plain text as `(normalized, as written)`, in
+/// order of first appearance and deduplicated by the normalized form.
+///
+/// The written form is the spelling of the first occurrence, without the `#`.
+#[must_use]
+pub fn hashtag_spellings(text: &str) -> Vec<(String, String)> {
+    let Some(re) = HASHTAG_RE.as_ref() else {
+        return Vec::new();
+    };
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut found: Vec<(String, String)> = Vec::new();
+    for word in re
+        .captures_iter(text)
+        .filter_map(|caps| caps.name("tag").map(|w| w.as_str()))
+    {
+        if let Some(tag) = normalized_tag(word)
+            && seen.insert(tag.clone())
+        {
+            found.push((tag, written_word(word)));
+        }
+    }
+    found
 }
 
 /// Turns a matched hashtag word into the tag it yields: the first
@@ -653,6 +694,58 @@ mod tests {
     }
 
     #[test]
+    fn hashtag_link_html_splits_the_href_from_the_text() {
+        assert_eq!(
+            hashtag_link_html("https://example.com", "fedlab", "Fed<Lab>"),
+            r#"<a class="mention hashtag" href="https://example.com/tags/fedlab" rel="tag ugc">#<span>Fed&lt;Lab&gt;</span></a>"#,
+            "the href takes the tag, the span the escaped text"
+        );
+    }
+
+    #[test]
+    fn linkify_keeps_the_written_casing_in_the_link_text() {
+        let resolver = &|_: &MentionRef| None;
+        assert_eq!(
+            linkify_entities("<p>#FedLab</p>", resolver, "https://e.example"),
+            format!(
+                "<p>{}</p>",
+                hashtag_link_html("https://e.example", "fedlab", "FedLab")
+            ),
+            "text as written, href lowercased"
+        );
+        assert!(
+            linkify_entities("<p>#FedLab</p>", resolver, "https://e.example")
+                .contains("href=\"https://e.example/tags/fedlab\""),
+            "the href is the normalized tag"
+        );
+    }
+
+    #[test]
+    fn linkify_links_a_full_width_tag_to_its_normalized_form() {
+        let resolver = &|_: &MentionRef| None;
+        assert_eq!(
+            linkify_entities("<p>#ＦｅｄＬａｂ</p>", resolver, "https://e.example"),
+            format!(
+                "<p>{}</p>",
+                hashtag_link_html("https://e.example", "fedlab", "ＦｅｄＬａｂ")
+            ),
+            "the href is NFKC-folded, the text is as written"
+        );
+    }
+
+    #[test]
+    fn hashtag_spellings_keep_the_first_written_form() {
+        assert_eq!(
+            hashtag_spellings("a #FedLab #fedlab #123 #Other"),
+            vec![
+                ("fedlab".to_owned(), "FedLab".to_owned()),
+                ("other".to_owned(), "Other".to_owned()),
+            ],
+            "deduplicated by tag, first spelling kept, digits-only skipped"
+        );
+    }
+
+    #[test]
     fn linkify_replaces_known_mentions_and_all_hashtags() {
         let resolver = &|m: &MentionRef| {
             m.domain.is_none().then(|| {
@@ -666,9 +759,9 @@ mod tests {
             format!(
                 "<p>Hi {}, not @bob@remote.example, see {}</p>",
                 mention_html("https://example.com/users/alice", "alice"),
-                hashtag_html("https://example.com", "rust")
+                hashtag_link_html("https://example.com", "rust", "Rust")
             ),
-            "the known mention becomes its h-card, the unknown stays text, the tag links lowercased"
+            "the known mention becomes its h-card, the unknown stays text, the tag links lowercased but reads as written"
         );
     }
 
@@ -710,7 +803,7 @@ mod tests {
             format!(
                 r#"<p>Hi {} <a href="https://x.example/@alice">@alice #Nope</a> {}</p>"#,
                 mention_html("https://example.com/users/alice", "alice"),
-                hashtag_html("https://x.example", "yes")
+                hashtag_link_html("https://x.example", "yes", "Yes")
             ),
             "text and href inside an existing anchor are never touched"
         );

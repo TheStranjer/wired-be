@@ -12,7 +12,7 @@ use wired_be::{
         status::Visibility,
         user::{Flag, NewUser},
     },
-    util::entities::{hashtag_html, mention_html},
+    util::entities::{hashtag_html, hashtag_link_html, mention_html},
 };
 
 use super::support::{
@@ -460,9 +460,10 @@ async fn hashtags_are_stored_linked_and_answered() {
     assert_eq!(
         value["content"],
         format!(
-            "<p>hello {tag} and {tag}, also #123</p>",
-            tag = hashtag_html(TEST_BASE_URL, "rust")
+            "<p>hello {tag} and {lower}, also #123</p>",
+            tag = hashtag_link_html(TEST_BASE_URL, "rust", "Rust"),
+            lower = hashtag_html(TEST_BASE_URL, "rust")
         ),
-        "and every spelling of it is linked in the content"
+        "and every spelling of it is linked in the content, each as written"
     );
 }
