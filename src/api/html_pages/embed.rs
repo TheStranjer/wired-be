@@ -19,7 +19,8 @@ use crate::{
     error::AppResult,
     models::{
         media_attachment::{self, MediaAttachment},
-        status::{self, Status, Visibility},
+        status::{self, Status},
+        status_visibility,
         user::{self, User},
     },
     state::AppState,
@@ -85,8 +86,8 @@ async fn load_card(state: &AppState, id: &str) -> AppResult<Option<CardRows>> {
 
 /// The status path segment `id` names when it is embeddable: `id` is a
 /// [`uuid::Uuid`], a live status carries it (an unknown id and a
-/// tombstone read the same) and its visibility is [`Visibility::Public`]
-/// or [`Visibility::Unlisted`]. `None` is the one refusal both the embed
+/// tombstone read the same) and an anonymous viewer may see it
+/// ([`status_visibility::can_view`]). `None` is the one refusal both the embed
 /// card and the player answer with a 404 page for.
 ///
 /// # Errors
@@ -99,7 +100,7 @@ pub(super) async fn embeddable_status(state: &AppState, id: &str) -> AppResult<O
     let Some(status) = status::get_by_id(&state.db, uuid).await? else {
         return Ok(None);
     };
-    if !matches!(status.visibility, Visibility::Public | Visibility::Unlisted) {
+    if !status_visibility::can_view(&state.db, &status, None).await? {
         return Ok(None);
     }
     Ok(Some(status))
