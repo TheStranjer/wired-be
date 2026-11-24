@@ -1,9 +1,13 @@
 //! One tag's usage: the per-UTC-day buckets that make up the tag
 //! endpoints' `history` ([`day_counts`]).
 //!
-//! The read is of the tag's *live* statuses: a soft-deleted row's content
-//! is gone, so its use of the tag counts nowhere here. [`day_counts`] is
-//! grouped by calendar day with the boundary pinned to UTC.
+//! The read is of the tag's *live, public, original* statuses: a
+//! soft-deleted row's content is gone, so its use of the tag counts nowhere
+//! here, and an unlisted, followers-only, direct or local status or a reblog
+//! is no use either (the history is public, so counting them would leak when
+//! private posts were written; Mastodon's `Trends::Tags` records only public
+//! non-reblog statuses). [`day_counts`] is grouped by calendar day with the
+//! boundary pinned to UTC.
 
 use chrono::{DateTime, NaiveDate, Utc};
 use sqlx::PgPool;
@@ -11,10 +15,12 @@ use uuid::Uuid;
 
 use crate::error::AppResult;
 
-/// The statement behind [`day_counts`]: the tag's live statuses bucketed by
-/// UTC calendar day. `AT TIME ZONE 'UTC'` makes the day boundary explicit
-/// (the session zone must not move a status between two days), soft-deleted
-/// rows are out (their content is gone, so their use of the tag is), and
+/// The statement behind [`day_counts`]: the tag's live, public, non-reblog
+/// statuses bucketed by UTC calendar day. `AT TIME ZONE 'UTC'` makes the day
+/// boundary explicit (the session zone must not move a status between two
+/// days), soft-deleted rows are out (their content is gone, so their use of
+/// the tag is), only `visibility = 'public'` originals count (the history is
+/// anonymous-readable, so a non-public use must not show), and
 /// `COUNT(DISTINCT user_id)` is the day's account count — Mastodon's
 /// `uses`/`accounts` pair.
 const DAY_COUNTS_SQL: &str = "SELECT (s.inserted_at AT TIME ZONE 'UTC')::date,
@@ -22,11 +28,14 @@ const DAY_COUNTS_SQL: &str = "SELECT (s.inserted_at AT TIME ZONE 'UTC')::date,
   FROM status_hashtags sh
   JOIN statuses s ON s.id = sh.status_id
        WHERE sh.hashtag_id = $1 AND s.deleted_at IS NULL AND s.inserted_at >= $2
+         AND s.visibility = 'public' AND s.reblog_of_id IS NULL
        GROUP BY 1
        ORDER BY 1";
 
-/// The per-UTC-day usage of tag `hashtag_id`, oldest bucket first, for every
-/// live status created at or after `since`.
+/// The per-UTC-day usage of tag `hashtag_id`, oldest bucket first.
+///
+/// Every live public non-reblog status created at or after `since` counts;
+/// unlisted, followers-only, direct and local statuses and reblogs do not.
 ///
 /// The `(day, uses, accounts)` triples are what the tag endpoints'
 /// `history` is built from; a day no status used the tag on is simply
@@ -102,6 +111,51 @@ mod tests {
             .await
             .expect("the pin runs");
         assert_eq!(pinned.rows_affected(), 1, "the fixture status moved");
+    }
+
+    #[tokio::test]
+    async fn day_counts_ignores_non_public_statuses_and_reblogs() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let anchor = Utc::now();
+        let today = anchor.date_naive();
+        let public = post(&pool, "alice", "#rust").await;
+        let unlisted = post(&pool, "bob", "#rust").await;
+        let private = post(&pool, "carol", "#rust").await;
+        let direct = post(&pool, "dave", "#rust").await;
+        let local = post(&pool, "erin", "#rust").await;
+        let reblog = post(&pool, "frank", "#rust").await;
+        for (status, visibility) in [
+            (&unlisted, "unlisted"),
+            (&private, "private"),
+            (&direct, "direct"),
+            (&local, "local"),
+        ] {
+            let changed = sqlx::query("UPDATE statuses SET visibility = $2 WHERE id = $1")
+                .bind(status.id)
+                .bind(visibility)
+                .execute(&pool)
+                .await
+                .expect("the visibility changes");
+            assert_eq!(changed.rows_affected(), 1, "the fixture status moved");
+        }
+        let reblogged = sqlx::query("UPDATE statuses SET reblog_of_id = $2 WHERE id = $1")
+            .bind(reblog.id)
+            .bind(public.id)
+            .execute(&pool)
+            .await
+            .expect("the reblog link is set");
+        assert_eq!(reblogged.rows_affected(), 1, "the fixture status moved");
+        for status in [&public, &unlisted, &private, &direct, &local, &reblog] {
+            pin_day(&pool, status.id, anchor, 0).await;
+        }
+
+        assert_eq!(
+            week_of(&pool, "rust", anchor).await,
+            vec![(today, 1, 1)],
+            "only the public original is a use: unlisted, followers-only, \
+             direct, local and reblog rows leave no trace in the history"
+        );
     }
 
     #[tokio::test]
