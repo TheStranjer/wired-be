@@ -1,7 +1,7 @@
 //! The optional-field readers of an actor document: URLs, media, profile
 //! fields, aliases and timestamps, each dropping what is malformed.
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use serde_json::{Value, json};
 
 use super::{
@@ -139,6 +139,22 @@ fn bool_at(json: &Value, parent: &str, key: &str) -> Flag {
             .and_then(Value::as_bool)
             .unwrap_or_default(),
     )
+}
+
+/// The actor's `vcard:bday` as a calendar date.
+///
+/// A plain `YYYY-MM-DD` string is read as is; a full RFC 3339 datetime
+/// keeps its own written date, without shifting it to UTC. Absent, `null`,
+/// non-string and unparseable values are `None`.
+pub(super) fn parse_birthday(json: &Value) -> Option<NaiveDate> {
+    let text = json.get("vcard:bday").and_then(Value::as_str)?.trim();
+    NaiveDate::parse_from_str(text, "%Y-%m-%d")
+        .ok()
+        .or_else(|| {
+            DateTime::parse_from_rfc3339(text)
+                .ok()
+                .map(|moment| moment.date_naive())
+        })
 }
 
 /// The actor's `published` creation time as an RFC 3339 timestamp

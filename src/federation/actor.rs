@@ -17,8 +17,9 @@
 //! remote mirror.
 //!
 //! Deliberately absent, unlike Pleroma: the `uploadMedia` endpoint (no
-//! upload-over-AP endpoint yet), `webfinger` and `vcard:bday`, which
-//! arrive with their own tickets.
+//! upload-over-AP endpoint yet) and `webfinger`, which arrive with their
+//! own tickets. `vcard:bday` is emitted, as Pleroma does, only while the
+//! user shows a birthday; otherwise the key is left out.
 //!
 //! The `tag` list carries one `Emoji` tag per local custom emoji the profile
 //! text uses. The document stays pure by taking those rows as an argument;
@@ -133,6 +134,9 @@ fn actor_fields(
     ]);
     if let Some(moved_to) = user.moved_to_ap_id.as_deref() {
         fields.push(("movedTo", json!(moved_to)));
+    }
+    if let Some(birthday) = user.birthday.filter(|_| user.show_birthday.get()) {
+        fields.push(("vcard:bday", json!(birthday.to_string())));
     }
     fields.push(("capabilities", capabilities()));
     fields
@@ -529,6 +533,39 @@ mod tests {
         assert!(
             document.get("icon").is_none() && document.get("image").is_none(),
             "a row without media emits neither icon nor image"
+        );
+    }
+
+    #[test]
+    fn a_shown_birthday_renders_vcard_bday() {
+        let mut alice = local_alice();
+        alice.birthday = chrono::NaiveDate::from_ymd_opt(1991, 6, 16);
+        alice.show_birthday = Flag::new(true);
+        assert_eq!(
+            render(&alice)["vcard:bday"],
+            "1991-06-16",
+            "an ISO date, Pleroma's Date.to_iso8601"
+        );
+        let schema = litepub_context_json();
+        assert_eq!(
+            schema["@context"]["vcard"], "http://www.w3.org/2006/vcard/ns#",
+            "the served schema defines the vcard prefix"
+        );
+    }
+
+    #[test]
+    fn a_hidden_or_missing_birthday_renders_no_vcard_bday() {
+        let mut alice = local_alice();
+        alice.birthday = chrono::NaiveDate::from_ymd_opt(1991, 6, 16);
+        assert!(
+            render(&alice).get("vcard:bday").is_none(),
+            "a birthday that is not shown stays private"
+        );
+        alice.birthday = None;
+        alice.show_birthday = Flag::new(true);
+        assert!(
+            render(&alice).get("vcard:bday").is_none(),
+            "shown but unset has nothing to emit"
         );
     }
 

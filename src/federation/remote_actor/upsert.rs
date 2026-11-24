@@ -12,7 +12,7 @@ use crate::{
 
 /// The upsert behind [`upsert_remote_user`]: insert keyed by a fresh
 /// `UUIDv7`, or, when `ap_id` already has a row, overwrite exactly the
-/// profile, key, endpoint, `alsoKnownAs` and `bot` columns the actor
+/// profile, key, endpoint, `alsoKnownAs`, `bot` and birthday columns the actor
 /// document describes plus
 /// `last_fetched_at` and `updated_at`. `local`, the login columns,
 /// the moderation roles and the denormalised counters are deliberately not
@@ -23,11 +23,14 @@ const UPSERT_SQL: &str = "INSERT INTO users (
      avatar_url, banner_url, profile_url, locked, discoverable, fields,
      inbox, shared_inbox, outbox, followers_url, following_url,
      featured_url, public_key, also_known_as, public_key_id, bot,
-     last_fetched_at
+     birthday, show_birthday, last_fetched_at
  ) VALUES (
      $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15,
-     $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, now()
+     $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26::date, $26::date IS NOT NULL,
+     now()
  ) ON CONFLICT (ap_id) DO UPDATE SET
+     birthday = EXCLUDED.birthday,
+     show_birthday = EXCLUDED.show_birthday,
      nickname = EXCLUDED.nickname,
      domain = EXCLUDED.domain,
      actor_type = EXCLUDED.actor_type,
@@ -166,6 +169,7 @@ pub async fn upsert_remote_user(pool: &PgPool, new: NewRemoteUser) -> Result<Use
         .bind(&new.also_known_as)
         .bind(new.public_key_id.as_deref())
         .bind(new.bot)
+        .bind(new.birthday)
         .fetch_one(&mut *tx)
         .await?;
     tx.commit().await?;
@@ -667,6 +671,38 @@ mod tests {
             .await
             .unwrap();
         assert!(!group.bot.get(), "a Group is not a bot");
+    }
+
+    /// The birthday follows `vcard:bday` on every fetch and clears when absent.
+    #[tokio::test]
+    async fn an_upsert_stores_and_clears_the_vcard_birthday() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let mut document = fixture(MASTODON);
+        let plain = upsert_remote_user(&pool, parse_actor(&document).unwrap())
+            .await
+            .unwrap();
+        assert!(plain.birthday.is_none(), "no birthday without the key");
+        assert!(!plain.show_birthday.get(), "and nothing to show");
+
+        document["vcard:bday"] = json!("1990-05-15");
+        let shown = upsert_remote_user(&pool, parse_actor(&document).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(shown.id, plain.id, "the same row is updated");
+        assert_eq!(
+            shown.birthday,
+            chrono::NaiveDate::from_ymd_opt(1990, 5, 15),
+            "the date is stored"
+        );
+        assert!(shown.show_birthday.get(), "a federated birthday is shown");
+
+        document["vcard:bday"] = Value::Null;
+        let cleared = upsert_remote_user(&pool, parse_actor(&document).unwrap())
+            .await
+            .unwrap();
+        assert!(cleared.birthday.is_none(), "a null bday clears the date");
+        assert!(!cleared.show_birthday.get(), "and the switch");
     }
 
     /// A fetched actor's `Emoji` tags land in `custom_emojis`.
