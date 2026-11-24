@@ -36,11 +36,11 @@ use uuid::Uuid;
 use crate::{
     error::AppError,
     jobs::{
-        AttemptInfo, HandlerFuture, JobError, QUEUE_SCHEDULED, load_user, parse_args, retry,
-        scheduler::PeriodicJob,
+        AttemptInfo, HandlerFuture, JobError, QUEUE_SCHEDULED, enqueue_keyed, load_user,
+        parse_args, retry, scheduler::PeriodicJob,
     },
     models::{
-        job::{NewJob, cancel_pending, enqueue},
+        job::{NewJob, cancel_pending},
         scheduled_status::{self, ScheduledStatus},
         user,
     },
@@ -79,7 +79,7 @@ pub fn job_args(scheduled_id: Uuid) -> Value {
 /// The dedupe key of schedule `scheduled_id`'s publish job.
 ///
 /// At most one live fire per schedule, however many times its create is
-/// replayed ([`enqueue`]'s `None` swallows the second claim).
+/// replayed ([`enqueue`](crate::models::job::enqueue)'s `None` swallows the second claim).
 #[must_use]
 pub fn unique_key(scheduled_id: Uuid) -> String {
     format!("sched:{scheduled_id}")
@@ -122,20 +122,7 @@ pub async fn schedule(state: &AppState, row: &ScheduledStatus) {
         max_attempts: None,
         unique_key: Some(&key),
     };
-    match enqueue(&state.db, request).await {
-        Ok(Some(job)) => debug!(
-            job = %job.id,
-            scheduled = %row.id,
-            due = %row.scheduled_at,
-            "scheduled status queued"
-        ),
-        Ok(None) => debug!(scheduled = %row.id, "scheduled status already queued"),
-        Err(err) => warn!(
-            %err,
-            scheduled = %row.id,
-            "could not schedule status publication; the sweep will publish it"
-        ),
-    }
+    drop(enqueue_keyed(&state.db, request, "scheduled status").await);
 }
 
 /// Re-queues `row`'s fire at the moment it now carries, replacing the one

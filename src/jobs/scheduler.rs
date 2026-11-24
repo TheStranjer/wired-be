@@ -32,9 +32,10 @@ use chrono::{DateTime, TimeDelta, Utc};
 use serde_json::json;
 use sqlx::PgPool;
 use tokio::time::{Instant, interval};
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
-use crate::models::job::{NewJob, enqueue};
+use super::enqueue_keyed;
+use crate::models::job::NewJob;
 
 /// How often [`run`] wakes to enqueue whatever period is current.
 const TICK_INTERVAL: Duration = Duration::from_secs(10);
@@ -282,17 +283,7 @@ async fn enqueue_for_period(pool: &PgPool, job: PeriodicJob, now: DateTime<Utc>)
         max_attempts: None,
         unique_key: Some(key.as_str()),
     };
-    match enqueue(pool, request).await {
-        Ok(Some(row)) => {
-            debug!(kind = job.kind, id = %row.id, %key, "periodic job enqueued");
-        }
-        Ok(None) => {
-            debug!(kind = job.kind, %key, "period already enqueued");
-        }
-        Err(err) => {
-            warn!(%err, kind = job.kind, %key, "periodic enqueue failed");
-        }
-    }
+    drop(enqueue_keyed(pool, request, "periodic job").await);
 }
 
 #[cfg(test)]

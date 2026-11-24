@@ -28,14 +28,16 @@ use chrono::{DateTime, TimeDelta, Utc};
 use scraper::{ElementRef, Html, Selector};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tracing::{debug, warn};
+use tracing::debug;
 use uuid::Uuid;
 
 use crate::{
     config::Config,
-    jobs::{AttemptInfo, HandlerFuture, JobError, QUEUE_BACKGROUND, parse_args, retry},
+    jobs::{
+        AttemptInfo, HandlerFuture, JobError, QUEUE_BACKGROUND, enqueue_keyed, parse_args, retry,
+    },
     models::{
-        job::{NewJob, enqueue},
+        job::NewJob,
         link_card::{self, LinkCard},
         status::{self, Status, Visibility},
     },
@@ -83,7 +85,7 @@ pub fn job_args(status_id: Uuid) -> Value {
 /// The dedupe key of status `status_id`'s fetch job.
 ///
 /// At most one queued card fetch per status, however many times its create
-/// is replayed ([`enqueue`]'s `None` swallows the second claim).
+/// is replayed ([`enqueue`](crate::models::job::enqueue)'s `None` swallows the second claim).
 #[must_use]
 pub fn unique_key(status_id: Uuid) -> String {
     format!("rich_media:{status_id}")
@@ -107,19 +109,7 @@ pub async fn schedule_fetch(state: &AppState, row: &Status) {
         max_attempts: None,
         unique_key: Some(&key),
     };
-    match enqueue(&state.db, request).await {
-        Ok(Some(job)) => debug!(
-            job = %job.id,
-            status = %row.id,
-            "rich media card fetch scheduled"
-        ),
-        Ok(None) => debug!(status = %row.id, "rich media card fetch already scheduled"),
-        Err(err) => warn!(
-            %err,
-            status = %row.id,
-            "could not schedule rich media card fetch"
-        ),
-    }
+    drop(enqueue_keyed(&state.db, request, "rich media card fetch").await);
 }
 
 /// The first ordinary link in sanitized status HTML, the URL its card is
