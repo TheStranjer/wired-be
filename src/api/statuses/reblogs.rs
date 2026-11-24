@@ -54,7 +54,7 @@ use tracing::debug;
 use uuid::Uuid;
 
 use crate::{
-    api::helpers::status_for_viewer_or_404,
+    api::helpers::{retain_open_to_viewer, status_for_viewer_or_404},
     auth::{AuthUser, MaybeAuthUser},
     entities::{
         account::{Account, AccountViewer},
@@ -245,7 +245,9 @@ pub(super) async fn list_reblogged_by(
 /// behind the shared 404; [`status::quoting_page`] answers the live quoting
 /// rows newest-first and [`filter_visible`] then drops what this viewer may
 /// not see — the same narrowing step as [`list_favourites`]'s, keeping the
-/// page's order. Being a read, the route rides no throttle bucket.
+/// page's order. An anonymous request further loses the quoters the
+/// instance's `activities_*` restriction closes ([`retain_open_to_viewer`]).
+/// Being a read, the route rides no throttle bucket.
 ///
 /// # Errors
 ///
@@ -268,6 +270,7 @@ pub(super) async fn list_quotes(
     let target = status_for_viewer_or_404(&state, viewer, &id).await?;
     let rows = status::quoting_page(&state.db, target.id, page).await?;
     let visible = status_visibility::filter_visible(&state.db, rows, viewer).await?;
+    let visible = retain_open_to_viewer(&state, viewer, visible).await?;
     debug!(
         status = %target.id,
         quoters = visible.len(),
