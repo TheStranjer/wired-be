@@ -12,7 +12,7 @@ use super::*;
 use crate::{
     config::Config,
     jobs::{
-        QUEUE_BACKGROUND,
+        JobError, QUEUE_BACKGROUND,
         maintenance::test_support::{
             DAY, FIRST_ATTEMPT, HOURLY, app_state, broken_state, row_exists, state_with_config,
             user,
@@ -294,7 +294,7 @@ async fn an_unreachable_database_retries_the_token_sweep() {
 
     match outcome {
         Err(JobError::Retry(detail)) => assert!(
-            detail.starts_with("token sweep failed"),
+            detail.starts_with("expired tokens deleted failed"),
             "the retry states what failed: {detail}"
         ),
         Ok(()) => panic!("a closed pool must not read as a successful sweep"),
