@@ -173,6 +173,7 @@ fn edit_params(
         hashtags: parsed.hashtags.clone(),
         media_ids: media_changed.then(Vec::new),
         edited_at,
+        media_attributes: Vec::new(),
     }
 }
 

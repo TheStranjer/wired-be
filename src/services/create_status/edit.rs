@@ -13,7 +13,9 @@ use tracing::debug;
 use uuid::Uuid;
 
 use super::{
-    CreateStatusParams, POLL_WITH_MEDIA, TOO_MANY_ATTACHMENTS, render_status_fields,
+    CreateStatusParams, POLL_WITH_MEDIA, TOO_MANY_ATTACHMENTS,
+    edit_media::{MediaAttribute, into_changes},
+    render_status_fields,
     validate::{Backing, check_body_backed},
 };
 use crate::{
@@ -59,6 +61,10 @@ pub struct EditStatusParams {
     /// attachment the author may attach drop out — see [`edit_status`].
     #[serde(default)]
     media_ids: Option<Vec<String>>,
+    /// New alt text and focal points for the post's attachments; see
+    /// [`edit_media`](super::edit_media).
+    #[serde(default, deserialize_with = "super::edit_media::deserialize")]
+    media_attributes: Option<Vec<MediaAttribute>>,
 }
 
 /// The edit body merged over the stored row: every [`CreateStatusParams`]
@@ -129,6 +135,12 @@ fn kept<T, F: FnOnce() -> T>(submitted: Option<T>, stored: F) -> Option<T> {
 /// claims and text that is no id at all name nothing and drop out, as
 /// Pleroma's `CommonAPI.Utils.attachments_from_ids` rejects its nils.
 ///
+/// The body's `media_attributes` ride the same write: each entry's `id`
+/// must name an attachment the post wears once the edit lands, or the whole
+/// edit is refused with 422 `Validation failed`; its `description` and
+/// `focus` are checked as the media endpoint checks them, and an entry that
+/// alters what is stored counts as a change to the version.
+///
 /// An edit that submits more `media_ids` than
 /// [`crate::config::Config::max_media_attachments`] is refused with 422
 /// `Too many attachments`, and one that leaves a polled post with any
@@ -159,6 +171,10 @@ pub async fn edit_status(
     {
         return Err(AppError::Unprocessable(TOO_MANY_ATTACHMENTS.to_owned()));
     }
+    let media_attributes = match &params.media_attributes {
+        Some(entries) => into_changes(&state.config, entries)?,
+        None => Vec::new(),
+    };
     let media_ids: Option<Vec<Uuid>> = params
         .media_ids
         .as_ref()
@@ -200,6 +216,7 @@ pub async fn edit_status(
         hashtags: fields.hashtags,
         media_ids,
         edited_at: None,
+        media_attributes,
     };
     let Some(updated) = status_edit::update_status(&state.db, row.id, edit).await? else {
         return Ok(None);
@@ -244,6 +261,7 @@ mod tests {
         assert_eq!(empty.language, None, "the tag");
         assert_eq!(empty.content_type, None, "the type");
         assert_eq!(empty.media_ids, None, "and nothing is said about media");
+        assert_eq!(empty.media_attributes, None, "or about its metadata");
 
         let full = body(json!({
             "status": "new words",
