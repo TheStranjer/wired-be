@@ -7,12 +7,12 @@ use std::collections::HashSet;
 
 use sqlx::PgPool;
 use tracing::debug;
-use url::Url;
 
 use crate::{
     error::AppResult,
-    federation::mrf,
+    federation::{delivery::is_local_inbox, mrf},
     models::{instance, instance_policy_domain, user::User},
+    util::url::parse_http_url,
 };
 
 /// The final target set: candidates deduplicated by URL, each kept only
@@ -69,17 +69,9 @@ pub(super) fn unreachable_grace(secs: usize) -> chrono::Duration {
 /// instance's origin holds local recipients, whom a delivery would only
 /// ask this process to `POST` to itself.
 fn deliverable_host(inbox: &str, actor_ap_id: &str) -> Option<String> {
-    let parsed = Url::parse(inbox).ok()?;
-    if !matches!(parsed.scheme(), "http" | "https") {
-        return None;
-    }
-    let host = parsed.host_str()?;
-    let local = Url::parse(actor_ap_id).is_ok_and(|actor_id| {
-        actor_id
-            .authority()
-            .eq_ignore_ascii_case(parsed.authority())
-    });
-    (!local).then(|| host.to_owned())
+    parse_http_url(inbox)
+        .filter(|parsed| !is_local_inbox(parsed, actor_ap_id))
+        .and_then(|parsed| parsed.host_str().map(str::to_owned))
 }
 
 #[cfg(test)]

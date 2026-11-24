@@ -23,6 +23,7 @@ use crate::{
     jobs::{AttemptInfo, HandlerFuture, JobError},
     models::user::{self, User},
     state::AppState,
+    util::url::same_origin,
 };
 
 /// Most response-body bytes a delivery buffers from the peer's inbox: only
@@ -106,16 +107,15 @@ async fn deliver(state: AppState, attempt: AttemptInfo, args: Value) -> Result<(
     outcome
 }
 
-/// Whether `inbox` is served by this very instance: its authority (host,
-/// plus the port when it is not the scheme's default) is the authority of
-/// the local signing actor's own id, which lives on this instance's origin
-/// (`docs/ARCHITECTURE.md` decision 6). Delivering to it would mean asking
-/// this process to `POST` an activity to itself.
-pub(super) fn is_local_inbox(inbox: &Url, actor_ap_id: &str) -> bool {
-    let Ok(id) = Url::parse(actor_ap_id) else {
-        return false;
-    };
-    id.authority().eq_ignore_ascii_case(inbox.authority())
+/// Whether `inbox` is served by this very instance.
+///
+/// Its origin (host, plus the port when it is not the scheme's default) is
+/// the origin of the local signing actor's own id, which lives on this
+/// instance's origin (`docs/ARCHITECTURE.md` decision 6). Delivering to it
+/// would mean asking this process to `POST` an activity to itself.
+#[must_use]
+pub fn is_local_inbox(inbox: &Url, actor_ap_id: &str) -> bool {
+    Url::parse(actor_ap_id).is_ok_and(|id| same_origin(&id, inbox))
 }
 
 /// The `ActivityPub` id an activity carries: the identity a delivery is for,

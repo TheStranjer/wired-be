@@ -79,7 +79,7 @@ mod send_signing;
 mod test_support;
 
 pub use enqueue::{best_inbox, enqueue_delivery};
-pub use send::handle;
+pub use send::{handle, is_local_inbox};
 
 /// The job kind of one inbox delivery, on
 /// [`QUEUE_FEDERATOR_OUTGOING`].

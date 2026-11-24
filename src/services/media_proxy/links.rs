@@ -9,7 +9,7 @@ use crate::{
     config::Config,
     util::{
         hmac::{hmac_sha256, verify_hmac_sha256},
-        url::is_http_url,
+        url::{is_http_url, is_local_url},
     },
 };
 
@@ -99,7 +99,7 @@ fn proxy_target<'config>(config: &'config Config, remote_url: &str) -> Option<(&
 /// host of the configured media prefix — Pleroma's `local?` and its
 /// upload-`base_url` whitelist entry combined.
 fn is_local(config: &Config, url: &Url) -> bool {
-    if url.authority() == config.domain() {
+    if is_local_url(config, url) {
         return true;
     }
     let Some(host) = url.host_str() else {
