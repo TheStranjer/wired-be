@@ -40,7 +40,7 @@ use wired_be::{
         oauth_app::OauthApp,
         user::{self, Flag, NewUser, User},
     },
-    util::password::hash_password,
+    util::{password::hash_password, token::sha256_hex},
 };
 
 use crate::common;
@@ -474,7 +474,7 @@ async fn the_refresh_grant_refuses_an_unready_account() {
     assert_login_refused(&response, APPROVAL_ERROR, "awaiting_approval");
     let standing: i64 =
         sqlx::query_scalar("SELECT count(*) FROM oauth_tokens WHERE refresh_token = $1")
-            .bind(&pair.refresh_token)
+            .bind(sha256_hex(&pair.refresh_token))
             .fetch_one(&pool)
             .await
             .expect("the lookup runs");

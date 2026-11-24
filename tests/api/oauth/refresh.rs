@@ -14,6 +14,7 @@ use uuid::Uuid;
 use wired_be::{
     config::DEFAULT_OAUTH_TOKEN_TTL_SECS,
     models::{oauth_app::OauthApp, oauth_token},
+    util::token::sha256_hex,
 };
 
 use super::revoke::{probe_user_endpoint, token_rows};
@@ -104,7 +105,11 @@ async fn refresh_token_grant_rotates_the_pair() {
         .expect("the lookup reaches the database")
         .expect("the new token row was stored");
     assert_eq!(stored.id, id, "the response id is the stored primary key");
-    assert_eq!(stored.refresh_token, refresh, "the new secret");
+    assert_eq!(
+        stored.refresh_token,
+        sha256_hex(refresh),
+        "the new secret, stored as its digest"
+    );
     assert_eq!(stored.user_id, Some(user.id), "the token keeps its user");
     assert_eq!(stored.app_id, app.id, "and its app");
     assert_eq!(stored.scopes, "read write", "and its scopes");

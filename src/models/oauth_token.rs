@@ -79,9 +79,13 @@ pub struct OauthToken {
     pub id: Uuid,
     /// The access token, presented as `Authorization: Bearer`. Never in
     /// `Debug` output.
+    ///
+    /// The database stores only its SHA-256 hex digest, so a row read back
+    /// holds the digest; the raw value exists solely on the row
+    /// [`create_token`] returns, once, for the `/oauth/token` response.
     pub token: String,
     /// The refresh token, exchanged for a fresh pair. Never in `Debug`
-    /// output.
+    /// output. Stored as a SHA-256 hex digest like [`token`](Self::token).
     pub refresh_token: String,
     /// The user this token acts as; `None` for an app-only token from
     /// the `client_credentials` grant.

@@ -54,6 +54,8 @@ mod authorize_post;
 mod client_credentials;
 /// The `authorization_code` grant's `redirect_uri` binding.
 mod code_grant;
+/// A token's life (issue, use, rotate, revoke) with only digests stored.
+mod digest_lifecycle;
 /// The JSON `GET`/`POST /oauth/authorize` a trusted frontend drives.
 mod json_authorize;
 /// The `password` grant over JSON, form and Basic: successes and the
