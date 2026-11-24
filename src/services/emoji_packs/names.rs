@@ -37,17 +37,15 @@ pub fn file_name_valid(file: &str) -> bool {
 
 /// Whether `code` may be an emoji shortcode.
 ///
-/// A non-empty run of `[A-Za-z0-9_-]`, deliberately stricter than a pack
+/// A non-empty run of `[A-Za-z0-9_+-]`, deliberately stricter than a pack
 /// name — no dots, no separators — so a shortcode can neither hide an
-/// extension nor name a path. The pattern the file routes pin and
-/// [`import_packs`](super::import_packs) applies to the file stems it
-/// turns into shortcodes.
+/// extension nor name a path. The same set [`crate::util::emoji::shortcode`]
+/// accepts, so every stored emoji can be reacted with. The pattern the file
+/// routes pin and [`import_packs`](super::import_packs) applies to the file
+/// stems it turns into shortcodes.
 #[must_use]
 pub fn shortcode_valid(code: &str) -> bool {
-    !code.is_empty()
-        && code
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    !code.is_empty() && code.chars().all(crate::util::emoji::is_shortcode_char)
 }
 
 /// Rejects a pack name that [`pack_name_valid`] would refuse, for the
@@ -204,7 +202,15 @@ mod tests {
 
     #[test]
     fn shortcodes_follow_the_pinned_pattern_in_the_service_too() {
-        for code in ["cat", "a", "0", "dog_1", "well-known", "MiXeD42"] {
+        for code in [
+            "cat",
+            "a",
+            "0",
+            "dog_1",
+            "well-known",
+            "MiXeD42",
+            "blobfox+1",
+        ] {
             assert!(shortcode_valid(code), "{code} is a shortcode");
         }
         for code in ["", "cat.png", "two words", "a/b", ".hidden", "é"] {

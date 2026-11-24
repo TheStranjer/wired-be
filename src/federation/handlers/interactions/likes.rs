@@ -405,6 +405,22 @@ mod tests {
             "the image is the tag's own"
         );
 
+        let pleroma = json!({
+            "content": ":blob-cat:",
+            "tag": [{"type": "Emoji", "name": "blob-cat",
+                     "icon": {"url": "https://remote.example/emoji/blob-cat.png"}}],
+        });
+        let dashed = reaction_of(&pleroma, ":blob-cat:").expect("a dashed shortcode folds");
+        assert_eq!(
+            dashed.emoji, ":blob-cat:",
+            "the colons stay in the stored text"
+        );
+        assert_eq!(
+            dashed.url.as_deref(),
+            Some("https://remote.example/emoji/blob-cat.png"),
+            "Pleroma's colon-less tag name still vouches for it"
+        );
+
         let untagged = json!({"content": ":railroad_track:"});
         assert!(
             reaction_of(&untagged, ":railroad_track:").is_none(),

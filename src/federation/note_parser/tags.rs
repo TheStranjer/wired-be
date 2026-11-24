@@ -51,7 +51,7 @@ fn parse_hashtag(entry: &Value) -> Option<String> {
 /// One `Emoji` tag: the colon-stripped `name` and the first `http(s)` url
 /// under `icon`, in the author's domain (Pleroma's `fix_emoji` reads the
 /// same fields). A tag with neither is skipped, and so is one whose name is
-/// no shortcode (`[A-Za-z0-9_]+`, like Mastodon's model validation) or is
+/// no shortcode (`[A-Za-z0-9_+-]+`, a superset of Pleroma's matcher) or is
 /// over [`MAX_SHORTCODE_BYTES`] long.
 fn parse_emoji(entry: &Value, author: &User) -> Option<RemoteEmoji> {
     let trimmed = entry.get("name").and_then(Value::as_str)?.trim_matches(':');
@@ -129,6 +129,7 @@ mod tests {
         document["tag"] = json!([
             {"type": "Emoji", "name": ":ok_1:", "icon": icon},
             {"type": "Emoji", "name": ":a b:", "icon": icon},
+            {"type": "Emoji", "name": ":a.b:", "icon": icon},
             {"type": "Emoji", "name": ":<x>:", "icon": icon},
             {"type": "Emoji", "name": long, "icon": icon},
             {"type": "Emoji", "name": edge, "icon": icon},
@@ -144,7 +145,28 @@ mod tests {
         assert_eq!(
             names,
             ["ok_1", "b".repeat(MAX_SHORTCODE_BYTES).as_str()],
-            "only [A-Za-z0-9_] names up to the cap are kept"
+            "only [A-Za-z0-9_+-] names up to the cap are kept"
+        );
+    }
+
+    #[test]
+    fn dashed_and_plus_emoji_names_parse_to_their_shortcode() {
+        let icon = json!({"type": "Image", "url": "https://remote.example/emoji/x.png"});
+        let mut document = minimal_note();
+        document["tag"] = json!([
+            {"type": "Emoji", "name": ":blob-cat:", "icon": icon},
+            {"type": "Emoji", "name": "blobfox+1", "icon": icon},
+        ]);
+        let parsed = parse(&document);
+        let names: Vec<&str> = parsed
+            .emojis
+            .iter()
+            .map(|emoji| emoji.shortcode.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            ["blob-cat", "blobfox+1"],
+            "colons stripped, rest kept"
         );
     }
 
