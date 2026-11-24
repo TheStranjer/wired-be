@@ -73,8 +73,9 @@ const LIST_SQL: &str = "SELECT * FROM status_edits
   ORDER BY created_at, id";
 
 /// [`update_status`]'s write: every column the edit resolves, the `edited_at`
-/// stamp moved to `now()` only when a revision was recorded (an edit of
-/// nothing has nothing to mark), and `RETURNING *` answers the row as it
+/// stamp moved only when a revision was recorded (an edit of nothing has
+/// nothing to mark) — to the author's own time when [`EditParams::edited_at`]
+/// names one, `now()` otherwise — and `RETURNING *` answers the row as it
 /// now stands for the entity render.
 const APPLY_SQL: &str = "UPDATE statuses
      SET content = $2,
@@ -83,7 +84,7 @@ const APPLY_SQL: &str = "UPDATE statuses
          spoiler_text = $5,
          sensitive = $6,
          language = $7,
-         edited_at = CASE WHEN $8 THEN now() ELSE edited_at END,
+         edited_at = CASE WHEN $8 THEN COALESCE($9::timestamptz, now()) ELSE edited_at END,
          updated_at = now()
    WHERE id = $1 AND deleted_at IS NULL
 RETURNING *";
@@ -188,6 +189,11 @@ pub struct EditParams {
     /// (their own, unposted or already on this post), puts those on the
     /// post in that order, and frees the attachments it leaves out.
     pub media_ids: Option<Vec<Uuid>>,
+    /// The moment the author made this edit, for an edit a remote author
+    /// made: `None` stamps the local receipt time (`now()`), which is what a
+    /// local edit is; `Some(time)` stamps the author's clock instead, so a
+    /// later remote edit compares against the same clock.
+    pub edited_at: Option<DateTime<Utc>>,
 }
 
 /// Snapshots the current state of `status` as a revision row on `conn`.
@@ -369,6 +375,7 @@ async fn apply_edit(
         .bind(params.sensitive)
         .bind(params.language.as_deref())
         .bind(changed)
+        .bind(params.edited_at)
         .fetch_optional(&mut *conn)
         .await?)
 }
@@ -483,6 +490,7 @@ mod tests {
             mentioned_user_ids: Vec::new(),
             hashtags: Vec::new(),
             media_ids: None,
+            edited_at: None,
         }
     }
 
@@ -532,6 +540,48 @@ mod tests {
             "the first version was authored when the post was"
         );
         assert!(revision.media_ids.is_empty(), "it carried no media");
+    }
+
+    #[tokio::test]
+    async fn a_local_edit_stamps_the_receipt_time() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = user(&pool, "local-stamp").await;
+        let row = post(&pool, &alice, "first words").await;
+        let before = Utc::now() - chrono::Duration::seconds(5);
+
+        let updated = update_status(&pool, row.id, edit_to("second", "<p>second</p>"))
+            .await
+            .expect("the edit writes")
+            .expect("the status is live");
+
+        let stamped = updated.edited_at.expect("the edit is stamped");
+        assert!(
+            stamped >= before && stamped <= Utc::now() + chrono::Duration::seconds(5),
+            "a local edit is stamped with the clock of this server"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_edit_naming_the_authors_time_stamps_that_time() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = user(&pool, "remote-stamp").await;
+        let row = post(&pool, &alice, "first words").await;
+        let authored = Utc::now() - chrono::Duration::hours(3);
+
+        let mut params = edit_to("second", "<p>second</p>");
+        params.edited_at = Some(authored);
+        let updated = update_status(&pool, row.id, params)
+            .await
+            .expect("the edit writes")
+            .expect("the status is live");
+
+        assert_eq!(
+            updated.edited_at.map(|at| at.timestamp_micros()),
+            Some(authored.timestamp_micros()),
+            "the row wears the author's moment, not the receipt time"
+        );
     }
 
     #[tokio::test]
