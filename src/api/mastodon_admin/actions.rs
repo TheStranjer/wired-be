@@ -25,7 +25,7 @@ use crate::{
         report::{self, ReportState},
         user::{User, admin},
     },
-    services::webhooks,
+    services::report_moderation::set_report_state,
     state::AppState,
     util::id::parse_id,
 };
@@ -140,8 +140,9 @@ async fn queue_content_deletion(state: &AppState, account: &User) -> AppResult<(
 /// request: no `report_id` is no report to resolve, an id that names none is
 /// the same 404 the account half gives, a report about another account is
 /// the 400 [`WRONG_TARGET`], and a report that passes both is moved to
-/// `resolved` — the write, its `report_update` entry and its
-/// `report.updated` event, exactly what the console's own state change does.
+/// `resolved` through [`set_report_state`] — the write, its `report_update`
+/// entry and its `report.updated` event, exactly what the console's own
+/// state change does.
 ///
 /// # Errors
 ///
@@ -167,17 +168,11 @@ async fn resolve_report(
     if filed.target_id != account.id {
         return Err(AppError::BadRequest(WRONG_TARGET.to_owned()));
     }
-    let resolved = report::set_state(&state.db, id, ReportState::Resolved, Some(actor.id))
+    let resolved = set_report_state(state, actor, id, ReportState::Resolved)
         .await?
         .ok_or(AppError::NotFound)?;
-    let logged =
-        moderation_log::report_update(&state.db, actor, id, resolved.state.as_str(), Some(account))
-            .await?;
-    webhooks::report_updated(state, &resolved).await;
     debug!(
-        log = %logged.id,
-        report = %id,
-        state = resolved.state.as_str(),
+        report = %resolved.id,
         "admin action resolved a report"
     );
     Ok(())

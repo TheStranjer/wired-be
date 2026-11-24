@@ -133,6 +133,7 @@ pub mod mentions;
 pub mod notify;
 pub mod relay;
 pub mod render_status;
+pub mod report_moderation;
 pub mod rich_media;
 pub mod runtime_config;
 pub mod schedule_status;
