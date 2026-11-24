@@ -80,14 +80,34 @@ async fn the_litepub_schema_document_is_served() {
     assert_eq!(
         context.get("Hashtag"),
         Some(&json!("as:Hashtag")),
-        "…and the tag type"
+        "…and the tag type…"
     );
+    for (term, definition) in [
+        ("blurhash", json!("toot:blurhash")),
+        (
+            "focalPoint",
+            json!({"@container": "@list", "@id": "toot:focalPoint"}),
+        ),
+        ("formerType", json!("as:formerType")),
+        (
+            "_misskey_quote",
+            json!("https://misskey-hub.net/ns#_misskey_quote"),
+        ),
+        ("ChatMessage", json!("litepub:ChatMessage")),
+        ("discoverable", json!("toot:discoverable")),
+        ("PropertyValue", json!("schema:PropertyValue")),
+    ] {
+        assert_eq!(
+            context.get(term),
+            Some(&definition),
+            "…and the actor and media terms, the one map for every document: {term}"
+        );
+    }
 }
 
 /// The whole document a provisioned local account is served as: every key
-/// and value of Pleroma's `user.json`, end to end over HTTP. The `@context`
-/// is taken from the response because its exact terms are the renderer's
-/// own test's business.
+/// and value of Pleroma's `user.json`, end to end over HTTP, with the
+/// `@context` naming the one served schema instead of inlining terms.
 #[tokio::test]
 async fn a_local_user_is_served_as_its_actor_document() {
     let db = common::test_db().await;
@@ -106,11 +126,15 @@ async fn a_local_user_is_served_as_its_actor_document() {
     .await;
 
     let document = fetch_actor(&pool, &alice).await;
-    let context = document["@context"].clone();
     assert_eq!(
         document,
         json!({
-            "@context": context,
+            "@context": [
+                "https://www.w3.org/ns/activitystreams",
+                "https://w3id.org/security/v1",
+                format!("{BASE}/schemas/litepub-0.1.jsonld"),
+                {"@language": "und"},
+            ],
             "id": format!("{BASE}/users/alice"),
             "type": "Person",
             "preferredUsername": "alice",
