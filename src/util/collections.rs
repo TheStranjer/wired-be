@@ -9,7 +9,11 @@ use std::{collections::HashMap, hash::Hash};
 /// query (already ordered as the caller wants them shown) and the map hands
 /// each key its values in that same order.
 #[must_use]
-pub fn group_pairs<K: Eq + Hash, V>(pairs: impl IntoIterator<Item = (K, V)>) -> HashMap<K, Vec<V>> {
+pub fn group_pairs<K, V, I>(pairs: I) -> HashMap<K, Vec<V>>
+where
+    K: Eq + Hash,
+    I: IntoIterator<Item = (K, V)>,
+{
     let mut grouped: HashMap<K, Vec<V>> = HashMap::new();
     for (key, value) in pairs {
         grouped.entry(key).or_default().push(value);

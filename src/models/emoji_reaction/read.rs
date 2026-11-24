@@ -10,7 +10,7 @@ use super::{
     MAX_SUMMARY_REACTORS, ReactionSummary,
     groups::{ReactionRow, ReactorGroup, group},
 };
-use crate::error::AppResult;
+use crate::{error::AppResult, util::collections::group_pairs};
 
 /// [`for_statuses`]: one aggregated row per `(status, emoji)` of a batch of
 /// statuses (`$1`), computed in the database so a status with thousands of
@@ -102,14 +102,10 @@ pub async fn for_statuses(
         .bind(i32::try_from(MAX_SUMMARY_REACTORS).unwrap_or(i32::MAX))
         .fetch_all(pool)
         .await?;
-    let mut rollups: HashMap<Uuid, Vec<ReactionSummary>> = HashMap::new();
-    for row in rows {
-        rollups
-            .entry(row.status_id)
-            .or_default()
-            .push(ReactionSummary::from(row));
-    }
-    Ok(rollups)
+    Ok(group_pairs(
+        rows.into_iter()
+            .map(|row| (row.status_id, ReactionSummary::from(row))),
+    ))
 }
 
 /// Every reaction of `status_id` as one [`ReactorGroup`] per emoji, in the same
