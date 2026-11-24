@@ -168,8 +168,8 @@
 //! - `PATCH /users/{nickname}/toggle_activation` — Pleroma's
 //!   `toggle_activation`: flips one account's flag, answers its single
 //!   admin entity and logs the move it made under the other pair's
-//!   actions. Unlike the bulk pair it does not protect the caller: the
-//!   segment that names an account names it.
+//!   actions. Like the bulk deactivation it protects the caller: toggling
+//!   the caller's own active account is a 403 and writes nothing.
 //! - `PATCH /users/approve` — `nicknames[]`: every named account still
 //!   awaiting staff clears `approval_pending` and gets the
 //!   `account_approved` letter; an already-approved one answers unchanged
