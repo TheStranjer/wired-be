@@ -9,12 +9,11 @@ use super::{
     success_body,
 };
 use crate::{
+    api::helpers::start_deletion,
     auth::AuthUser,
     error::{AppError, AppResult},
     extract::ApiBody,
-    jobs::{QUEUE_BACKGROUND, deletion},
     models::{
-        job::{NewJob, enqueue},
         oauth_token,
         user::{self, User},
     },
@@ -27,10 +26,11 @@ use crate::{
 /// config gate comes first: on an instance that switched deletion off
 /// the endpoint answers 403 `{"error":"Account deletion is disabled"}`
 /// whatever else the request said. Past it, the password gate, then the
-/// start: the account is deactivated with `deleted_at` stamped and all
-/// its tokens — the presenting one included — revoked in one transaction,
-/// the [`users.delete`](deletion::KIND_DELETE) sweep is queued on
-/// [`QUEUE_BACKGROUND`]. The `Delete` announcement to the peers is the
+/// start ([`start_deletion`]): the account is deactivated with `deleted_at`
+/// stamped and all its tokens — the presenting one included — revoked in
+/// one transaction, the [`users.delete`](crate::jobs::deletion::KIND_DELETE)
+/// sweep is queued on [`QUEUE_BACKGROUND`](crate::jobs::QUEUE_BACKGROUND).
+/// The `Delete` announcement to the peers is the
 /// sweep's own first act (see
 /// [`federation_out::after_account_deleted`](crate::services::federation_out::after_account_deleted)),
 /// not the endpoint's: the announcement reads the relationship rows the
@@ -55,37 +55,8 @@ pub(super) async fn delete_account(
     if !password_accepted(&auth.0, &params.password) {
         return Ok(error_body(INVALID_PASSWORD));
     }
-    let revoked = mark_and_revoke_all(&state, &auth.0).await?;
-    let queued = enqueue(
-        &state.db,
-        NewJob {
-            queue: QUEUE_BACKGROUND,
-            kind: deletion::KIND_DELETE,
-            args: deletion::job_args(auth.0.id),
-            run_at: None,
-            max_attempts: None,
-            unique_key: None,
-        },
-    )
-    .await?;
-    debug!(
-        account = %auth.0.nickname,
-        revoked,
-        queued = queued.is_some(),
-        "account deletion started"
-    );
+    start_deletion(&state, &auth.0).await?;
     Ok(success_body())
-}
-
-/// The `delete_account` write: inactive with `deleted_at` stamped, and
-/// every token gone, as one transaction — a half-started deletion must
-/// not leave the account active or still signed in.
-async fn mark_and_revoke_all(state: &AppState, account: &User) -> AppResult<u64> {
-    let mut tx = state.db.begin().await?;
-    user::mark_deleted(&mut *tx, account.id).await?;
-    let revoked = oauth_token::delete_all_for_user(&mut *tx, account.id).await?;
-    tx.commit().await?;
-    Ok(revoked)
 }
 
 /// `POST /api/pleroma/disable_account` — deactivate the account and keep
