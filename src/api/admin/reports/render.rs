@@ -13,6 +13,7 @@ use crate::{
         user::User,
     },
     state::AppState,
+    util::collections::group_pairs,
 };
 
 /// The one entity for `row`, through the batched [`entities`] read.
@@ -81,10 +82,7 @@ async fn note_lists(
     report_ids: &[Uuid],
 ) -> AppResult<HashMap<Uuid, Vec<AdminReportNote>>> {
     let rows = report::notes_for_reports(&state.db, report_ids).await?;
-    let mut notes: HashMap<Uuid, Vec<AdminReportNote>> = HashMap::new();
-    for row in rows {
-        let entity = AdminReportNote::from_row(&row);
-        notes.entry(row.report_id).or_default().push(entity);
-    }
-    Ok(notes)
+    Ok(group_pairs(rows.iter().map(|row| {
+        (row.report_id, AdminReportNote::from_row(row))
+    })))
 }

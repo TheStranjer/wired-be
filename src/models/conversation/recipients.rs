@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use sqlx::{PgConnection, PgPool};
 use uuid::Uuid;
 
-use crate::error::AppResult;
+use crate::{error::AppResult, util::collections::group_pairs};
 
 /// [`participate`]'s recipient arm, first half: the list is refreshed, not
 /// accumulated, so the old set goes before the new one lands.
@@ -112,11 +112,7 @@ pub async fn recipients_map(
         .bind(participation_ids)
         .fetch_all(pool)
         .await?;
-    let mut lists: HashMap<Uuid, Vec<Uuid>> = HashMap::new();
-    for (participation_id, user_id) in rows {
-        lists.entry(participation_id).or_default().push(user_id);
-    }
-    Ok(lists)
+    Ok(group_pairs(rows))
 }
 
 /// Makes `user_ids` the whole addressee list of `participation_id`.
