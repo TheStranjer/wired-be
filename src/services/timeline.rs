@@ -158,7 +158,7 @@ impl TimelineQuery {
         let _active: &mut _ = builder.push(ACTIVE_AUTHOR);
         push_source(&mut builder, &self.source, viewer);
         self.filters.push_clauses(&mut builder, viewer);
-        push_block_exclusions(&mut builder, viewer);
+        push_block_exclusions(&mut builder, &self.source, viewer);
         if !self.filters.with_muted.get() {
             push_mute_exclusions(&mut builder, viewer);
         }
