@@ -491,6 +491,50 @@ async fn a_pleroma_create_lands_unlisted_with_its_context() {
     );
 }
 
+/// The quote fallbacks Mastodon and Misskey put in `content` keep their
+/// `quote-inline` class through ingest, so clients can hide them, and no
+/// element is left with an empty `class`.
+#[tokio::test]
+async fn quote_fallback_markup_keeps_its_quote_inline_class() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let state = delivering_state(&pool);
+    let signer = bob(&pool).await;
+    let _carol = common::create_remote_user(&pool, "carol", "remote.example").await;
+    let cases = [
+        (
+            "quote-mastodon",
+            r#"<p class="quote-inline">RE: <a href="https://remote.example/@alice/1">remote.example/@alice/1</a></p><p>alice self-quote</p>"#,
+        ),
+        (
+            "quote-misskey",
+            r#"Misskey quote of wanda<br><br><span class="quote-inline">RE: <a href="https://remote.example/notes/1">remote.example/notes/1</a></span><span class="evil">x</span>"#,
+        ),
+    ];
+
+    for (name, content) in cases {
+        let mut activity = mastodon_named(name);
+        object_field_mut(&mut activity, "content", content);
+        deliver(&state, &activity, &signer).await;
+
+        let row = stored(
+            &pool,
+            &format!("https://remote.example/users/bob/statuses/{name}"),
+        )
+        .await;
+        assert!(
+            row.content.contains(r#"class="quote-inline""#),
+            "{name} keeps quote-inline: {}",
+            row.content
+        );
+        assert!(
+            !row.content.contains(r#"class="""#),
+            "{name} has no empty class: {}",
+            row.content
+        );
+    }
+}
+
 /// The [MRF chain](wired_be::federation::mrf) runs inside the dispatcher,
 /// so what a policy rewrites is what gets folded: a `Create` from a host on
 /// `followers_only` lands private, the same post from a host on
