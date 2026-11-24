@@ -1,11 +1,12 @@
-//! Applying an `Update` of a remote actor: the flood guard, the mirror
+//! Applying an `Update` of a remote actor: the staleness check, the mirror
 //! write and the move fields.
 
 use chrono::{DateTime, Utc};
+use serde_json::Value;
 use sqlx::PgPool;
 use tracing::debug;
 
-use super::{MIN_UPDATE_INTERVAL, transient};
+use super::transient;
 use crate::{
     federation::{
         dispatch::{ActivityView, FederationError, Outcome},
@@ -14,10 +15,11 @@ use crate::{
     },
     models::user::{self, User},
     state::AppState,
+    util::time::parse_time,
 };
 
 /// The body of [`update_actor`], in the order the ticket fixes: the shape
-/// checks, the flood guard, the two columns the mirror write leaves alone,
+/// checks, the staleness check, the two columns the mirror write leaves alone,
 /// then the mirror write itself.
 pub(super) async fn apply_update(
     state: AppState,
@@ -43,9 +45,9 @@ pub(super) async fn apply_update(
             "an Update whose object id is not the actor's own id",
         ));
     }
-    if within_update_interval(signer.last_fetched_at) {
+    if is_stale(object, signer.updated_at) {
         return Ok(Outcome::Ignored(
-            "an Update inside the minimum interval since the last write",
+            "an Update no newer than the stored mirror",
         ));
     }
     let document = mrf::filter_actor(&state, object.clone()).await;
@@ -65,13 +67,17 @@ pub(super) async fn apply_update(
     Ok(Outcome::Handled)
 }
 
-/// Whether a mirror written since `stamp` still answers for itself, the
-/// flood guard of [`update_actor`]: `true` for a stamp in the future as
-/// well, because a peer whose clock runs ahead is no reason to fold its
-/// updates more often. `None` — an account stored with no fetch stamp — is
-/// not too fresh.
-fn within_update_interval(stamp: Option<DateTime<Utc>>) -> bool {
-    stamp.is_some_and(|fetched| Utc::now().signed_duration_since(fetched) < MIN_UPDATE_INTERVAL)
+/// Whether the embedded document is no newer than the stored mirror, the
+/// staleness check of [`update_actor`]: `true` only when the document
+/// carries a parseable `updated` that is not after `stored_at`. A document
+/// with no `updated`, or one that does not parse, says nothing about its
+/// age and is applied, so two edits in quick succession both land.
+fn is_stale(document: &Value, stored_at: DateTime<Utc>) -> bool {
+    document
+        .get("updated")
+        .and_then(Value::as_str)
+        .and_then(parse_time)
+        .is_some_and(|updated| updated <= stored_at)
 }
 
 /// What a refused actor document means for the activity: a document that is

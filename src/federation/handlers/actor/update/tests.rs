@@ -1,6 +1,7 @@
 //! Tests of the actor `Update` handler.
 
 use serde_json::json;
+use uuid::Uuid;
 
 use super::super::{
     test_support::{
@@ -13,8 +14,7 @@ use super::*;
 use crate::services::runtime_config;
 
 /// The profile half of an `Update`: name, note, avatar, fields and the
-/// endpoints the document changed all land on the mirror, and the write
-/// refreshes the stamp the flood guard reads.
+/// endpoints the document changed all land on the mirror.
 #[tokio::test]
 async fn an_update_folds_the_new_profile_into_the_mirror() {
     let db = crate::test_db::test_db().await.expect("test database slot");
@@ -72,10 +72,6 @@ async fn an_update_folds_the_new_profile_into_the_mirror() {
         Some(NEW_PEM),
         "and so did the signing key"
     );
-    assert!(
-        within_update_interval(stored.last_fetched_at),
-        "the write is stamped as fresh, which is what arms the flood guard"
-    );
 }
 
 /// The MRF actor stage on the inbound half of the mirror: an `Update`
@@ -127,12 +123,24 @@ async fn an_update_lands_stripped_by_the_mrf_actor_lists() {
     );
 }
 
-/// The flood guard: a mirror a fetch or an earlier `Update` wrote less
-/// than ten seconds ago answers for itself, so neither the delivery that
-/// follows a fetch nor the one that follows a successful fold rewrites
-/// it.
+/// Backdates a mirror's `updated_at` to `stamp` and hands back the row, so
+/// a test can put the document's `updated` on either side of it.
+async fn stored_as_of(pool: &PgPool, id: Uuid, stamp: &str) -> User {
+    let at = parse_time(stamp).expect("the fixture stamp parses");
+    let _aged = sqlx::query("UPDATE users SET updated_at = $2 WHERE id = $1")
+        .bind(id)
+        .bind(at)
+        .execute(pool)
+        .await
+        .expect("the fixture backdates the mirror");
+    fresh_user(pool, id).await
+}
+
+/// A profile saved twice in quick succession sends two `Update`s; the
+/// second, the final state, lands even though the first just stamped the
+/// mirror, and so does one right behind a fetch.
 #[tokio::test]
-async fn an_update_that_arrives_too_soon_is_ignored() {
+async fn two_updates_inside_ten_seconds_both_apply() {
     let db = crate::test_db::test_db().await.expect("test database slot");
     let pool = db.pool().clone();
     let state = app_state(&pool);
@@ -141,54 +149,111 @@ async fn an_update_that_arrives_too_soon_is_ignored() {
             .await
             .expect("the mirror fixture stores");
     let alice_id = just_fetched.id;
+    let just_fetched = stored_as_of(&pool, alice_id, "2026-01-01T00:00:00Z").await;
     assert!(
-        within_update_interval(just_fetched.last_fetched_at),
-        "a fetch that just ran is inside the guard"
+        just_fetched.last_fetched_at.is_some(),
+        "the fetch stamped the mirror a moment ago"
     );
 
     let mut first = person();
     first["name"] = json!("First rewrite");
+    first["updated"] = json!("2026-01-01T00:00:01Z");
     let after_fetch = update_actor(
         state.clone(),
-        view("Update", "flood-1", ALICE, first.clone()),
+        view("Update", "rapid-1", ALICE, first),
         just_fetched,
     )
     .await;
+    assert_handled(&after_fetch);
+    assert_eq!(
+        fresh_user(&pool, alice_id).await.name,
+        "First rewrite",
+        "the update right after a fetch folds"
+    );
+
+    let mut second = person();
+    second["name"] = json!("Second rewrite");
+    second["updated"] = json!("2026-01-01T00:00:02Z");
+    let stamped = stored_as_of(&pool, alice_id, "2026-01-01T00:00:01Z").await;
+    let folded = update_actor(
+        state.clone(),
+        view("Update", "rapid-2", ALICE, second),
+        stamped,
+    )
+    .await;
+    assert_handled(&folded);
+    assert_eq!(
+        fresh_user(&pool, alice_id).await.name,
+        "Second rewrite",
+        "the delivery right behind a fold folds as well"
+    );
+}
+
+/// A document whose `updated` is not after the mirror's `updated_at` is an
+/// older (or the same) profile than the one stored, and writes nothing.
+#[tokio::test]
+async fn an_update_older_than_the_mirror_is_ignored() {
+    let db = crate::test_db::test_db().await.expect("test database slot");
+    let pool = db.pool().clone();
+    let state = app_state(&pool);
+    let alice_id = mirror(&pool).await.id;
+    let stored = stored_as_of(&pool, alice_id, "2026-01-02T00:00:00Z").await;
+
+    let mut older = person();
+    older["name"] = json!("Older rewrite");
+    older["updated"] = json!("2026-01-01T00:00:00Z");
+    let behind = update_actor(
+        state.clone(),
+        view("Update", "stale-1", ALICE, older),
+        stored.clone(),
+    )
+    .await;
     assert!(
-        ignored(after_fetch).contains("minimum interval"),
-        "the update right after a fetch is ignored"
+        ignored(behind).contains("no newer"),
+        "an older document is ignored"
+    );
+
+    let mut same = person();
+    same["name"] = json!("Same-instant rewrite");
+    same["updated"] = json!("2026-01-02T00:00:00Z");
+    let level = update_actor(state, view("Update", "stale-2", ALICE, same), stored).await;
+    assert!(
+        ignored(level).contains("no newer"),
+        "a document dated the mirror's own instant is ignored too"
     );
     assert_eq!(
         fresh_user(&pool, alice_id).await.name,
         "Alice",
         "nothing landed"
     );
+}
 
-    let aged = ready_for_update(&pool, alice_id).await;
-    let folded = update_actor(state.clone(), view("Update", "flood-2", ALICE, first), aged).await;
+/// A document with no `updated` says nothing about its age, so it applies,
+/// even straight after a fetch.
+#[tokio::test]
+async fn an_update_without_updated_applies() {
+    let db = crate::test_db::test_db().await.expect("test database slot");
+    let pool = db.pool().clone();
+    let state = app_state(&pool);
+    let just_fetched =
+        upsert_remote_user(&pool, parse_actor(&person()).expect("the fixture parses"))
+            .await
+            .expect("the mirror fixture stores");
+    let alice_id = just_fetched.id;
+
+    let mut document = person();
+    document["name"] = json!("Undated rewrite");
+    let folded = update_actor(
+        state,
+        view("Update", "undated-1", ALICE, document),
+        just_fetched,
+    )
+    .await;
     assert_handled(&folded);
     assert_eq!(
         fresh_user(&pool, alice_id).await.name,
-        "First rewrite",
-        "out of the guard, the first update folds"
-    );
-
-    let mut second = person();
-    second["name"] = json!("Second rewrite");
-    let redelivered = update_actor(
-        state.clone(),
-        view("Update", "flood-3", ALICE, second),
-        fresh_user(&pool, alice_id).await,
-    )
-    .await;
-    assert!(
-        ignored(redelivered).contains("minimum interval"),
-        "the delivery right behind a fold is ignored, not folded"
-    );
-    assert_eq!(
-        fresh_user(&pool, alice_id).await.name,
-        "First rewrite",
-        "and the profile it carried never landed"
+        "Undated rewrite",
+        "the undated document folded"
     );
 }
 
