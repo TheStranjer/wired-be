@@ -21,13 +21,16 @@
 //!   [`ingest::ingest_note`], so an `Update` for a post this instance never
 //!   received lands the post (an edit of a deleted one is refused by the
 //!   ingest's own tombstone check, and its answer rides out unchanged). The
-//!   edit itself: a document no newer than the stored version — its
-//!   `updated` at or before the row's `edited_at`, or its creation time
-//!   while the row has never been edited — is ignored; everything else
-//!   re-folds the status through [`crate::models::status_edit`], the same
-//!   write the edit endpoint runs, which snapshots the superseded version
-//!   into `status_edits` (visible at
-//!   `GET /api/v1/statuses/{id}/history`) and stamps `edited_at`. Content,
+//!   edit itself: a document older than the stored version — its
+//!   `updated` before the row's `edited_at` (the author's own stamp of the
+//!   last remote edit), or before the creation time while the row has never
+//!   been edited — is ignored, as is one with the same `updated` and the
+//!   same content; a document with no `updated` is never stale. Everything
+//!   else re-folds the status through [`crate::models::status_edit`], the
+//!   same write the edit endpoint runs, which snapshots the superseded
+//!   version into `status_edits` (visible at
+//!   `GET /api/v1/statuses/{id}/history`) and stamps `edited_at` with the
+//!   author's `updated` time. Content,
 //!   source text, warning, sensitive flag, hashtags and mentions — resolved
 //!   through the create path's own resolver (`ingest::resolve_mentions`) —
 //!   are its new state; the attachments are replaced wholesale in the

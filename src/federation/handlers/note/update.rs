@@ -1,6 +1,8 @@
 //! The `Update` fold: the authorship gate, the stale check and the edit of
 //! the stored post, or the ingest of one this instance never stored.
 
+use std::cmp::Ordering;
+
 use chrono::{DateTime, Utc};
 use serde_json::Value;
 use tracing::debug;
@@ -99,17 +101,15 @@ async fn fold_edit(
     stored: &Status,
 ) -> Result<Outcome, FederationError> {
     let now = Utc::now();
-    if is_stale(object, stored, now) {
-        debug!(
-            status = %stored.id,
-            "an Update no newer than the stored version; ignoring"
-        );
-        return Ok(Outcome::Ignored(
-            "an Update no newer than the stored version",
-        ));
+    let recency = recency(object, stored, now);
+    if recency == Ordering::Less {
+        return Ok(ignore_stale(stored));
     }
     let parsed = note_parser::parse_note(object, signer, now)
         .map_err(|err| FederationError::permanent("the updated object is not parseable", &err))?;
+    if recency == Ordering::Equal && restates(&parsed, stored) {
+        return Ok(ignore_stale(stored));
+    }
     let mut mentioned = ingest::resolve_mentions(state, &parsed.mention_hrefs).await?;
     ingest::merge_accounts(
         &mut mentioned,
@@ -119,7 +119,13 @@ async fn fold_edit(
         .await
         .map_err(|err| FederationError::transient("the attachment read failed", &err))?;
     let media_changed = media_replacement_needed(&media, &parsed.attachments);
-    let params = edit_params(&parsed, stored, &mentioned, media_changed);
+    let params = edit_params(
+        &parsed,
+        stored,
+        &mentioned,
+        media_changed,
+        update_time(object, now),
+    );
     let Some(updated) = status_edit::update_status(&state.db, stored.id, params)
         .await
         .map_err(|err| FederationError::transient("the status edit failed", &err))?
@@ -147,12 +153,14 @@ async fn fold_edit(
 /// replacement: an empty submitted set, which [`status_edit::update_status`]
 /// reads as "detach everything the post wears now" — the rows the remote
 /// named are nobody's uploads, so the fold rewrites them itself beside the
-/// versioned write.
+/// versioned write. `edited_at` is the author's own [`update_time`], the
+/// stamp the row wears so the next stale check compares like with like.
 fn edit_params(
     parsed: &ParsedNote,
     stored: &Status,
     mentioned: &[User],
     media_changed: bool,
+    edited_at: Option<DateTime<Utc>>,
 ) -> EditParams {
     EditParams {
         content: parsed.status.content.clone(),
@@ -164,29 +172,50 @@ fn edit_params(
         mentioned_user_ids: mentioned.iter().map(|account| account.id).collect(),
         hashtags: parsed.hashtags.clone(),
         media_ids: media_changed.then(Vec::new),
+        edited_at,
     }
 }
 
-/// The stale gate of [`fold_edit`] (see [`update_time`]): an update whose
-/// own moment does not postdate the version this instance holds describes
-/// an edit the fold already made — or an older peer's restatement of the
-/// original — and writes nothing.
-fn is_stale(object: &Value, stored: &Status, now: DateTime<Utc>) -> bool {
-    let Some(incoming) = update_time(object, now) else {
-        return false;
-    };
-    incoming <= stored.edited_at.unwrap_or(stored.inserted_at)
+/// The answer of a [`fold_edit`] that found the `Update` stale.
+fn ignore_stale(stored: &Status) -> Outcome {
+    debug!(
+        status = %stored.id,
+        "an Update no newer than the stored version; ignoring"
+    );
+    Outcome::Ignored("an Update no newer than the stored version")
+}
+
+/// The stale gate of [`fold_edit`], as an ordering of the update's own
+/// moment (see [`update_time`]) against the version this instance holds.
+///
+/// Remote edits are stamped with the author's clock, so both sides are the
+/// same clock. `Less` is an edit the fold already made or an older peer's
+/// restatement: it writes nothing. `Equal` is stale only when the content
+/// is identical too ([`restates`]), since `updated` has one-second
+/// precision on some servers. `Greater`, or no `updated` to compare, edits.
+fn recency(object: &Value, stored: &Status, now: DateTime<Utc>) -> Ordering {
+    update_time(object, now).map_or(Ordering::Greater, |incoming| {
+        incoming.cmp(&stored.edited_at.unwrap_or(stored.inserted_at))
+    })
+}
+
+/// Whether `parsed` restates the version `stored` already holds.
+fn restates(parsed: &ParsedNote, stored: &Status) -> bool {
+    parsed.status.content == stored.content
+        && parsed.status.raw_text == stored.raw_text
+        && parsed.status.spoiler_text == stored.spoiler_text
+        && parsed.status.sensitive == stored.sensitive
 }
 
 /// The moment an `Update` claims its document was last changed: its
-/// `updated`, falling back to its `published` for a document that carries
-/// only that, clamped by [`clamped_time`] the way the note parse clamps
+/// `updated`, clamped by [`clamped_time`] the way the note parse clamps
 /// creation times — a stamp from a runaway clock answers `now`, still the
-/// freshest the fold can honestly call it. `None` for a document whose
-/// stamps are unreadable: with nothing to compare, the fold trusts the
+/// freshest the fold can honestly call it. `None` for a document without a
+/// readable `updated`: its `published` says when the post was made, not when
+/// it changed, so there is nothing to compare and the fold trusts the
 /// sender and edits.
 fn update_time(object: &Value, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
-    clamped_time(object.get("updated"), now).or_else(|| clamped_time(object.get("published"), now))
+    clamped_time(object.get("updated"), now)
 }
 
 #[cfg(test)]
@@ -199,6 +228,152 @@ mod tests {
     };
     use super::super::update_note;
     use super::*;
+
+    /// The stored row for `uri`.
+    async fn stored_row(pool: &sqlx::PgPool, uri: &str) -> Status {
+        status::get_by_uri(pool, uri)
+            .await
+            .expect("the uri read")
+            .expect("the post is stored")
+    }
+
+    /// An `Update` of `uri` to `text` carrying the author's `updated` stamp.
+    fn edit_at(uri: &str, text: &str, updated: Option<&str>) -> Value {
+        let mut extra = json!({ "content": format!("<p>{text}</p>") });
+        if let Some(stamp) = updated {
+            extra["updated"] = json!(stamp);
+        }
+        note(uri, extra)
+    }
+
+    #[tokio::test]
+    async fn a_later_edit_older_than_local_now_still_applies_with_the_authors_time() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let state = app_state(&pool);
+        let author = author(&pool).await;
+        let uri = "https://remote.example/users/bob/statuses/skew-1";
+        drop(mirrored(&pool, &author, uri, "first words").await);
+        let first = Utc::now() - chrono::Duration::seconds(60);
+        let second = Utc::now() - chrono::Duration::seconds(55);
+        let stamp = |time: DateTime<Utc>| time.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+
+        for (text, time) in [("edit a", first), ("edit b", second)] {
+            let outcome = update_note(
+                state.clone(),
+                view_of("Update", edit_at(uri, text, Some(&stamp(time))), None),
+                author_again(&pool).await,
+            )
+            .await
+            .expect("the fold completes");
+            assert_eq!(outcome, Outcome::Handled, "{text} is applied");
+        }
+
+        let row = stored_row(&pool, uri).await;
+        assert_eq!(row.content, "<p>edit b</p>", "the newer edit won");
+        assert_eq!(
+            row.edited_at.map(|at| at.timestamp_millis()),
+            Some(second.timestamp_millis()),
+            "and `edited_at` is the author's time, not the receipt time"
+        );
+        assert_eq!(revisions(&pool, row.id).await.len(), 2, "both are kept");
+    }
+
+    #[tokio::test]
+    async fn an_older_edit_delivered_late_is_still_ignored() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let state = app_state(&pool);
+        let author = author(&pool).await;
+        let uri = "https://remote.example/users/bob/statuses/late-1";
+        drop(mirrored(&pool, &author, uri, "first words").await);
+        let newer = "2024-05-01T12:00:05.000Z";
+        let older = "2024-05-01T12:00:00.000Z";
+
+        let first = update_note(
+            state.clone(),
+            view_of("Update", edit_at(uri, "edit b", Some(newer)), None),
+            author_again(&pool).await,
+        )
+        .await
+        .expect("the fold completes");
+        assert_eq!(first, Outcome::Handled, "the newer edit applies");
+        let late = update_note(
+            state,
+            view_of("Update", edit_at(uri, "edit a", Some(older)), None),
+            author,
+        )
+        .await
+        .expect("the fold completes");
+
+        assert_eq!(
+            late,
+            Outcome::Ignored("an Update no newer than the stored version"),
+            "the older edit arrived second"
+        );
+        assert_eq!(
+            live_content(&pool, uri).await.as_deref(),
+            Some("<p>edit b</p>")
+        );
+    }
+
+    #[tokio::test]
+    async fn an_equal_stamp_applies_only_when_the_content_differs() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let state = app_state(&pool);
+        let author = author(&pool).await;
+        let uri = "https://remote.example/users/bob/statuses/tie-1";
+        drop(mirrored(&pool, &author, uri, "first words").await);
+        let stamp = Some("2024-05-01T12:00:00.000Z");
+
+        let outcomes = [
+            ("edit a", Outcome::Handled),
+            ("edit b", Outcome::Handled),
+            (
+                "edit b",
+                Outcome::Ignored("an Update no newer than the stored version"),
+            ),
+        ];
+        for (text, expected) in outcomes {
+            let outcome = update_note(
+                state.clone(),
+                view_of("Update", edit_at(uri, text, stamp), None),
+                author_again(&pool).await,
+            )
+            .await
+            .expect("the fold completes");
+            assert_eq!(outcome, expected, "{text} at the same second");
+        }
+        assert_eq!(
+            live_content(&pool, uri).await.as_deref(),
+            Some("<p>edit b</p>")
+        );
+    }
+
+    #[tokio::test]
+    async fn an_update_without_updated_and_new_content_applies() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let state = app_state(&pool);
+        let author = author(&pool).await;
+        let uri = "https://remote.example/users/bob/statuses/no-stamp-1";
+        drop(mirrored(&pool, &author, uri, "first words").await);
+
+        let outcome = update_note(
+            state,
+            view_of("Update", edit_at(uri, "fresh words", None), None),
+            author_again(&pool).await,
+        )
+        .await
+        .expect("the fold completes");
+
+        assert_eq!(outcome, Outcome::Handled, "nothing to compare, so it edits");
+        assert_eq!(
+            live_content(&pool, uri).await.as_deref(),
+            Some("<p>fresh words</p>")
+        );
+    }
 
     #[tokio::test]
     async fn an_edit_rewrites_the_post_and_records_its_previous_version() {
@@ -412,8 +587,15 @@ mod tests {
             .expect("the second fold completes");
         assert_eq!(
             again,
-            Outcome::Ignored("an Update no newer than the stored version"),
-            "a restatement of the same version writes nothing further"
+            Outcome::Handled,
+            "an Update with no `updated` has nothing to compare, so it is folded"
+        );
+        assert_eq!(
+            revisions(&pool, stored_row(&pool, uri).await.id)
+                .await
+                .len(),
+            0,
+            "but a restatement of the same text supersedes no version"
         );
         assert_eq!(
             rows_for_uri(&pool, uri).await,

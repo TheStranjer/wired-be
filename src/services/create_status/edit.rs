@@ -199,6 +199,7 @@ pub async fn edit_status(
         mentioned_user_ids: fields.mentioned_user_ids,
         hashtags: fields.hashtags,
         media_ids,
+        edited_at: None,
     };
     let Some(updated) = status_edit::update_status(&state.db, row.id, edit).await? else {
         return Ok(None);
