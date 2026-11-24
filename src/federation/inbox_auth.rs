@@ -53,28 +53,30 @@ use std::time::Duration;
 
 use axum::{
     extract::{FromRequest, Request},
-    http::{HeaderMap, HeaderName},
+    http::HeaderMap,
 };
 use bytes::Bytes;
 use serde_json::Value;
 
 use crate::{
-    federation::signature::verify::{ParsedSignature, SignedRequestParts, verify_digest},
+    federation::signature::verify::{
+        ParsedSignature, SignedRequestParts, path_and_query, verify_digest,
+    },
     models::user::User,
     state::AppState,
 };
 
 mod body;
 mod error;
-mod signer;
+pub mod signer;
 #[cfg(test)]
 mod test_support;
-mod verify;
+pub mod verify;
 
 pub use crate::federation::policy::signer_host;
 pub use error::InboxAuthError;
 
-use body::{declares_json_type, parse_json_body, present_signature, read_limited, request_target};
+use body::{declares_json_type, parse_json_body, present_signature, read_limited};
 use signer::resolve_signer;
 use verify::{require_containment, require_unblocked, verify_signature};
 
@@ -104,10 +106,6 @@ const REJECTED: &str = "Rejected";
 /// The `ActivityStreams` type of the one activity accepted while unsigned:
 /// an actor's own deletion (see the [module docs](self) step 7).
 const DELETE_TYPE: &str = "Delete";
-/// The `Authorization` scheme an inbox `Signature` header may hide under.
-const SIGNATURE_SCHEME: &str = "Signature";
-/// The bare `Signature` request header.
-const SIGNATURE_HEADER: HeaderName = HeaderName::from_static("signature");
 /// The media types an inbox delivery may be labelled with, lowercase and
 /// without parameters: the `Content-Type` must name exactly one.
 const JSON_MEDIA_TYPES: [&str; 3] = [
@@ -195,7 +193,7 @@ async fn authenticate(
     require_unblocked(state, &parsed.key_id).await?;
     verify_digest(&parts.headers, &body).map_err(|_err| InboxAuthError::invalid_digest())?;
     let signer = resolve_signer(state, &parsed.key_id, &json).await?;
-    let target = request_target(&parts.uri);
+    let target = path_and_query(&parts.uri);
     let inbound = Inbound {
         parsed: &parsed,
         headers: &parts.headers,
