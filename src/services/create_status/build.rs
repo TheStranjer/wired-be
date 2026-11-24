@@ -26,7 +26,11 @@ use super::{
 };
 use crate::{
     error::AppResult,
-    models::{oauth_app::OauthApp, status::NewStatus, user::User},
+    models::{
+        oauth_app::OauthApp,
+        status::NewStatus,
+        user::{self, User},
+    },
     services::mentions::resolve_mentions,
     state::AppState,
     util::entities::{MentionRef, extract_hashtags, linkify_entities},
@@ -62,17 +66,32 @@ pub async fn render_status_fields(
     text: &str,
     content_type: &str,
 ) -> AppResult<RenderedFields> {
+    let (fields, _found) = render_status_fields_with_mentions(state, text, content_type).await?;
+    Ok(fields)
+}
+
+/// [`render_status_fields`] keeping the resolved `(mention, account)` pairs.
+///
+/// The same render, plus the pairs it linked in mention order, for the
+/// caller whose entity renders the mentioned accounts themselves (the
+/// preview, through `prepared_new_status`).
+///
+/// # Errors
+///
+/// Those of [`render_status_fields`].
+pub async fn render_status_fields_with_mentions(
+    state: &AppState,
+    text: &str,
+    content_type: &str,
+) -> AppResult<(RenderedFields, Vec<(MentionRef, User)>)> {
     let found = resolve_mentions(state, text).await?;
-    Ok(rendered_fields(state, text, content_type, &found))
+    let fields = rendered_fields(state, text, content_type, &found);
+    Ok((fields, found))
 }
 
 /// The pure half of [`render_status_fields`]: the same HTML, the same
-/// mentioned ids and the same tags, for mentions a caller has already
-/// resolved. [`preview_status`] keeps the resolved rows beside the fields
-/// (its entity renders the mentioned accounts themselves), so the split is
-/// the preview's, not the create's — for `create_status` and `edit_status`
-/// this is the step [`render_status_fields`] runs after its lookup.
-pub(super) fn rendered_fields(
+/// mentioned ids and the same tags, for mentions already resolved.
+fn rendered_fields(
     state: &AppState,
     text: &str,
     content_type: &str,
@@ -128,11 +147,45 @@ fn new_status(
 }
 
 /// What [`prepared_new_status`] answers: the [`NewStatus`] both create
-/// arms store and the checked body's poll beside it — the question names
-/// no `NewStatus` column, so it rides out separately for `store_poll`.
-/// Factored out because a mixed tuple of row and poll reads better by
-/// name (and a bare `Result` of it trips `type_complexity`).
-type Prepared = (NewStatus, Option<CheckedPoll>);
+/// arms store, the checked body's poll beside it — the question names no
+/// `NewStatus` column, so it rides out separately for `store_poll` — and
+/// the accounts the row links as mentions.
+#[derive(Debug)]
+pub(crate) struct Prepared {
+    /// The row to store, every reply decision applied.
+    pub(crate) new: NewStatus,
+    /// The checked body's poll, `None` for a body carrying none.
+    pub(crate) poll: Option<CheckedPoll>,
+    /// The accounts [`NewStatus::mentioned_user_ids`] names, in that order:
+    /// the ones the text mentioned, then the parent's and the
+    /// conversation's auto-mentions. The preview renders them as the
+    /// entity's `mentions`.
+    pub(crate) mentioned: Vec<User>,
+}
+
+/// The accounts behind `ids`, in `ids` order: those `found` already
+/// resolved are taken from it, the rest (a reply's auto-mentions) are read
+/// in one query. An id with no row is skipped.
+async fn mentioned_users(
+    state: &AppState,
+    ids: &[Uuid],
+    found: Vec<(MentionRef, User)>,
+) -> AppResult<Vec<User>> {
+    let mut known: HashMap<Uuid, User> = found
+        .into_iter()
+        .map(|(_, account)| (account.id, account))
+        .collect();
+    let missing: Vec<Uuid> = ids
+        .iter()
+        .copied()
+        .filter(|id| !known.contains_key(id))
+        .collect();
+    if !missing.is_empty() {
+        let fetched = user::get_many(&state.db, &missing).await?;
+        known.extend(fetched.into_iter().map(|account| (account.id, account)));
+    }
+    Ok(ids.iter().filter_map(|id| known.remove(id)).collect())
+}
 
 /// The shared pre-write half of both create arms and of the schedule
 /// service: [`check_body`] over the body, the reply's parent when the body
@@ -181,7 +234,8 @@ pub(crate) async fn prepared_new_status(
     let parent = reply_parent(state, user, params).await?;
     let participation = reply_participation(state, user, params).await?;
     let quote_of_id = quote_target(state, user, params.quote_id.as_deref()).await?;
-    let entities = render_status_fields(state, checked.text, checked.content_type).await?;
+    let (entities, found) =
+        render_status_fields_with_mentions(state, checked.text, checked.content_type).await?;
     let mut new = new_status(user, app, &checked, &entities, quote_of_id);
     if let Some(parent) = parent {
         let inherited = inherited_mentions(
@@ -205,5 +259,10 @@ pub(crate) async fn prepared_new_status(
     if let Some(participation) = participation {
         apply_conversation_reply(state, &participation, &mut new).await?;
     }
-    Ok((new, checked.poll))
+    let mentioned = mentioned_users(state, &new.mentioned_user_ids, found).await?;
+    Ok(Prepared {
+        new,
+        poll: checked.poll,
+        mentioned,
+    })
 }
