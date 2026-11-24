@@ -112,7 +112,7 @@ use crate::{
     pagination::{PageParams, link_header, set_link_header},
     services::{
         render_status::{ViewerMode, render_statuses},
-        webhooks,
+        report_moderation::set_report_state,
     },
     state::AppState,
     util::id::parse_id,
@@ -244,10 +244,10 @@ async fn reopen_report(
     entity(&state, &staff.0, &row).await.map(Json)
 }
 
-/// The shared write of the two state routes: [`report::set_state`] to
-/// `to`, the acting staff member named only on the resolution (Pleroma's
-/// `update_report_state` takes no actor; the ticket's `resolve` does),
-/// beside the `report_update` [`moderation_log`] entry and the
+/// The shared write of the two state routes: [`set_report_state`] to `to`,
+/// which names the acting staff member only on the resolution (Pleroma's
+/// `update_report_state` takes no actor; the ticket's `resolve` does) and
+/// leaves the `report_update` [`moderation_log`] entry and the
 /// `report.updated` [`webhooks`] event every state change of this table
 /// leaves — the same follow-ups the console's own bulk `PATCH /reports`
 /// runs.
@@ -264,27 +264,9 @@ async fn move_state(
     filed: &ReportRow,
     to: ReportState,
 ) -> AppResult<ReportRow> {
-    let acted_by = (to == ReportState::Resolved).then_some(staff.id);
-    let moved = report::set_state(&state.db, filed.id, to, acted_by)
+    set_report_state(state, staff, filed.id, to)
         .await?
-        .ok_or(AppError::NotFound)?;
-    let target = user::get_by_id(&state.db, moved.target_id).await?;
-    let logged = moderation_log::report_update(
-        &state.db,
-        staff,
-        moved.id,
-        moved.state.as_str(),
-        target.as_ref(),
-    )
-    .await?;
-    debug!(
-        log = %logged.id,
-        report = %moved.id,
-        state = moved.state.as_str(),
-        "admin mastodon report state changed"
-    );
-    webhooks::report_updated(state, &moved).await;
-    Ok(moved)
+        .ok_or(AppError::NotFound)
 }
 
 /// `POST /api/v1/admin/reports/{id}/assign_to_self` — Pleroma's
