@@ -72,18 +72,6 @@ pub(super) fn about(target: &User) -> Value {
     json!({"account_id": target.id.to_string()})
 }
 
-/// The keys of a JSON object, sorted, for exact key-set assertions.
-pub(super) fn json_keys(value: &Value) -> Vec<&str> {
-    let mut keys: Vec<&str> = value
-        .as_object()
-        .expect("reports render objects")
-        .keys()
-        .map(String::as_str)
-        .collect();
-    keys.sort_unstable();
-    keys
-}
-
 /// The `id` the entity answered with, as the row's own `UUIDv7` text.
 pub(super) fn entity_id(value: &Value) -> Uuid {
     let text = value["id"].as_str().expect("the entity carries its own id");

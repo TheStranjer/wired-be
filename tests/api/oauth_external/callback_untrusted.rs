@@ -7,8 +7,8 @@ use serde_json::json;
 
 use super::provider::{LINKED_UID, PROVIDER, REDIRECT};
 use super::support::{
-    assert_no_store, count_codes, count_states, error_text, fixture, link, location, prepare,
-    query_param, set_trusted, stored_params,
+    assert_no_store, count_codes, count_states, fixture, link, location, prepare, query_param,
+    set_trusted, stored_params,
 };
 use crate::common;
 
@@ -91,7 +91,7 @@ async fn a_second_callback_rotates_the_confirm_token() {
         StatusCode::BAD_REQUEST,
         "the old token is dead"
     );
-    assert_eq!(error_text(&old_reply), "Invalid state", "the usual refusal");
+    assert_eq!(old_reply.error_text(), "Invalid state", "the usual refusal");
     assert_eq!(count_codes(&pool).await, 0, "and no code was ever minted");
     site.provider.stop();
 }

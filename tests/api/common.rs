@@ -59,10 +59,10 @@ pub use self::{
         reload_user,
     },
     jobs::run_all_jobs,
-    json::{id_of, ids_of},
+    json::{id_of, ids_of, sorted_keys},
     request::{MultipartPart, TestRequest},
     response::{
         TestResponse, activity_json, assert_all_answered, assert_all_errors, assert_all_refused,
-        assert_answer, assert_error,
+        assert_answer, assert_error, expected_link,
     },
 };

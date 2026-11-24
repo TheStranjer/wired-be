@@ -9,8 +9,8 @@ use uuid::Uuid;
 use wired_be::util::time::mastodon_time;
 
 use super::support::{
-    NOT_FOUND, READ, READ_WRITE, V1, assert_empty_object, assert_listed, expected_link, fixture,
-    key_set, ladder, list, listed_ids, seed_listing, seed_mutes, ungrouped,
+    NOT_FOUND, READ, READ_WRITE, V1, assert_empty_object, assert_listed, fixture, ladder, list,
+    listed_ids, seed_listing, seed_mutes, ungrouped,
 };
 use crate::common;
 
@@ -37,7 +37,7 @@ async fn the_listing_answers_newest_first_with_a_link_header() {
     );
     assert_eq!(
         response.header("link"),
-        Some(expected_link(seed.follow.id, seed.favourite.id).as_str()),
+        Some(common::expected_link(V1, &seed.follow.id, &seed.favourite.id).as_str()),
         "the cursors walk the page's own row ids"
     );
     assert_eq!(
@@ -62,7 +62,7 @@ async fn flat_entities_carry_the_show_view_shape() {
     let entities = body.as_array().expect("an array");
     let (follow, favourite) = (&entities[0], &entities[2]);
     assert_eq!(
-        key_set(follow),
+        common::sorted_keys(follow),
         [
             "account",
             "created_at",
@@ -129,7 +129,7 @@ async fn the_listing_pages_with_its_cursors() {
     );
     assert_eq!(
         page.header("link"),
-        Some(expected_link(notes[4].id, notes[3].id).as_str()),
+        Some(common::expected_link(V1, &notes[4].id, &notes[3].id).as_str()),
         "and the cursors into the elders"
     );
 

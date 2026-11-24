@@ -10,8 +10,8 @@ use uuid::Uuid;
 use wired_be::{models::filter, util::time::parse_time};
 
 use super::support::{
-    EXPECTED_KEYS, ROOT, create_body, create_form, create_json, destroy, fixture, json_keys, list,
-    listed, phrases, seed, show, update,
+    EXPECTED_KEYS, ROOT, create_body, create_form, create_json, destroy, fixture, list, listed,
+    phrases, seed, show, update,
 };
 use crate::common;
 
@@ -46,7 +46,11 @@ async fn crud_round_trip() {
     let created = create_json(&app, &token, create_body()).await;
     assert_eq!(created.status, StatusCode::OK, "creation answers 200");
     let filter = created.json_value();
-    assert_eq!(json_keys(&filter), EXPECTED_KEYS, "exactly the entity keys");
+    assert_eq!(
+        common::sorted_keys(&filter),
+        EXPECTED_KEYS,
+        "exactly the entity keys"
+    );
     let id = filter["id"].as_str().expect("the id is text").to_owned();
     assert!(
         Uuid::parse_str(&id).is_ok(),

@@ -44,8 +44,8 @@ async fn v1_and_v2_answer_the_same() {
     let (_, first) = &entities[0];
     let (second_path, second) = &entities[1];
     assert_eq!(
-        sorted_keys(first),
-        sorted_keys(second),
+        common::sorted_keys(first),
+        common::sorted_keys(second),
         "{second_path} reports the same keys as v1"
     );
     for field in ["type", "description", "blurhash", "remote_url", "meta"] {
@@ -216,20 +216,4 @@ async fn only_post_uploads() {
         );
         assert!(response.body.is_empty(), "axum's 405 body is empty");
     }
-}
-
-/// The keys of an entity object, sorted, for comparing two responses exactly.
-///
-/// # Panics
-///
-/// If the value is not an object.
-fn sorted_keys(entity: &Value) -> Vec<&str> {
-    let mut names: Vec<&str> = entity
-        .as_object()
-        .expect("an entity object")
-        .keys()
-        .map(String::as_str)
-        .collect();
-    names.sort_unstable();
-    names
 }

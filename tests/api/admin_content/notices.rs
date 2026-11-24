@@ -7,7 +7,7 @@ use wired_be::util::format::text_to_html;
 
 use super::support::{
     ALL_ADMIN, FUTURE, NOTICE_KEYS, NOTICES, PAST, USER_NOTICES, a_notice, admin, app,
-    create_notice, destroy, get, json_keys, log_entry, patch,
+    create_notice, destroy, get, log_entry, patch,
 };
 use crate::common;
 
@@ -30,7 +30,11 @@ async fn a_created_notice_answers_the_entity_with_its_raw_content() {
         &json!({"content": typed, "starts_at": PAST, "ends_at": FUTURE, "all_day": true}),
     )
     .await;
-    assert_eq!(json_keys(&created), NOTICE_KEYS, "exactly the entity keys");
+    assert_eq!(
+        common::sorted_keys(&created),
+        NOTICE_KEYS,
+        "exactly the entity keys"
+    );
     assert_eq!(
         created["content"],
         text_to_html(typed),
@@ -46,7 +50,7 @@ async fn a_created_notice_answers_the_entity_with_its_raw_content() {
         "while the source is kept verbatim"
     );
     assert_eq!(
-        json_keys(&created["pleroma"]),
+        common::sorted_keys(&created["pleroma"]),
         ["raw_content"],
         "the pleroma block carries that key alone"
     );

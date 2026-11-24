@@ -11,8 +11,8 @@ use super::messages_support::{
     post_message, post_text, poster,
 };
 use super::support::{
-    MESSAGE_KEYS, READ_SCOPE, SCOPE, count_messages, delete_as, error_message, fixture,
-    get_anonymous, get_as, json_keys, message_delete_path, messages_path, open_chat,
+    MESSAGE_KEYS, READ_SCOPE, SCOPE, count_messages, delete_as, fixture, get_anonymous, get_as,
+    message_delete_path, messages_path, open_chat,
 };
 use crate::common;
 
@@ -54,7 +54,7 @@ async fn a_recipient_delete_only_removes_the_recipients_copy() {
     );
     let value = removed.json_value();
     assert_eq!(
-        json_keys(&value),
+        common::sorted_keys(&value),
         MESSAGE_KEYS,
         "the full entity, as he saw it"
     );
@@ -210,7 +210,7 @@ async fn the_message_routes_answer_the_one_chat_404() {
             "no listing of {foreign}"
         );
         assert_eq!(
-            error_message(&listed).as_deref(),
+            listed.error_field().as_deref(),
             Some("Record not found"),
             "the plain 404 wording on {foreign}"
         );

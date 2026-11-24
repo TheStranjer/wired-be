@@ -11,12 +11,6 @@ use axum::http::StatusCode;
 
 use crate::common;
 
-/// The `error` string of a JSON error response, or `None` when the body is
-/// not an error object with a string `error` field.
-fn error_message(response: &common::TestResponse) -> Option<String> {
-    Some(response.json_value().get("error")?.as_str()?.to_owned())
-}
-
 /// `/api/v1/nothing` is unmatched under the empty `/api/v1` router: 404 with
 /// Pleroma's `api_not_implemented` message.
 #[tokio::test]
@@ -36,7 +30,7 @@ async fn unmatched_api_path_reports_not_implemented() {
         "errors answer with JSON"
     );
     assert_eq!(
-        error_message(&response).as_deref(),
+        response.error_field().as_deref(),
         Some("Not implemented"),
         "unmatched API paths use api_not_implemented"
     );
@@ -57,7 +51,7 @@ async fn other_api_paths_also_report_not_implemented() {
             "unmatched API path status for {path}"
         );
         assert_eq!(
-            error_message(&response).as_deref(),
+            response.error_field().as_deref(),
             Some("Not implemented"),
             "api_not_implemented message for {path}"
         );
@@ -78,7 +72,7 @@ async fn unmatched_non_api_path_reports_not_found() {
         "unmatched non-API path status"
     );
     assert_eq!(
-        error_message(&response).as_deref(),
+        response.error_field().as_deref(),
         Some("Not found"),
         "non-API paths get the plain router-level 404"
     );
@@ -98,7 +92,7 @@ async fn api_lookalike_prefix_reports_not_found() {
         "status for a non-API lookalike path"
     );
     assert_eq!(
-        error_message(&response).as_deref(),
+        response.error_field().as_deref(),
         Some("Not found"),
         "/apibot is not under /api/"
     );
@@ -153,7 +147,7 @@ async fn fallback_covers_all_verbs() {
         "POST to an unmatched API path"
     );
     assert_eq!(
-        error_message(&response).as_deref(),
+        response.error_field().as_deref(),
         Some("Not implemented"),
         "POST keeps the api_not_implemented body"
     );
@@ -164,7 +158,7 @@ async fn fallback_covers_all_verbs() {
         "PUT to an unmatched non-API path"
     );
     assert_eq!(
-        error_message(&put_response).as_deref(),
+        put_response.error_field().as_deref(),
         Some("Not found"),
         "PUT keeps the Not found body"
     );
@@ -180,7 +174,7 @@ async fn openapi_document_is_not_routed() {
     let response = common::TestRequest::get("/api/openapi").send(&app).await;
     assert_eq!(response.status, StatusCode::NOT_FOUND, "no such route");
     assert_eq!(
-        error_message(&response).as_deref(),
+        response.error_field().as_deref(),
         Some("Not implemented"),
         "the api_not_implemented body"
     );

@@ -8,7 +8,7 @@ use wired_be::models::{
     user::{Flag, NewUser},
 };
 
-use super::support::{ACTIVITY_JSON, BASE, fetch_ap, granted, key_set, pin};
+use super::support::{ACTIVITY_JSON, BASE, fetch_ap, granted, pin};
 use crate::common;
 
 /// The followers and following collections: the roots count what the
@@ -30,7 +30,7 @@ async fn the_follow_collections_page_actor_ids_newest_first() {
     common::assert_answer(&root, StatusCode::OK, "the followers root");
     let document = root.json_value();
     assert_eq!(
-        key_set(&document),
+        common::sorted_keys(&document),
         ["@context", "first", "id", "totalItems", "type"],
         "the same two-level summary as the outbox's"
     );
@@ -226,7 +226,7 @@ async fn hidden_lists_page_empty_and_hidden_counts_say_nothing() {
     let counted_root = fetch_ap(&app, "/users/counted/followers").await;
     let counted_document = counted_root.json_value();
     assert_eq!(
-        key_set(&counted_document),
+        common::sorted_keys(&counted_document),
         ["@context", "first", "id", "type"],
         "a hidden count means no totalItems key at all"
     );
@@ -261,7 +261,7 @@ async fn the_featured_collection_inlines_whole_notes() {
     );
     let document = response.json_value();
     assert_eq!(
-        key_set(&document),
+        common::sorted_keys(&document),
         ["@context", "id", "orderedItems", "totalItems", "type"],
         "one document, items inline, no page links"
     );

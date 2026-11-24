@@ -9,8 +9,8 @@ use wired_be::models::oauth_token;
 
 use super::provider::{LINKED_UID, OOB, PROVIDER, REDIRECT, UNLINKED_UID};
 use super::support::{
-    assert_no_store, count_codes, count_states, error_text, fixture, link, location, oob_app,
-    prepare, prepare_to, query_pairs, query_param, stored_params,
+    assert_no_store, count_codes, count_states, fixture, link, location, oob_app, prepare,
+    prepare_to, query_pairs, query_param, stored_params,
 };
 use crate::common;
 
@@ -259,7 +259,7 @@ async fn a_linked_callback_burns_its_state() {
 
     let replay = common::TestRequest::get(&callback).send(&site.http).await;
     assert_eq!(replay.status, StatusCode::BAD_REQUEST, "the replay");
-    assert_eq!(error_text(&replay), "Invalid state", "is an invalid state");
+    assert_eq!(replay.error_text(), "Invalid state", "is an invalid state");
     let redirect = common::TestRequest::get(&format!("/oauth/{PROVIDER}?state={state}"))
         .send(&site.http)
         .await;
@@ -296,7 +296,7 @@ async fn a_denied_callback_burns_its_state() {
     .send(&site.http)
     .await;
     assert_eq!(replay.status, StatusCode::BAD_REQUEST, "the replay");
-    assert_eq!(error_text(&replay), "Invalid state", "is an invalid state");
+    assert_eq!(replay.error_text(), "Invalid state", "is an invalid state");
     assert_eq!(count_codes(&pool).await, 0, "no code was minted");
     site.provider.stop();
 }

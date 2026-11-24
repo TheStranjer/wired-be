@@ -155,32 +155,11 @@ pub(super) fn listed_ids(response: &common::TestResponse) -> Vec<String> {
         .collect()
 }
 
-/// The keys of an entity object, sorted, for exact shape assertions.
-pub(super) fn key_set(entity: &Value) -> Vec<String> {
-    let mut keys: Vec<String> = entity
-        .as_object()
-        .expect("entities render objects")
-        .keys()
-        .cloned()
-        .collect();
-    keys.sort();
-    keys
-}
-
 /// Assert the listing response answers exactly the ids of `want`, in
 /// order — newest first wherever the listing is the one answering.
 pub(super) fn assert_listed(response: &common::TestResponse, want: &[&Notification], who: &str) {
     let ids: Vec<String> = want.iter().map(|note| note.id.to_string()).collect();
     assert_eq!(listed_ids(response), ids, "{who}");
-}
-
-/// The `Link` header Pleroma's `add_link_headers` writes for a page whose
-/// newest row is `newest` and oldest `oldest`.
-pub(super) fn expected_link(newest: Uuid, oldest: Uuid) -> String {
-    format!(
-        "<{BASE}{V1}?max_id={oldest}>; rel=\"next\", \
-         <{BASE}{V1}?min_id={newest}>; rel=\"prev\""
-    )
 }
 
 /// Alice's five plain follows of `bob`, oldest first — the cursor walk's

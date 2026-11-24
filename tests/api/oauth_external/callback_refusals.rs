@@ -11,8 +11,7 @@ use wired_be::models::user_identity;
 
 use super::provider::{LINKED_UID, MockProvider, PROVIDER, REDIRECT, UNLINKED_UID};
 use super::support::{
-    assert_no_store, count_codes, error_text, fixture, link, location, prepare, query_param,
-    stored_params,
+    assert_no_store, count_codes, fixture, link, location, prepare, query_param, stored_params,
 };
 use crate::common;
 
@@ -168,7 +167,7 @@ async fn the_callback_refuses_a_deleted_application() {
         StatusCode::BAD_REQUEST,
         "no application to mint for"
     );
-    assert_eq!(error_text(&response), "Invalid client", "named as such");
+    assert_eq!(response.error_text(), "Invalid client", "named as such");
     assert_no_store(&response);
     site.provider.stop();
 }
@@ -287,7 +286,7 @@ async fn the_provider_route_leaves_the_sibling_paths_alone() {
         "the consent endpoint still runs its own flow check"
     );
     assert_eq!(
-        error_text(&consent),
+        consent.error_text(),
         "unsupported_response_type",
         "with its own body"
     );
@@ -302,7 +301,7 @@ async fn the_provider_route_leaves_the_sibling_paths_alone() {
         "the token endpoint answers"
     );
     assert_eq!(
-        error_text(&token),
+        token.error_text(),
         "Invalid credentials",
         "with its own body"
     );

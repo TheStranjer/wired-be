@@ -7,8 +7,7 @@ use serde_json::{Value, json};
 use wired_be::{config::Toggle, models::user};
 
 use super::support::{
-    assert_no_store, count_codes, count_identities, count_users, error_text, fixture_with,
-    pending_state,
+    assert_no_store, count_codes, count_identities, count_users, fixture_with, pending_state,
 };
 use crate::common;
 
@@ -107,7 +106,7 @@ async fn closed_registrations_are_a_403() {
     .await;
     assert_eq!(response.status, StatusCode::FORBIDDEN, "closed");
     assert_eq!(
-        error_text(&response),
+        response.error_text(),
         "Registrations are closed",
         "the refusal line"
     );

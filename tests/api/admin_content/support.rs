@@ -195,15 +195,3 @@ pub(super) fn texts_of(listed: &Value) -> Vec<String> {
         })
         .collect()
 }
-
-/// The rendered object's keys, sorted, for exact key-set assertions.
-pub(super) fn json_keys(value: &Value) -> Vec<&str> {
-    let mut keys: Vec<&str> = value
-        .as_object()
-        .expect("entities render objects")
-        .keys()
-        .map(String::as_str)
-        .collect();
-    keys.sort_unstable();
-    keys
-}

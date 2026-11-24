@@ -32,7 +32,7 @@ async fn the_history_of_an_unedited_status_is_its_current_version() {
     assert_eq!(items.len(), 1, "the current version is the whole history");
     let item = &items[0];
     assert_eq!(
-        json_keys(item),
+        common::sorted_keys(item),
         vec![
             "account",
             "content",

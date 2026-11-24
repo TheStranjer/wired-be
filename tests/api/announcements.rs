@@ -141,18 +141,6 @@ fn flags(rows: &[Value]) -> Vec<(&str, bool)> {
         .collect()
 }
 
-/// The keys of a JSON object, sorted, for exact key-set assertions.
-fn json_keys(value: &Value) -> Vec<&str> {
-    let mut keys: Vec<&str> = value
-        .as_object()
-        .expect("announcements render objects")
-        .keys()
-        .map(String::as_str)
-        .collect();
-    keys.sort_unstable();
-    keys
-}
-
 /// How many dismissal rows the database holds.
 async fn marker_count(pool: &PgPool) -> i64 {
     sqlx::query_scalar("SELECT count(*) FROM announcement_reads")
@@ -234,7 +222,11 @@ async fn a_notice_renders_the_announcement_entity() {
     assert_eq!(body.len(), 1, "the seeded notice, and only it");
     let value = &body[0];
 
-    assert_eq!(json_keys(value), EXPECTED_KEYS, "exactly the entity keys");
+    assert_eq!(
+        common::sorted_keys(value),
+        EXPECTED_KEYS,
+        "exactly the entity keys"
+    );
     assert_eq!(value["id"], stored.id.to_string(), "the id as text");
     assert_eq!(
         value["content"], "<p>Scheduled maintenance</p>",
@@ -245,7 +237,7 @@ async fn a_notice_renders_the_announcement_entity() {
         "the source text in the `pleroma` block"
     );
     assert_eq!(
-        json_keys(&value["pleroma"]),
+        common::sorted_keys(&value["pleroma"]),
         ["raw_content"],
         "which carries that key alone"
     );

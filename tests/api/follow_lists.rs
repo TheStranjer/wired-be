@@ -30,8 +30,6 @@ use wired_be::{
 
 use crate::common;
 
-/// The instance origin the fixtures live on (`Config::for_tests`).
-const BASE: &str = "https://test.example";
 /// The body every account miss on these routes carries (decision 8).
 const NOT_FOUND: &str = r#"{"error":"Record not found"}"#;
 /// The 401 body `MaybeAuthUser` renders for a token that does not resolve.
@@ -161,15 +159,6 @@ fn embedded_relationships(body: &Value) -> serde_json::Map<String, Value> {
         assert!(previous.is_none(), "one entry per account");
     }
     map
-}
-
-/// The `Link` header Pleroma's `add_link_headers` writes for a page of
-/// `path`: `next` walks to the oldest row, `prev` back to the newest.
-fn expected_link(path: &str, oldest: &Uuid, newest: &Uuid) -> String {
-    format!(
-        "<{BASE}{path}?max_id={oldest}>; rel=\"next\", \
-         <{BASE}{path}?min_id={newest}>; rel=\"prev\""
-    )
 }
 
 /// Both routes list the accepted relationships newest follow first without
@@ -307,7 +296,7 @@ async fn pages_key_on_follow_row_ids_and_link() {
     );
     assert_eq!(
         first.header("link"),
-        Some(expected_link(&path, &wanted_rows[1], &wanted_rows[0]).as_str()),
+        Some(common::expected_link(&path, &wanted_rows[0], &wanted_rows[1]).as_str()),
         "the Link cursors are the page's follow row ids, not user ids"
     );
 

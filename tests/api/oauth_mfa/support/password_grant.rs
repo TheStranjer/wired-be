@@ -40,7 +40,7 @@ async fn the_password_grant_of_an_mfa_user_answers_mfa_required() {
     bad["password"] = json!("not-her-password");
     let denied = post_json(&http, &bad).await;
     assert_eq!(denied.status, StatusCode::BAD_REQUEST, "wrong password");
-    assert_eq!(error_text(&denied), "Invalid credentials", "stays the 400");
+    assert_eq!(denied.error_text(), "Invalid credentials", "stays the 400");
 
     let suspended =
         common::create_deactivated_user_with_password(&pool, "suspended", PASSWORD).await;

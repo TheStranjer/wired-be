@@ -172,36 +172,6 @@ async fn backdate_chat(pool: &PgPool, id: Uuid, hours: i64) {
     .expect("the stamp is settable");
 }
 
-/// The `Link` header value the paged lists answer with for a page whose
-/// first and last row carry `newest` and `oldest` as cursors.
-fn expected_link(path: &str, newest: &str, oldest: &str) -> String {
-    format!(
-        "<https://test.example{path}?max_id={oldest}>; rel=\"next\", \
-         <https://test.example{path}?min_id={newest}>; rel=\"prev\""
-    )
-}
-
-/// The `error` string of a JSON error response.
-fn error_message(response: &common::TestResponse) -> Option<String> {
-    response
-        .json_value()
-        .get("error")
-        .and_then(Value::as_str)
-        .map(str::to_owned)
-}
-
-/// The rendered object's keys, sorted, for exact key-set assertions.
-fn json_keys(value: &Value) -> Vec<&str> {
-    let mut keys: Vec<&str> = value
-        .as_object()
-        .expect("entities render objects")
-        .keys()
-        .map(String::as_str)
-        .collect();
-    keys.sort_unstable();
-    keys
-}
-
 /// A GET through the real app.
 async fn get(app: &Router, token: &str, path: &str) -> common::TestResponse {
     common::TestRequest::get(path).bearer(token).send(app).await

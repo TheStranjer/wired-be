@@ -13,8 +13,7 @@ use wired_be::{
 };
 
 use super::support::{
-    CHAT_KEYS, READ_SCOPE, ROOT, V2_ROOT, error_message, expected_link, fixture, get_as, json_keys,
-    open_chat, parse, send,
+    CHAT_KEYS, READ_SCOPE, ROOT, V2_ROOT, fixture, get_as, open_chat, parse, send,
 };
 use crate::common;
 
@@ -109,12 +108,12 @@ async fn the_v1_list_orders_by_activity_and_pages_by_id() {
     );
     for chat in value.as_array().expect("the list is an array") {
         assert_eq!(
-            json_keys(chat),
+            common::sorted_keys(chat),
             CHAT_KEYS,
             "every entry is the full Chat entity"
         );
     }
-    let want = expected_link(ROOT, &ids[0], &ids[2]);
+    let want = common::expected_link(ROOT, &ids[0], &ids[2]);
     assert_eq!(
         response.header("link"),
         Some(want.as_str()),
@@ -150,7 +149,7 @@ async fn the_v1_list_orders_by_activity_and_pages_by_id() {
         "a malformed cursor is a 400"
     );
     assert_eq!(
-        error_message(&junk).as_deref(),
+        junk.error_field().as_deref(),
         Some("Invalid id"),
         "with the pagination module's wording"
     );
@@ -276,7 +275,7 @@ async fn the_v2_list_orders_by_the_last_message_and_pages_by_id() {
         value[1]["last_message"].is_null(),
         "carol's chat never had a message at all"
     );
-    let want = expected_link(V2_ROOT, &ids[0], &ids[1]);
+    let want = common::expected_link(V2_ROOT, &ids[0], &ids[1]);
     assert_eq!(
         response.header("link"),
         Some(want.as_str()),

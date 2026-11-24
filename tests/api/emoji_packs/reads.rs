@@ -11,9 +11,7 @@ use wired_be::{
     util::token::sha256_hex_bytes,
 };
 
-use super::support::{
-    GIF_BYTES, PNG_BYTES, cats_pack, error_message, pack, pack_names, read_zip, seed_pack,
-};
+use super::support::{GIF_BYTES, PNG_BYTES, cats_pack, pack, pack_names, read_zip, seed_pack};
 use crate::common;
 
 /// `GET /api/v1/pleroma/emoji/packs` lists every pack keyed by name with
@@ -158,7 +156,7 @@ async fn shows_one_pack_with_files_paginated() {
             .await;
         assert_eq!(response.status, want_status, "status for ?{query}");
         assert_eq!(
-            error_message(&response).as_deref(),
+            response.error_field().as_deref(),
             Some(want_body),
             "body for ?{query}"
         );
@@ -329,7 +327,7 @@ async fn archives_a_shared_pack_as_a_zip_download() {
         .await;
     assert_eq!(denied.status, StatusCode::FORBIDDEN, "unshared is a 403");
     assert_eq!(
-        error_message(&denied).as_deref(),
+        denied.error_field().as_deref(),
         Some("Pack is not shared"),
         "the refusal names sharing"
     );
@@ -339,7 +337,7 @@ async fn archives_a_shared_pack_as_a_zip_download() {
         .await;
     assert_eq!(missing.status, StatusCode::NOT_FOUND, "unknown is a 404");
     assert_eq!(
-        error_message(&missing).as_deref(),
+        missing.error_field().as_deref(),
         Some("Pack not found"),
         "the refusal names the pack kind"
     );
@@ -349,7 +347,7 @@ async fn archives_a_shared_pack_as_a_zip_download() {
         .await;
     assert_eq!(no_name.status, StatusCode::BAD_REQUEST, "no name is a 400");
     assert_eq!(
-        error_message(&no_name).as_deref(),
+        no_name.error_field().as_deref(),
         Some("pack name cannot be empty"),
         "Pleroma's empty-value message"
     );

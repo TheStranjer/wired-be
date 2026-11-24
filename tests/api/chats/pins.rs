@@ -11,9 +11,8 @@ use wired_be::{
 };
 
 use super::support::{
-    CHAT_KEYS, ROOT, SCOPE, all_page, assert_refused, error_message, fixture, json_keys,
-    marker_body, message_read_path, parse, post_as, post_empty, post_json, read_path,
-    stored_unread, thread,
+    CHAT_KEYS, ROOT, SCOPE, all_page, assert_refused, fixture, marker_body, message_read_path,
+    parse, post_as, post_empty, post_json, read_path, stored_unread, thread,
 };
 use crate::common;
 
@@ -78,7 +77,7 @@ async fn chats_are_only_their_owners_to_read_and_pin() {
             "chat {foreign} is not bob's to read-mark"
         );
         assert_eq!(
-            error_message(&read).as_deref(),
+            read.error_field().as_deref(),
             Some("Record not found"),
             "the 404 wording on {foreign}"
         );
@@ -130,7 +129,11 @@ async fn pin_and_unpin_toggle_the_flag_and_the_list_filter() {
         pinned.text()
     );
     let value = pinned.json_value();
-    assert_eq!(json_keys(&value), CHAT_KEYS, "the full Chat entity");
+    assert_eq!(
+        common::sorted_keys(&value),
+        CHAT_KEYS,
+        "the full Chat entity"
+    );
     assert_eq!(value["id"], chat, "bob's chat");
     assert_eq!(value["pinned"], true, "now pinned");
     assert_eq!(value["unread"], 3, "pinning marks nothing read");

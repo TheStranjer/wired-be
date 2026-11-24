@@ -86,14 +86,6 @@ async fn post_json(http: &Router, body: &Value) -> common::TestResponse {
         .await
 }
 
-/// The `error` message of a JSON error response.
-fn error_text(response: &common::TestResponse) -> String {
-    response.json_value()["error"]
-        .as_str()
-        .expect("errors carry a string error field")
-        .to_owned()
-}
-
 /// Assert the no-store cache headers every `/oauth/token`-family answer
 /// carries (RFC 6749 §5.1).
 fn assert_no_store(response: &common::TestResponse) {

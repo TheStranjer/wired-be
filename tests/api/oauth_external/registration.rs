@@ -14,9 +14,8 @@ use wired_be::models::{
 
 use super::provider::{PROVIDER, REDIRECT, UNLINKED_UID};
 use super::support::{
-    assert_no_store, count_codes, count_identities, count_states, count_users, error_text, expire,
-    fixture, location, pending_nickname, pending_state, post_form, prepare, query_param,
-    set_pending,
+    assert_no_store, count_codes, count_identities, count_states, count_users, expire, fixture,
+    location, pending_nickname, pending_state, post_form, prepare, query_param, set_pending,
 };
 use crate::common;
 
@@ -149,7 +148,7 @@ async fn registration_refuses_states_that_cannot_register() {
             Some("application/json"),
             "the refusal is JSON, not a page, for the state that {why}"
         );
-        assert_eq!(error_text(&response), "Invalid state", "for {why} (GET)");
+        assert_eq!(response.error_text(), "Invalid state", "for {why} (GET)");
         assert_no_store(&response);
     }
 
@@ -169,7 +168,7 @@ async fn registration_refuses_states_that_cannot_register() {
         )
         .await;
         assert_eq!(response.status, StatusCode::BAD_REQUEST, "{why} (POST)");
-        assert_eq!(error_text(&response), "Invalid state", "for {why} (POST)");
+        assert_eq!(response.error_text(), "Invalid state", "for {why} (POST)");
         assert_no_store(&response);
     }
     assert_eq!(count_users(&pool).await, 1, "only the fixture user");

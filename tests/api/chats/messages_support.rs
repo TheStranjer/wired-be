@@ -11,7 +11,7 @@ use wired_be::models::{
     user::User,
 };
 
-use super::support::{all_page, delete_as, error_message, message_delete_path, messages_path};
+use super::support::{all_page, delete_as, message_delete_path, messages_path};
 use crate::common;
 
 /// The status `response` answers, with its body for the message.
@@ -22,7 +22,7 @@ pub(super) fn assert_answer(response: &common::TestResponse, status: StatusCode,
 /// The `error` body `response` carries.
 pub(super) fn assert_says(response: &common::TestResponse, message: &str, who: &str) {
     assert_eq!(
-        error_message(response).as_deref(),
+        response.error_field().as_deref(),
         Some(message),
         "the refusal wording for {who}"
     );
@@ -59,7 +59,7 @@ pub(super) async fn assert_delete_404(
         refused.text()
     );
     assert_eq!(
-        error_message(&refused).as_deref(),
+        refused.error_field().as_deref(),
         Some("Record not found"),
         "the plain 404 wording for {who}"
     );

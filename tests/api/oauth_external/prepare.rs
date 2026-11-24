@@ -12,8 +12,8 @@ use super::provider::{
     CALLBACK_URI, LINKED_UID, OTHER, PROVIDER, PROVIDER_CLIENT_ID, PROVIDER_SCOPES, REDIRECT,
 };
 use super::support::{
-    assert_no_store, count_identities, count_states, error_text, expire, fixture, location,
-    prepare, query_pairs, query_param, seconds_left, stored_params,
+    assert_no_store, count_identities, count_states, expire, fixture, location, prepare,
+    query_pairs, query_param, seconds_left, stored_params,
 };
 use crate::common;
 
@@ -110,7 +110,7 @@ async fn an_unconfigured_provider_is_a_404_everywhere() {
     ] {
         let response = common::TestRequest::get(uri).send(&site.http).await;
         assert_eq!(response.status, StatusCode::NOT_FOUND, "`{uri}`");
-        assert_eq!(error_text(&response), "Unknown provider", "for `{uri}`");
+        assert_eq!(response.error_text(), "Unknown provider", "for `{uri}`");
         assert_no_store(&response);
     }
     site.provider.stop();
@@ -155,7 +155,7 @@ async fn prepare_request_validates_the_app_parameters() {
         .send(&site.http)
         .await;
         assert_eq!(response.status, StatusCode::BAD_REQUEST, "`{query}`");
-        assert_eq!(error_text(&response), want, "for `{query}`");
+        assert_eq!(response.error_text(), want, "for `{query}`");
         assert_no_store(&response);
     }
     assert_eq!(count_states(&pool).await, 0, "no refusal stored a state");
@@ -244,7 +244,7 @@ async fn a_bad_state_is_refused_on_both_legs() {
         let response = common::TestRequest::get(&uri).send(&site.http).await;
         assert_eq!(response.status, StatusCode::BAD_REQUEST, "{why}");
         assert_eq!(
-            error_text(&response),
+            response.error_text(),
             "Invalid state",
             "for the state that {why}"
         );

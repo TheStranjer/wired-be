@@ -1,4 +1,4 @@
-//! Id extraction from rendered JSON entities.
+//! Id and key extraction from rendered JSON entities.
 
 use serde_json::Value;
 
@@ -28,11 +28,44 @@ pub fn id_of(entity: &Value) -> String {
     id.to_owned()
 }
 
+/// The keys of the JSON object `value`, sorted, for exact key-set
+/// assertions.
+///
+/// # Panics
+///
+/// If `value` is not a JSON object.
+#[must_use]
+pub fn sorted_keys(value: &Value) -> Vec<&str> {
+    let Some(object) = value.as_object() else {
+        panic!("expected a JSON object, got {value}");
+    };
+    let mut keys: Vec<&str> = object.keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    keys
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
 
     use super::*;
+
+    /// An object's keys come back sorted.
+    #[test]
+    fn sorted_keys_sorts_the_object_keys() {
+        assert_eq!(
+            sorted_keys(&json!({"b": 1, "c": 2, "a": 3})),
+            vec!["a", "b", "c"]
+        );
+        assert_eq!(sorted_keys(&json!({})), Vec::<&str>::new());
+    }
+
+    /// A non-object panics.
+    #[test]
+    #[should_panic(expected = "JSON object")]
+    fn sorted_keys_panics_on_a_non_object() {
+        drop(sorted_keys(&json!([1])));
+    }
 
     /// An entity's `id` text is returned.
     #[test]

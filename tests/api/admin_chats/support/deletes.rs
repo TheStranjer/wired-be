@@ -30,7 +30,8 @@ async fn the_admin_delete_hides_the_message_from_both_participants() {
     .await;
     common::assert_answer(&deleted, StatusCode::OK, "withdrawing through alice's chat");
     let entity = deleted.json_value();
-    assert_eq!(json_keys(&entity), MESSAGE_KEYS, "the ordinary entity");
+    let keys = common::sorted_keys(&entity);
+    assert_eq!(keys, MESSAGE_KEYS, "the ordinary entity");
     assert_eq!(
         entity["id"],
         alice_ref.id.to_string(),
@@ -86,7 +87,7 @@ async fn the_admin_delete_hides_the_message_from_both_participants() {
         "or the same message through bob's chat",
     );
     assert_eq!(
-        error_message(&via_bob).as_deref(),
+        via_bob.error_field().as_deref(),
         Some(RECORD_NOT_FOUND),
         "the withdrawn message leaves nothing to delete either way"
     );
@@ -184,7 +185,7 @@ async fn the_delete_only_names_references_of_the_named_chat() {
         let refused = delete(&app, &token, &message_path(&chat_id, &message_id)).await;
         common::assert_answer(&refused, StatusCode::NOT_FOUND, who);
         assert_eq!(
-            error_message(&refused).as_deref(),
+            refused.error_field().as_deref(),
             Some(RECORD_NOT_FOUND),
             "{who} is the one 404"
         );

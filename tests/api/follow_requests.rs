@@ -28,8 +28,6 @@ use wired_be::{
 
 use crate::common;
 
-/// The instance origin the fixtures live on (`Config::for_tests`).
-const BASE: &str = "https://test.example";
 /// The queue listing's path, as the `Link` header links back to it.
 const QUEUE: &str = "/api/v1/follow_requests";
 /// The body every miss on the answer routes carries (decision 8).
@@ -160,16 +158,6 @@ fn listed_entry<'a>(body: &'a Value, id: &Uuid) -> &'a Value {
         .iter()
         .find(|entry| entry["id"] == id.to_string())
         .unwrap_or_else(|| panic!("account {id} is on the page"))
-}
-
-/// The `Link` header Pleroma's `add_link_headers` writes for a page of
-/// the queue: `next` walks to the oldest request row, `prev` back to the
-/// newest.
-fn expected_link(oldest: &Uuid, newest: &Uuid) -> String {
-    format!(
-        "<{BASE}{QUEUE}?max_id={oldest}>; rel=\"next\", \
-         <{BASE}{QUEUE}?min_id={newest}>; rel=\"prev\""
-    )
 }
 
 /// The full relationship JSON for `target` with every flag at the
@@ -308,7 +296,7 @@ async fn the_queue_pages_key_on_follow_row_ids_and_link() {
     );
     assert_eq!(
         first.header("link"),
-        Some(expected_link(&wanted_rows[1], &wanted_rows[0]).as_str()),
+        Some(common::expected_link(QUEUE, &wanted_rows[0], &wanted_rows[1]).as_str()),
         "the Link cursors are the page's follow row ids, not requester ids"
     );
 

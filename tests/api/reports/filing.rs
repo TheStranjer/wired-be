@@ -8,9 +8,7 @@ use wired_be::models::{
     status::Visibility,
 };
 
-use super::support::{
-    EXPECTED_KEYS, ROOT, about, filed, filings, json_keys, post, reporter, rule, stored,
-};
+use super::support::{EXPECTED_KEYS, ROOT, about, filed, filings, post, reporter, rule, stored};
 use crate::common;
 
 /// A filing with everything the reporter may send: two of the target's public
@@ -40,7 +38,11 @@ async fn a_full_filing_stores_and_answers_what_it_was_given() {
     )
     .await;
 
-    assert_eq!(json_keys(&value), EXPECTED_KEYS, "exactly the keys");
+    assert_eq!(
+        common::sorted_keys(&value),
+        EXPECTED_KEYS,
+        "exactly the keys"
+    );
     assert_eq!(value["action_taken"], false, "nothing is done yet");
     assert_eq!(value["action_taken_at"], Value::Null, "and nothing was");
     assert_eq!(value["category"], "violation", "the cited category");
@@ -93,7 +95,11 @@ async fn a_bare_filing_answers_the_defaults() {
 
     let value = filed(&app, &token, about(&bob)).await;
 
-    assert_eq!(json_keys(&value), EXPECTED_KEYS, "exactly the keys");
+    assert_eq!(
+        common::sorted_keys(&value),
+        EXPECTED_KEYS,
+        "exactly the keys"
+    );
     assert_eq!(value["comment"], "", "no comment is the empty comment");
     assert_eq!(value["category"], "other", "and no category is `other`");
     assert_eq!(value["forwarded"], false, "reports are not forwarded");

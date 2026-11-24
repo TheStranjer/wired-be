@@ -25,8 +25,6 @@ use wired_be::{
 
 use crate::common;
 
-/// The instance origin the fixtures live on (`Config::for_tests`).
-const BASE: &str = "https://test.example";
 /// The 422 body both pin routes answer without an accepted follow (the
 /// wording this endpoint's ticket pins).
 const NOT_FOLLOWING: &str = r#"{"error":"You must follow this user to endorse them"}"#;
@@ -147,15 +145,6 @@ async fn stored_endorsements(pool: &PgPool, endorser: &User) -> Vec<(Uuid, Uuid)
     .fetch_all(pool)
     .await
     .expect("the stored rows read")
-}
-
-/// The `Link` header Pleroma's `add_link_headers` writes for a page of
-/// `path`: `next` walks to the oldest row, `prev` back to the newest.
-fn expected_link(path: &str, oldest: &Uuid, newest: &Uuid) -> String {
-    format!(
-        "<{BASE}{path}?max_id={oldest}>; rel=\"next\", \
-         <{BASE}{path}?min_id={newest}>; rel=\"prev\""
-    )
 }
 
 /// Pinning demands an accepted follow: without one both action spellings
@@ -501,10 +490,10 @@ async fn own_endorsements_lists_the_callers_pins() {
     );
     assert_eq!(
         body.header("link"),
-        Some(expected_link(
+        Some(common::expected_link(
             "/api/v1/endorsements",
-            &stored[1].0,
-            &stored[0].0
+            &stored[0].0,
+            &stored[1].0
         ))
         .as_deref(),
         "the Link header cursors are the endorsement row ids"
@@ -591,10 +580,10 @@ async fn own_endorsements_pages_by_endorsement_id() {
     );
     assert_eq!(
         first.header("link"),
-        Some(expected_link(
+        Some(common::expected_link(
             "/api/v1/endorsements",
-            &stored[1].0,
-            &stored[0].0
+            &stored[0].0,
+            &stored[1].0
         ))
         .as_deref(),
         "the page links its own cursors"
@@ -687,7 +676,7 @@ async fn account_endorsements_are_public_on_both_prefixes() {
         );
         assert_eq!(
             anonymous.header("link"),
-            Some(expected_link(&path, &stored[0].0, &stored[0].0)).as_deref(),
+            Some(common::expected_link(&path, &stored[0].0, &stored[0].0)).as_deref(),
             "the Link header targets the request's own prefix"
         );
     }

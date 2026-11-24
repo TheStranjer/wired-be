@@ -4,9 +4,7 @@ use axum::http::StatusCode;
 use serde_json::{Value, json};
 use wired_be::models::status::Visibility;
 
-use super::support::{
-    ACTIVITY_JSON, AS_PUBLIC, BASE, fetch_ap, key_set, outbox_fixture, stored_user,
-};
+use super::support::{ACTIVITY_JSON, AS_PUBLIC, BASE, fetch_ap, outbox_fixture, stored_user};
 use crate::common;
 
 /// The outbox root: the collection's address, the page link, and the
@@ -36,7 +34,7 @@ async fn the_outbox_root_is_a_paged_collection_summary() {
     );
     let document = response.json_value();
     assert_eq!(
-        key_set(&document),
+        common::sorted_keys(&document),
         ["@context", "first", "id", "totalItems", "type"],
         "the root's documented keys — no items at this level"
     );
