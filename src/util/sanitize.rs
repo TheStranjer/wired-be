@@ -3,8 +3,9 @@
 //!
 //! [`sanitize_html`] runs input through an `ammonia` allowlist built from
 //! the ticket policy: a fixed tag set, per-tag attribute sets, value-
-//! filtered `class` attributes (on `a`, `span` and `img`; links keep only
-//! `hashtag`, `u-url` and `mention`), a fixed URL scheme set and a forced `rel`
+//! filtered `class` attributes (on `a`, `span`, `img` and `p`; links keep only
+//! `hashtag`, `u-url` and `mention`, `p` only `quote-inline`; an element with
+//! no allowed class token left loses the attribute), a fixed URL scheme set and a forced `rel`
 //! on every link. Everything else — comments, `style` and `script`
 //! including their contents, `iframe` and `form` tags, all event handler
 //! attributes — is removed; text of stripped elements survives, "Links in
@@ -20,6 +21,7 @@
 //! all, and [`sanitize_display_name`] reduces arbitrary content to the
 //! single line of plain text a name may be.
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 
 use ammonia::Builder;
@@ -73,7 +75,7 @@ const IMAGE_CLASSES: [&str; 1] = ["emoji"];
 
 /// The only `class` values `span` may keep; other classes are dropped from
 /// the attribute (Pleroma's `h-card`/`invisible`/`ellipsis`/... list).
-const SPAN_CLASSES: [&str; 7] = [
+const SPAN_CLASSES: [&str; 8] = [
     "h-card",
     "mention",
     "hashtag",
@@ -81,7 +83,44 @@ const SPAN_CLASSES: [&str; 7] = [
     "ellipsis",
     "emoji",
     "recipients-inline",
+    QUOTE_INLINE_CLASS,
 ];
+
+/// The class Mastodon, Misskey and Pleroma put on the fallback link to a
+/// quoted post, so quote-aware clients can hide it.
+const QUOTE_INLINE_CLASS: &str = "quote-inline";
+
+/// The only `class` value `p` may keep (Mastodon wraps its `RE:` fallback in
+/// `<p class="quote-inline">`).
+const PARAGRAPH_CLASSES: [&str; 1] = [QUOTE_INLINE_CLASS];
+
+/// The `class` values `tag` may keep; empty for tags without a class list.
+fn allowed_classes_for(tag: &str) -> &'static [&'static str] {
+    match tag {
+        "a" => &LINK_CLASSES,
+        "img" => &IMAGE_CLASSES,
+        "span" => &SPAN_CLASSES,
+        "p" => &PARAGRAPH_CLASSES,
+        _ => &[],
+    }
+}
+
+/// Drops a `class` attribute none of whose tokens is allowed on its tag.
+///
+/// Runs before ammonia's own per-token class filter, so an element left with
+/// no allowed class serializes without the attribute instead of `class=""`.
+fn drop_empty_class<'v>(tag: &str, attribute: &str, value: &'v str) -> Option<Cow<'v, str>> {
+    if attribute == "class" {
+        let allowed = allowed_classes_for(tag);
+        if !value
+            .split_ascii_whitespace()
+            .any(|class| allowed.contains(&class))
+        {
+            return None;
+        }
+    }
+    Some(Cow::Borrowed(value))
+}
 
 /// URL schemes links and images may use; anything else (`javascript:`,
 /// `data:`, ...) loses its `href`/`src`.
@@ -109,7 +148,9 @@ fn builder() -> Builder<'static> {
         .link_rel(Some(FORCED_LINK_REL))
         .add_allowed_classes("a", LINK_CLASSES)
         .add_allowed_classes("img", IMAGE_CLASSES)
-        .add_allowed_classes("span", SPAN_CLASSES);
+        .add_allowed_classes("span", SPAN_CLASSES)
+        .add_allowed_classes("p", PARAGRAPH_CLASSES)
+        .attribute_filter(drop_empty_class);
     builder
 }
 
@@ -118,8 +159,9 @@ fn builder() -> Builder<'static> {
 /// Kept verbatim: the `ALLOWED_TAGS` elements, `href`/`title` and the
 /// `LINK_CLASSES` classes (`hashtag`, `u-url`, `mention`) on links,
 /// `src`/`alt`/`title` and the `emoji` class on images (images exist for
-/// custom emoji only), and the `SPAN_CLASSES` classes on spans. Other class
-/// tokens are dropped from the attribute.
+/// custom emoji only), the `SPAN_CLASSES` classes on spans and the
+/// `quote-inline` class on paragraphs. Other class tokens are dropped from
+/// the attribute, and the attribute itself when none is left.
 /// `rel` on every link is forced to `FORCED_LINK_REL`; no `target` is
 /// added. Everything else goes: comments, event handler attributes,
 /// `style`, and `script`, `iframe` and `form` tags (text of stripped
@@ -389,8 +431,8 @@ mod tests {
         );
         assert_eq!(
             sanitize_html(r#"<span class="evil">x</span>"#),
-            r#"<span class="">x</span>"#,
-            "an all-evil class list becomes empty, not a removed attribute"
+            "<span>x</span>",
+            "an all-evil class list removes the attribute instead of leaving class=\"\""
         );
         assert_eq!(
             sanitize_html(
@@ -401,7 +443,7 @@ mod tests {
         );
         assert_eq!(
             sanitize_html(r#"<span class="p-name">Bob</span>"#),
-            r#"<span class="">Bob</span>"#,
+            "<span>Bob</span>",
             "microformat classes on span go (they are not on this list)"
         );
         assert_eq!(
@@ -411,13 +453,43 @@ mod tests {
         );
         assert_eq!(
             sanitize_html(r#"<img src="https://x.example/i.png" class="avatar">"#),
-            r#"<img src="https://x.example/i.png" class="">"#,
+            r#"<img src="https://x.example/i.png">"#,
             "img is for emoji only"
         );
         assert_eq!(
-            sanitize_html(r#"<p class="quote-inline">x</p>"#),
+            sanitize_html(r#"<p class="evil">x</p>"#),
             "<p>x</p>",
-            "class is not allowed on p at all"
+            "p keeps only quote-inline"
+        );
+        assert_eq!(
+            sanitize_html(r#"<p class="evil quote-inline">x</p>"#),
+            r#"<p class="quote-inline">x</p>"#,
+            "quote-inline survives next to a dropped class"
+        );
+    }
+
+    #[test]
+    fn keeps_the_quote_inline_class_of_remote_quote_fallbacks() {
+        let mastodon = r#"<p class="quote-inline">RE: <a href="https://x.example/p/1">x.example/p/1</a></p><p>text</p>"#;
+        assert_eq!(
+            sanitize_html(mastodon),
+            format!(
+                r#"<p class="quote-inline">RE: <a href="https://x.example/p/1" {REL}>x.example/p/1</a></p><p>text</p>"#
+            ),
+            "Mastodon's paragraph fallback keeps its class"
+        );
+        let misskey = r#"text<br><br><span class="quote-inline">RE: <a href="https://x.example/p/1">x</a></span>"#;
+        assert_eq!(
+            sanitize_html(misskey),
+            format!(
+                r#"text<br><br><span class="quote-inline">RE: <a href="https://x.example/p/1" {REL}>x</a></span>"#
+            ),
+            "Misskey's span fallback keeps its class"
+        );
+        let pleroma = r#"<span class="quote-inline"><br/><br/><bdi>RT:</bdi> <a href="https://x.example/p/1">x</a></span>"#;
+        assert!(
+            sanitize_html(pleroma).starts_with(r#"<span class="quote-inline"><br><br>"#),
+            "Pleroma's span fallback keeps its class"
         );
     }
 
@@ -430,8 +502,8 @@ mod tests {
         );
         assert_eq!(
             sanitize_html(r#"<a href="https://example.org" class="anything">x</a>"#),
-            format!(r#"<a href="https://example.org" class="" {REL}>x</a>"#),
-            "an unlisted link class is dropped"
+            format!(r#"<a href="https://example.org" {REL}>x</a>"#),
+            "an unlisted link class is dropped with its attribute"
         );
         assert_eq!(
             sanitize_html(r#"<a href="https://example.org" class="mention evil">x</a>"#),
