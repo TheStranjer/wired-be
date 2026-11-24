@@ -37,7 +37,7 @@
 //! `extauth` http contract and the manifest `<link>` convention fix.
 //! [`html_pages::router`] joins it at the root too: the shared HTML helper
 //! pages live at the top-level paths Pleroma routes them on,
-//! `/frontend_switcher`, `/embed/{id}`, `/notice/{id}/embed_player` and
+//! `/embed/{id}`, `/notice/{id}/embed_player` and
 //! `/mailer/unsubscribe/{token}`.
 //! [`remote_interaction::router`] joins it at the root as well: the
 //! ostatus subscribe pages, `GET /authorize_interaction` and the
