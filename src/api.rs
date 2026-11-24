@@ -32,9 +32,6 @@
 //! providers are configured to answer to; and pack images
 //! live at `/emoji/{pack}/{file}`, the address
 //! [`crate::services::emoji_packs`] stores in `custom_emojis`.
-//! [`misc::router`] joins that list at the root: the `MongooseIM` auth
-//! endpoints live at `/…`, the addresses `MongooseIM`'s `extauth` http
-//! contract fixes.
 //! [`remote_interaction::pleroma_router`] rides on [`v1`] for
 //! `POST /api/v1/pleroma/remote_interaction`.
 //! [`password_reset::auth_router`] joins it at `POST /auth/password`, the

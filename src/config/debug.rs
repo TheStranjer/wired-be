@@ -79,7 +79,6 @@ fn debug_identity_and_exposure<'a, 'b, 'd>(
             &config.account_activation_required,
         )
         .field("allow_account_deletion", &config.allow_account_deletion)
-        .field("mongooseim_enabled", &config.mongooseim_enabled)
         .field("captcha_enabled", &config.captcha_enabled)
         .field("healthcheck_enabled", &config.healthcheck_enabled)
         .field("registrations_open", &config.registrations_open)

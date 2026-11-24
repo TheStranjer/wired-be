@@ -112,7 +112,7 @@ mod tests {
     use super::{AuthClass, ROUTES, RouteSpec, routes};
 
     /// The assembled table is exactly the one that lived in this file before
-    /// the split: twelve sections, none of them empty, 368 rows, opening
+    /// the split: twelve sections, none of them empty, 366 rows, opening
     /// with the instance metadata route and closing with the custom emoji
     /// files.
     #[test]
@@ -125,7 +125,7 @@ mod tests {
         let rows: Vec<&RouteSpec> = routes().collect();
         assert_eq!(
             rows.len(),
-            368,
+            366,
             "the assembled table holds every row exactly once"
         );
         assert_eq!(

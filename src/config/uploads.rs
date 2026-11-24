@@ -1,4 +1,4 @@
-//! Reads the settings that bound uploads and the three feature toggles
+//! Reads the settings that bound uploads and the two feature toggles
 //! that gate the endpoints of [`crate::api::misc`].
 
 #[cfg(doc)]
@@ -9,16 +9,14 @@ use crate::extract::multipart::UploadLimits;
 use super::{
     defaults::{
         DEFAULT_AVATAR_LIMIT_BYTES, DEFAULT_BANNER_LIMIT_BYTES, DEFAULT_CAPTCHA_ENABLED,
-        DEFAULT_HEALTHCHECK_ENABLED, DEFAULT_MONGOOSEIM_ENABLED, DEFAULT_UPLOAD_LIMIT_BYTES,
-        DEFAULT_UPLOAD_MAX_FILES,
+        DEFAULT_HEALTHCHECK_ENABLED, DEFAULT_UPLOAD_LIMIT_BYTES, DEFAULT_UPLOAD_MAX_FILES,
     },
     error::ConfigError,
     federation_types::Toggle,
     parse::{boolean, number},
     vars::{
         AVATAR_LIMIT_BYTES_VAR, BANNER_LIMIT_BYTES_VAR, CAPTCHA_ENABLED_VAR,
-        HEALTHCHECK_ENABLED_VAR, MONGOOSEIM_ENABLED_VAR, UPLOAD_LIMIT_BYTES_VAR,
-        UPLOAD_MAX_FILES_VAR,
+        HEALTHCHECK_ENABLED_VAR, UPLOAD_LIMIT_BYTES_VAR, UPLOAD_MAX_FILES_VAR,
     },
 };
 
@@ -53,9 +51,8 @@ where
     ))
 }
 
-/// Reads the three feature toggles that gate the endpoints of
-/// [`crate::api::misc`]: the `MongooseIM` auth endpoints, the captcha
-/// provider and the healthcheck. Grouped because each is a plain
+/// Reads the two feature toggles that gate the endpoints of
+/// [`crate::api::misc`]: the captcha provider and the healthcheck. Grouped because each is a plain
 /// default-or-parse and [`Config::from_lookup`] has a size budget
 /// (AGENTS.md); the tuple comes back in field order.
 ///
@@ -63,12 +60,11 @@ where
 ///
 /// Returns [`ConfigError::InvalidBoolean`] for whichever variable holds a
 /// value that is neither spelling.
-pub(crate) fn misc_toggles<F>(lookup: &F) -> Result<(Toggle, Toggle, Toggle), ConfigError>
+pub(crate) fn misc_toggles<F>(lookup: &F) -> Result<(Toggle, Toggle), ConfigError>
 where
     F: Fn(&str) -> Option<String>,
 {
     Ok((
-        boolean(lookup, MONGOOSEIM_ENABLED_VAR, DEFAULT_MONGOOSEIM_ENABLED)?.into(),
         boolean(lookup, CAPTCHA_ENABLED_VAR, DEFAULT_CAPTCHA_ENABLED)?.into(),
         boolean(lookup, HEALTHCHECK_ENABLED_VAR, DEFAULT_HEALTHCHECK_ENABLED)?.into(),
     ))
@@ -119,11 +115,7 @@ mod tests {
 
     #[test]
     fn misc_toggles_parse_booleans() {
-        for var in [
-            MONGOOSEIM_ENABLED_VAR,
-            CAPTCHA_ENABLED_VAR,
-            HEALTHCHECK_ENABLED_VAR,
-        ] {
+        for var in [CAPTCHA_ENABLED_VAR, HEALTHCHECK_ENABLED_VAR] {
             for (value, want) in [
                 ("true", true),
                 ("TRUE", true),
@@ -135,7 +127,6 @@ mod tests {
             ] {
                 let config = config_with(&[(var, value)]);
                 let got = match var {
-                    MONGOOSEIM_ENABLED_VAR => config.mongooseim_enabled,
                     CAPTCHA_ENABLED_VAR => config.captcha_enabled,
                     _ => config.healthcheck_enabled,
                 };
@@ -146,11 +137,7 @@ mod tests {
 
     #[test]
     fn invalid_misc_toggles_are_errors() {
-        for var in [
-            MONGOOSEIM_ENABLED_VAR,
-            CAPTCHA_ENABLED_VAR,
-            HEALTHCHECK_ENABLED_VAR,
-        ] {
+        for var in [CAPTCHA_ENABLED_VAR, HEALTHCHECK_ENABLED_VAR] {
             let err = try_config_with(&[(var, "maybe")]).unwrap_err();
             assert_eq!(err, ConfigError::InvalidBoolean(var), "error for {var}");
             assert!(
@@ -163,15 +150,10 @@ mod tests {
     #[test]
     fn debug_shows_the_misc_toggles() {
         let config = config_with(&[
-            (MONGOOSEIM_ENABLED_VAR, "true"),
             (CAPTCHA_ENABLED_VAR, "false"),
             (HEALTHCHECK_ENABLED_VAR, "true"),
         ]);
         let debug = format!("{config:?}");
-        assert!(
-            debug.contains("mongooseim_enabled: Toggle(true)"),
-            "the `MongooseIM` toggle is visible in Debug output: {debug}"
-        );
         assert!(
             debug.contains("captcha_enabled: Toggle(false)"),
             "the captcha toggle is visible in Debug output: {debug}"
