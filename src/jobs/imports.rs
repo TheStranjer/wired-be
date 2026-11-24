@@ -22,10 +22,10 @@
 //! every import write is idempotent, so the rerun converges.
 //!
 //! Pleroma enqueues one Oban job per acct; this server enqueues one job
-//! per import and lets the follow handler throttle itself: each run
-//! processes the first `FOLLOW_CHUNK` entries in order and re-enqueues
-//! the remainder as a fresh [`KIND_FOLLOWS`] job `FOLLOW_CHUNK_DELAY`
-//! later. Blocks and mutes run their whole list in one pass.
+//! per import and lets every handler throttle itself: each run
+//! processes the first `IMPORT_CHUNK` entries in order and re-enqueues
+//! the remainder as a fresh job of the same kind `IMPORT_CHUNK_DELAY`
+//! later, so no job outlives the stuck-lock age however long the list.
 //!
 //! [`get_or_fetch_by_acct`]: crate::federation::fetch_actor::get_or_fetch_by_acct
 //! [`follow::follow`]: crate::models::follow::follow
@@ -63,12 +63,12 @@ pub const KIND_BLOCKS: &str = "imports.blocks";
 /// The job kind of a mute import, handled by [`handle_mutes`] on
 /// [`QUEUE_BACKGROUND`].
 pub const KIND_MUTES: &str = "imports.mutes";
-/// Entries one [`handle_follows`] run processes before re-enqueuing the
-/// rest (the ticket's chunk size of 50).
-const FOLLOW_CHUNK: usize = 50;
-/// How long the re-enqueued remainder of a follow import waits before its
-/// next chunk may run (the ticket's 5 s throttle).
-const FOLLOW_CHUNK_DELAY: TimeDelta = TimeDelta::seconds(5);
+/// Entries one import run ([`handle_follows`], [`handle_blocks`] or
+/// [`handle_mutes`]) processes before re-enqueuing the rest.
+const IMPORT_CHUNK: usize = 50;
+/// How long the re-enqueued remainder of an import waits before its next
+/// chunk may run (the 5 s throttle).
+const IMPORT_CHUNK_DELAY: TimeDelta = TimeDelta::seconds(5);
 
 /// The `{user_id, accts, options}` arguments of an import job.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -150,45 +150,50 @@ impl Action {
     }
 }
 
-/// The [`JobRegistry`](super::JobRegistry) handler for [`KIND_FOLLOWS`].
-///
-/// Applies the first `FOLLOW_CHUNK` entries in order, then re-enqueues
-/// the remainder on [`QUEUE_BACKGROUND`] due `FOLLOW_CHUNK_DELAY` later
-/// — the follow import throttles itself.
+/// The [`JobRegistry`](super::JobRegistry) handler for [`KIND_FOLLOWS`]:
+/// one chunk of follows per run, the rest re-enqueued.
 pub fn handle_follows(state: AppState, _attempt: AttemptInfo, args: Value) -> HandlerFuture {
-    Box::pin(async move {
-        let parsed = ImportArgs::from_value(&args)?.with_options_aligned();
-        let importer = load_importer(&state, parsed.user_id).await?;
-        let head_count = parsed.accts.len().min(FOLLOW_CHUNK);
-        let mut head = parsed;
-        let tail_accts = head.accts.split_off(head_count);
-        let tail_options = head.options.split_off(head_count);
-        apply_entries(&state, &importer, Action::Follow, &head).await?;
-        if !tail_accts.is_empty() {
-            enqueue_next_chunk(&state, head.user_id, tail_accts, tail_options).await?;
-        }
-        Ok(())
-    })
+    Box::pin(async move { handle_chunked(&state, &args, Action::Follow, KIND_FOLLOWS).await })
 }
 
 /// The [`JobRegistry`](super::JobRegistry) handler for [`KIND_BLOCKS`]:
-/// block every acct of the list in one pass.
+/// one chunk of blocks per run, the rest re-enqueued.
 pub fn handle_blocks(state: AppState, _attempt: AttemptInfo, args: Value) -> HandlerFuture {
-    Box::pin(async move {
-        let parsed = ImportArgs::from_value(&args)?.with_options_aligned();
-        let importer = load_importer(&state, parsed.user_id).await?;
-        apply_entries(&state, &importer, Action::Block, &parsed).await
-    })
+    Box::pin(async move { handle_chunked(&state, &args, Action::Block, KIND_BLOCKS).await })
 }
 
 /// The [`JobRegistry`](super::JobRegistry) handler for [`KIND_MUTES`]:
-/// mute every acct of the list in one pass.
+/// one chunk of mutes per run, the rest re-enqueued.
 pub fn handle_mutes(state: AppState, _attempt: AttemptInfo, args: Value) -> HandlerFuture {
-    Box::pin(async move {
-        let parsed = ImportArgs::from_value(&args)?.with_options_aligned();
-        let importer = load_importer(&state, parsed.user_id).await?;
-        apply_entries(&state, &importer, Action::Mute, &parsed).await
-    })
+    Box::pin(async move { handle_chunked(&state, &args, Action::Mute, KIND_MUTES).await })
+}
+
+/// Applies the first [`IMPORT_CHUNK`] entries of `args` in order with
+/// `action`, then re-enqueues the remainder as a fresh `kind` job on
+/// [`QUEUE_BACKGROUND`] due [`IMPORT_CHUNK_DELAY`] later, so no job runs
+/// longer than one chunk of resolutions.
+///
+/// # Errors
+///
+/// [`JobError::Discard`] for unusable arguments or an importer that can no
+/// longer act, [`JobError::Retry`] on a database failure.
+async fn handle_chunked(
+    state: &AppState,
+    args: &Value,
+    action: Action,
+    kind: &'static str,
+) -> Result<(), JobError> {
+    let parsed = ImportArgs::from_value(args)?.with_options_aligned();
+    let importer = load_importer(state, parsed.user_id).await?;
+    let head_count = parsed.accts.len().min(IMPORT_CHUNK);
+    let mut head = parsed;
+    let tail_accts = head.accts.split_off(head_count);
+    let tail_options = head.options.split_off(head_count);
+    apply_entries(state, &importer, action, &head).await?;
+    if !tail_accts.is_empty() {
+        enqueue_next_chunk(state, kind, head.user_id, tail_accts, tail_options).await?;
+    }
+    Ok(())
 }
 
 /// The importer the job acts as. A vanished user, or one that can no
@@ -371,572 +376,33 @@ fn skip_or_retry(err: AppError, action: Action, target: &User) -> Result<(), Job
     Ok(())
 }
 
-/// Re-enqueues the not-yet-processed remainder of a follow import as a
-/// fresh [`KIND_FOLLOWS`] job on [`QUEUE_BACKGROUND`], due
-/// [`FOLLOW_CHUNK_DELAY`] from now.
+/// Re-enqueues the not-yet-processed remainder of an import as a fresh
+/// `kind` ([`KIND_FOLLOWS`], [`KIND_BLOCKS`] or [`KIND_MUTES`]) job on
+/// [`QUEUE_BACKGROUND`], due [`IMPORT_CHUNK_DELAY`] from now.
 ///
 /// # Errors
 ///
 /// [`JobError::Retry`] when the job row cannot be written.
 async fn enqueue_next_chunk(
     state: &AppState,
+    kind: &'static str,
     user_id: Uuid,
     accts: Vec<String>,
     options: Vec<ImportOption>,
 ) -> Result<(), JobError> {
     let queued = NewJob {
         queue: QUEUE_BACKGROUND,
-        kind: KIND_FOLLOWS,
+        kind,
         args: job_args(user_id, &accts, &options),
-        run_at: Some(Utc::now() + FOLLOW_CHUNK_DELAY),
+        run_at: Some(Utc::now() + IMPORT_CHUNK_DELAY),
         max_attempts: None,
         unique_key: None,
     };
-    let _job = enqueue(&state.db, queued).await.map_err(|err| {
-        JobError::Retry(format!("follow import chunk could not be enqueued: {err}"))
-    })?;
+    let _job = enqueue(&state.db, queued)
+        .await
+        .map_err(|err| JobError::Retry(format!("{kind} chunk could not be enqueued: {err}")))?;
     Ok(())
 }
 
 #[cfg(test)]
-mod tests {
-    use serde_json::json;
-    use sqlx::PgPool;
-    use sqlx::postgres::PgPoolOptions;
-
-    use super::*;
-    use crate::{
-        config::{Config, TEST_BASE_URL},
-        models::job::Job,
-        models::user::{NewUser, insert, local_ap_id},
-    };
-
-    /// A handle that neither the database nor a fast-failing `WebFinger`
-    /// check can resolve (single-label domain), the skip case.
-    const UNRESOLVABLE: &str = "ghost@invalid";
-
-    /// Test state over `pool` with the fixed test config.
-    fn app_state(pool: &PgPool) -> AppState {
-        AppState::for_tests(pool.clone(), Config::for_tests())
-    }
-
-    /// Test state over a pool that cannot answer: closed before it ever
-    /// connected, which is how a handler sees a database that went away.
-    async fn broken_state() -> AppState {
-        let pool = PgPoolOptions::new()
-            .connect_lazy("postgres://localhost/unused")
-            .expect("a lazy pool needs no database");
-        pool.close().await;
-        app_state(&pool)
-    }
-
-    /// Inserts a local user named `nickname`.
-    async fn local_user(pool: &PgPool, nickname: &str) -> User {
-        insert(
-            pool,
-            &NewUser::local(nickname, &local_ap_id(TEST_BASE_URL, nickname)),
-        )
-        .await
-        .expect("the local fixture inserts")
-    }
-
-    /// Inserts a mirror of `nickname` on `host`: the shape of a remote
-    /// account the fetch would store, so a handler entry resolves from the
-    /// database without any network (the ticket's mock-remote-fixture).
-    async fn remote_user(pool: &PgPool, nickname: &str, host: &str) -> User {
-        let ap_id = format!("https://{host}/users/{nickname}");
-        let new = NewUser {
-            nickname: format!("{nickname}@{host}"),
-            ap_id,
-            domain: Some(host.to_owned()),
-            name: nickname.to_owned(),
-            ..NewUser::default()
-        };
-        insert(pool, &new)
-            .await
-            .expect("remote user fixture inserts")
-    }
-
-    /// The handler's attempt info: imports do not depend on the attempt.
-    const FIRST_ATTEMPT: AttemptInfo = AttemptInfo {
-        attempts: 1,
-        max_attempts: 5,
-    };
-
-    /// The stored job rows of `kind`, oldest first.
-    async fn jobs_of(pool: &PgPool, kind: &str) -> Vec<Job> {
-        sqlx::query_as::<_, Job>("SELECT * FROM jobs WHERE kind = $1 ORDER BY id")
-            .bind(kind)
-            .fetch_all(pool)
-            .await
-            .expect("the job rows read")
-    }
-
-    /// The follow row of the pair, which the test expects to exist.
-    async fn relation(pool: &PgPool, follower: &User, target: &User) -> follow::Follow {
-        follow::get(pool, follower.id, target.id)
-            .await
-            .unwrap()
-            .expect("the relationship exists")
-    }
-
-    /// Whether the pair has any follow row.
-    async fn relation_exists(pool: &PgPool, follower: &User, target: &User) -> bool {
-        follow::get(pool, follower.id, target.id)
-            .await
-            .unwrap()
-            .is_some()
-    }
-
-    /// The follow handler follows resolvable accts — a stored local and a
-    /// stored remote one, the mock-remote-fixture case — writes the
-    /// `Show boosts` column it was given, and logs-and-skips an acct
-    /// nothing resolves.
-    #[tokio::test]
-    async fn follows_apply_the_list_and_skip_unresolvable_accts() {
-        let db = crate::test_db::test_db().await.expect("test database slot");
-        let pool = db.pool().clone();
-        let alice = local_user(&pool, "alice").await;
-        let bob = remote_user(&pool, "bob", "remote.example").await;
-        let carol = local_user(&pool, "carol").await;
-        let args = json!({
-            "user_id": alice.id,
-            "accts": [bob.nickname, carol.nickname, UNRESOLVABLE],
-            "options": [{"show_reblogs": false}, {}, {"show_reblogs": true}],
-        });
-
-        let outcome = handle_follows(app_state(&pool), FIRST_ATTEMPT, args).await;
-
-        assert_eq!(outcome, Ok(()), "a skipped entry never fails the job");
-        let bob_follow = relation(&pool, &alice, &bob).await;
-        assert!(!bob_follow.show_reblogs, "the False column reaches the row");
-        assert_eq!(
-            bob_follow.state,
-            follow::FollowState::Pending,
-            "a mirror of a remote account waits for that instance, as the \
-             interactive follow does"
-        );
-        assert!(
-            relation(&pool, &alice, &carol).await.show_reblogs,
-            "an entry without a value keeps the default"
-        );
-        assert!(
-            follow::is_following(&pool, &alice, &carol).await.unwrap(),
-            "the local acct's follow was granted on the spot"
-        );
-        assert!(
-            jobs_of(&pool, KIND_FOLLOWS).await.is_empty(),
-            "a list shorter than the chunk leaves no remainder job"
-        );
-    }
-
-    /// The follow handler processes the first 50 entries and re-enqueues
-    /// the remainder (in order, with the aligned options) due 5 s later.
-    #[tokio::test]
-    async fn follows_chunk_at_fifty_and_reenqueue_the_remainder() {
-        let db = crate::test_db::test_db().await.expect("test database slot");
-        let pool = db.pool().clone();
-        let alice = local_user(&pool, "alice").await;
-        let mut names: Vec<String> = Vec::new();
-        let mut users = Vec::new();
-        for i in 0..60 {
-            let name = format!("user{i}@chunk.example");
-            users.push(remote_user(&pool, &format!("user{i}"), "chunk.example").await);
-            names.push(name);
-        }
-        let options: Vec<Value> = names.iter().map(|_| json!({})).collect();
-        let args = json!({"user_id": alice.id, "accts": names, "options": options});
-
-        let outcome = handle_follows(app_state(&pool), FIRST_ATTEMPT, args).await;
-
-        assert_eq!(outcome, Ok(()), "the first chunk runs clean");
-        for user in users.iter().take(50) {
-            assert!(
-                relation_exists(&pool, &alice, user).await,
-                "the first chunk followed {}",
-                user.nickname
-            );
-        }
-        for user in users.iter().skip(50) {
-            assert!(
-                !relation_exists(&pool, &alice, user).await,
-                "the remainder is left for the next chunk: {}",
-                user.nickname
-            );
-        }
-        let pending = jobs_of(&pool, KIND_FOLLOWS).await;
-        assert_eq!(pending.len(), 1, "exactly one remainder job");
-        let next = &pending[0];
-        assert_eq!(next.queue, QUEUE_BACKGROUND, "on the background queue");
-        assert_eq!(
-            next.args
-                .get("accts")
-                .and_then(Value::as_array)
-                .map(Vec::len),
-            Some(10),
-            "the remainder carries the last ten accts, in order: {}",
-            next.args
-        );
-        assert_eq!(
-            next.args["accts"][0],
-            json!("user50@chunk.example"),
-            "and it starts exactly where this run stopped"
-        );
-        assert_eq!(
-            next.args["options"].as_array().map_or_default(Vec::len),
-            10,
-            "the options travel with the accts"
-        );
-        assert!(
-            next.run_at > Utc::now(),
-            "the chunk is throttled into the future: {}",
-            next.run_at
-        );
-        assert!(
-            next.run_at < Utc::now() + FOLLOW_CHUNK_DELAY + FOLLOW_CHUNK_DELAY,
-            "the throttle is the ticket's 5 s, not a backoff: {}",
-            next.run_at
-        );
-    }
-
-    /// The second chunk of the ticket's own throttling: running the
-    /// re-enqueued job applies its remainder and enqueues nothing more.
-    #[tokio::test]
-    async fn the_remainder_chunk_completes_the_import() {
-        let db = crate::test_db::test_db().await.expect("test database slot");
-        let pool = db.pool().clone();
-        let alice = local_user(&pool, "alice").await;
-        let bob = remote_user(&pool, "bob", "remote.example").await;
-        let args = json!({
-            "user_id": alice.id,
-            "accts": [bob.nickname],
-            "options": [{"show_reblogs": true}],
-        });
-
-        let outcome = handle_follows(app_state(&pool), FIRST_ATTEMPT, args).await;
-
-        assert_eq!(outcome, Ok(()), "a small job is its own whole chunk");
-        assert!(
-            relation_exists(&pool, &alice, &bob).await,
-            "and it followed"
-        );
-        assert!(
-            jobs_of(&pool, KIND_FOLLOWS).await.is_empty(),
-            "no remainder"
-        );
-    }
-
-    /// The blocks handler blocks resolvable accts — local and mirrored
-    /// remote — logs-and-skips the rest, and is idempotent across runs.
-    #[tokio::test]
-    async fn blocks_apply_to_resolvable_accts() {
-        let db = crate::test_db::test_db().await.expect("test database slot");
-        let pool = db.pool().clone();
-        let alice = local_user(&pool, "alice").await;
-        let bob = remote_user(&pool, "bob", "remote.example").await;
-        let args = json!({
-            "user_id": alice.id,
-            "accts": [bob.nickname, alice.nickname, UNRESOLVABLE],
-            "options": [],
-        });
-        let state = app_state(&pool);
-
-        let outcome = handle_blocks(state.clone(), FIRST_ATTEMPT, args.clone()).await;
-        assert_eq!(outcome, Ok(()), "the self refusal and the skip pass");
-        assert!(
-            block::is_blocking(&pool, alice.id, bob.id).await.unwrap(),
-            "the stored remote acct is blocked"
-        );
-        assert!(
-            !block::is_blocking(&pool, alice.id, alice.id).await.unwrap(),
-            "importing yourself is skipped, not written"
-        );
-
-        let rerun = handle_blocks(state, FIRST_ATTEMPT, args).await;
-        assert_eq!(
-            rerun,
-            Ok(()),
-            "a second run changes nothing and fails nowhere"
-        );
-        let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM blocks")
-            .fetch_one(&pool)
-            .await
-            .expect("the count reads");
-        assert_eq!(rows, 1, "idempotent: still exactly one block row");
-    }
-
-    /// The mutes handler mutes resolvable accts with the Mastodon
-    /// defaults (notifications hidden, indefinite) and skips what it
-    /// cannot resolve.
-    #[tokio::test]
-    async fn mutes_apply_to_resolvable_accts() {
-        let db = crate::test_db::test_db().await.expect("test database slot");
-        let pool = db.pool().clone();
-        let alice = local_user(&pool, "alice").await;
-        let bob = remote_user(&pool, "bob", "remote.example").await;
-        let args = json!({
-            "user_id": alice.id,
-            "accts": [bob.nickname, UNRESOLVABLE],
-            "options": [],
-        });
-
-        let outcome = handle_mutes(app_state(&pool), FIRST_ATTEMPT, args).await;
-
-        assert_eq!(outcome, Ok(()), "the unresolvable entry is a skip");
-        assert!(
-            mute::is_muting(&pool, alice.id, bob.id).await.unwrap(),
-            "the stored remote acct is muted"
-        );
-        let expires: Option<chrono::DateTime<Utc>> =
-            sqlx::query_scalar("SELECT expires_at FROM mutes WHERE muter_id = $1")
-                .bind(alice.id)
-                .fetch_one(&pool)
-                .await
-                .expect("the mute row reads");
-        assert_eq!(expires, None, "an import mute is indefinite");
-    }
-
-    /// A blocked pair is Pleroma's logged skip, not a job failure: the
-    /// follow of an account that blocks the importer keeps the walk going.
-    #[tokio::test]
-    async fn a_blocked_target_is_skipped_not_fatal() {
-        let db = crate::test_db::test_db().await.expect("test database slot");
-        let pool = db.pool().clone();
-        let alice = local_user(&pool, "alice").await;
-        let bob = local_user(&pool, "bob").await;
-        let _blocked = block::block(&pool, TEST_BASE_URL, &bob, &alice)
-            .await
-            .expect("bob blocks alice");
-        let carol = local_user(&pool, "carol").await;
-        let args = json!({
-            "user_id": alice.id,
-            "accts": [bob.nickname, carol.nickname],
-            "options": [],
-        });
-
-        let outcome = handle_follows(app_state(&pool), FIRST_ATTEMPT, args).await;
-
-        assert_eq!(outcome, Ok(()), "the refusal is logged and skipped");
-        assert!(
-            !follow::is_following(&pool, &alice, &bob).await.unwrap(),
-            "the blocking account was not followed"
-        );
-        assert!(
-            follow::is_following(&pool, &alice, &carol).await.unwrap(),
-            "and the list walk continued to the next entry"
-        );
-    }
-
-    /// Arguments that do not fit [`ImportArgs`] are permanent: discard.
-    #[tokio::test]
-    async fn unusable_arguments_discard_the_job() {
-        let db = crate::test_db::test_db().await.expect("test database slot");
-        let pool = db.pool().clone();
-
-        let outcome = handle_follows(app_state(&pool), FIRST_ATTEMPT, json!({"accts": []})).await;
-
-        match outcome {
-            Err(JobError::Discard(detail)) => assert!(
-                detail.contains("unusable"),
-                "the discard says why: {detail}"
-            ),
-            Ok(()) => panic!("a missing user_id must not complete the job"),
-            Err(other) => panic!("a missing user_id must discard, not {other}"),
-        }
-    }
-
-    /// A user the database no longer has is permanent: discard.
-    #[tokio::test]
-    async fn a_vanished_user_discards_the_job() {
-        let db = crate::test_db::test_db().await.expect("test database slot");
-        let pool = db.pool().clone();
-        let args = job_args(Uuid::now_v7(), &[], &[]);
-
-        let outcome = handle_blocks(app_state(&pool), FIRST_ATTEMPT, args).await;
-
-        match outcome {
-            Err(JobError::Discard(detail)) => assert!(
-                detail.contains("no longer exists"),
-                "the discard says why: {detail}"
-            ),
-            Ok(()) => panic!("a vanished user must not complete the job"),
-            Err(other) => panic!("a vanished user must discard, not {other}"),
-        }
-    }
-
-    /// Asserts `outcome` is the "can no longer act" discard.
-    fn assert_cannot_act(outcome: Result<(), JobError>) {
-        match outcome {
-            Err(JobError::Discard(detail)) => assert!(
-                detail.contains("can no longer act"),
-                "the discard says why: {detail}"
-            ),
-            Ok(()) => panic!("an inactive importer must not complete the job"),
-            Err(other) => panic!("an inactive importer must discard, not {other}"),
-        }
-    }
-
-    /// A deleted importer's follow import is discarded: no follow row, and
-    /// no next chunk even when the list exceeds one chunk.
-    #[tokio::test]
-    async fn a_deleted_importer_follows_nothing_and_ends_the_chain() {
-        let db = crate::test_db::test_db().await.expect("test database slot");
-        let pool = db.pool().clone();
-        let alice = local_user(&pool, "alice").await;
-        let mut names: Vec<String> = Vec::new();
-        let mut users = Vec::new();
-        for i in 0..60 {
-            users.push(remote_user(&pool, &format!("user{i}"), "chunk.example").await);
-            names.push(format!("user{i}@chunk.example"));
-        }
-        user::mark_deleted(&pool, alice.id)
-            .await
-            .expect("alice is marked deleted");
-        let args = job_args(alice.id, &names, &[]);
-
-        let outcome = handle_follows(app_state(&pool), FIRST_ATTEMPT, args).await;
-
-        assert_cannot_act(outcome);
-        for target in &users {
-            assert!(
-                !relation_exists(&pool, &alice, target).await,
-                "no follow row for {}",
-                target.nickname
-            );
-        }
-        assert!(
-            jobs_of(&pool, KIND_FOLLOWS).await.is_empty(),
-            "no next chunk is enqueued"
-        );
-    }
-
-    /// A deactivated importer's block and mute imports are discarded and
-    /// write nothing.
-    #[tokio::test]
-    async fn a_deactivated_importer_blocks_and_mutes_nothing() {
-        let db = crate::test_db::test_db().await.expect("test database slot");
-        let pool = db.pool().clone();
-        let alice = local_user(&pool, "alice").await;
-        let bob = remote_user(&pool, "bob", "remote.example").await;
-        sqlx::query("UPDATE users SET is_active = false WHERE id = $1")
-            .bind(alice.id)
-            .execute(&pool)
-            .await
-            .map(drop)
-            .expect("alice is deactivated");
-        let args = job_args(alice.id, std::slice::from_ref(&bob.nickname), &[]);
-        let state = app_state(&pool);
-
-        assert_cannot_act(handle_blocks(state.clone(), FIRST_ATTEMPT, args.clone()).await);
-        assert_cannot_act(handle_mutes(state, FIRST_ATTEMPT, args).await);
-
-        assert!(
-            !block::is_blocking(&pool, alice.id, bob.id).await.unwrap(),
-            "no block was written"
-        );
-        assert!(
-            !mute::is_muting(&pool, alice.id, bob.id).await.unwrap(),
-            "no mute was written"
-        );
-    }
-
-    /// An importer awaiting staff approval cannot act either.
-    #[tokio::test]
-    async fn an_unapproved_importer_is_discarded() {
-        let db = crate::test_db::test_db().await.expect("test database slot");
-        let pool = db.pool().clone();
-        let alice = local_user(&pool, "alice").await;
-        sqlx::query("UPDATE users SET approval_pending = true WHERE id = $1")
-            .bind(alice.id)
-            .execute(&pool)
-            .await
-            .map(drop)
-            .expect("alice awaits approval");
-
-        let outcome = handle_blocks(
-            app_state(&pool),
-            FIRST_ATTEMPT,
-            job_args(alice.id, &[], &[]),
-        )
-        .await;
-
-        assert_cannot_act(outcome);
-    }
-
-    /// An active importer still applies its entries.
-    #[tokio::test]
-    async fn an_active_importer_still_applies_entries() {
-        let db = crate::test_db::test_db().await.expect("test database slot");
-        let pool = db.pool().clone();
-        let alice = local_user(&pool, "alice").await;
-        let bob = remote_user(&pool, "bob", "remote.example").await;
-        let carol = remote_user(&pool, "carol", "remote.example").await;
-        let dave = remote_user(&pool, "dave", "remote.example").await;
-        let state = app_state(&pool);
-        let args_for =
-            |target: &User| job_args(alice.id, std::slice::from_ref(&target.nickname), &[]);
-
-        assert_eq!(
-            handle_follows(state.clone(), FIRST_ATTEMPT, args_for(&bob)).await,
-            Ok(())
-        );
-        assert_eq!(
-            handle_blocks(state.clone(), FIRST_ATTEMPT, args_for(&carol)).await,
-            Ok(())
-        );
-        assert_eq!(
-            handle_mutes(state, FIRST_ATTEMPT, args_for(&dave)).await,
-            Ok(())
-        );
-
-        assert!(
-            relation_exists(&pool, &alice, &bob).await,
-            "the follow was written"
-        );
-        assert!(
-            block::is_blocking(&pool, alice.id, carol.id).await.unwrap(),
-            "the block was written"
-        );
-        assert!(
-            mute::is_muting(&pool, alice.id, dave.id).await.unwrap(),
-            "the mute was written"
-        );
-    }
-
-    /// A database that cannot answer is transient: retry, so the import
-    /// resumes with its idempotent writes once the database is back.
-    #[tokio::test]
-    async fn an_unreachable_database_retries_the_job() {
-        let args = json!({"user_id": Uuid::now_v7().to_string(), "accts": [], "options": []});
-        let state = broken_state().await;
-
-        let outcome = handle_mutes(state, FIRST_ATTEMPT, args).await;
-
-        match outcome {
-            Err(JobError::Retry(detail)) => assert!(
-                detail.contains("import user read failed"),
-                "the retry states what failed: {detail}"
-            ),
-            Ok(()) => panic!("a closed pool must not read as a successful import"),
-            Err(other) => panic!("a closed pool is retryable, not {other}"),
-        }
-    }
-
-    /// All three kinds are registered with the worker's registry, each
-    /// bound to this module's handler.
-    #[tokio::test]
-    async fn the_kinds_are_registered() {
-        let db = crate::test_db::test_db().await.expect("test database slot");
-        let pool = db.pool().clone();
-        let registry = crate::job_registry();
-        let alice = local_user(&pool, "alice").await;
-        let args = job_args(alice.id, &[], &[]);
-        for kind in [KIND_FOLLOWS, KIND_BLOCKS, KIND_MUTES] {
-            let handler = registry
-                .get(kind)
-                .unwrap_or_else(|| panic!("`{kind}` is registered"));
-            let outcome = handler(app_state(&pool), FIRST_ATTEMPT, args.clone()).await;
-            assert_eq!(outcome, Ok(()), "the registered handler for `{kind}` runs");
-        }
-    }
-}
+mod tests;
