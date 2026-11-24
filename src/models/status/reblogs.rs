@@ -12,7 +12,7 @@ use crate::{
     error::{AppError, AppResult},
     models::user::User,
     pagination::PageParams,
-    util::id::new_id,
+    util::id::{activity_ap_id, new_id},
 };
 
 use super::{
@@ -111,7 +111,7 @@ pub async fn create_reblog(
     let id = new_id();
     let written = sqlx::query_as::<_, Status>(INSERT_REBLOG_SQL)
         .bind(id)
-        .bind(format!("{base_url}/activities/{id}"))
+        .bind(activity_ap_id(base_url, id))
         .bind(format!("{base_url}/notice/{id}"))
         .bind(user.id)
         .bind(visibility)

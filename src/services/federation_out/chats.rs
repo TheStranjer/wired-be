@@ -21,7 +21,7 @@ use crate::{
         user::User,
     },
     state::AppState,
-    util::time::mastodon_time,
+    util::{id::activity_ap_id, time::mastodon_time},
 };
 
 /// One chat message as the REMOTE counterpart must see it: the stored
@@ -99,10 +99,7 @@ fn chat_create_document(
 ) -> Value {
     json!({
         "@context": note::json_ld_context(&state.config),
-        "id": format!(
-            "{}/activities/{}",
-            state.config.base_url, delivery.message.message_id
-        ),
+        "id": activity_ap_id(&state.config.base_url, delivery.message.message_id),
         "type": "Create",
         "actor": delivery.sender_ap_id,
         "to": [delivery.recipient_ap_id],

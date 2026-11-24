@@ -12,14 +12,10 @@ use crate::{
         user::{NewUser, User, insert, local_ap_id},
     },
     pagination::{MAX_LIMIT, PageParams},
-    util::id::parse_id,
+    util::id::assert_local_activity_id,
 };
 
 use super::{Category, NewReport, Report, create, get};
-
-/// The `ActivityPub` path segment a local reporter's `ap_id` is built
-/// under, as [`create`] must write it (decision 6).
-pub(super) const ACTIVITY_PREFIX: &str = "/activities/";
 
 /// Inserts a local, unlocked user named `nickname`.
 pub(super) async fn local_user(pool: &PgPool, nickname: &str) -> User {
@@ -120,21 +116,5 @@ pub(super) fn page(query: &str) -> PageParams {
 /// The `{TEST_BASE_URL}/activities/{uuid}` id [`create`] minted for a
 /// local reporter, checked for its shape and reduced to the id part.
 pub(super) fn activity_id(row: &Report) -> String {
-    let prefix = format!("{TEST_BASE_URL}{ACTIVITY_PREFIX}");
-    let ap_id = row
-        .ap_id
-        .clone()
-        .expect("a local reporter's row carries a minted activity id");
-    assert!(
-        ap_id.starts_with(&prefix),
-        "the activity id is this instance's, got {ap_id}"
-    );
-    let tail = ap_id
-        .strip_prefix(&prefix)
-        .expect("the prefix was just checked");
-    assert!(
-        parse_id(tail).is_some(),
-        "the tail of the activity id is an id: {tail}"
-    );
-    tail.to_owned()
+    assert_local_activity_id(row.ap_id.as_deref())
 }

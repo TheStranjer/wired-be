@@ -18,6 +18,22 @@ pub fn new_id() -> Uuid {
     Uuid::now_v7()
 }
 
+/// The activity id for `id` on the instance at `base_url` (decision 6).
+///
+/// The shape is `{base_url}/activities/{id}`. Every place that writes or reads
+/// a local activity id builds it here, so the shape lives in one spot.
+#[must_use]
+pub fn activity_ap_id(base_url: &str, id: Uuid) -> String {
+    format!("{base_url}/activities/{id}")
+}
+
+/// A freshly minted local activity id: [`activity_ap_id`] over a fresh
+/// [`new_id`].
+#[must_use]
+pub fn new_activity_ap_id(base_url: &str) -> String {
+    activity_ap_id(base_url, new_id())
+}
+
 /// Reads a [`Uuid`] back from its hyphenated or simple text, `None` for
 /// anything else.
 ///
@@ -34,6 +50,24 @@ pub fn parse_id(text: &str) -> Option<Uuid> {
         return None;
     }
     Uuid::parse_str(text).ok()
+}
+
+/// The minted local activity id a test row carries, reduced to its id part.
+///
+/// It must be present, sit under `{TEST_BASE_URL}/activities/` and end in an
+/// id [`parse_id`] reads.
+#[cfg(test)]
+pub(crate) fn assert_local_activity_id(ap_id: Option<&str>) -> String {
+    let prefix = format!("{}/activities/", crate::config::TEST_BASE_URL);
+    let ap_id = ap_id.expect("a local actor's row carries a minted activity id");
+    let tail = ap_id
+        .strip_prefix(&prefix)
+        .unwrap_or_else(|| panic!("the activity id is this instance's, got {ap_id}"));
+    assert!(
+        parse_id(tail).is_some(),
+        "the tail of the activity id is an id: {tail}"
+    );
+    tail.to_owned()
 }
 
 #[cfg(test)]
@@ -98,6 +132,60 @@ mod tests {
             Some(id),
             "hex digits are case-insensitive"
         );
+    }
+
+    #[test]
+    fn activity_ap_id_joins_base_prefix_and_id() {
+        let id = new_id();
+        assert_eq!(
+            activity_ap_id("https://h", id),
+            format!("https://h/activities/{id}"),
+            "the id sits under the instance's activities path"
+        );
+    }
+
+    #[test]
+    fn new_activity_ap_ids_differ_and_parse_back() {
+        let prefix = "https://h/activities/";
+        let first = new_activity_ap_id("https://h");
+        let second = new_activity_ap_id("https://h");
+        assert_ne!(first, second, "every minted activity is its own object");
+        for minted in [&first, &second] {
+            let tail = minted
+                .strip_prefix(prefix)
+                .unwrap_or_else(|| panic!("{minted} is under {prefix}"));
+            let id = parse_id(tail).expect("the tail is an id");
+            assert_eq!(
+                id.get_version(),
+                Some(Version::SortRand),
+                "the tail is a UUIDv7"
+            );
+        }
+    }
+
+    #[test]
+    fn assert_local_activity_id_returns_the_tail() {
+        let id = new_id();
+        let ap_id = activity_ap_id(crate::config::TEST_BASE_URL, id);
+        assert_eq!(
+            assert_local_activity_id(Some(&ap_id)),
+            id.to_string(),
+            "the helper reduces the id to its uuid text"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "carries a minted activity id")]
+    fn assert_local_activity_id_rejects_a_missing_id() {
+        drop(assert_local_activity_id(None));
+    }
+
+    #[test]
+    #[should_panic(expected = "this instance's")]
+    fn assert_local_activity_id_rejects_a_foreign_id() {
+        drop(assert_local_activity_id(Some(
+            "https://elsewhere.example/activities/x",
+        )));
     }
 
     #[test]

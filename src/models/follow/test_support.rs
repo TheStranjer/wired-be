@@ -12,7 +12,7 @@ use crate::{
         user::{Flag, NewUser, User, get_by_id, insert, local_ap_id},
     },
     pagination::{MAX_LIMIT, PageParams},
-    util::id::{new_id, parse_id},
+    util::id::{assert_local_activity_id, new_id},
 };
 
 use super::{Follow, FollowPageEntry, get};
@@ -150,23 +150,7 @@ pub(super) fn follow_ids(entries: &[FollowPageEntry]) -> Vec<Uuid> {
 /// minted for a local follower, checked for its shape and reduced to the id
 /// part.
 pub(super) fn activity_id(follow: &Follow) -> String {
-    let prefix = format!("{TEST_BASE_URL}{ACTIVITY_PREFIX}");
-    let ap_id = follow
-        .ap_id
-        .clone()
-        .expect("a local follower's row carries a minted activity id");
-    assert!(
-        ap_id.starts_with(&prefix),
-        "the activity id is this instance's, got {ap_id}"
-    );
-    let tail = ap_id
-        .strip_prefix(&prefix)
-        .expect("the prefix was just checked");
-    assert!(
-        parse_id(tail).is_some(),
-        "the tail of the activity id is an id: {tail}"
-    );
-    tail.to_owned()
+    assert_local_activity_id(follow.ap_id.as_deref())
 }
 
 /// The SQLSTATE a database failure carries, or an empty string when the
