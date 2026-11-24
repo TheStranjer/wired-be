@@ -5,7 +5,9 @@
 use tracing::debug;
 
 use crate::{
-    federation::fetch_actor::{FetchError, error::server_error, fetch::fetch_and_store},
+    federation::fetch_actor::{
+        FetchError, error::server_error, fetch::fetch_and_store, handle::Naming,
+    },
     models::user::{User, get_by_ap_id},
     state::AppState,
 };
@@ -33,26 +35,56 @@ use super::{fresh_since, is_local_ap_id};
 /// mirror write reports. On a refresh those failures only log and the
 /// stale mirror answers.
 pub async fn get_or_fetch_by_ap_id(state: &AppState, ap_id: &str) -> Result<User, FetchError> {
+    get_or_fetch(state, ap_id, Naming::Confirm).await
+}
+
+/// [`get_or_fetch_by_ap_id`] for an actor id the caller has just taken
+/// from a `WebFinger` answer, and whose handle the caller settles from that
+/// answer itself (as [`get_or_fetch_by_acct`](super::get_or_fetch_by_acct)
+/// does). A fetch here asks `WebFinger` nothing more: the mirror is written
+/// under the parser's derived nickname, or under the stored one when its
+/// local part still matches, so a split-domain handle survives a refetch.
+/// One handle lookup is one `WebFinger` request.
+///
+/// # Errors
+///
+/// As [`get_or_fetch_by_ap_id`].
+pub async fn get_or_fetch_by_fingered_ap_id(
+    state: &AppState,
+    ap_id: &str,
+) -> Result<User, FetchError> {
+    get_or_fetch(state, ap_id, Naming::Caller).await
+}
+
+/// The lookup behind [`get_or_fetch_by_ap_id`] and
+/// [`get_or_fetch_by_fingered_ap_id`], with `naming` saying who settles a
+/// fetched actor's nickname.
+async fn get_or_fetch(state: &AppState, ap_id: &str, naming: Naming) -> Result<User, FetchError> {
     if let Some(stored) = get_by_ap_id(&state.db, ap_id)
         .await
         .map_err(|err| server_error(&err))?
     {
-        return serve_or_refresh(state, stored, ap_id).await;
+        return serve_or_refresh(state, stored, ap_id, naming).await;
     }
     if is_local_ap_id(&state.config, ap_id) {
         return Err(FetchError::NotFound);
     }
-    fetch_and_store(state, ap_id).await
+    fetch_and_store(state, ap_id, naming).await
 }
 
 /// Answers from the stored mirror when it can (a local row, or a remote
 /// one inside the refresh window), refetches otherwise — and on a failed
 /// refetch keeps serving the stale mirror, `Gone` excepted.
-async fn serve_or_refresh(state: &AppState, stored: User, ap_id: &str) -> Result<User, FetchError> {
+async fn serve_or_refresh(
+    state: &AppState,
+    stored: User,
+    ap_id: &str,
+    naming: Naming,
+) -> Result<User, FetchError> {
     if stored.local.get() || fresh_since(stored.last_fetched_at) {
         return Ok(stored);
     }
-    match fetch_and_store(state, ap_id).await {
+    match fetch_and_store(state, ap_id, naming).await {
         Ok(user) => Ok(user),
         // Gone states that the actor is permanently gone; every other
         // failure only says the peer is unreachable or wrong at this

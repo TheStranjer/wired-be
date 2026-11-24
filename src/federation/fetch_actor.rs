@@ -45,7 +45,9 @@ mod test_support;
 
 pub use error::FetchError;
 pub use fetch::fetch_actor_json;
-pub use lookup::{get_or_fetch_by_acct, get_or_fetch_by_ap_id, refresh_user};
+pub use lookup::{
+    get_or_fetch_by_acct, get_or_fetch_by_ap_id, get_or_fetch_by_fingered_ap_id, refresh_user,
+};
 pub use signer::Signer;
 
 pub(crate) use self::{

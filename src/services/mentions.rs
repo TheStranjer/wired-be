@@ -34,7 +34,7 @@ use tracing::debug;
 use crate::{
     error::AppResult,
     federation::{
-        fetch_actor::{FetchError, get_or_fetch_by_acct, get_or_fetch_by_ap_id},
+        fetch_actor::{FetchError, get_or_fetch_by_acct, get_or_fetch_by_fingered_ap_id},
         webfinger_client::resolve_acct_with_base,
     },
     models::user::{self, User},
@@ -214,7 +214,7 @@ async fn fetch_remote_acct(
             let ap_id = resolve_acct_with_base(&state.http_client, acct, Some(base))
                 .await?
                 .actor;
-            get_or_fetch_by_ap_id(state, &ap_id).await
+            get_or_fetch_by_fingered_ap_id(state, &ap_id).await
         }
     }
 }

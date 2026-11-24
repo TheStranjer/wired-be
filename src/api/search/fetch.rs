@@ -14,7 +14,10 @@ use uuid::Uuid;
 use crate::{
     config::Config,
     federation::{
-        fetch_actor::{FetchError, get_or_fetch_by_acct, get_or_fetch_by_ap_id, is_local_ap_id},
+        fetch_actor::{
+            FetchError, get_or_fetch_by_acct, get_or_fetch_by_ap_id,
+            get_or_fetch_by_fingered_ap_id, is_local_ap_id,
+        },
         fetch_object::resolve_status,
         webfinger_client::resolve_acct_with_base,
     },
@@ -75,7 +78,7 @@ async fn lookup_handle(
             let ap_id = resolve_acct_with_base(&state.http_client, acct, Some(base))
                 .await?
                 .actor;
-            get_or_fetch_by_ap_id(state, &ap_id).await
+            get_or_fetch_by_fingered_ap_id(state, &ap_id).await
         }
     }
 }
