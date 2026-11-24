@@ -7,7 +7,7 @@ use std::{collections::HashMap, sync::LazyLock};
 use sqlx::{AssertSqlSafe, PgPool};
 use uuid::Uuid;
 
-use crate::error::AppResult;
+use crate::{error::AppResult, util::collections::group_pairs};
 
 use super::{POLL_COLUMNS, Poll, PollOption};
 
@@ -161,11 +161,9 @@ pub async fn options_for_statuses(
     // Rows arrive grouped by poll (one poll per status) and ordered by
     // position, so pushing in read order hands each entry its choices in
     // the order voters see them.
-    let mut grouped: HashMap<Uuid, Vec<PollOption>> = HashMap::new();
-    for row in rows {
-        grouped.entry(row.status_id).or_default().push(row.option);
-    }
-    Ok(grouped)
+    Ok(group_pairs(
+        rows.into_iter().map(|row| (row.status_id, row.option)),
+    ))
 }
 
 #[cfg(test)]

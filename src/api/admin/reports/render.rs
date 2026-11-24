@@ -14,6 +14,7 @@ use crate::{
     },
     services::render_status::{ViewerMode, render_statuses},
     state::AppState,
+    util::collections::group_pairs,
 };
 
 /// The one entity for `row`, through the batched [`entities`] read.
@@ -54,12 +55,8 @@ pub(super) async fn entities(
     let users = named_users(state, rows).await?;
     let notes = note_lists(state, &report_ids).await?;
     let cited = report::statuses_for_reports(&state.db, &report_ids).await?;
-    let mut by_report: HashMap<Uuid, Vec<Uuid>> = HashMap::new();
-    let mut status_ids: Vec<Uuid> = Vec::new();
-    for (report_id, status_id) in cited {
-        by_report.entry(report_id).or_default().push(status_id);
-        status_ids.push(status_id);
-    }
+    let status_ids: Vec<Uuid> = cited.iter().map(|&(_, status_id)| status_id).collect();
+    let by_report = group_pairs(cited);
     let status_rows = status::get_many(&state.db, &status_ids).await?;
     let by_id: HashMap<Uuid, &status::Status> =
         status_rows.iter().map(|row| (row.id, row)).collect();
@@ -115,12 +112,9 @@ async fn note_lists(
     report_ids: &[Uuid],
 ) -> AppResult<HashMap<Uuid, Vec<AdminReportNote>>> {
     let rows = report::notes_for_reports(&state.db, report_ids).await?;
-    let mut notes: HashMap<Uuid, Vec<AdminReportNote>> = HashMap::new();
-    for row in rows {
-        let entity = AdminReportNote::from_row(&row);
-        notes.entry(row.report_id).or_default().push(entity);
-    }
-    Ok(notes)
+    Ok(group_pairs(rows.iter().map(|row| {
+        (row.report_id, AdminReportNote::from_row(row))
+    })))
 }
 
 /// The account an entity slot names; its absence is the impossible state

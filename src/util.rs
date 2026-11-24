@@ -9,10 +9,12 @@
 //! sanitizer in [`sanitize`], the content formatter in [`mod@format`], the
 //! mention/hashtag extraction and link builders in [`entities`], what counts
 //! as one reaction emoji in [`emoji`] and the XML escaper in [`xml`].
-//! Time-expiring in-memory values go through [`cache`], and the `http(s)` URL
+//! Time-expiring in-memory values go through [`cache`], the batched
+//! group-by-key fold lives in [`collections`], and the `http(s)` URL
 //! checks every origin, signing and delivery guard shares live in [`mod@url`].
 
 pub mod cache;
+pub mod collections;
 pub mod emoji;
 pub mod entities;
 pub mod format;

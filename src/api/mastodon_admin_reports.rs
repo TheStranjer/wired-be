@@ -115,7 +115,7 @@ use crate::{
         webhooks,
     },
     state::AppState,
-    util::id::parse_id,
+    util::{collections::group_pairs, id::parse_id},
 };
 
 /// The read endpoint class of [`StaffUser::require`].
@@ -532,12 +532,8 @@ async fn cited_statuses(
 ) -> AppResult<HashMap<Uuid, Vec<Status>>> {
     let report_ids: Vec<Uuid> = rows.iter().map(|row| row.id).collect();
     let cited = report::statuses_for_reports(&state.db, &report_ids).await?;
-    let mut ids_per_report: HashMap<Uuid, Vec<Uuid>> = HashMap::new();
-    let mut status_ids: Vec<Uuid> = Vec::new();
-    for (report_id, status_id) in cited {
-        ids_per_report.entry(report_id).or_default().push(status_id);
-        status_ids.push(status_id);
-    }
+    let status_ids: Vec<Uuid> = cited.iter().map(|&(_, status_id)| status_id).collect();
+    let ids_per_report = group_pairs(cited);
     let status_rows = status::get_many(&state.db, &status_ids).await?;
     let by_id: HashMap<Uuid, &status::Status> =
         status_rows.iter().map(|row| (row.id, row)).collect();

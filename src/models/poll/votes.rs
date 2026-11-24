@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use crate::error::AppResult;
+use crate::{error::AppResult, util::collections::group_pairs};
 
 /// [`voted_option_positions`]: one account's marks on one poll, walked through
 /// the primary key's `poll_id` lead and joined to `poll_options` because the
@@ -78,11 +78,7 @@ pub async fn votes_by_status(
         .bind(user_id)
         .fetch_all(pool)
         .await?;
-    let mut grouped: HashMap<Uuid, Vec<i32>> = HashMap::new();
-    for (status_id, position) in rows {
-        grouped.entry(status_id).or_default().push(position);
-    }
-    Ok(grouped)
+    Ok(group_pairs(rows))
 }
 
 /// [`has_voted`]: one probe of the primary key's `poll_id, option_id`
