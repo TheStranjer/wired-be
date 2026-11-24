@@ -36,7 +36,7 @@ use uuid::Uuid;
 use crate::{
     error::AppError,
     jobs::{
-        AttemptInfo, HandlerFuture, JobError, QUEUE_SCHEDULED, parse_args, retry,
+        AttemptInfo, HandlerFuture, JobError, QUEUE_SCHEDULED, load_user, parse_args, retry,
         scheduler::PeriodicJob,
     },
     models::{
@@ -230,19 +230,13 @@ async fn publish_one(state: &AppState, row: &ScheduledStatus) -> Result<(), JobE
             .await;
         }
     };
-    let author = match user::get_by_id(&state.db, row.user_id).await {
-        Ok(Some(author)) => author,
-        Ok(None) => return drop_row(state, row, "the scheduling account is gone").await,
-        Err(err) => return Err(retry(PASS_JOB, &err)),
+    // An author who is gone or can no longer post means the row can never
+    // fire: the loader's discard is this job's drop-the-row arm.
+    let author = match load_user(state, row.user_id, "scheduled status", true).await {
+        Ok(author) => author,
+        Err(JobError::Discard(reason)) => return drop_row(state, row, &reason).await,
+        Err(other) => return Err(other),
     };
-    if author.deleted_at.is_some()
-        || matches!(
-            author.account_status(),
-            user::AccountStatus::Deactivated | user::AccountStatus::ApprovalPending
-        )
-    {
-        return drop_row(state, row, "the scheduling account can no longer post").await;
-    }
     publish_params(state, row, &author, params).await
 }
 
