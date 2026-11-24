@@ -32,16 +32,15 @@ const ACTIVITY_JSON: &str = "application/activity+json; charset=utf-8";
 /// The actor id of the instance actor on the test instance.
 const AP_ID: &str = "https://test.example/internal/fetch";
 /// Every key of an actor document that carries neither avatar nor banner:
-/// the same set `GET /users/{nickname}` serves, because the instance
-/// actor is built by the same renderer.
-const ACTOR_KEYS: [&str; 21] = [
+/// the set `GET /users/{nickname}` serves minus `featured`, which the
+/// instance actor has no collection for.
+const ACTOR_KEYS: [&str; 20] = [
     "@context",
     "alsoKnownAs",
     "attachment",
     "capabilities",
     "discoverable",
     "endpoints",
-    "featured",
     "followers",
     "following",
     "id",
@@ -135,7 +134,7 @@ async fn the_instance_actor_document_is_served_and_created_once() {
     assert_eq!(
         common::sorted_keys(&document),
         ACTOR_KEYS,
-        "the same builder as the user documents"
+        "the user document's key set, without featured"
     );
 
     let (count,): (i64,) = sqlx::query_as("SELECT count(*) FROM users WHERE nickname = $1")
@@ -158,6 +157,51 @@ async fn the_instance_actor_document_is_served_and_created_once() {
     assert!(
         password_hash.is_none(),
         "the instance actor has no password and cannot log in"
+    );
+}
+
+/// Every collection the instance actor advertises resolves to an empty
+/// `OrderedCollection`, and `featured` is not advertised at all; a normal
+/// user's actor still advertises its `featured` collection.
+#[tokio::test]
+async fn every_collection_the_instance_actor_advertises_resolves_empty() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let _alice = common::create_local_user(&pool, "alice").await;
+    let app = common::test_app(pool.clone());
+
+    let document = fetch_instance_actor(&app).await;
+    assert!(document.get("featured").is_none(), "no featured collection");
+
+    for field in ["outbox", "followers", "following"] {
+        let url = document[field].as_str().unwrap();
+        assert_eq!(url, format!("{AP_ID}/{field}"), "{field} address");
+        let path = url.strip_prefix(BASE).unwrap();
+        let response = common::TestRequest::get(path)
+            .header("accept", "application/activity+json")
+            .send(&app)
+            .await;
+        assert_eq!(response.status, StatusCode::OK, "{field} resolves");
+        assert_eq!(
+            response.header("content-type"),
+            Some(ACTIVITY_JSON),
+            "{field} is an ActivityPub document"
+        );
+        let collection = response.json_value();
+        assert_eq!(collection["id"], url, "{field} id");
+        assert_eq!(collection["type"], "OrderedCollection", "{field} type");
+        assert_eq!(collection["totalItems"], 0, "{field} is empty");
+        assert!(collection.get("first").is_none(), "{field} has no page");
+    }
+
+    let alice = common::TestRequest::get("/users/alice")
+        .header("accept", "application/activity+json")
+        .send(&app)
+        .await
+        .json_value();
+    assert_eq!(
+        alice["featured"], "https://test.example/users/alice/collections/featured",
+        "user actors are unchanged"
     );
 }
 
