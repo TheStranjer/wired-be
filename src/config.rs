@@ -175,6 +175,27 @@ impl Config {
         domain_of(&self.base_url)
     }
 
+    /// The lifetime of a freshly minted OAuth token:
+    /// [`oauth_token_ttl_secs`](Self::oauth_token_ttl_secs) as a
+    /// [`Duration`](std::time::Duration). On any target where the
+    /// `usize` could exceed `u64::MAX` the absurd upper bound is kept
+    /// rather than silently shortening the lifetime.
+    #[must_use]
+    pub fn oauth_token_ttl(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(u64::try_from(self.oauth_token_ttl_secs).unwrap_or(u64::MAX))
+    }
+
+    /// How long a password-reset token stays valid:
+    /// [`password_reset_ttl_secs`](Self::password_reset_ttl_secs) as a
+    /// [`Duration`](std::time::Duration), saturating like
+    /// [`oauth_token_ttl`](Self::oauth_token_ttl).
+    #[must_use]
+    pub fn password_reset_ttl(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(
+            u64::try_from(self.password_reset_ttl_secs).unwrap_or(u64::MAX),
+        )
+    }
+
     /// Whether [`base_url`](Self::base_url) uses the `https` scheme.
     #[must_use]
     pub fn is_https(&self) -> bool {

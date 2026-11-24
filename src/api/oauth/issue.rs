@@ -6,8 +6,6 @@
 //! consults before an account may act; the 200 body renders the fresh
 //! pair Pleroma's "token.json" shape.
 
-use std::time::Duration;
-
 use chrono::Utc;
 use serde::Serialize;
 use sqlx::{Executor, PgPool, Postgres};
@@ -105,7 +103,7 @@ pub(crate) fn check_account_ready(user: &User) -> Result<(), AppError> {
 /// # Errors
 ///
 /// Any database failure arrives as [`AppError::Database`].
-pub(super) async fn issue_token(
+pub(crate) async fn issue_token(
     state: &AppState,
     user: Option<&User>,
     app: &OauthApp,
@@ -130,17 +128,13 @@ pub(super) async fn issue_token_on<'e, E>(
 where
     E: Executor<'e, Database = Postgres>,
 {
-    // `OAUTH_TOKEN_TTL_SECS` is a `usize`; on any target where it could
-    // exceed `u64::MAX` the absurd upper bound fails the insert instead
-    // of silently shortening the lifetime.
-    let ttl_secs = u64::try_from(state.config.oauth_token_ttl_secs).unwrap_or(u64::MAX);
     oauth_token::create_token(
         executor,
         &NewToken {
             user_id: user.map(|user| user.id),
             app_id: app.id,
             scopes: scopes.to_string(),
-            ttl: Some(Duration::from_secs(ttl_secs)),
+            ttl: Some(state.config.oauth_token_ttl()),
         },
     )
     .await
@@ -152,23 +146,23 @@ where
 /// `client_credentials` token the `refresh_token` and `me` keys are left
 /// out of the JSON entirely.
 #[derive(Debug, Serialize)]
-pub(super) struct TokenResponse {
+pub(crate) struct TokenResponse {
     /// Token type, always `Bearer`.
     token_type: &'static str,
     /// The access token, to present as `Authorization: Bearer`.
     access_token: String,
-    /// The refresh token, to exchange for a fresh pair; absent for an
-    /// app-only token.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    refresh_token: Option<String>,
     /// The granted scopes, space-separated.
     scope: String,
     /// Issue time, in unix seconds (Pleroma's `format_created_at`).
     created_at: i64,
-    /// Seconds of validity left at render time.
-    expires_in: i64,
     /// The token row's `UUIDv7` id, hyphenated (decision 4).
     id: String,
+    /// Seconds of validity left at render time.
+    expires_in: i64,
+    /// The refresh token, to exchange for a fresh pair; absent for an
+    /// app-only token.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    refresh_token: Option<String>,
     /// The authenticated user's `ActivityPub` actor id; absent for an
     /// app-only token.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -179,21 +173,29 @@ impl TokenResponse {
     /// Renders the freshly minted `token`, owned by `user` — `None` for
     /// an app-only `client_credentials` token, which then serializes
     /// without `refresh_token` and `me`.
-    pub(super) fn new(token: OauthToken, user: Option<&User>) -> Self {
+    pub(crate) fn new(token: OauthToken, user: Option<&User>) -> Self {
         let owner = user.map(|user| user.ap_id.clone());
         Self {
             token_type: TOKEN_TYPE_BEARER,
             access_token: token.token,
-            refresh_token: owner.is_some().then_some(token.refresh_token),
             scope: token.scopes,
             created_at: token.inserted_at.timestamp(),
+            id: token.id.to_string(),
             expires_in: token
                 .valid_until
                 .signed_duration_since(Utc::now())
                 .num_seconds(),
-            id: token.id.to_string(),
+            refresh_token: owner.is_some().then_some(token.refresh_token),
             me: owner,
         }
+    }
+
+    /// This answer without its `me` key: the shape `POST /api/v1/accounts`
+    /// renders (Pleroma's `me` belongs to `/oauth/token` only).
+    #[must_use]
+    pub(crate) fn without_me(mut self) -> Self {
+        self.me = None;
+        self
     }
 }
 
@@ -433,6 +435,55 @@ mod tests {
             json.as_object().expect("an object").len(),
             6,
             "exactly the app-only documented keys"
+        );
+    }
+
+    #[test]
+    fn the_registration_shape_is_the_token_without_me() {
+        let token = token_row(new_id(), "read write follow push");
+        let user = user_row(true);
+        let json =
+            serde_json::to_value(TokenResponse::new(token, Some(&user)).without_me()).unwrap();
+        assert!(json.get("me").is_none(), "no actor id: {json}");
+        for key in [
+            "token_type",
+            "access_token",
+            "refresh_token",
+            "scope",
+            "created_at",
+            "id",
+            "expires_in",
+        ] {
+            assert!(json.get(key).is_some(), "`{key}` stays: {json}");
+        }
+        assert_eq!(
+            json.as_object().expect("an object").len(),
+            7,
+            "exactly the registration's seven keys"
+        );
+    }
+
+    #[test]
+    fn the_registration_keys_serialize_in_their_documented_order() {
+        let token = token_row(new_id(), "read");
+        let user = user_row(true);
+        let text =
+            serde_json::to_string(&TokenResponse::new(token, Some(&user)).without_me()).unwrap();
+        let positions: Vec<usize> = [
+            "token_type",
+            "access_token",
+            "scope",
+            "created_at",
+            "id",
+            "expires_in",
+            "refresh_token",
+        ]
+        .iter()
+        .map(|key| text.find(&format!("\"{key}\":")).expect("key present"))
+        .collect();
+        assert!(
+            positions.is_sorted(),
+            "the registration answer keeps its key order: {text}"
         );
     }
 }

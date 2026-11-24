@@ -36,7 +36,7 @@
 //! client-influenced text and must never break out of their attribute or
 //! element.
 
-use std::{fmt, time::Duration};
+use std::fmt;
 
 use axum::{
     Router,
@@ -159,7 +159,9 @@ async fn reset_page(
     State(state): State<AppState>,
     Path(token): Path<String>,
 ) -> AppResult<Html<String>> {
-    let page = match password_reset::get_valid(&state.db, &token, token_ttl(&state)).await? {
+    let page = match password_reset::get_valid(&state.db, &token, state.config.password_reset_ttl())
+        .await?
+    {
         Some(record) => match user::get_by_id(&state.db, record.user_id).await? {
             Some(target) => reset_form_page(Some(&target.nickname), &record.token, None),
             None => invalid_token_page(),
@@ -281,7 +283,9 @@ async fn reset_attempt(
     password: &str,
     confirmation: &str,
 ) -> AppResult<String> {
-    let Some(record) = password_reset::get_valid(&state.db, token, token_ttl(state)).await? else {
+    let Some(record) =
+        password_reset::get_valid(&state.db, token, state.config.password_reset_ttl()).await?
+    else {
         return Ok(reset_form_page(None, token, Some(INVALID_TOKEN)));
     };
     let Some(target) = user::get_by_id(&state.db, record.user_id).await? else {
@@ -327,13 +331,6 @@ async fn complete_reset(
     tx.commit().await?;
     debug!(account = %target.nickname, others, revoked, "password reset: tokens revoked");
     Ok(true)
-}
-
-/// The configured token window as a [`Duration`] — the same
-/// `usize`-seconds-to-`u64`-seconds shape the OAuth endpoints use for their
-/// TTL (see [`crate::api::oauth`]).
-fn token_ttl(state: &AppState) -> Duration {
-    Duration::from_secs(u64::try_from(state.config.password_reset_ttl_secs).unwrap_or(u64::MAX))
 }
 
 /// The "Invalid Token" page (Pleroma's `invalid_token.html.eex`): the
@@ -432,6 +429,8 @@ fn push_escaped(out: &mut String, text: &str) {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use serde_json::json;
 
     use super::*;

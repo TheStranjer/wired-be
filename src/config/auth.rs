@@ -222,6 +222,24 @@ mod tests {
     }
 
     #[test]
+    fn ttl_accessors_return_the_configured_seconds_as_durations() {
+        let config = config_with(&[
+            (OAUTH_TOKEN_TTL_SECS_VAR, "600"),
+            (PASSWORD_RESET_TTL_SECS_VAR, "1200"),
+        ]);
+        assert_eq!(
+            config.oauth_token_ttl().as_secs(),
+            600,
+            "the token lifetime"
+        );
+        assert_eq!(
+            config.password_reset_ttl().as_secs(),
+            1_200,
+            "the reset-token lifetime"
+        );
+    }
+
+    #[test]
     fn debug_shows_the_registration_settings() {
         let config = config_with(&[
             (ACCOUNTS_EMAIL_OPTIONAL_VAR, "true"),

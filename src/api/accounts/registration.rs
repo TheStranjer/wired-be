@@ -4,30 +4,16 @@
 //!
 //! [`register`]: super::register
 
-use chrono::Utc;
 use serde::{Deserialize, Serialize};
 
 use crate::{
+    api::oauth::issue::TokenResponse,
+    auth::{AWAITING_APPROVAL_ID, EMAIL_UNCONFIRMED_ID},
     extract::flex,
-    models::{
-        oauth_token::OauthToken,
-        user::{User, register::RegisterParams},
-    },
+    models::user::{User, register::RegisterParams},
 };
 
 use super::{REGISTERED_AWAITING_APPROVAL, REGISTERED_AWAITING_CONFIRMATION};
-
-/// `token_type` of the registration answer: issued tokens are bearer
-/// credentials, as on `/oauth/token` (see [`crate::api::oauth`]).
-const TOKEN_TYPE_BEARER: &str = "Bearer";
-
-/// The machine-readable identifier of an approval-pending registration and
-/// of every login that account attempts.
-const AWAITING_APPROVAL: &str = "awaiting_approval";
-
-/// The machine-readable identifier of an unconfirmed registration and of
-/// every login that account attempts.
-const MISSING_CONFIRMED_EMAIL: &str = "missing_confirmed_email";
 
 /// The request parameters of `POST /api/v1/accounts`, Pleroma's
 /// `AccountCreateRequest` (`lib/pleroma/web/api_spec/operations/
@@ -97,47 +83,6 @@ impl CreateAccountParams {
     }
 }
 
-/// The 200 body of a successful registration: the freshly minted user
-/// token in the shape Pleroma's "token.json" view renders on this
-/// endpoint (its `me` key belongs to `/oauth/token`; the registration
-/// ticket's response does not carry it).
-#[derive(Debug, Serialize)]
-pub(super) struct RegistrationToken {
-    /// Token type, always `Bearer`.
-    token_type: &'static str,
-    /// The access token, to present as `Authorization: Bearer`.
-    access_token: String,
-    /// The granted scopes, space-separated — the presenting token's.
-    scope: String,
-    /// Issue time, in unix seconds (Pleroma's `format_created_at`).
-    created_at: i64,
-    /// The token row's `UUIDv7` id, hyphenated (decision 4).
-    id: String,
-    /// Seconds of validity left at render time.
-    expires_in: i64,
-    /// The refresh token, to exchange for a fresh pair.
-    refresh_token: String,
-}
-
-impl RegistrationToken {
-    /// Renders the freshly minted `token` (always user-bound here, so
-    /// `refresh_token` is always in).
-    pub(super) fn new(token: OauthToken) -> Self {
-        Self {
-            token_type: TOKEN_TYPE_BEARER,
-            access_token: token.token,
-            scope: token.scopes,
-            created_at: token.inserted_at.timestamp(),
-            id: token.id.to_string(),
-            expires_in: token
-                .valid_until
-                .signed_duration_since(Utc::now())
-                .num_seconds(),
-            refresh_token: token.refresh_token,
-        }
-    }
-}
-
 /// The 200 body of a registration whose account may not log in yet: Pleroma's
 /// `create` answer for `{:account_status, :approval_pending}` and
 /// `{:account_status, :confirmation_pending}` — a human-facing `message`
@@ -148,8 +93,8 @@ pub(super) struct RegistrationMessage {
     /// [`REGISTERED_AWAITING_APPROVAL`] and
     /// [`REGISTERED_AWAITING_CONFIRMATION`].
     message: &'static str,
-    /// Why the registration has no token: [`AWAITING_APPROVAL`] or
-    /// [`MISSING_CONFIRMED_EMAIL`].
+    /// Why the registration has no token: [`AWAITING_APPROVAL_ID`] or
+    /// [`EMAIL_UNCONFIRMED_ID`].
     identifier: &'static str,
 }
 
@@ -161,8 +106,9 @@ pub(super) struct RegistrationMessage {
 #[derive(Debug, Serialize)]
 #[serde(untagged)]
 pub(super) enum RegistrationAnswer {
-    /// The token JSON of a ready account.
-    Ready(RegistrationToken),
+    /// The token JSON of a ready account: the `/oauth/token` answer
+    /// without its `me` key ([`TokenResponse::without_me`]).
+    Ready(TokenResponse),
     /// The `message`/`identifier` pair of an account that first has to be
     /// approved, confirmed, or both.
     Pending(RegistrationMessage),
@@ -179,13 +125,13 @@ impl RegistrationMessage {
         if user.approval_pending.get() {
             return Some(Self {
                 message: REGISTERED_AWAITING_APPROVAL,
-                identifier: AWAITING_APPROVAL,
+                identifier: AWAITING_APPROVAL_ID,
             });
         }
         if !user.email_confirmed.get() {
             return Some(Self {
                 message: REGISTERED_AWAITING_CONFIRMATION,
-                identifier: MISSING_CONFIRMED_EMAIL,
+                identifier: EMAIL_UNCONFIRMED_ID,
             });
         }
         None
@@ -194,13 +140,14 @@ impl RegistrationMessage {
 
 #[cfg(test)]
 mod tests {
+    use chrono::Utc;
     use serde_json::{Value, json};
     use uuid::Uuid;
 
     use crate::{
         api::accounts::test_support::stored_user,
         error::{AppError, AppResult},
-        models::user::Flag,
+        models::{oauth_token::OauthToken, user::Flag},
     };
 
     use super::*;
@@ -212,7 +159,7 @@ mod tests {
     }
 
     /// A stored-looking token row minted right now, for the
-    /// [`RegistrationToken`] render.
+    /// registration answer's render.
     fn minted_token() -> OauthToken {
         let now = Utc::now();
         OauthToken {
@@ -339,7 +286,9 @@ mod tests {
         let stored = minted_token();
         let expected_id = stored.id;
         let expected_created = stored.inserted_at.timestamp();
-        let body = serde_json::to_value(RegistrationToken::new(stored)).unwrap();
+        let body =
+            serde_json::to_value(TokenResponse::new(stored, Some(&stored_user())).without_me())
+                .unwrap();
         assert_eq!(body["token_type"], "Bearer", "bearer credentials");
         assert_eq!(body["access_token"], "access-secret", "the access token");
         assert_eq!(body["refresh_token"], "refresh-secret", "the refresh token");
@@ -395,7 +344,7 @@ mod tests {
             approval,
             json!({
                 "message": REGISTERED_AWAITING_APPROVAL,
-                "identifier": AWAITING_APPROVAL,
+                "identifier": "awaiting_approval",
             }),
             "the approval answer, with no token keys beside it"
         );
@@ -413,7 +362,7 @@ mod tests {
             confirmation,
             json!({
                 "message": REGISTERED_AWAITING_CONFIRMATION,
-                "identifier": MISSING_CONFIRMED_EMAIL,
+                "identifier": "missing_confirmed_email",
             }),
             "the confirmation answer"
         );
@@ -424,7 +373,7 @@ mod tests {
         let both = RegistrationMessage::for_user(&registered(Flag::new(true), Flag::new(false)))
             .expect("both wait");
         assert_eq!(
-            both.identifier, AWAITING_APPROVAL,
+            both.identifier, AWAITING_APPROVAL_ID,
             "an account waiting on staff and on its mailbox is told about staff"
         );
         assert_eq!(
@@ -435,9 +384,9 @@ mod tests {
 
     #[test]
     fn the_registration_answer_serializes_either_arm_without_a_wrapper() {
-        let ready = serde_json::to_value(RegistrationAnswer::Ready(RegistrationToken::new(
-            minted_token(),
-        )))
+        let ready = serde_json::to_value(RegistrationAnswer::Ready(
+            TokenResponse::new(minted_token(), Some(&stored_user())).without_me(),
+        ))
         .expect("the token arm");
         assert!(
             ready["access_token"].is_string() && ready["message"].is_null(),
@@ -445,12 +394,11 @@ mod tests {
         );
         let pending = serde_json::to_value(RegistrationAnswer::Pending(RegistrationMessage {
             message: REGISTERED_AWAITING_CONFIRMATION,
-            identifier: MISSING_CONFIRMED_EMAIL,
+            identifier: EMAIL_UNCONFIRMED_ID,
         }))
         .expect("the message arm");
         assert!(
-            pending.get("access_token").is_none()
-                && pending["identifier"] == MISSING_CONFIRMED_EMAIL,
+            pending.get("access_token").is_none() && pending["identifier"] == EMAIL_UNCONFIRMED_ID,
             "the message is written bare, with no credential in it: {pending}"
         );
     }
