@@ -68,9 +68,11 @@ const REBLOGGED_IDS_SQL: &str = "SELECT reblog_of_id FROM statuses
 /// on. The text stops where its one placeholder belongs, because that is
 /// where [`reblogger_page`] pushes its bind; the live-row and distributable
 /// visibility filters and the keyset then run on the reblog row `s`.
+/// Deactivated accounts (`u.is_active` false) are left out, the way
+/// Mastodon's `without_suspended` scope drops them.
 pub(super) const REBLOGGERS_PAGE_SQL: &str = "SELECT s.id AS reblog_id, u.* FROM statuses s
      JOIN users u ON u.id = s.user_id
-      WHERE s.reblog_of_id = ";
+      WHERE u.is_active AND s.reblog_of_id = ";
 
 /// Records `user`'s reblog of `original` at `visibility` and answers the
 /// reblog row with a flag saying whether this call wrote it.
