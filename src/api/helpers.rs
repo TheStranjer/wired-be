@@ -48,7 +48,7 @@ use crate::{
 
 mod visible;
 
-pub use visible::{keyed_json, render_visible};
+pub use visible::{FilteredStatuses, keyed_json, render_filtered, render_visible};
 
 /// The `RESTRICT_UNAUTHENTICATED` area that closes anonymous reads of a
 /// local status.
