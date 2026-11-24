@@ -415,20 +415,14 @@ fn totp_matches(user: &User, code: &str) -> bool {
 
 /// Spends a backup code: when the SHA-256 of `code` matches one of the
 /// stored hashes, that hash comes off the list — the code works exactly
-/// once — and the settings are saved.
+/// once, even across concurrent challenges, because [`mfa::consume_backup_code`]
+/// removes it in a single atomic statement.
 ///
 /// # Errors
 ///
 /// Any database failure arrives as [`AppError::Database`].
 async fn consume_backup_code(state: &AppState, user: &User, code: &str) -> AppResult<bool> {
-    let mut settings = mfa::MfaSettings::for_user(user);
-    let hash = totp::hash_backup_code(code);
-    let matched = settings.backup_codes.contains(&hash);
-    if matched {
-        settings.backup_codes.retain(|stored| *stored != hash);
-        mfa::save(&state.db, user.id, &settings).await?;
-    }
-    Ok(matched)
+    mfa::consume_backup_code(&state.db, user.id, &totp::hash_backup_code(code)).await
 }
 
 /// The request parameters of `POST /oauth/mfa/challenge`. Every field is
