@@ -7,8 +7,8 @@
 //! inside an `Arc` (no external crate), keyed by bucket name plus the
 //! request's subject — the authenticated user id when the request presents
 //! a valid bearer token, else the client IP. Expired windows are pruned
-//! whenever a new key is inserted, so the map only ever holds live
-//! windows.
+//! when a new key is inserted, at most once a second, and past a soft cap
+//! of held windows new subjects are refused as throttled.
 //!
 //! [`rate_limit`] builds the axum middleware layer for one bucket through
 //! [`axum::middleware::from_fn_with_state`]; area routers wrap their
