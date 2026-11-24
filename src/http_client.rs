@@ -68,10 +68,16 @@ pub fn user_agent(base_url: &str, contact_email: Option<&str>) -> String {
 
 /// The shared outbound HTTP client. Cloning is cheap: every clone drives
 /// the same `reqwest` connection pool.
-#[derive(Clone, Debug, Default)]
+///
+/// There is deliberately no `Default`: every constructor goes through
+/// [`HttpClient::new`] or `From<&Config>`, so no client can exist without
+/// the SSRF guard's connect-time halves.
+#[derive(Clone, Debug)]
 pub struct HttpClient {
-    /// The wrapped `reqwest` client.
-    inner: Client,
+    /// The wrapped `reqwest` client, or [`None`] when `reqwest` rejected
+    /// every configuration. A client without the pinned resolver and the
+    /// redirect policy is never substituted: requests fail instead.
+    inner: Option<Client>,
     /// The SSRF guard, or [`None`] when private hosts are allowed (see
     /// `HTTP_ALLOW_PRIVATE_HOSTS`): pre-flight URL checks consult it, while
     /// connect-time and redirect-time checks are baked into `inner`'s
@@ -132,6 +138,17 @@ impl HttpClient {
         Self::configured(Some(user_agent), true, total, MAX_REDIRECTS)
     }
 
+    /// Test-only client whose `reqwest` build failed: no inner client, with
+    /// the SSRF guard enabled or not per `guarded`.
+    #[cfg(test)]
+    #[must_use]
+    fn unavailable(guarded: bool) -> Self {
+        Self {
+            inner: None,
+            ssrf: guarded.then_some(ssrf::SsrfGuard),
+        }
+    }
+
     /// Assembles the real client for the given knobs, degrading in two
     /// steps rather than panicking if `reqwest` rejects the configuration
     /// (which only happens for a `User-Agent` no header value can carry).
@@ -147,9 +164,9 @@ impl HttpClient {
                 error!(%err, "outbound client rejected its User-Agent; rebuilding without it");
                 Self::try_configured(None, allow_private, total, max_redirects).unwrap_or_else(
                     |fallback| {
-                        error!(%fallback, "outbound client rejected its configuration; using reqwest defaults");
+                        error!(%fallback, "outbound client rejected its configuration; outbound requests will fail");
                         Self {
-                            inner: Client::default(),
+                            inner: None,
                             ssrf: (!allow_private).then_some(ssrf::SsrfGuard),
                         }
                     },
@@ -186,7 +203,7 @@ impl HttpClient {
                 .build()?
         };
         Ok(Self {
-            inner,
+            inner: Some(inner),
             ssrf: (!allow_private).then_some(ssrf::SsrfGuard),
         })
     }
@@ -268,8 +285,10 @@ impl HttpClient {
     ///
     /// [`HttpError::InvalidUrl`] for a non-`http(s)` or unparsable URL,
     /// [`HttpError::Connect`] if a header name or value is one HTTP cannot
-    /// represent, since such a request could never leave this process, and
-    /// [`HttpError::Blocked`] when the SSRF guard refuses the target.
+    /// represent, since such a request could never leave this process,
+    /// [`HttpError::Blocked`] when the SSRF guard refuses the target, and
+    /// [`HttpError::Connect`] when no `reqwest` client could be built at
+    /// all (`inner` is [`None`]).
     async fn build_request(
         &self,
         method: Method,
@@ -282,8 +301,10 @@ impl HttpClient {
         if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
             return Err(HttpError::InvalidUrl);
         }
-        let builder = self
-            .inner
+        let Some(inner) = &self.inner else {
+            return Err(HttpError::Connect("outbound client unavailable".to_owned()));
+        };
+        let builder = inner
             .request(method, parsed.as_str())
             .headers(header_map(headers)?);
         if let Some(guard) = &self.ssrf {
@@ -421,6 +442,38 @@ mod tests {
             "a degraded client still blocks loopback, got {result:?}"
         );
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn unavailable_client_fails_every_verb_without_a_default_client() {
+        let guarded = HttpClient::unavailable(true);
+        let unguarded = HttpClient::unavailable(false);
+        let expected = HttpError::Connect("outbound client unavailable".to_owned());
+
+        for client in [&guarded, &unguarded] {
+            let got = client.get_limited("https://example.com/", &[], 1024).await;
+            assert_eq!(got.err(), Some(expected.clone()), "get_limited");
+            let posted = client
+                .post_bytes("https://example.com/", &[], Vec::new(), 1024)
+                .await;
+            assert_eq!(posted.err(), Some(expected.clone()), "post_bytes");
+            let other = client
+                .request(Method::DELETE, "https://example.com/", &[], 1024)
+                .await;
+            assert_eq!(other.err(), Some(expected.clone()), "request");
+        }
+    }
+
+    #[tokio::test]
+    async fn unavailable_client_still_rejects_invalid_urls_first() {
+        let result = HttpClient::unavailable(true)
+            .get_limited("ftp://example.com/", &[], 1024)
+            .await;
+
+        assert!(
+            matches!(result, Err(HttpError::InvalidUrl)),
+            "URL validation precedes the missing-client error, got {result:?}"
+        );
     }
 
     #[tokio::test]
