@@ -34,6 +34,7 @@ use uuid::Uuid;
 use crate::{
     config::Config,
     error::{AppError, AppResult},
+    util::media_type::essence,
 };
 
 /// Bytes behind the random part of a media key: 8 bytes are 16 hex characters.
@@ -280,14 +281,10 @@ fn extension_for(content_type: &str, filename: Option<&str>) -> String {
 /// The canonical extension of `content_type`, ignoring any `; charset=…`
 /// parameters and letter case; `None` for a type [`MEDIA_TYPES`] does not list.
 fn extension_for_media_type(content_type: &str) -> Option<&'static str> {
-    let media_type = content_type
-        .split(';')
-        .next()
-        .unwrap_or(content_type)
-        .trim();
+    let media_type = essence(content_type);
     MEDIA_TYPES
         .iter()
-        .find(|(known, _)| known.eq_ignore_ascii_case(media_type))
+        .find(|(known, _)| known.eq_ignore_ascii_case(&media_type))
         .map(|(_, extension)| *extension)
 }
 

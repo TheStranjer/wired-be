@@ -39,8 +39,9 @@ use serde::de::DeserializeOwned;
 use crate::{
     config::Config,
     error::AppError,
-    extract::{body_value, into_params, media_type_of, parse_pairs},
+    extract::{body_value, into_params, parse_pairs},
     state::AppState,
+    util::media_type::essence,
 };
 
 /// Media type of a multipart request body.
@@ -147,7 +148,7 @@ fn is_multipart(headers: &HeaderMap) -> bool {
     headers
         .get(CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
-        .is_some_and(|content_type| media_type_of(content_type) == MULTIPART_MIME)
+        .is_some_and(|content_type| essence(content_type) == MULTIPART_MIME)
 }
 
 /// Drains the multipart `stream`, splitting it into the text fields'

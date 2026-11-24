@@ -11,7 +11,8 @@
 //! as one reaction emoji in [`emoji`], the HMAC-SHA256 helpers in [`mod@hmac`]
 //! and the XML escaper in [`xml`].
 //! Time-expiring in-memory values go through [`cache`], and the `http(s)` URL
-//! checks every origin, signing and delivery guard shares live in [`mod@url`].
+//! checks every origin, signing and delivery guard shares live in [`mod@url`],
+//! and the one `Content-Type` media-type parser in [`media_type`].
 
 pub mod cache;
 pub mod emoji;
@@ -21,6 +22,7 @@ pub mod headers;
 pub mod hmac;
 pub mod id;
 pub mod keys;
+pub mod media_type;
 pub mod password;
 pub mod sanitize;
 pub mod time;
