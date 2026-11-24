@@ -35,6 +35,21 @@ async fn quote(
     .expect("a quote of a stored status inserts")
 }
 
+/// A followers-only post by `author`, straight through the model — the
+/// quoted original an anonymous viewer may not reach.
+async fn private_post(pool: &PgPool, author: &User) -> StatusRow {
+    insert(
+        pool,
+        BASE,
+        &NewStatus {
+            visibility: Visibility::Private,
+            ..NewStatus::local(author, "followers only")
+        },
+    )
+    .await
+    .expect("a private post inserts")
+}
+
 /// The quoting ticket's nested render inside the fixed query set: the
 /// batch's one visibility read decides which quoted originals render,
 /// a quote nests exactly one level deep, an invisible one leaves
@@ -50,16 +65,7 @@ async fn the_quote_nests_from_the_batch_with_its_visibility_read() {
     let carol = user(&pool, "carol").await;
     let source = post(&pool, &bob, "the source").await;
     let public_quote = quote(&pool, &carol, &source, Visibility::Public).await;
-    let secret = insert(
-        &pool,
-        BASE,
-        &NewStatus {
-            visibility: Visibility::Private,
-            ..NewStatus::local(&alice, "followers only")
-        },
-    )
-    .await
-    .expect("a private post inserts");
+    let secret = private_post(&pool, &alice).await;
     // C ← B (alice's private quote) ← A (carol's public quote of B):
     // the depth chain, seeded past the endpoint's quotability rule.
     let deep = quote(&pool, &alice, &secret, Visibility::Private).await;
@@ -75,18 +81,20 @@ async fn the_quote_nests_from_the_batch_with_its_visibility_read() {
         source.id.to_string(),
         "the hyphenated id of the quoted row (decision 4)"
     );
-    assert_eq!(open["quote"]["id"], source.id.to_string());
+    assert_eq!(open["quote"]["state"], "accepted");
+    let quoted = &open["quote"]["quoted_status"];
+    assert_eq!(quoted["id"], source.id.to_string());
     assert_eq!(
-        open["quote"]["content"], "<p>the source</p>",
+        quoted["content"], "<p>the source</p>",
         "the nested entity is the quoted row's own render"
     );
     assert_eq!(
-        open["quote"]["account"]["acct"], "bob",
+        quoted["account"]["acct"], "bob",
         "the quote's author rode the page's user read"
     );
     assert_eq!(
-        open["pleroma"]["quote"], open["quote"],
-        "the pleroma mirror is the same object"
+        open["pleroma"]["quote"], *quoted,
+        "the pleroma mirror is the bare quoted status"
     );
     assert_eq!(open["pleroma"]["quote_visible"], json!(true));
 
@@ -95,18 +103,19 @@ async fn the_quote_nests_from_the_batch_with_its_visibility_read() {
         .expect("the chain renders for alice")
         .expect("and answers");
     let owned = serde_json::to_value(&for_owner).expect("it serializes");
+    let owned_quoted = &owned["quote"]["quoted_status"];
     assert_eq!(
-        owned["quote"]["id"],
+        owned_quoted["id"],
         deep.id.to_string(),
         "alice sees her own private quote nested even though it is private"
     );
     assert_eq!(
-        owned["quote"]["quote"],
-        Value::Null,
-        "depth 1: the quoted status's own quote never renders"
+        owned_quoted["quote"],
+        json!({ "state": "accepted", "quoted_status_id": secret.id.to_string() }),
+        "depth 1: the quoted status's own quote is only a reference"
     );
-    assert_eq!(owned["quote"]["quote_id"], secret.id.to_string());
-    assert_eq!(owned["quote"]["pleroma"]["quote_visible"], json!(false));
+    assert_eq!(owned_quoted["quote_id"], secret.id.to_string());
+    assert_eq!(owned_quoted["pleroma"]["quote_visible"], json!(false));
 
     let anonymous_chain = render_status(&state, ViewerMode::ANONYMOUS, &chain)
         .await
@@ -120,7 +129,7 @@ async fn the_quote_nests_from_the_batch_with_its_visibility_read() {
     );
     assert_eq!(
         quiet["quote"],
-        Value::Null,
+        json!({ "state": "unauthorized", "quoted_status": null }),
         "alice's private row is invisible to the anonymous viewer"
     );
     assert_eq!(quiet["pleroma"]["quote"], Value::Null);
@@ -140,16 +149,7 @@ async fn the_admin_view_nests_a_quote_its_viewer_cannot_reach() {
     let state = test_state(&pool);
     let alice = user(&pool, "alice").await;
     let root = user(&pool, "root").await;
-    let secret = insert(
-        &pool,
-        BASE,
-        &NewStatus {
-            visibility: Visibility::Private,
-            ..NewStatus::local(&alice, "followers only")
-        },
-    )
-    .await
-    .expect("a private post inserts");
+    let secret = private_post(&pool, &alice).await;
     let quoting = quote(&pool, &alice, &secret, Visibility::Public).await;
 
     let anonymous_row = render_status(&state, ViewerMode::ANONYMOUS, &quoting)
@@ -159,7 +159,7 @@ async fn the_admin_view_nests_a_quote_its_viewer_cannot_reach() {
     let anonymous = serde_json::to_value(&anonymous_row).expect("it serializes");
     assert_eq!(
         anonymous["quote"],
-        Value::Null,
+        json!({ "state": "unauthorized", "quoted_status": null }),
         "an anonymous viewer may not reach alice's private quote"
     );
     assert_eq!(anonymous["pleroma"]["quote_visible"], json!(false));
@@ -170,7 +170,7 @@ async fn the_admin_view_nests_a_quote_its_viewer_cannot_reach() {
         .expect("and answers");
     let seen = serde_json::to_value(&staff_row).expect("it serializes");
     assert_eq!(
-        seen["quote"]["id"],
+        seen["quote"]["quoted_status"]["id"],
         secret.id.to_string(),
         "the admin view admits the private quote and nests it"
     );

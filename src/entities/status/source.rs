@@ -26,6 +26,41 @@ use super::PleromaMetadata;
 #[cfg(doc)]
 use crate::entities::account::Account;
 
+/// What a batch found behind a row's `quote_of_id`.
+///
+/// The `Linked*` variants are for a row that is itself rendered inside
+/// another's quote: one level deep only the reference to its own quote
+/// (`state` and `quoted_status_id`) is emitted, as Pleroma does. The
+/// batch only loads the quote targets of the page's own rows, so a
+/// nested reference can tell a hidden target from a visible one but
+/// never a deleted one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum QuoteSlot {
+    /// The quoted status is visible to the viewer; its serialized
+    /// one-level-deep render.
+    Visible(Value),
+    /// The quoted row exists but the viewer may not see it.
+    Hidden,
+    /// The quoted row is gone.
+    Deleted,
+    /// Nested reference to a quote the viewer may see (`accepted`).
+    Linked,
+    /// Nested reference to a quote hidden from the viewer
+    /// (`unauthorized`).
+    LinkedHidden,
+}
+
+impl QuoteSlot {
+    /// The serialized quoted status, only for [`QuoteSlot::Visible`].
+    #[must_use]
+    pub fn into_rendered(self) -> Option<Value> {
+        match self {
+            Self::Visible(rendered) => Some(rendered),
+            Self::Hidden | Self::Deleted | Self::Linked | Self::LinkedHidden => None,
+        }
+    }
+}
+
 /// One row plus every batch-loaded part its render needs, gathered by
 /// [`crate::services::render_status`] with one query per part for the
 /// whole page (no N+1).
@@ -129,15 +164,16 @@ pub struct StatusSource<'a> {
     /// answering `pleroma.direct_conversation_id`. An anonymous viewer has
     /// no rows and so no participation.
     pub direct_participation: Option<Uuid>,
-    /// The quoted original as the batch rendered it for this viewer,
-    /// already serialized to JSON: [`crate::services::render_status`]'s
-    /// nested quote render handed over so this layer stays pure
-    /// (decision 3), one level deep — the quoted status's own quote was
-    /// forced `null` there. `None` when the row quotes nothing or its
-    /// viewer may not see what it quotes; it renders top-level
-    /// [`quote`](Status::quote) and `pleroma.quote` `null`, with
-    /// `pleroma.quote_visible` false beside them.
-    pub quote: Option<Value>,
+    /// What the batch found behind this row's quote, as a [`QuoteSlot`]:
+    /// [`crate::services::render_status`]'s nested quote render handed
+    /// over so this layer stays pure (decision 3), one level deep — the
+    /// quoted status's own quote is only a [`QuoteSlot::Linked`]
+    /// reference. `None` when the row quotes nothing (a row that does
+    /// quote but carries `None` renders as a deleted quote). Feeds the
+    /// Mastodon [`quote`](Status::quote) object; only a
+    /// [`QuoteSlot::Visible`] feeds `pleroma.quote`, whose
+    /// `pleroma.quote_visible` is exactly that slot's presence.
+    pub quote: Option<QuoteSlot>,
     /// The already-rendered original, boxed, when [`row`](Self::row) is
     /// a reblog; `None` for anything else. The nested entity is rendered
     /// from the original's own `StatusSource`, one level deep — Pleroma's
