@@ -6,7 +6,7 @@ use serde::Deserialize;
 
 use tracing::debug;
 
-use super::{AREA_BACKUPS, CLASS_WRITE, MISSING_NICKNAME, frontends::first_of};
+use super::{AREA_BACKUPS, CLASS_WRITE, MISSING_NICKNAME};
 use crate::{
     auth::admin::AdminUser,
     entities::backup::Backup,
@@ -43,7 +43,12 @@ pub(super) async fn create_backup(
     ApiBody(body): ApiBody<BackupBody>,
 ) -> AppResult<Json<Vec<Backup>>> {
     admin.require(CLASS_WRITE, AREA_BACKUPS)?;
-    let Some(nickname) = first_of(body.nickname.as_deref(), None) else {
+    let Some(nickname) = body
+        .nickname
+        .as_deref()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+    else {
         return Err(AppError::BadRequest(MISSING_NICKNAME.to_owned()));
     };
     let target = get_by_nickname(&state.db, nickname)

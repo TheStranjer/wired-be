@@ -1,16 +1,13 @@
 //! Admin ops endpoints over HTTP (`/api/v1/pleroma/admin/…`, WBE-208): the
 //! media-proxy cache ledger (`media_proxy_caches`, its `delete` and `purge`
-//! actions, the optional `PURGE` forwarding), the frontends catalogue and
-//! installer (`frontends`, `frontends/install`), and the admin backup
-//! trigger (`backups`) — against the real router, through mock upstream,
-//! archive and cache servers on loopback.
+//! actions, the optional `PURGE` forwarding) and the admin backup trigger
+//! (`backups`) — against the real router, through mock upstream and cache
+//! servers on loopback. Pleroma's frontend routes are not ported and fall
+//! through to the JSON 404.
 
 #![cfg(test)]
 
-use std::{
-    io::{Cursor, Write as _},
-    sync::{Arc, Mutex},
-};
+use std::sync::{Arc, Mutex};
 
 use axum::{
     Router,
@@ -24,7 +21,7 @@ use sqlx::PgPool;
 use tempfile::TempDir;
 use tokio::net::TcpListener;
 use wired_be::{
-    config::{Config, FrontendConfig, FrontendSettings},
+    config::Config,
     models::user::{Flag, NewUser},
     services::media_proxy,
 };
@@ -54,24 +51,6 @@ fn ops_config(purge_url: Option<&str>) -> Config {
     .expect("the fixed admin-ops test config is valid")
 }
 
-/// [`ops_config`] with `FRONTENDS_DIR` moved to `dir` and one installable
-/// frontend configured: `pleroma-fe` at ref `main`, its `dist` subtree
-/// built from `build_url`.
-fn frontend_config(dir: &std::path::Path, build_url: &str) -> Config {
-    let mut config = ops_config(None);
-    config.statics.frontends = FrontendSettings {
-        dir: dir.to_path_buf(),
-        available: vec![FrontendConfig {
-            name: "pleroma-fe".to_owned(),
-            git: Some("https://example.com/pleroma-fe".to_owned()),
-            build_url: Some(build_url.to_owned()),
-            reference: Some("main".to_owned()),
-            build_dir: Some("dist".to_owned()),
-        }],
-    };
-    config
-}
-
 /// Binds `app` on loopback and returns its origin; the task lives for the
 /// rest of the test runtime, as the fetching endpoints need it to.
 async fn serve(app: Router) -> String {
@@ -99,59 +78,6 @@ async fn upstream_media() -> Response {
         Bytes::from_static(CACHED),
     )
         .into_response()
-}
-
-/// The mock build server: its known archives and the request lines it saw.
-#[derive(Debug)]
-struct ArchiveServer {
-    /// The archives by request path (`/name.zip`).
-    archives: Vec<(String, Vec<u8>)>,
-    /// Every `"{METHOD} {path}"` line the server answered.
-    asked: Arc<Mutex<Vec<String>>>,
-}
-
-impl ArchiveServer {
-    /// The bytes of the archive stored under `path`, if any.
-    fn archive_at(&self, path: &str) -> Option<Vec<u8>> {
-        self.archives
-            .iter()
-            .find(|(name, _)| name == path)
-            .map(|(_, bytes)| bytes.clone())
-    }
-}
-
-/// A mock build server: every `GET` answers the archive stored under its
-/// path (404 for no path it knows) and every request line is recorded.
-async fn spawn_archive_server(archives: Vec<(&str, Vec<u8>)>) -> (String, Arc<Mutex<Vec<String>>>) {
-    let server = Arc::new(ArchiveServer {
-        archives: archives
-            .into_iter()
-            .map(|(name, bytes)| (format!("/{name}"), bytes))
-            .collect(),
-        asked: Arc::new(Mutex::new(Vec::new())),
-    });
-    let app = Router::new()
-        .fallback(record_and_serve)
-        .with_state(Arc::clone(&server));
-    let origin = serve(app).await;
-    (origin, Arc::clone(&server.asked))
-}
-
-/// Records the request line and answers the matching archive.
-async fn record_and_serve(
-    State(server): State<Arc<ArchiveServer>>,
-    method: Method,
-    uri: Uri,
-) -> Response {
-    server
-        .asked
-        .lock()
-        .unwrap()
-        .push(format!("{method} {}", uri.path()));
-    server.archive_at(uri.path()).map_or_else(
-        || StatusCode::NOT_FOUND.into_response(),
-        |bytes| ([(header::CONTENT_TYPE, "application/zip")], bytes).into_response(),
-    )
 }
 
 /// The mock CDN cache: records every request line and always accepts it.
@@ -215,21 +141,6 @@ async fn caches(app: &Router, token: &str, query: &str) -> Value {
         .await;
     common::assert_answer(&response, StatusCode::OK, "the cache listing reads");
     response.json_value()
-}
-
-/// A zip holding `files` as `(entry name, contents)`.
-fn zip_bytes(files: &[(&str, &[u8])]) -> Vec<u8> {
-    let mut buffer = Vec::new();
-    {
-        let mut writer = zip::ZipWriter::new(Cursor::new(&mut buffer));
-        let options = zip::write::SimpleFileOptions::default();
-        for (name, contents) in files {
-            writer.start_file(*name, options).unwrap();
-            writer.write_all(contents).unwrap();
-        }
-        let _closed = writer.finish().unwrap();
-    }
-    buffer
 }
 
 #[tokio::test]
@@ -426,7 +337,7 @@ async fn the_admin_ops_routes_guard_their_scopes() {
     );
     common::assert_error(&unauthenticated, "Invalid credentials", "no token at all");
 
-    let not_admin = common::TestRequest::get(&format!("{ADMIN}/frontends"))
+    let not_admin = common::TestRequest::get(&format!("{ADMIN}/media_proxy_caches"))
         .bearer(&user_token)
         .send(&app)
         .await;
@@ -488,286 +399,49 @@ async fn the_admin_ops_routes_guard_their_scopes() {
     );
 }
 
+/// Pleroma's frontend installer routes are not ported: even a full-scope
+/// admin gets the app-wide JSON 404 from the fallback, never a handler.
 #[tokio::test]
-async fn frontends_list_the_catalogue_with_their_installed_flag() {
-    let dir = TempDir::new().unwrap();
-    std::fs::create_dir_all(dir.path().join("pleroma-fe/main")).unwrap();
+async fn the_frontend_routes_fall_through_to_the_api_fallback() {
     let db = common::test_db().await;
     let pool = db.pool().clone();
-    let app = common::test_app_with_config(
-        pool.clone(),
-        frontend_config(dir.path(), "https://build.invalid/fe.zip"),
-    );
-    let token = admin_token(&pool, "fe-reader", "admin:read").await;
+    let app = common::test_app_with_config(pool.clone(), ops_config(None));
+    let token = admin_token(&pool, "fe-gone", "admin:read admin:write").await;
 
-    let response = common::TestRequest::get(&format!("{ADMIN}/frontends"))
+    let listing = common::TestRequest::get(&format!("{ADMIN}/frontends"))
         .bearer(&token)
         .send(&app)
         .await;
-    common::assert_answer(&response, StatusCode::OK, "the catalogue reads");
-    let body = response.json_value();
-    let frontends = body.as_array().expect("the answer is an array");
-    assert_eq!(frontends.len(), 1, "exactly the configured entries");
+    common::assert_answer(&listing, StatusCode::NOT_FOUND, "the frontend listing");
+    common::assert_error(&listing, "Not implemented", "the frontend listing");
     assert_eq!(
-        frontends[0],
-        json!({
-            "name": "pleroma-fe",
-            "git": "https://example.com/pleroma-fe",
-            "build_url": "https://build.invalid/fe.zip",
-            "ref": "main",
-            "installed": true,
-        })
+        listing.header("x-wired-fallback"),
+        Some("1"),
+        "the fallback answers the listing"
     );
 
-    // Removing the ref directory flips the flag back.
-    std::fs::remove_dir_all(dir.path().join("pleroma-fe/main")).unwrap();
-    let relisted = common::TestRequest::get(&format!("{ADMIN}/frontends"))
-        .bearer(&token)
-        .send(&app)
-        .await;
-    assert_eq!(relisted.json_value()[0]["installed"], json!(false));
-}
-
-#[tokio::test]
-async fn frontend_installs_download_extract_and_land_a_build() {
-    let dir = TempDir::new().unwrap();
-    let (server, asked) = spawn_archive_server(vec![
-        (
-            "fe-main.zip",
-            zip_bytes(&[
-                ("dist/index.html", b"<!doctype html>fe".as_slice()),
-                ("dist/assets/app.js", b"console.log(1)".as_slice()),
-            ]),
-        ),
-        (
-            "fe-dev.zip",
-            zip_bytes(&[("dist/index.html", b"dev build".as_slice())]),
-        ),
-    ])
-    .await;
-    let db = common::test_db().await;
-    let pool = db.pool().clone();
-    let app = common::test_app_with_config(
-        pool.clone(),
-        frontend_config(dir.path(), &format!("{server}/fe-${{ref}}.zip")),
-    );
-    let token = admin_token(&pool, "fe-installer", "admin:read admin:write").await;
-
-    let install = |body: Value| {
-        let app = app.clone();
-        let token = token.clone();
-        async move {
-            common::TestRequest::post(&format!("{ADMIN}/frontends/install"))
-                .bearer(&token)
-                .json(&body)
-                .send(&app)
-                .await
-        }
-    };
-
-    let main_answer = install(json!({ "name": "pleroma-fe" })).await;
-    common::assert_answer(&main_answer, StatusCode::OK, "the config ref installs");
-    assert_eq!(main_answer.json_value(), json!({ "status": "ok" }));
-    assert_eq!(
-        std::fs::read(dir.path().join("pleroma-fe/main/index.html")).unwrap(),
-        b"<!doctype html>fe",
-        "the dist subtree lands at the destination, not inside it"
-    );
-    assert_eq!(
-        std::fs::read(dir.path().join("pleroma-fe/main/assets/app.js")).unwrap(),
-        b"console.log(1)"
-    );
-    assert!(!dir.path().join("pleroma-fe/main/dist").exists());
-
-    // `ref` from the request re-selects the archive through ${ref}.
-    let dev_answer = install(json!({ "name": "pleroma-fe", "ref": "dev" })).await;
-    common::assert_answer(&dev_answer, StatusCode::OK, "the request ref installs");
-    assert_eq!(dev_answer.json_value(), json!({ "status": "ok" }));
-    assert_eq!(
-        std::fs::read(dir.path().join("pleroma-fe/dev/index.html")).unwrap(),
-        b"dev build"
-    );
-    assert_eq!(
-        *asked.lock().unwrap(),
-        ["GET /fe-main.zip".to_owned(), "GET /fe-dev.zip".to_owned()],
-        "each install fetched its own ref's archive"
-    );
-
-    // The listing reports the frontend installed.
-    let listed = common::TestRequest::get(&format!("{ADMIN}/frontends"))
-        .bearer(&token)
-        .send(&app)
-        .await;
-    assert_eq!(listed.json_value()[0]["installed"], json!(true));
-}
-
-/// Reinstalling replaces the target, an unknown name with a `build_url`
-/// installs off-catalogue, and every source-less or name-less request is
-/// the ticket's refusal.
-#[tokio::test]
-async fn frontend_install_validates_names_and_sources() {
-    let dir = TempDir::new().unwrap();
-    let (server, _asked) = spawn_archive_server(vec![(
-        "fe-main.zip",
-        zip_bytes(&[("dist/index.html", b"<!doctype html>fe".as_slice())]),
-    )])
-    .await;
-    let db = common::test_db().await;
-    let pool = db.pool().clone();
-    let app = common::test_app_with_config(
-        pool.clone(),
-        frontend_config(dir.path(), &format!("{server}/fe-main.zip")),
-    );
-    let token = admin_token(&pool, "fe-validator", "admin:write").await;
-
-    let install = |body: Value| {
-        let app = app.clone();
-        let token = token.clone();
-        async move {
-            common::TestRequest::post(&format!("{ADMIN}/frontends/install"))
-                .bearer(&token)
-                .json(&body)
-                .send(&app)
-                .await
-        }
-    };
-
-    // A first install and a second one over the same target: the files
-    // come back intact, not doubled or half-landed.
-    let first = install(json!({ "name": "pleroma-fe" })).await;
-    common::assert_answer(&first, StatusCode::OK, "the first install lands");
-    let again = install(json!({ "name": "pleroma-fe" })).await;
-    common::assert_answer(&again, StatusCode::OK, "a reinstall lands too");
-    assert_eq!(
-        std::fs::read(dir.path().join("pleroma-fe/main/index.html")).unwrap(),
-        b"<!doctype html>fe",
-        "the target holds exactly the fresh build"
-    );
-
-    // An unknown name with a build_url installs anyway; without one it is
-    // the ticket's refusal.
-    let off_catalogue = install(json!({
-        "name": "my-fe",
-        "build_url": format!("{server}/fe-main.zip"),
-    }))
-    .await;
-    common::assert_answer(
-        &off_catalogue,
-        StatusCode::OK,
-        "an off-catalogue build installs",
-    );
-    assert_eq!(
-        std::fs::read(dir.path().join("my-fe/master/index.html")).unwrap(),
-        b"<!doctype html>fe",
-        "the ref defaults to master"
-    );
-
-    let ghost = install(json!({ "name": "ghost" })).await;
-    common::assert_answer(&ghost, StatusCode::BAD_REQUEST, "an unknown name");
-    common::assert_error(
-        &ghost,
-        r#"Could not install frontend: unknown frontend "ghost""#,
-        "an unknown name",
-    );
-
-    let no_name = install(json!({})).await;
-    common::assert_answer(&no_name, StatusCode::BAD_REQUEST, "a body without a name");
-    common::assert_error(&no_name, "Missing parameter: name", "a body without a name");
-}
-
-#[tokio::test]
-async fn frontend_install_refuses_a_traversing_archive() {
-    let dir = TempDir::new().unwrap();
-    let archive = zip_bytes(&[
-        ("dist/index.html", b"fine".as_slice()),
-        ("dist/../../escape.txt", b"escaped".as_slice()),
-    ]);
-    let (server, _asked) = spawn_archive_server(vec![("evil.zip", archive)]).await;
-    let db = common::test_db().await;
-    let pool = db.pool().clone();
-    let app = common::test_app_with_config(
-        pool.clone(),
-        frontend_config(dir.path(), &format!("{server}/evil.zip")),
-    );
-    let token = admin_token(&pool, "fe-slip", "admin:write").await;
-
-    let response = common::TestRequest::post(&format!("{ADMIN}/frontends/install"))
+    let install = common::TestRequest::post(&format!("{ADMIN}/frontends/install"))
         .bearer(&token)
         .json(&json!({ "name": "pleroma-fe" }))
         .send(&app)
         .await;
-    common::assert_answer(&response, StatusCode::BAD_REQUEST, "the zip-slip archive");
-    let error = response.json_value()["error"]
-        .as_str()
-        .expect("an error body")
-        .to_owned();
-    assert!(
-        error.starts_with("Could not install frontend: "),
-        "the ticket's wording: {error}"
-    );
-    assert!(
-        error.contains("escape.txt"),
-        "the refusal names the traversing entry: {error}"
+    common::assert_answer(&install, StatusCode::NOT_FOUND, "the frontend install");
+    common::assert_error(&install, "Not implemented", "the frontend install");
+    assert_eq!(
+        install.header("x-wired-fallback"),
+        Some("1"),
+        "the fallback answers the install"
     );
 
-    assert!(
-        !dir.path().join("pleroma-fe").exists(),
-        "nothing landed in the frontends directory"
-    );
-    assert!(
-        !std::env::temp_dir().join("escape.txt").exists(),
-        "nothing escaped the destination"
-    );
-    let leftovers: Vec<_> = std::fs::read_dir(dir.path())
-        .unwrap()
-        .filter_map(Result::ok)
-        .filter(|entry| {
-            entry
-                .file_name()
-                .to_string_lossy()
-                .starts_with(".tmp-install-")
-        })
-        .collect();
-    assert!(leftovers.is_empty(), "the staging directory went too");
-}
-
-#[tokio::test]
-async fn frontend_install_accepts_an_uploaded_archive() {
-    let dir = TempDir::new().unwrap();
-    let db = common::test_db().await;
-    let pool = db.pool().clone();
-    // The configured build_url is unreachable on purpose: the uploaded
-    // file must win over it.
-    let app = common::test_app_with_config(
-        pool.clone(),
-        frontend_config(dir.path(), "http://127.0.0.1:1/unreachable.zip"),
-    );
-    let token = admin_token(&pool, "fe-uploader", "admin:write").await;
-
-    let archive = zip_bytes(&[("index.html", b"uploaded fe".as_slice())]);
-    let response = common::TestRequest::post(&format!("{ADMIN}/frontends/install"))
+    // The routes beside them still answer as before.
+    assert_eq!(caches(&app, &token, "").await["count"], 0);
+    let backup = common::TestRequest::post(&format!("{ADMIN}/backups"))
         .bearer(&token)
-        .multipart(
-            "----wired-admin-ops-boundary",
-            &[
-                common::MultipartPart::text("name", "pleroma-fe"),
-                common::MultipartPart::file(
-                    "file",
-                    "fe.zip",
-                    "application/zip",
-                    Bytes::from(archive),
-                ),
-            ],
-        )
+        .json(&json!({}))
         .send(&app)
         .await;
-    common::assert_answer(&response, StatusCode::OK, "the upload installs");
-    assert_eq!(response.json_value(), json!({ "status": "ok" }));
-    assert_eq!(
-        std::fs::read(dir.path().join("pleroma-fe/main/index.html")).unwrap(),
-        b"uploaded fe",
-        "a flat archive lands directly in the target"
-    );
+    common::assert_answer(&backup, StatusCode::BAD_REQUEST, "the backup trigger");
+    common::assert_error(&backup, "Missing parameter: nickname", "the backup trigger");
 }
 
 #[tokio::test]
@@ -869,6 +543,18 @@ async fn the_admin_backup_trigger_checks_nickname_and_scope() {
         &no_nick,
         "Missing parameter: nickname",
         "a body without a nickname",
+    );
+
+    let blank_nick = common::TestRequest::post(&format!("{ADMIN}/backups"))
+        .bearer(&admin)
+        .json(&json!({ "nickname": "   " }))
+        .send(&app)
+        .await;
+    common::assert_answer(&blank_nick, StatusCode::BAD_REQUEST, "a blank nickname");
+    common::assert_error(
+        &blank_nick,
+        "Missing parameter: nickname",
+        "a blank nickname",
     );
 
     // The trigger asks for `admin:write`; a read-scoped admin is refused.

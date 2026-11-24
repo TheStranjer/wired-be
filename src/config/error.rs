@@ -7,7 +7,7 @@ use std::{error::Error, fmt, net::AddrParseError};
 use super::{
     defaults::MIN_MEDIA_PROXY_SECRET_CHARS,
     vars::{
-        BASE_URL_VAR, BIND_ADDR_VAR, FRONTENDS_AVAILABLE_VAR, OAUTH_PROVIDERS_VAR, RATE_LIMITS_VAR,
+        BASE_URL_VAR, BIND_ADDR_VAR, OAUTH_PROVIDERS_VAR, RATE_LIMITS_VAR,
         RESTRICT_UNAUTHENTICATED_AREAS, RESTRICT_UNAUTHENTICATED_VAR, VAPID_PRIVATE_KEY_VAR,
     },
 };
@@ -39,9 +39,6 @@ pub enum ConfigError {
     /// than [`MIN_MEDIA_PROXY_SECRET_CHARS`] requires; the value is the
     /// variable name.
     ShortMediaProxySecret(&'static str),
-    /// `FRONTENDS_AVAILABLE` is not the JSON text of an array of frontend
-    /// objects; the value is what the JSON parser said.
-    InvalidFrontends(String),
     /// `RATE_LIMITS` holds an entry that is not a `bucket=max:window_secs`
     /// triple (or a degenerate one); the value is the parser's reason.
     InvalidRateLimits(String),
@@ -81,10 +78,6 @@ impl fmt::Display for ConfigError {
                 f,
                 "invalid {var}: expected at least {MIN_MEDIA_PROXY_SECRET_CHARS} characters"
             ),
-            Self::InvalidFrontends(detail) => write!(
-                f,
-                "invalid {FRONTENDS_AVAILABLE_VAR}: expected a JSON array of frontend objects: {detail}"
-            ),
             Self::InvalidRateLimits(detail) => {
                 write!(f, "invalid {RATE_LIMITS_VAR}: {detail}")
             }
@@ -114,7 +107,6 @@ impl Error for ConfigError {
             | Self::InvalidSmtpTls(_)
             | Self::InvalidTranslationProvider(_)
             | Self::ShortMediaProxySecret(_)
-            | Self::InvalidFrontends(_)
             | Self::InvalidRateLimits(_)
             | Self::InvalidRestrictUnauthenticated(_)
             | Self::VapidPublicWithoutPrivate(_) => None,

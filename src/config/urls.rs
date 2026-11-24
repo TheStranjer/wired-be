@@ -16,7 +16,7 @@ use super::{
 };
 
 /// Reads one directory-location variable (`UPLOADS_DIR`, `EMOJI_DIR`,
-/// `FRONTENDS_DIR`): the configured value trimmed, or `default` when it is
+/// `INSTANCE_DOCS_DIR`): the configured value trimmed, or `default` when it is
 /// unset or blank. Factored out of [`Config::from_lookup`], which has a
 /// size budget (AGENTS.md), because each path keeps its own field there.
 pub(crate) fn directory<F>(lookup: &F, var: &'static str, default: &str) -> PathBuf

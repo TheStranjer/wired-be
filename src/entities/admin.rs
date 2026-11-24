@@ -28,7 +28,6 @@ use serde::ser::SerializeMap as _;
 use serde_json::Value;
 
 use crate::{
-    config::FrontendConfig,
     entities::status::Status,
     models::{
         instance_rule::InstanceRule, invite_token::InviteToken, moderation_log,
@@ -325,54 +324,6 @@ impl MediaProxyCacheUrls {
             urls: urls.to_vec(),
         }
     }
-}
-
-/// One installable frontend of `GET /api/v1/pleroma/admin/frontends`: the
-/// `FRONTENDS_AVAILABLE` entry's four keys beside its installed flag.
-///
-/// Pleroma's `FrontendView`
-/// (`lib/pleroma/web/admin_api/views/frontend_view.ex`) narrowed to the
-/// five keys the ticket pins.
-#[derive(Debug, Serialize)]
-pub struct AdminFrontend {
-    /// The frontend name, its identity and install-directory segment.
-    pub name: String,
-    /// The source repository, `None` rendered as `null`.
-    pub git: Option<String>,
-    /// The build-archive download URL, `None` rendered as `null`.
-    pub build_url: Option<String>,
-    /// The build ref — the JSON key is `ref`, a Rust keyword.
-    #[serde(rename = "ref")]
-    pub reference: Option<String>,
-    /// Whether `FRONTENDS_DIR/<name>/<ref>` stands on disk.
-    pub installed: bool,
-}
-
-impl AdminFrontend {
-    /// Renders one configured frontend with its installed flag.
-    #[must_use]
-    pub fn from_config(frontend: &FrontendConfig, installed: bool) -> Self {
-        Self {
-            name: frontend.name.clone(),
-            git: frontend.git.clone(),
-            build_url: frontend.build_url.clone(),
-            reference: frontend.reference.clone(),
-            installed,
-        }
-    }
-}
-
-/// The `POST /api/v1/pleroma/admin/frontends/install` answer, the ticket's
-/// `{"status":"ok"}`.
-#[derive(Debug, Serialize)]
-pub struct FrontendInstallStatus {
-    /// The always-`ok` status: a failure answers an error body instead.
-    pub status: &'static str,
-}
-
-impl FrontendInstallStatus {
-    /// The success body.
-    pub const OK: Self = Self { status: "ok" };
 }
 
 /// One relay of the admin ledger: the followed actor's `ActivityPub` id
