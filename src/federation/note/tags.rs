@@ -8,7 +8,7 @@ use crate::{
     models::{
         custom_emoji::CustomEmoji, media_attachment::MediaAttachment, status::Status, user::User,
     },
-    util::time::mastodon_time,
+    util::{entities::hashtag_spellings, time::mastodon_time},
 };
 
 use super::{
@@ -21,10 +21,16 @@ use super::{
 /// (`add_hashtags`, `add_mention_tags`, `add_emoji_tags`).
 pub(super) fn tags_json(ctx: &NoteContext) -> Vec<Value> {
     let base = ctx.config.base_url.as_str();
+    let spellings = hashtag_spellings(&ctx.status.raw_text);
     let mut tags: Vec<Value> = ctx
         .hashtags
         .iter()
-        .map(|name| hashtag_tag(base, name))
+        .map(|name| {
+            let written = spellings
+                .iter()
+                .find_map(|(tag, written)| (tag == name).then_some(written.as_str()));
+            hashtag_tag(base, name, written.unwrap_or(name))
+        })
         .collect();
     tags.extend(ctx.mentions.iter().map(mention_tag));
     tags.extend(used_emoji_tags(ctx));
@@ -32,11 +38,14 @@ pub(super) fn tags_json(ctx: &NoteContext) -> Vec<Value> {
 }
 
 /// One hashtag as its tag object, pointing at this instance's tag page.
-fn hashtag_tag(base: &str, name: &str) -> Value {
+///
+/// The `href` takes the stored (normalized) `name`; the visible `name` field
+/// takes `written`, the casing the author first typed.
+fn hashtag_tag(base: &str, name: &str, written: &str) -> Value {
     json!({
         "type": TYPE_HASHTAG,
         "href": format!("{base}/tags/{name}"),
-        "name": format!("#{name}"),
+        "name": format!("#{written}"),
     })
 }
 
@@ -170,6 +179,22 @@ mod tests {
                  "icon": {"type": "Image", "url": format!("{BASE}/emoji/railroad_track.png")}},
             ]),
             "hashtags, mentions, then the emojis the content actually uses"
+        );
+    }
+
+    #[test]
+    fn hashtag_names_keep_the_authors_casing_and_hrefs_stay_lowercase() {
+        let mut ctx = note_context(Visibility::Public);
+        ctx.hashtags = vec!["fedlab".to_owned(), "other".to_owned()];
+        ctx.status.raw_text = "hello #FedLab and #fedlab".to_owned();
+        let document = note_json(&ctx).expect("a tagged note federates");
+        assert_eq!(
+            document["tag"],
+            json!([
+                {"type": "Hashtag", "href": format!("{BASE}/tags/fedlab"), "name": "#FedLab"},
+                {"type": "Hashtag", "href": format!("{BASE}/tags/other"), "name": "#other"},
+            ]),
+            "the first written casing names the tag; a tag not in the text keeps its stored name"
         );
     }
 

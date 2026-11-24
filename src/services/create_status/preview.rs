@@ -185,7 +185,7 @@ mod tests {
                 refused, replying, state, user, wire,
             },
         },
-        util::entities::{hashtag_html, mention_html},
+        util::entities::{hashtag_html, hashtag_link_html, mention_html},
     };
     #[tokio::test]
     async fn a_preview_builds_the_whole_entity() {
@@ -222,7 +222,7 @@ mod tests {
             format!(
                 "<p>hi {} and @nobody, see {} {}</p>",
                 mention_html(&bob.ap_id, "bob"),
-                hashtag_html(BASE, "rust"),
+                hashtag_link_html(BASE, "rust", "Rust"),
                 hashtag_html(BASE, "rust"),
             ),
             "the same render the create stores, mentions and tags linkified"
