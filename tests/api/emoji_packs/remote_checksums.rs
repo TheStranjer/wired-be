@@ -7,7 +7,7 @@ use std::sync::atomic::Ordering;
 
 use axum::http::StatusCode;
 use serde_json::{Value, json};
-use wired_be::api::instance::sha256_hex_bytes;
+use wired_be::util::token::sha256_hex_bytes;
 
 use super::{
     remote_mocks::{

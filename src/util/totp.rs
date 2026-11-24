@@ -31,10 +31,12 @@ use base32::Alphabet;
 use hmac::{Hmac, KeyInit as _, Mac as _};
 use rand::{Rng as _, RngCore as _, rngs::OsRng};
 use sha1::Sha1;
-use sha2::{Digest as _, Sha256};
 use subtle::{Choice, ConstantTimeEq as _};
 
-use crate::error::{AppError, AppResult};
+use crate::{
+    error::{AppError, AppResult},
+    util::token::sha256_hex,
+};
 
 /// Length of a generated secret in bytes: 160 bits, what `RFC 6238`
 /// appendix B tests with and the size every authenticator app accepts.
@@ -65,8 +67,6 @@ const BACKUP_ALPHABET_SIZE: u8 = 36;
 const BACKUP_CODE_LEN: usize = 8;
 /// Upper-case alphabet for hex digits, used by percent-encoding.
 const HEX_UPPER_BASE: u8 = b'A';
-/// Lower-case alphabet for hex digits, used by [`hash_backup_code`].
-const HEX_LOWER_BASE: u8 = b'a';
 
 /// Base32 ([`RFC 4648`]) without padding: the spelling authenticator apps
 /// display and consume secrets in.
@@ -178,12 +178,7 @@ pub fn generate_backup_codes(n: usize) -> Vec<String> {
 /// [SHA-256]: https://datatracker.ietf.org/doc/html/rfc6234
 #[must_use]
 pub fn hash_backup_code(code: &str) -> String {
-    let mut hex = String::with_capacity(Sha256::output_size() * 2);
-    for &byte in &Sha256::digest(code.as_bytes()) {
-        hex.push(hex_digit(byte >> 4, HEX_LOWER_BASE));
-        hex.push(hex_digit(byte & 0x0F, HEX_LOWER_BASE));
-    }
-    hex
+    sha256_hex(code)
 }
 
 /// One character of a backup code: uniform over the 36-character alphabet
@@ -248,13 +243,12 @@ fn hotp(key: &[u8], step: i64) -> AppResult<String> {
     Ok(format!("{truncated:0CODE_DIGITS$}"))
 }
 
-/// One hex digit for `nibble` (which must be below 16), with `letter_base`
-/// picking upper- or lower-case `a`–`f`.
-fn hex_digit(nibble: u8, letter_base: u8) -> char {
+/// One uppercase hex digit for `nibble` (which must be below 16).
+fn hex_digit(nibble: u8) -> char {
     if nibble < 10 {
         char::from(b'0' + nibble)
     } else {
-        char::from(letter_base + (nibble - 10))
+        char::from(HEX_UPPER_BASE + (nibble - 10))
     }
 }
 
@@ -273,8 +267,8 @@ fn percent_encode(value: &str) -> String {
             }
             other => {
                 encoded.push('%');
-                encoded.push(hex_digit(other >> 4, HEX_UPPER_BASE));
-                encoded.push(hex_digit(other & NIBBLE_MASK, HEX_UPPER_BASE));
+                encoded.push(hex_digit(other >> 4));
+                encoded.push(hex_digit(other & NIBBLE_MASK));
             }
         }
     }

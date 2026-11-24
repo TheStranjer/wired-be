@@ -18,7 +18,7 @@ use axum::{
 };
 use serde_json::{Value, json};
 use tokio::task::JoinHandle;
-use wired_be::api::instance::sha256_hex_bytes;
+use wired_be::util::token::sha256_hex_bytes;
 
 use super::server::{
     BASE, Part, SCOPES, Server, Verb, call, expect, get_value, png_fixture, post_multipart,

@@ -4,7 +4,6 @@
 
 use chrono::{DateTime, Utc};
 use serde::Serialize;
-use sha2::{Digest as _, Sha256};
 
 use crate::{
     config::Config,
@@ -12,7 +11,7 @@ use crate::{
         Transparency,
         simple::{self, SimpleConfig},
     },
-    util::time::mastodon_time,
+    util::{time::mastodon_time, token::sha256_hex},
 };
 
 /// One entry of `GET /api/v1/instance/domain_blocks`: a domain the
@@ -146,39 +145,6 @@ impl ExtendedDescription {
     }
 }
 
-/// The lowercase hex `SHA-256` of `text`: Mastodon's domain-block digest.
-///
-/// Pleroma's renderer writes it as `:crypto.hash(:sha256, host)` encoded
-/// with `Base.encode16(case: :lower)`. Also what
-/// [`crate::api::pleroma_account_settings`] derives email-confirmation
-/// tokens from, and what the endpoint's tests hash the published domains
-/// with — which is why it is public.
-#[must_use]
-pub fn sha256_hex(text: &str) -> String {
-    sha256_hex_bytes(text.as_bytes())
-}
-
-/// The lowercase hex `SHA-256` of `bytes`: [`sha256_hex`] for data that
-/// is not text, such as a downloaded emoji pack archive.
-#[must_use]
-pub fn sha256_hex_bytes(bytes: &[u8]) -> String {
-    let mut hex = String::with_capacity(Sha256::output_size() * 2);
-    for &byte in &Sha256::digest(bytes) {
-        hex.push(hex_digit(byte >> 4));
-        hex.push(hex_digit(byte & 0x0F));
-    }
-    hex
-}
-
-/// One lowercase hex digit for `nibble` (which must be below `16`).
-fn hex_digit(nibble: u8) -> char {
-    if nibble < 10 {
-        char::from(b'0' + nibble)
-    } else {
-        char::from(b'a' + (nibble - 10))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use serde_json::json;
@@ -309,21 +275,6 @@ mod tests {
                 },
             ]),
             "the excluded host is simply not there"
-        );
-    }
-
-    #[test]
-    fn the_sha256_hex_digest_is_lowercase_hex() {
-        // The published SHA-256 of the ASCII string "abc".
-        assert_eq!(
-            sha256_hex("abc"),
-            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
-            "the digest matches the SHA-256 test vector"
-        );
-        assert_eq!(
-            sha256_hex(""),
-            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-            "even the empty string hashes"
         );
     }
 

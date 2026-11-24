@@ -13,6 +13,7 @@
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use rand::RngCore as _;
+use sha2::{Digest as _, Sha256};
 use std::fmt::Write as _;
 
 /// Bytes behind the 43-character credentials Pleroma and Mastodon issue
@@ -53,6 +54,24 @@ pub fn to_hex(bytes: &[u8]) -> String {
             hex
         },
     )
+}
+
+/// The lowercase hex `SHA-256` of `text`: 64 characters.
+///
+/// Mastodon's domain-block digest (Pleroma writes it as
+/// `:crypto.hash(:sha256, host)` with `Base.encode16(case: :lower)`), the
+/// stored form of two-factor backup codes, and what email-confirmation
+/// tokens derive from.
+#[must_use]
+pub fn sha256_hex(text: &str) -> String {
+    sha256_hex_bytes(text.as_bytes())
+}
+
+/// The lowercase hex `SHA-256` of `bytes`: [`sha256_hex`] for data that
+/// is not text, such as a downloaded emoji pack archive.
+#[must_use]
+pub fn sha256_hex_bytes(bytes: &[u8]) -> String {
+    to_hex(&Sha256::digest(bytes))
 }
 
 /// `bytes` random bytes from the OS CSPRNG, base64url-encoded with no
@@ -126,6 +145,29 @@ mod tests {
             "`{secret}` is lowercase hex"
         );
         assert_eq!(random_hex(0), "", "nothing in, nothing out");
+    }
+
+    #[test]
+    fn the_sha256_hex_digest_is_lowercase_hex() {
+        // The published SHA-256 of the ASCII string "abc".
+        assert_eq!(
+            sha256_hex("abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+            "the digest matches the SHA-256 test vector"
+        );
+        assert_eq!(
+            sha256_hex(""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "even the empty string hashes"
+        );
+        let digest = sha256_hex("Wired");
+        assert_eq!(digest.len(), 64, "SHA-256 is 32 bytes, 64 hex characters");
+        assert!(
+            digest
+                .chars()
+                .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)),
+            "`{digest}` is lowercase hex"
+        );
     }
 
     #[test]
