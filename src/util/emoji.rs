@@ -59,11 +59,34 @@ impl<'a> Emoji<'a> {
 #[must_use]
 pub fn shortcode(text: &str) -> Option<&str> {
     let inner = text.strip_prefix(':')?.strip_suffix(':')?;
-    (!inner.is_empty()
+    is_shortcode_body(inner).then_some(inner)
+}
+
+/// Whether `inner` is a usable shortcode between colons: non-empty, only
+/// `[A-Za-z0-9_]`.
+fn is_shortcode_body(inner: &str) -> bool {
+    !inner.is_empty()
         && inner
             .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_'))
-    .then_some(inner)
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+}
+
+/// Every `:shortcode:` token in `text`, bare and in order of appearance,
+/// repeats included.
+///
+/// A token is a run of `[A-Za-z0-9_]` with a colon at both ends, so `:a:b:`
+/// yields `a` and `b`, and `12:30` or `http://x` yield nothing. Whether a
+/// token names a real emoji is the caller's database question.
+#[must_use]
+pub fn shortcodes_in(text: &str) -> Vec<&str> {
+    let mut found = Vec::new();
+    let mut parts = text.split(':').skip(1).peekable();
+    while let Some(part) = parts.next() {
+        if parts.peek().is_some() && is_shortcode_body(part) {
+            found.push(part);
+        }
+    }
+    found
 }
 
 /// Whether `text` is exactly one grapheme cluster that is an emoji.
@@ -199,6 +222,33 @@ mod tests {
         assert_eq!(shortcode("::"), None, "so is nothing between colons");
         assert_eq!(shortcode("cat"), None, "colons are required");
         assert_eq!(shortcode(":a;b:"), None, "and only word characters ride");
+    }
+
+    #[test]
+    fn shortcodes_in_finds_colon_wrapped_runs_in_order() {
+        assert_eq!(
+            shortcodes_in("hi :cat: and :dog: or :cat:"),
+            vec!["cat", "dog", "cat"],
+            "order kept, repeats kept"
+        );
+        assert_eq!(shortcodes_in(":a:b:"), vec!["a", "b"], "adjacent tokens");
+        assert_eq!(shortcodes_in("<p>:x_1:</p>"), vec!["x_1"], "markup around");
+    }
+
+    #[test]
+    fn shortcodes_in_ignores_text_that_is_no_token() {
+        for text in [
+            "",
+            "cat",
+            ":cat",
+            "cat:",
+            "12:30",
+            "http://x.example",
+            "::",
+            ":a b:",
+        ] {
+            assert!(shortcodes_in(text).is_empty(), "{text:?} has no token");
+        }
     }
 
     #[test]

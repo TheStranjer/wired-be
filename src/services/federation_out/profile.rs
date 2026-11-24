@@ -14,10 +14,14 @@ use tracing::{debug, warn};
 use crate::{
     error::AppResult,
     federation::{
-        activities::activity_id, actor::actor_json, delivery::best_inbox, note, publisher,
+        activities::activity_id,
+        actor::{actor_json, profile_emojis},
+        delivery::best_inbox,
+        note, publisher,
         vocab::AS_PUBLIC,
     },
     models::{
+        custom_emoji::CustomEmoji,
         follow, relay,
         user::{self, User, followers_address},
     },
@@ -50,7 +54,14 @@ pub async fn after_profile_updated(state: &AppState, account: &User) {
     let Some(followers_collection) = account.followers_url.as_deref() else {
         return; // an actor with no followers collection has nobody to tell
     };
-    let document = update_document(state, account, followers_collection);
+    let emojis = match profile_emojis(&state.db, account).await {
+        Ok(emojis) => emojis,
+        Err(err) => {
+            warn!(%err, actor = %account.ap_id, "could not load profile emoji for the Update");
+            return;
+        }
+    };
+    let document = update_document(state, account, followers_collection, &emojis);
     let unique_key = format!("profile-update:{}", account.id);
     match publisher::publish_in_background(state, account.id, &document, &[], Some(&unique_key))
         .await
@@ -61,14 +72,20 @@ pub async fn after_profile_updated(state: &AppState, account: &User) {
 }
 
 /// The actor document for the profile in `account`, as an `Update` activity
-/// addressed to the public and to the account's followers collection.
-fn update_document(state: &AppState, account: &User, followers_collection: &str) -> Value {
+/// addressed to the public and to the account's followers collection;
+/// `emojis` are the custom emojis the profile uses, tagged on the actor.
+fn update_document(
+    state: &AppState,
+    account: &User,
+    followers_collection: &str,
+    emojis: &[CustomEmoji],
+) -> Value {
     json!({
         "@context": note::json_ld_context(&state.config),
         "id": activity_id(&state.config, new_id()),
         "type": "Update",
         "actor": account.ap_id,
-        "object": actor_json(account, &state.config),
+        "object": actor_json(account, &state.config, emojis),
         "to": [AS_PUBLIC],
         "cc": [followers_collection],
     })
@@ -184,7 +201,10 @@ mod tests {
 
     use crate::{
         config::TEST_BASE_URL,
-        models::user::{Flag, NewUser, insert},
+        models::{
+            custom_emoji::{self, NewCustomEmoji},
+            user::{Flag, NewUser, insert},
+        },
         services::federation_out::test_support::{
             accepted_follow, app_state, delivered_inboxes, delivery_jobs, job_count, local,
             publish_jobs, remote, run_publishes,
@@ -224,6 +244,38 @@ mod tests {
         assert_eq!(activity["object"]["id"], alice.ap_id);
         assert_eq!(activity["to"][0], AS_PUBLIC);
         assert_eq!(activity["cc"][0], alice.followers_url.unwrap());
+    }
+
+    /// The queued `Update` carries the `Emoji` tags of the local emojis the
+    /// profile uses, and none for a shortcode without a row.
+    #[tokio::test]
+    async fn the_update_document_carries_the_profile_emoji_tags() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let mut alice = local(&pool, "alice").await;
+        let carol = remote(&pool, "carol").await;
+        accepted_follow(&pool, &carol, &alice).await;
+        let url = format!("{TEST_BASE_URL}/emoji/wiredcat.png");
+        let _stored = custom_emoji::upsert(&pool, &NewCustomEmoji::local("wiredcat", &url))
+            .await
+            .expect("the emoji stores");
+        alice.name = "Alice :wiredcat: :nosuch:".to_owned();
+        let state = app_state(&pool);
+
+        after_profile_updated(&state, &alice).await;
+
+        let jobs = publish_jobs(&pool).await;
+        let (args, _key) = &jobs[0];
+        assert_eq!(
+            args["activity"]["object"]["tag"],
+            json!([{
+                "type": "Emoji",
+                "id": url,
+                "name": ":wiredcat:",
+                "icon": {"type": "Image", "url": url},
+            }]),
+            "one tag for the known emoji, none for `:nosuch:`"
+        );
     }
 
     /// The account `Delete` names the actor id as both `actor` and

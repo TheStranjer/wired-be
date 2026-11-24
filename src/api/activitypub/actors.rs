@@ -47,7 +47,7 @@ pub(super) async fn get_actor(
 ) -> Response {
     let outcome = gate_actor_read(&state, &nickname, &headers, &uri).await;
     let response = match outcome {
-        Ok(Reader::Account(user)) => Ok(actor_response(&user, &state.config)),
+        Ok(Reader::Account(user)) => actor_response(&state, &user).await,
         Ok(Reader::Redirect(redirect)) => Ok(redirect),
         Err(err) => Err(err),
     };
@@ -150,7 +150,9 @@ pub(super) async fn get_featured(
 /// needs in order to be able to sign).
 pub(super) async fn get_instance_actor(State(state): State<AppState>) -> Response {
     match instance_actor::ensure_instance_actor(&state.db, &state.config).await {
-        Ok(actor) => actor_response(&actor, &state.config),
+        Ok(actor) => actor_response(&state, &actor)
+            .await
+            .unwrap_or_else(AppError::into_response),
         Err(err) => err.into_response(),
     }
 }
@@ -178,7 +180,7 @@ async fn relay_actor_document(state: &AppState, headers: &HeaderMap) -> AppResul
         return Err(AppError::RouteNotFound);
     }
     let actor = instance_actor::ensure_instance_actor(&state.db, &state.config).await?;
-    Ok(actor_response(&actor, &state.config))
+    actor_response(state, &actor).await
 }
 
 /// `GET /relay/following` — whom this instance follows in the relay role:

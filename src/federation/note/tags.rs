@@ -69,7 +69,9 @@ fn content_uses(status: &Status, shortcode: &str) -> bool {
 
 /// One custom emoji as its tag object: the image URL as both `id` and
 /// `icon.url`, the colon-wrapped shortcode as the `name`.
-fn emoji_tag(emoji: &CustomEmoji) -> Value {
+///
+/// Shared by notes and actor documents.
+pub(crate) fn emoji_tag(emoji: &CustomEmoji) -> Value {
     json!({
         "type": TYPE_EMOJI,
         "id": &emoji.image_url,
