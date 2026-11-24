@@ -29,37 +29,42 @@ pub fn follow_json(
     target_ap_id: &str,
     published: &DateTime<Utc>,
 ) -> Value {
-    follow_json_to(
-        config,
+    let follow = FollowActivity {
         id,
         follower_ap_id,
         target_ap_id,
-        &[target_ap_id],
         published,
-    )
+    };
+    follow_json_to(config, &follow, &[target_ap_id])
+}
+
+/// The parts of one `Follow` document that [`follow_json_to`] renders.
+#[derive(Debug, Clone, Copy)]
+pub struct FollowActivity<'a> {
+    /// The activity id: the follow row's stored `ap_id` (decision 6).
+    pub id: &'a str,
+    /// The actor asking to follow.
+    pub follower_ap_id: &'a str,
+    /// The followed actor, the activity's object.
+    pub target_ap_id: &'a str,
+    /// The follow's creation moment.
+    pub published: &'a DateTime<Utc>,
 }
 
 /// [`follow_json`] addressed to `to` instead of the followed actor: the
 /// relay handshake names the relay's *inbox*, the endpoint that must
 /// receive the `Follow`.
 #[must_use]
-pub fn follow_json_to(
-    config: &Config,
-    id: &str,
-    follower_ap_id: &str,
-    target_ap_id: &str,
-    to: &[&str],
-    published: &DateTime<Utc>,
-) -> Value {
+pub fn follow_json_to(config: &Config, follow: &FollowActivity<'_>, to: &[&str]) -> Value {
     document_json(ActivityDocument {
         config,
-        id: id.to_owned(),
+        id: follow.id.to_owned(),
         type_name: TYPE_FOLLOW,
-        actor_ap_id: follower_ap_id,
-        object: json!(target_ap_id),
+        actor_ap_id: follow.follower_ap_id,
+        object: json!(follow.target_ap_id),
         to: address_values(to),
         cc: Vec::new(),
-        published,
+        published: follow.published,
         extra: Vec::new(),
     })
 }
@@ -228,14 +233,13 @@ mod tests {
     #[test]
     fn a_follow_renders_the_id_it_is_given_and_an_overriding_to() {
         let stored = "https://stored.example/activities/follow-row";
-        let document = follow_json_to(
-            &config(),
-            stored,
-            BOB_AP,
-            ALICE_AP,
-            &["https://relay.example/inbox"],
-            &published(),
-        );
+        let follow = FollowActivity {
+            id: stored,
+            follower_ap_id: BOB_AP,
+            target_ap_id: ALICE_AP,
+            published: &published(),
+        };
+        let document = follow_json_to(&config(), &follow, &["https://relay.example/inbox"]);
         assert_eq!(document["id"], json!(stored), "the stored id, verbatim");
         assert_eq!(
             document["object"],

@@ -40,7 +40,7 @@ use crate::{
     config::Config,
     error::{AppError, AppResult},
     federation::{
-        activities::{AnsweredActivity, follow_json_to, undo_json},
+        activities::{AnsweredActivity, FollowActivity, follow_json_to, undo_json},
         fetch_actor::get_or_fetch_by_ap_id,
         publisher::{self, PublishOpts},
     },
@@ -210,14 +210,13 @@ fn relay_follow_document(
     relay_inbox: &str,
 ) -> Option<Value> {
     let stored_id = row.ap_id.as_deref()?;
-    Some(follow_json_to(
-        config,
-        stored_id,
-        &follower.ap_id,
-        &target.ap_id,
-        &[relay_inbox],
-        &row.inserted_at,
-    ))
+    let follow = FollowActivity {
+        id: stored_id,
+        follower_ap_id: &follower.ap_id,
+        target_ap_id: &target.ap_id,
+        published: &row.inserted_at,
+    };
+    Some(follow_json_to(config, &follow, &[relay_inbox]))
 }
 
 /// Hand one built handshake document to the publisher addressed to the
