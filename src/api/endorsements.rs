@@ -65,16 +65,16 @@ use tracing::debug;
 use uuid::Uuid;
 
 use crate::{
-    api::helpers::account_or_404,
+    api::helpers::{AccountPageEntry, account_or_404, account_page, empty_account_page},
     auth::{AuthUser, MaybeAuthUser},
     entities::{
         account::{Account, AccountViewer},
         relationship::Relationship,
     },
     error::{AppError, AppResult},
-    models::{endorsement, follow},
+    models::{endorsement, follow, user::User},
     oauth::scopes::{READ_ACCOUNTS, WRITE_ACCOUNTS},
-    pagination::{NO_EXTRA_QUERY, PageParams, keyset_link, set_link_header},
+    pagination::PageParams,
     state::AppState,
 };
 
@@ -208,7 +208,7 @@ async fn unendorse_account(
 /// token; [`AppError::Forbidden`] when the token does not grant
 /// `read:accounts`; [`AppError::BadRequest`] from [`PageParams`] for a
 /// malformed cursor. Any database failure arrives through `?` as
-/// [`AppError::Database`], and [`set_link_header`] reports a `Link` value
+/// [`AppError::Database`], and [`set_link_header`](crate::pagination::set_link_header) reports a `Link` value
 /// that is not header-safe as [`AppError::Internal`].
 async fn own_endorsements(
     State(state): State<AppState>,
@@ -224,7 +224,7 @@ async fn own_endorsements(
         "own endorsements listed"
     );
     let viewer: AccountViewer<'_> = Some(&auth.0);
-    page_response(&state, viewer, &entries, uri.path()).await
+    account_page(&state, viewer, uri.path(), &entries).await
 }
 
 /// `GET /api/v1/accounts/{id}/endorsements` and
@@ -255,48 +255,21 @@ async fn list_endorsements(
     let target = account_or_404(&state, &id).await?;
     let viewer = auth.0.as_ref();
     if target.hide_follows.get() && viewer.is_none_or(|who| who.id != target.id) {
-        return Ok(empty_page());
+        return Ok(empty_account_page());
     }
     let entries = endorsement::page_for(&state.db, target.id, page).await?;
-    page_response(&state, viewer, &entries, uri.path()).await
+    account_page(&state, viewer, uri.path(), &entries).await
 }
 
-/// The answer to a hidden endorsement listing: the empty array as a plain
-/// 200 with no `Link` header at all — the followers/following listings'
-/// hidden branch, where the page never got a cursor to link from.
-fn empty_page() -> (HeaderMap, Json<Vec<Account>>) {
-    (HeaderMap::new(), Json(Vec::new()))
-}
+/// An endorsement-list row: the cursors key on the `endorsements` row
+/// ([`endorsement::EndorsementPageEntry::endorsement_id`]), not on the
+/// accounts.
+impl AccountPageEntry for endorsement::EndorsementPageEntry {
+    fn cursor(&self) -> Uuid {
+        self.endorsement_id
+    }
 
-/// Renders one fetched endorsement page for `viewer`: every entry's
-/// [`User`] as an [`Account`] with the viewer's relationship embedded
-/// where one is preloaded (see [`Relationship::load_map`]), under the
-/// `Link` header [`keyset_link`] derives from the endorsement ids.
-async fn page_response(
-    state: &AppState,
-    viewer: AccountViewer<'_>,
-    entries: &[endorsement::EndorsementPageEntry],
-    path: &str,
-) -> AppResult<(HeaderMap, Json<Vec<Account>>)> {
-    let targets: Vec<Uuid> = entries.iter().map(|entry| entry.user.id).collect();
-    let relationships = Relationship::load_map(&state.db, viewer, &targets).await?;
-    // The cursors key on the `endorsements` row
-    // ([`endorsement::EndorsementPageEntry::endorsement_id`]), not on the
-    // accounts.
-    let link = keyset_link(
-        &state.config.base_url,
-        path,
-        &NO_EXTRA_QUERY,
-        entries,
-        |e| e.endorsement_id,
-    );
-    let mut headers = HeaderMap::new();
-    set_link_header(&mut headers, link.as_deref())?;
-    let accounts = entries
-        .iter()
-        .map(|entry| {
-            Account::from_user_for(viewer, &entry.user, &state.config, relationships.as_ref())
-        })
-        .collect();
-    Ok((headers, Json(accounts)))
+    fn user(&self) -> &User {
+        &self.user
+    }
 }
