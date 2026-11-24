@@ -61,8 +61,9 @@ use bytes::Bytes;
 use serde_json::Value;
 
 use crate::{
-    federation::signature::verify::{
-        ParsedSignature, SignedRequestParts, path_and_query, verify_digest,
+    federation::{
+        signature::verify::{ParsedSignature, SignedRequestParts, path_and_query, verify_digest},
+        vocab::AP_MEDIA_TYPES,
     },
     models::user::User,
     state::AppState,
@@ -109,12 +110,10 @@ const REJECTED: &str = "Rejected";
 /// an actor's own deletion (see the [module docs](self) step 7).
 const DELETE_TYPE: &str = "Delete";
 /// The media types an inbox delivery may be labelled with, lowercase and
-/// without parameters: the `Content-Type` must name exactly one.
-const JSON_MEDIA_TYPES: [&str; 3] = [
-    "application/activity+json",
-    "application/ld+json",
-    "application/json",
-];
+/// without parameters: the `Content-Type` must name exactly one. The
+/// [`AP_MEDIA_TYPES`] pair plus plain `application/json`, which some peers
+/// send.
+const JSON_MEDIA_TYPES: [&str; 3] = [AP_MEDIA_TYPES[0], AP_MEDIA_TYPES[1], "application/json"];
 /// How often one actor's key may be refetched after a failed verification:
 /// Pleroma's `refetch_public_key` retry, rate limited to once per minute.
 const KEY_REFETCH_WINDOW: Duration = Duration::from_secs(60);

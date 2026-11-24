@@ -5,8 +5,8 @@
 use serde::Deserialize;
 use serde_json::{Map, Value};
 
-use super::{ACTIVITY_JSON, LD_JSON, SELF_REL};
-use crate::util::{media_type::essence, url::is_http_url};
+use super::SELF_REL;
+use crate::{federation::vocab::is_ap_media_type, util::url::is_http_url};
 
 /// One `Link` element or object of a `WebFinger` document: JRD objects
 /// deserialize straight into it, and the XRD reader fills the same shape
@@ -37,7 +37,7 @@ pub(super) struct FingerDocument {
 
 impl FingerDocument {
     /// The actor URL: the `href` of the first `rel=self` link whose `type`
-    /// names an `ActivityPub` media type (see [`is_activity_media_type`])
+    /// names an `ActivityPub` media type (see [`is_ap_media_type`])
     /// and whose `href` is an absolute `http(s)` URL. Links of any other
     /// shape — including the profile-page link — are not actors.
     pub(super) fn actor_href(&self) -> Option<&str> {
@@ -52,11 +52,7 @@ impl FingerLink {
         if self.rel.as_deref().map(str::trim) != Some(SELF_REL) {
             return None;
         }
-        if !self
-            .link_type
-            .as_deref()
-            .is_some_and(is_activity_media_type)
-        {
+        if !self.link_type.as_deref().is_some_and(is_ap_media_type) {
             return None;
         }
         self.href
@@ -85,45 +81,11 @@ impl FingerLink {
     }
 }
 
-/// Whether a link's declared `type` names an `ActivityPub` JSON document,
-/// ignoring parameters and whitespace: `application/activity+json` or
-/// `application/ld+json` with any (or no) parameters after the `;`.
-fn is_activity_media_type(candidate: &str) -> bool {
-    let media_type = essence(candidate);
-    media_type == ACTIVITY_JSON || media_type == LD_JSON
-}
-
 #[cfg(test)]
 mod tests {
     use serde_json::json;
 
-    use super::*;
     use crate::federation::webfinger_client::{JRD_JSON, WebfingerError, test_support::*};
-
-    #[test]
-    fn media_types_match_activitypub_json_only() {
-        for candidate in [
-            "application/activity+json",
-            "APPLICATION/Activity+JSON",
-            " application/activity+json ; charset=utf-8 ",
-            "application/ld+json",
-            r#"application/ld+json; profile="https://www.w3.org/ns/activitystreams""#,
-        ] {
-            assert!(is_activity_media_type(candidate), "{candidate} names AP");
-        }
-        for candidate in [
-            "text/html",
-            "application/json",
-            "application/jrd+json",
-            "activity+json",
-            "",
-        ] {
-            assert!(
-                !is_activity_media_type(candidate),
-                "{candidate} does not name AP"
-            );
-        }
-    }
 
     #[tokio::test]
     async fn a_self_link_of_the_wrong_type_is_ignored() {

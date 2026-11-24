@@ -211,17 +211,13 @@ mod outbox_relations;
 #[cfg(test)]
 mod test_support;
 
-/// `Content-Type` of an actor document: `ActivityPub` is JSON-LD with its
-/// own registered media type, and the charset is spelled out because
-/// axum's `Json` type would send it without one.
-pub(super) const ACTIVITY_JSON: &str = "application/activity+json; charset=utf-8";
+/// The text appended to [`ACTIVITY_JSON`](crate::federation::vocab::ACTIVITY_JSON)
+/// to make the `Content-Type` of an actor document: the charset is spelled
+/// out because axum's `Json` type would send it without one.
+pub(super) const CHARSET_SUFFIX: &str = "; charset=utf-8";
 /// The `Vary` value of every response: the `Accept` header picks the
 /// document, the redirect or the 404.
 pub(super) const VARY_ACCEPT: &str = "Accept";
-/// The media types whose presence in `Accept` means "this is an
-/// `ActivityPub` client", the pair Pleroma's `:activitypub` accepts
-/// pipeline lists.
-pub(super) const AP_MEDIA_TYPES: [&str; 2] = ["application/activity+json", "application/ld+json"];
 /// The media type whose presence in `Accept` means "this is a browser":
 /// Pleroma's HTML clients are sent to the frontend, and so here.
 pub(super) const HTML_MEDIA_TYPE: &str = "text/html";

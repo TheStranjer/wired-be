@@ -83,12 +83,6 @@ pub(crate) const XRD_XML: &str = "application/xrd+xml";
 const SELF_REL: &str = "self";
 /// The `rel` of the LRDD template link inside host-meta.
 const LRDD_REL: &str = "lrdd";
-/// First accepted media type of the self link: `ActivityPub` JSON.
-const ACTIVITY_JSON: &str = "application/activity+json";
-/// Second accepted media type of the self link. Its `profile` parameter is
-/// never compared — the ticket fixes "ignore parameters" — so any
-/// `application/ld+json` (with or without parameters) names the actor.
-const LD_JSON: &str = "application/ld+json";
 /// The resource macro of an LRDD template (RFC 7033 Section 5). Crate
 /// visibility because the remote-interaction endpoints expand the same
 /// macro in a subscribe template (see

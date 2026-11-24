@@ -13,6 +13,7 @@ use crate::{
     federation::{
         mrf,
         remote_actor::{parse_actor, upsert_remote_user},
+        vocab::{ACTIVITY_JSON, LD_JSON},
     },
     http_client::HttpClient,
     models::user::{User, get_by_ap_id},
@@ -21,8 +22,8 @@ use crate::{
 };
 
 use super::{
-    ACTIVITY_JSON, ACTIVITYSTREAMS_PROFILE, ACTOR_ACCEPT, FetchError, LD_JSON, MAX_BODY_BYTES,
-    STATUS_GONE, STATUS_NOT_FOUND,
+    ACTIVITYSTREAMS_PROFILE, ACTOR_ACCEPT, FetchError, MAX_BODY_BYTES, STATUS_GONE,
+    STATUS_NOT_FOUND,
     containment::{ensure_not_redirected, ensure_same_host, names_served_url},
     error::server_error,
     handle::{Naming, confirm_nickname, keep_stored_nickname},
