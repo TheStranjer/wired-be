@@ -69,7 +69,8 @@ fn push_following_arms(builder: &mut QueryBuilder<Postgres>, viewer_id: Uuid) {
 
 /// Appends the block exclusions — statuses authored by accounts the viewer
 /// blocked, reblogs **of** those accounts' statuses, and statuses by authors
-/// on a domain the viewer blocked. They read the viewer, so an anonymous
+/// on a domain the viewer blocked (a reblog of such an author's status
+/// included). They read the viewer, so an anonymous
 /// request gains no condition. Applied on every timeline, `with_muted` or
 /// not (Pleroma's `restrict_blocked`); [`push_visibility_clause`] — the
 /// author's side of a block — applies alongside.
@@ -83,9 +84,10 @@ pub(super) fn push_block_exclusions(builder: &mut QueryBuilder<Postgres>, viewer
     let _domain: &mut _ = builder
         .push(
             " AND NOT EXISTS (SELECT 1 FROM user_domain_blocks udb \
-               JOIN users d ON d.id = s.user_id \
-               WHERE udb.user_id = ",
+               JOIN users d ON d.id IN (s.user_id, ",
         )
+        .push(REBLOG_AUTHOR_SQL)
+        .push(") WHERE udb.user_id = ")
         .push_bind(viewer_id)
         .push(" AND udb.domain = d.domain)");
 }
@@ -330,6 +332,60 @@ mod tests {
                 &bob_reb_dave,
             ]),
             "none of this is an anonymous request's problem"
+        );
+    }
+
+    /// A domain block also hides a followed local friend's boost of a post
+    /// from the blocked domain, on Home and Public, while the friend's own
+    /// post and a boost of a post from another domain stay.
+    #[tokio::test]
+    async fn domain_block_hides_boosts_of_blocked_domain_posts() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = local(&pool, "alice").await;
+        let bob = local(&pool, "bob").await;
+        let carol = remote(&pool, "carol", "remote.example").await;
+        let erin = remote(&pool, "erin", "other.example").await;
+        let _follow = follow::follow(&pool, BASE, &alice, &bob)
+            .await
+            .expect("alice follows bob");
+        let _accepted = sqlx::query("UPDATE follows SET state = 'accepted'")
+            .execute(&pool)
+            .await
+            .expect("the follow is accepted");
+        domain_block::block_domain(&pool, alice.id, "remote.example")
+            .await
+            .expect("alice domain-blocks remote.example");
+        let carol_post = remote_post(&pool, &carol, "carol-public", &[]).await;
+        let erin_post = remote_post(&pool, &erin, "erin-public", &[]).await;
+        let bob_post = post(&pool, &bob, Visibility::Public, "plain bob").await;
+        let boost_blocked = reblog(&pool, &bob, &carol_post).await;
+        let boost_other = reblog(&pool, &bob, &erin_post).await;
+
+        let home = page_ids(
+            &pool,
+            &timeline(Some(as_viewer(&pool, &alice).await), TimelineSource::Home),
+        )
+        .await;
+        assert_eq!(
+            home,
+            newest_first(&[&bob_post, &boost_other]),
+            "bob's boost of the blocked domain's post is out of Home"
+        );
+        let public = page_ids(
+            &pool,
+            &timeline(Some(as_viewer(&pool, &alice).await), TimelineSource::Public),
+        )
+        .await;
+        assert_eq!(
+            public,
+            newest_first(&[&erin_post, &bob_post, &boost_other]),
+            "and out of Public, where the other domain's post and boost stay"
+        );
+        let anonymous = page_ids(&pool, &timeline(None, TimelineSource::Public)).await;
+        assert!(
+            anonymous.contains(&boost_blocked.id),
+            "an anonymous request has no domain blocks"
         );
     }
 
