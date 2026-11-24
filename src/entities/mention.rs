@@ -40,10 +40,7 @@ impl Mention {
         Self {
             id: user.id.to_string(),
             username: nickname_part(&user.nickname).to_owned(),
-            url: user
-                .profile_url
-                .clone()
-                .unwrap_or_else(|| user.ap_id.clone()),
+            url: user.mention_url(),
             acct: user.nickname.clone(),
         }
     }
@@ -161,6 +158,22 @@ mod tests {
                 "acct": "alice",
             }),
             "the four keys, the acct bare, the id the hyphenated string"
+        );
+    }
+
+    #[test]
+    fn mention_url_prefers_the_profile_url_over_the_actor_id() {
+        let mut alice = base_user("alice", &format!("{TEST_BASE_URL}/users/alice"));
+        assert_eq!(
+            alice.mention_url(),
+            format!("{TEST_BASE_URL}/users/alice"),
+            "without a profile URL the actor id is the link"
+        );
+        alice.profile_url = Some(format!("{TEST_BASE_URL}/@alice"));
+        assert_eq!(
+            alice.mention_url(),
+            format!("{TEST_BASE_URL}/@alice"),
+            "with one, the profile URL wins"
         );
     }
 

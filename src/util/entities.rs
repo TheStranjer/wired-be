@@ -105,6 +105,25 @@ impl MentionRef {
             .as_ref()
             .map_or_else(|| nickname.clone(), |domain| format!("{nickname}@{domain}"))
     }
+
+    /// The key one mention is looked up and recorded under: the account it
+    /// names, case-folded — `nick` for a bare reference, `nick@domain` when
+    /// the text spelled the domain out. It is the identity
+    /// [`extract_mentions`] deduplicates by.
+    #[must_use]
+    pub fn key(&self) -> String {
+        self.acct().to_lowercase()
+    }
+
+    /// Whether this mention names an account of `domain`: a bare `@nick`
+    /// always does, a `@nick@host` only when `host` equals `domain`
+    /// ignoring ASCII case.
+    #[must_use]
+    pub fn names_domain(&self, domain: &str) -> bool {
+        self.domain
+            .as_deref()
+            .is_none_or(|own| own.eq_ignore_ascii_case(domain))
+    }
 }
 
 /// Extracts every mention from plain text.
@@ -430,6 +449,32 @@ mod tests {
             mention("bob", Some("example.com")).acct(),
             "bob@example.com",
             "remote acct"
+        );
+    }
+
+    #[test]
+    fn mention_keys_fold_case_across_domains() {
+        assert_eq!(mention("Alice", None).key(), "alice", "a bare nick");
+        assert_eq!(
+            mention("Bob", Some("Peer.Example")).key(),
+            "bob@peer.example",
+            "the spelled-out domain joins the key, lowercased"
+        );
+    }
+
+    #[test]
+    fn names_domain_accepts_bare_and_own_domain_in_any_case() {
+        assert!(
+            mention("alice", None).names_domain("test.example"),
+            "a bare nick names any instance's local user"
+        );
+        assert!(
+            mention("alice", Some("TEST.example")).names_domain("test.EXAMPLE"),
+            "the own domain matches in any case"
+        );
+        assert!(
+            !mention("bob", Some("elsewhere.example")).names_domain("test.example"),
+            "another domain never matches"
         );
     }
 
