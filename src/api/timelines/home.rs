@@ -8,19 +8,16 @@ use axum::{
 };
 use url::form_urlencoded;
 
-use super::parse_reply_visibility;
+use super::{common_filters, parse_reply_visibility};
 use crate::{
-    api::helpers::{is_true, push_visibility, timeline_response},
+    api::helpers::{QueryPairs, timeline_response},
     auth::AuthUser,
     entities::status::Status as StatusEntity,
     error::AppResult,
-    models::{
-        status::Visibility,
-        user::{Flag, User},
-    },
+    models::user::User,
     oauth::scopes::READ_STATUSES,
     pagination::PageParams,
-    services::timeline::{ReplyVisibility, TimelineFilters, TimelineQuery, TimelineSource},
+    services::timeline::{TimelineFilters, TimelineQuery, TimelineSource},
     state::AppState,
 };
 
@@ -61,29 +58,16 @@ pub(super) async fn home_timeline(
 
 /// The home timeline's request parameters beyond the [`PageParams`] page:
 /// the four toggles, the visibility exclusions and the reply narrowing,
-/// every one of them a no-op in its [`Default`] spelling. The booleans are
-/// [`Flag`]s because that is what this repository models every boolean
-/// with (see [`crate::models::user`]). `exclude_replies` is not a
-/// parameter of this timeline (Pleroma's `home_operation` does not list
-/// it), so [`HomeParams::parse`] never reads it.
+/// every one of them a no-op in its [`Default`] spelling.
+/// `exclude_replies` is not a parameter of this timeline (Pleroma's
+/// `home_operation` does not list it), so [`HomeParams::parse`] never
+/// reads it.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct HomeParams {
-    /// `local`: keep only statuses whose authors this instance owns.
-    local: Flag,
-    /// `remote`: keep only statuses whose authors are remote mirrors.
-    remote: Flag,
-    /// `only_media`: keep only statuses carrying an attachment.
-    only_media: Flag,
-    /// `with_muted`: skip the viewer's block/mute exclusions (Pleroma's
-    /// `with_muted`, default `false`).
-    with_muted: Flag,
-    /// `exclude_visibilities[]`: drop rows whose visibility is one of
-    /// these; names that are not one of the five stored spellings are
-    /// ignored.
-    exclude_visibilities: Vec<Visibility>,
-    /// `reply_visibility`: which replies survive; `None` keeps them all,
-    /// anything outside `following` and `self` is the parse's 422.
-    reply_visibility: Option<ReplyVisibility>,
+    /// The narrowings [`common_filters`] reads plus `reply_visibility`:
+    /// which replies survive; `None` keeps them all, anything outside
+    /// `following` and `self` is the parse's 422.
+    filters: TimelineFilters,
 }
 
 impl HomeParams {
@@ -100,23 +84,18 @@ impl HomeParams {
     /// [`AppError::Unprocessable`](crate::error::AppError::Unprocessable) from
     /// [`parse_reply_visibility`].
     fn parse(query: Option<&str>) -> AppResult<Self> {
-        let mut found = Self::default();
+        let mut reply_visibility = None;
         for (key, value) in form_urlencoded::parse(query.unwrap_or_default().as_bytes()) {
-            match key.as_ref() {
-                "local" => found.local = Flag::new(is_true(&value)),
-                "remote" => found.remote = Flag::new(is_true(&value)),
-                "only_media" => found.only_media = Flag::new(is_true(&value)),
-                "with_muted" => found.with_muted = Flag::new(is_true(&value)),
-                "exclude_visibilities" | "exclude_visibilities[]" => {
-                    push_visibility(&mut found.exclude_visibilities, &value);
-                }
-                "reply_visibility" => {
-                    found.reply_visibility = Some(parse_reply_visibility(&value)?);
-                }
-                _ => {}
+            if key == "reply_visibility" {
+                reply_visibility = Some(parse_reply_visibility(&value)?);
             }
         }
-        Ok(found)
+        Ok(Self {
+            filters: TimelineFilters {
+                reply_visibility,
+                ..common_filters(&QueryPairs::parse(query))
+            },
+        })
     }
 
     /// Assembles the [`TimelineQuery`] the request asks for:
@@ -127,15 +106,7 @@ impl HomeParams {
         TimelineQuery {
             viewer: Some(viewer),
             source: TimelineSource::Home,
-            filters: TimelineFilters {
-                local_only: self.local,
-                remote_only: self.remote,
-                only_media: self.only_media,
-                with_muted: self.with_muted,
-                exclude_visibilities: self.exclude_visibilities,
-                reply_visibility: self.reply_visibility,
-                ..TimelineFilters::default()
-            },
+            filters: self.filters,
             page,
         }
     }
@@ -145,7 +116,11 @@ impl HomeParams {
 mod tests {
     use super::super::{REPLY_VISIBILITY_INVALID, test_support::fixture_user};
     use super::*;
-    use crate::error::AppError;
+    use crate::{
+        error::AppError,
+        models::{status::Visibility, user::Flag},
+        services::timeline::ReplyVisibility,
+    };
 
     /// The parsed home query, expecting success: `reply_visibility` is the
     /// one key this parse can reject, and the rejects get their own test.
@@ -158,9 +133,10 @@ mod tests {
         let params = home_parsed(
             "local=true&remote=1&only_media=TRUE&with_muted=yes\
              &exclude_visibilities[]=public&exclude_visibilities=Private",
-        );
-        assert!(params.local.get(), "`local=true`");
-        assert!(params.remote.get(), "`remote=1`");
+        )
+        .filters;
+        assert!(params.local_only.get(), "`local=true`");
+        assert!(params.remote_only.get(), "`remote=1`");
         assert!(params.only_media.get(), "`only_media` is case-insensitive");
         assert!(params.with_muted.get(), "`yes` is a true spelling");
         assert_eq!(
@@ -168,9 +144,9 @@ mod tests {
             vec![Visibility::Public],
             "both spellings fill the one list and only a stored name counts"
         );
-        let off = home_parsed("local=false&remote=&exclude_replies=true");
+        let off = home_parsed("local=false&remote=&exclude_replies=true").filters;
         assert!(
-            !off.local.get() && !off.remote.get(),
+            !off.local_only.get() && !off.remote_only.get(),
             "`false` and empty are off"
         );
         assert!(off.exclude_visibilities.is_empty(), "nothing is excluded");
@@ -178,22 +154,29 @@ mod tests {
             off.reply_visibility, None,
             "`exclude_replies` is not a home parameter and narrows nothing"
         );
+        assert!(!off.exclude_replies.get(), "and it stays off");
     }
 
     #[test]
     fn the_home_reply_visibility_takes_the_two_spellings_and_the_last_wins() {
         assert_eq!(
-            home_parsed("reply_visibility=following").reply_visibility,
+            home_parsed("reply_visibility=following")
+                .filters
+                .reply_visibility,
             Some(ReplyVisibility::Following),
             "`following` narrows to the viewer's follows"
         );
         assert_eq!(
-            home_parsed("reply_visibility=self").reply_visibility,
+            home_parsed("reply_visibility=self")
+                .filters
+                .reply_visibility,
             Some(ReplyVisibility::SelfOnly),
             "`self` narrows to the viewer"
         );
         assert_eq!(
-            home_parsed("reply_visibility=following&reply_visibility=self").reply_visibility,
+            home_parsed("reply_visibility=following&reply_visibility=self")
+                .filters
+                .reply_visibility,
             Some(ReplyVisibility::SelfOnly),
             "the last occurrence wins"
         );
@@ -248,12 +231,15 @@ mod tests {
             offset: None,
         };
         let query = HomeParams {
-            local: Flag::new(true),
-            remote: Flag::new(false),
-            only_media: Flag::new(true),
-            with_muted: Flag::new(true),
-            exclude_visibilities: vec![Visibility::Direct],
-            reply_visibility: Some(ReplyVisibility::SelfOnly),
+            filters: TimelineFilters {
+                local_only: Flag::new(true),
+                remote_only: Flag::new(false),
+                only_media: Flag::new(true),
+                with_muted: Flag::new(true),
+                exclude_visibilities: vec![Visibility::Direct],
+                reply_visibility: Some(ReplyVisibility::SelfOnly),
+                ..TimelineFilters::default()
+            },
         }
         .into_timeline(alice, page);
         assert_eq!(query.source, TimelineSource::Home, "the home source");

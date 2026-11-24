@@ -80,8 +80,10 @@
 use axum::{Router, routing::get};
 
 use crate::{
+    api::helpers::{QueryPairs, is_true, push_visibility},
     error::{AppError, AppResult},
-    services::timeline::ReplyVisibility,
+    models::user::Flag,
+    services::timeline::{ReplyVisibility, TimelineFilters},
     state::AppState,
 };
 
@@ -191,4 +193,125 @@ fn parse_public_reply_visibility(text: &str) -> Option<ReplyVisibility> {
 fn parse_instance(text: &str) -> Option<String> {
     let domain = text.trim();
     (!domain.is_empty()).then(|| domain.to_owned())
+}
+
+/// The five narrowings every timeline route shares, read out of `pairs`.
+///
+/// `local`, `remote`, `only_media` and `with_muted` are [`Flag`]s read with
+/// [`is_true`] (the last occurrence of a key wins, an empty value is off),
+/// and `exclude_visibilities` fills from both the bracketed and the bare
+/// spelling in occurrence order through [`push_visibility`], so a name that
+/// is not one of the five stored visibilities narrows nothing. Every other
+/// [`TimelineFilters`] field stays at its [`Default`]; a route sets its own
+/// extras on top with struct-update syntax, and one that honours fewer than
+/// these five clears the rest.
+fn common_filters(pairs: &QueryPairs) -> TimelineFilters {
+    let flag = |key: &str| Flag::new(pairs.value(key).is_some_and(|text| is_true(&text)));
+    let mut exclude_visibilities = Vec::new();
+    for name in pairs.values("exclude_visibilities") {
+        push_visibility(&mut exclude_visibilities, &name);
+    }
+    TimelineFilters {
+        local_only: flag("local"),
+        remote_only: flag("remote"),
+        only_media: flag("only_media"),
+        with_muted: flag("with_muted"),
+        exclude_visibilities,
+        ..TimelineFilters::default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::status::Visibility;
+
+    /// [`common_filters`] over a raw query string.
+    fn common(query: &str) -> TimelineFilters {
+        common_filters(&QueryPairs::parse(Some(query)))
+    }
+
+    #[test]
+    fn no_query_is_every_filter_off() {
+        for query in [
+            "",
+            "foo=bar&limit=5&reply_visibility=self&instance=x.example",
+        ] {
+            assert_eq!(
+                common(query),
+                TimelineFilters::default(),
+                "`{query}` narrows nothing"
+            );
+        }
+        assert_eq!(
+            common_filters(&QueryPairs::parse(None)),
+            TimelineFilters::default(),
+            "an absent query is no pairs"
+        );
+    }
+
+    #[test]
+    fn the_four_flags_read_truthy_text_and_the_last_occurrence_wins() {
+        let on = common("local=true&remote=1&only_media=TRUE&with_muted=yes");
+        assert!(on.local_only.get(), "`local=true`");
+        assert!(on.remote_only.get(), "`remote=1`");
+        assert!(on.only_media.get(), "`only_media` is case-insensitive");
+        assert!(on.with_muted.get(), "`yes` is a true spelling");
+        let off = common("local=false&remote=&only_media=maybe&with_muted=true&with_muted=false");
+        assert!(
+            !off.local_only.get()
+                && !off.remote_only.get()
+                && !off.only_media.get()
+                && !off.with_muted.get(),
+            "`false`, empty and junk are off and the last occurrence wins"
+        );
+        assert!(
+            !common("local=true&local=").local_only.get(),
+            "a later empty value overrides an earlier true one"
+        );
+    }
+
+    #[test]
+    fn exclude_visibilities_fills_from_both_spellings_in_order() {
+        let filters = common(
+            "exclude_visibilities[]=public&exclude_visibilities=private\
+             &exclude_visibilities[]=direct",
+        );
+        assert_eq!(
+            filters.exclude_visibilities,
+            vec![Visibility::Public, Visibility::Private, Visibility::Direct],
+            "the bracketed and the bare spelling fill one list, in order"
+        );
+        assert_eq!(
+            common("exclude_visibilities=unlisted").exclude_visibilities,
+            vec![Visibility::Unlisted],
+            "the bare spelling alone works"
+        );
+        assert_eq!(
+            common("exclude_visibilities[]=unlisted").exclude_visibilities,
+            vec![Visibility::Unlisted],
+            "the bracketed spelling alone works"
+        );
+    }
+
+    #[test]
+    fn exclude_visibilities_ignores_names_that_are_not_stored_spellings() {
+        let filters = common(
+            "exclude_visibilities[]=Public&exclude_visibilities[]=&exclude_visibilities=nope\
+             &exclude_visibilities[]=direct",
+        );
+        assert_eq!(
+            filters.exclude_visibilities,
+            vec![Visibility::Direct],
+            "a capitalization, an empty value and junk narrow nothing"
+        );
+    }
+
+    #[test]
+    fn the_route_extras_are_left_at_their_defaults() {
+        let filters = common("local=true&reply_visibility=self&instance=x.example");
+        assert_eq!(filters.reply_visibility, None, "the route's own extra");
+        assert_eq!(filters.instance, None, "the route's own extra");
+        assert!(!filters.exclude_replies.get(), "never a shared key");
+    }
 }

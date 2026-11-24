@@ -7,24 +7,21 @@ use axum::{
     extract::{OriginalUri, State},
     http::HeaderMap,
 };
-use url::form_urlencoded;
 
 use super::{
-    AUTHENTICATION_REQUIRED, parse_instance, parse_public_reply_visibility, timeline_area,
+    AUTHENTICATION_REQUIRED, common_filters, parse_instance, parse_public_reply_visibility,
+    timeline_area,
 };
 use crate::{
-    api::helpers::{is_true, push_visibility, timeline_response},
+    api::helpers::{QueryPairs, timeline_response},
     auth::MaybeAuthUser,
     config::Config,
     entities::status::Status as StatusEntity,
     error::{AppError, AppResult},
-    models::{
-        status::Visibility,
-        user::{Flag, User},
-    },
+    models::user::User,
     oauth::scopes::READ_STATUSES,
     pagination::PageParams,
-    services::timeline::{ReplyVisibility, TimelineFilters, TimelineQuery, TimelineSource},
+    services::timeline::{TimelineFilters, TimelineQuery, TimelineSource},
     state::AppState,
 };
 
@@ -68,63 +65,42 @@ pub(super) async fn public_timeline(
 /// The origin/media/mute narrowings and visibility exclusions the tag route
 /// shares, plus Pleroma's two public-page extensions, `reply_visibility`
 /// and `instance` — every one of them a no-op in its [`Default`] spelling.
-/// The booleans are [`Flag`]s because that is what this repository models
-/// every boolean with (see [`crate::models::user`]).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct PublicParams {
-    /// `local`: keep only statuses this instance authored.
+    /// The narrowings [`common_filters`] reads (`local`, `remote`,
+    /// `only_media`, `with_muted`, `exclude_visibilities[]`) plus the two
+    /// public-page extras: `reply_visibility` (keep only replies addressed
+    /// to the viewer (`self`) or to the viewer and their follows
+    /// (`following`); any other spelling — or no value — keeps every
+    /// reply) and `instance` (keep only statuses whose author is a remote
+    /// account of this domain, Pleroma's author-domain extension; `None`
+    /// filters nothing).
     ///
-    /// It is also the parameter that picks which [`Config::restricts`] area
-    /// gates an anonymous read (see [`timeline_area`]).
-    local: Flag,
-    /// `remote`: keep only statuses mirrored from other instances.
-    remote: Flag,
-    /// `only_media`: keep only statuses carrying an attachment.
-    only_media: Flag,
-    /// `with_muted`: skip the viewer's block/mute exclusions (Pleroma's
-    /// `with_muted`, default `false`).
-    with_muted: Flag,
-    /// `exclude_visibilities[]`: drop rows whose visibility is one of
-    /// these; names that are not one of the five stored spellings are
-    /// ignored.
-    exclude_visibilities: Vec<Visibility>,
-    /// `reply_visibility`: keep only replies addressed to the viewer
-    /// (`self`) or to the viewer and their follows (`following`); any other
-    /// spelling — or no value — keeps every reply.
-    reply_visibility: Option<ReplyVisibility>,
-    /// `instance`: keep only statuses whose author is a remote account of
-    /// this domain (Pleroma's author-domain extension); `None` filters
-    /// nothing.
-    instance: Option<String>,
+    /// `local` is also the parameter that picks which [`Config::restricts`]
+    /// area gates an anonymous read (see [`timeline_area`]).
+    filters: TimelineFilters,
 }
 
 impl PublicParams {
     /// Reads the parameters out of a raw query string the way
     /// [`TagParams::parse`] reads its own.
     ///
-    /// Percent-decoded; `key` and `key[]` fill the
-    /// [`Self::exclude_visibilities`] list in occurrence order; a repeated
-    /// single-value key takes its last value; an unrelated key is never
-    /// looked at.
+    /// Percent-decoded; `key` and `key[]` fill the exclusion list in
+    /// occurrence order; a repeated single-value key takes its last value;
+    /// an unrelated key is never looked at.
     fn parse(query: Option<&str>) -> Self {
-        let mut found = Self::default();
-        for (key, value) in form_urlencoded::parse(query.unwrap_or_default().as_bytes()) {
-            match key.as_ref() {
-                "local" => found.local = Flag::new(is_true(&value)),
-                "remote" => found.remote = Flag::new(is_true(&value)),
-                "only_media" => found.only_media = Flag::new(is_true(&value)),
-                "with_muted" => found.with_muted = Flag::new(is_true(&value)),
-                "exclude_visibilities" | "exclude_visibilities[]" => {
-                    push_visibility(&mut found.exclude_visibilities, &value);
-                }
-                "reply_visibility" => {
-                    found.reply_visibility = parse_public_reply_visibility(&value);
-                }
-                "instance" => found.instance = parse_instance(&value),
-                _ => {}
-            }
+        let pairs = QueryPairs::parse(query);
+        Self {
+            filters: TimelineFilters {
+                reply_visibility: pairs
+                    .value("reply_visibility")
+                    .and_then(|text| parse_public_reply_visibility(&text)),
+                instance: pairs
+                    .value("instance")
+                    .and_then(|text| parse_instance(&text)),
+                ..common_filters(&pairs)
+            },
         }
-        found
     }
 
     /// Pleroma's `restrict_unauthenticated?` gate, in
@@ -146,7 +122,7 @@ impl PublicParams {
         if authenticated {
             return Ok(());
         }
-        if config.restricts(timeline_area(self.local.get())) {
+        if config.restricts(timeline_area(self.filters.local_only.get())) {
             return Err(AppError::Forbidden(AUTHENTICATION_REQUIRED.to_owned()));
         }
         Ok(())
@@ -160,16 +136,7 @@ impl PublicParams {
         TimelineQuery {
             viewer,
             source: TimelineSource::Public,
-            filters: TimelineFilters {
-                local_only: self.local,
-                remote_only: self.remote,
-                only_media: self.only_media,
-                with_muted: self.with_muted,
-                exclude_visibilities: self.exclude_visibilities,
-                reply_visibility: self.reply_visibility,
-                instance: self.instance,
-                ..TimelineFilters::default()
-            },
+            filters: self.filters,
             page,
         }
     }
@@ -179,6 +146,7 @@ impl PublicParams {
 mod tests {
     use super::super::{TIMELINES_FEDERATED, TIMELINES_LOCAL};
     use super::*;
+    use crate::{models::status::Visibility, services::timeline::ReplyVisibility};
 
     /// The parsed public-page query as [`PublicParams`].
     fn public_parsed(query: &str) -> PublicParams {
@@ -208,18 +176,19 @@ mod tests {
         let params = public_parsed(
             "local=true&remote=1&only_media=TRUE&with_muted=true&exclude_visibilities[]=private",
         );
-        assert!(params.local.get(), "`local=true`");
-        assert!(params.remote.get(), "`remote=1`");
-        assert!(params.only_media.get(), "`only_media` is case-insensitive");
-        assert!(params.with_muted.get(), "`with_muted=true`");
+        let filters = &params.filters;
+        assert!(filters.local_only.get(), "`local=true`");
+        assert!(filters.remote_only.get(), "`remote=1`");
+        assert!(filters.only_media.get(), "`only_media` is case-insensitive");
+        assert!(filters.with_muted.get(), "`with_muted=true`");
         assert_eq!(
-            params.exclude_visibilities,
+            filters.exclude_visibilities,
             vec![Visibility::Private],
             "the verbatim visibility name is kept"
         );
-        let off = public_parsed("local=false&remote=&exclude_visibilities[]=Public");
+        let off = public_parsed("local=false&remote=&exclude_visibilities[]=Public").filters;
         assert!(
-            !off.local.get() && !off.remote.get() && off.exclude_visibilities.is_empty(),
+            !off.local_only.get() && !off.remote_only.get() && off.exclude_visibilities.is_empty(),
             "`false`, empty and un-spelled values narrow nothing"
         );
     }
@@ -227,18 +196,24 @@ mod tests {
     #[test]
     fn reply_visibility_names_the_two_filters_and_shrugs_at_the_rest() {
         assert_eq!(
-            public_parsed("reply_visibility=following").reply_visibility,
+            public_parsed("reply_visibility=following")
+                .filters
+                .reply_visibility,
             Some(ReplyVisibility::Following),
             "`following` is Pleroma's friends-and-self filter"
         );
         assert_eq!(
-            public_parsed("reply_visibility=%20self%20").reply_visibility,
+            public_parsed("reply_visibility=%20self%20")
+                .filters
+                .reply_visibility,
             Some(ReplyVisibility::SelfOnly),
             "`self` is trimmed like every other value"
         );
         for value in ["all", "ignored", "Self", ""] {
             assert_eq!(
-                public_parsed(&format!("reply_visibility={value}")).reply_visibility,
+                public_parsed(&format!("reply_visibility={value}"))
+                    .filters
+                    .reply_visibility,
                 None,
                 "`{value}` is no filter and keeps every reply"
             );
@@ -248,24 +223,28 @@ mod tests {
     #[test]
     fn instance_is_trimmed_and_an_empty_one_filters_nothing() {
         assert_eq!(
-            public_parsed("instance=remote.example").instance.as_deref(),
+            public_parsed("instance=remote.example")
+                .filters
+                .instance
+                .as_deref(),
             Some("remote.example"),
             "the domain is kept as spelled"
         );
         assert_eq!(
             public_parsed("instance=%20cdn.example%20")
+                .filters
                 .instance
                 .as_deref(),
             Some("cdn.example"),
             "whitespace trims off"
         );
         assert_eq!(
-            public_parsed("instance=").instance,
+            public_parsed("instance=").filters.instance,
             None,
             "an empty domain is no filter at all"
         );
         assert_eq!(
-            public_parsed("instance=%20%20%20").instance,
+            public_parsed("instance=%20%20%20").filters.instance,
             None,
             "and a blank one reads the same"
         );

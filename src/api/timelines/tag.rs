@@ -6,17 +6,14 @@ use axum::{
     extract::{OriginalUri, Path, State},
     http::HeaderMap,
 };
-use url::form_urlencoded;
 
+use super::common_filters;
 use crate::{
-    api::helpers::{is_true, normalize_tag, push_tag, push_visibility, timeline_response},
+    api::helpers::{QueryPairs, normalize_tag, push_tag, timeline_response},
     auth::MaybeAuthUser,
     entities::status::Status as StatusEntity,
     error::{AppError, AppResult},
-    models::{
-        status::Visibility,
-        user::{Flag, User},
-    },
+    models::user::User,
     oauth::scopes::READ_STATUSES,
     pagination::PageParams,
     services::timeline::{TimelineFilters, TimelineQuery, TimelineSource},
@@ -69,9 +66,7 @@ fn push_capped_tag(list: &mut Vec<String>, raw: &str) {
 
 /// The hashtag timeline's request parameters beyond the path tag and the
 /// [`PageParams`] page: the extra tag arrays and the narrowings, every one
-/// of them a no-op in its [`Default`] spelling. The booleans are [`Flag`]s
-/// because that is what this repository models every boolean with (see
-/// [`crate::models::user`]).
+/// of them a no-op in its [`Default`] spelling.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct TagParams {
     /// `any[]`: extra tags that join the path tag in the union every row
@@ -82,19 +77,10 @@ struct TagParams {
     all: Vec<String>,
     /// `none[]`: a row carrying any of these tags is dropped.
     none: Vec<String>,
-    /// `local`: keep only statuses this instance authored.
-    local: Flag,
-    /// `remote`: keep only statuses mirrored from other instances.
-    remote: Flag,
-    /// `only_media`: keep only statuses carrying an attachment.
-    only_media: Flag,
-    /// `with_muted`: skip the viewer's block/mute exclusions (Pleroma's
-    /// `with_muted`, default `false`).
-    with_muted: Flag,
-    /// `exclude_visibilities[]`: drop rows whose visibility is one of
-    /// these; names that are not one of the five stored spellings are
-    /// ignored.
-    exclude_visibilities: Vec<Visibility>,
+    /// The narrowings every timeline shares (`local`, `remote`,
+    /// `only_media`, `with_muted`, `exclude_visibilities[]`), read by
+    /// [`common_filters`].
+    filters: TimelineFilters,
 }
 
 impl TagParams {
@@ -105,23 +91,20 @@ impl TagParams {
     /// list, in occurrence order); a value that normalizes to nothing is
     /// dropped, and an unrelated key is never looked at.
     fn parse(query: Option<&str>) -> Self {
-        let mut found = Self::default();
-        for (key, value) in form_urlencoded::parse(query.unwrap_or_default().as_bytes()) {
-            match key.as_ref() {
-                "any" | "any[]" => push_capped_tag(&mut found.any, &value),
-                "all" | "all[]" => push_capped_tag(&mut found.all, &value),
-                "none" | "none[]" => push_capped_tag(&mut found.none, &value),
-                "local" => found.local = Flag::new(is_true(&value)),
-                "remote" => found.remote = Flag::new(is_true(&value)),
-                "only_media" => found.only_media = Flag::new(is_true(&value)),
-                "with_muted" => found.with_muted = Flag::new(is_true(&value)),
-                "exclude_visibilities" | "exclude_visibilities[]" => {
-                    push_visibility(&mut found.exclude_visibilities, &value);
-                }
-                _ => {}
+        let pairs = QueryPairs::parse(query);
+        let tag_list = |key: &str| {
+            let mut list = Vec::new();
+            for raw in pairs.values(key) {
+                push_capped_tag(&mut list, &raw);
             }
+            list
+        };
+        Self {
+            any: tag_list("any"),
+            all: tag_list("all"),
+            none: tag_list("none"),
+            filters: common_filters(&pairs),
         }
-        found
     }
 
     /// Assembles the [`TimelineQuery`] the request asks for: the path `tag`
@@ -140,14 +123,7 @@ impl TagParams {
                 all: self.all,
                 none: self.none,
             },
-            filters: TimelineFilters {
-                local_only: self.local,
-                remote_only: self.remote,
-                only_media: self.only_media,
-                with_muted: self.with_muted,
-                exclude_visibilities: self.exclude_visibilities,
-                ..TimelineFilters::default()
-            },
+            filters: self.filters,
             page,
         }
     }
@@ -156,6 +132,7 @@ impl TagParams {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::status::Visibility;
 
     /// The parsed query as owned pairs, so the assertions read like the
     /// query they came from.
@@ -238,13 +215,16 @@ mod tests {
     #[test]
     fn the_flags_read_pleroma_style_truthy_text() {
         let params = parsed("local=true&remote=1&only_media=TRUE&with_muted=yes");
-        assert!(params.local.get(), "`local=true`");
-        assert!(params.remote.get(), "`remote=1`");
-        assert!(params.only_media.get(), "`only_media` is case-insensitive");
-        assert!(params.with_muted.get(), "`yes` is a true spelling");
+        assert!(params.filters.local_only.get(), "`local=true`");
+        assert!(params.filters.remote_only.get(), "`remote=1`");
+        assert!(
+            params.filters.only_media.get(),
+            "`only_media` is case-insensitive"
+        );
+        assert!(params.filters.with_muted.get(), "`yes` is a true spelling");
         let off = parsed("local=false&remote=");
         assert!(
-            !off.local.get() && !off.remote.get(),
+            !off.filters.local_only.get() && !off.filters.remote_only.get(),
             "`false` and empty are off"
         );
     }
@@ -253,7 +233,7 @@ mod tests {
     fn exclude_visibilities_keeps_the_five_stored_spellings() {
         let params = parsed("exclude_visibilities[]=public&exclude_visibilities[]=Public&all=x");
         assert_eq!(
-            params.exclude_visibilities,
+            params.filters.exclude_visibilities,
             vec![Visibility::Public],
             "the verbatim spelling counts, a capitalization does not"
         );
