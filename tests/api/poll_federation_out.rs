@@ -10,8 +10,9 @@
 //! question's uri under the `{BASE_URL}/objects/vote-{vote id}-{option
 //! position}` id, the activity under the matching `{BASE_URL}/activities/…`
 //! id, both addressed to the poll's author alone, and the fan-out delivers
-//! to their personal inbox only. A vote on a LOCAL poll sends nothing: its
-//! author reads the counters, not the wire. The endpoint's refusals (the
+//! to their personal inbox only. A vote on a LOCAL poll sends no answer —
+//! its author reads the counters, not the wire — and queues one debounced
+//! `Update` of the `Question`. The endpoint's refusals (the
 //! invisible question, the author's own ballot) write nothing and announce
 //! nothing.
 //!
@@ -108,7 +109,7 @@ async fn remote_question(
 }
 
 /// A LOCAL status of `author` carrying a two-option poll — the fixture the
-/// "sends nothing" vote marks.
+/// "no answer" vote marks.
 async fn local_question(pool: &PgPool, author: &User) -> Poll {
     let posted = common::create_status(pool, author, "tea or coffee?", Visibility::Public).await;
     let mut conn = pool.acquire().await.expect("a slot connection");
@@ -374,9 +375,10 @@ async fn a_multiple_choice_ballot_publishes_one_answer_per_option() {
 }
 
 /// A vote on a LOCAL poll records itself exactly as the remote arm does —
-/// and announces nothing at all: the poll's own author reads the counters.
+/// and sends no answer: the one thing queued is the debounced `Update` of
+/// the poll's own `Question`, due in the future.
 #[tokio::test]
-async fn a_vote_on_a_local_poll_sends_nothing() {
+async fn a_vote_on_a_local_poll_queues_only_a_question_update() {
     let db = common::test_db().await;
     let pool = db.pool().clone();
     let app = common::test_app(pool.clone());
@@ -392,8 +394,12 @@ async fn a_vote_on_a_local_poll_sends_nothing() {
         (1, 1),
         "the ballot counted"
     );
-    assert!(published(&pool).await.is_empty(), "and sent nothing");
-    assert_eq!(delivery_count(&pool).await, 0, "not even a delivery job");
+    let queued = published(&pool).await;
+    assert_eq!(queued.len(), 1, "one job: the tally's Update");
+    assert_eq!(queued[0]["type"], "Update", "an Update, not an answer");
+    assert_eq!(queued[0]["object"]["type"], "Question", "of the question");
+    assert_eq!(queued[0]["object"]["votersCount"], 1, "with the new tally");
+    assert_eq!(delivery_count(&pool).await, 0, "and no delivery job yet");
 }
 
 /// A REMOTE private question the voter may not see is the shared 404: no

@@ -46,7 +46,9 @@
 //! The other halves of a federated poll are elsewhere by the ticket's own
 //! hand: this instance's own votes travelling out as answer activities is the
 //! outbound poll ticket, and the `Update` of a remote `Question`'s totals is
-//! the note-update ticket. Nothing here sends anything anywhere.
+//! the note-update ticket. The one thing sent from here is the debounced
+//! `Update` of the local `Question`'s new tally
+//! ([`after_local_poll_changed`]).
 
 use chrono::Utc;
 use futures::future::BoxFuture;
@@ -66,6 +68,7 @@ use crate::{
         status_visibility,
         user::User,
     },
+    services::federation_out::after_local_poll_changed,
     state::AppState,
 };
 
@@ -364,6 +367,8 @@ async fn mark(
         .map_err(|err| FederationError::transient("the poll read failed", &err))?;
     if let Some(updated) = updated {
         after_vote_cast(state, &updated, voter, &[option.id]).await;
+        // the tally moved on a poll this instance owns: tell its audience
+        after_local_poll_changed(state, &question.posted).await;
     }
     debug!(
         poll = %stand.id,

@@ -26,8 +26,8 @@ use tracing::debug;
 use crate::{
     error::AppError,
     jobs::{AttemptInfo, HandlerFuture, JobError, scheduler::PeriodicJob},
-    models::poll,
-    services::notify,
+    models::{poll, status},
+    services::{federation_out, notify},
     state::AppState,
 };
 
@@ -86,6 +86,14 @@ pub fn handle_end_notify(state: AppState, _attempt: AttemptInfo, _args: Value) -
             notify::on_poll_ended(&state, row)
                 .await
                 .map_err(|err| retry(&err))?;
+            // Remote copies learn the poll closed: the debounced `Update`
+            // of a local question (a no-op for a mirror or a gone row).
+            let posted = status::get_by_id(&state.db, row.status_id)
+                .await
+                .map_err(|err| retry(&err))?;
+            if let Some(posted) = posted {
+                federation_out::after_local_poll_changed(&state, &posted).await;
+            }
             // `0` would say a concurrent sweep retired the row first,
             // which the per-recipient deduplication has already made
             // harmless; the count itself is the flag write's concern.
@@ -252,6 +260,46 @@ mod tests {
                 recipient.nickname
             );
         }
+    }
+
+    /// The `(object type, unique key, due in the future)` of every queued
+    /// `federator.publish` job.
+    async fn publish_facts(pool: &PgPool) -> Vec<(String, Option<String>, bool)> {
+        sqlx::query_as::<_, (String, Option<String>, bool)>(
+            "SELECT args->'activity'->'object'->>'type', unique_key, run_at > now() \
+               FROM jobs WHERE kind = $1 ORDER BY inserted_at",
+        )
+        .bind(crate::federation::publisher::KIND_PUBLISH)
+        .fetch_all(pool)
+        .await
+        .expect("the publish jobs read")
+    }
+
+    /// Closing a local poll queues the debounced `Update` of its
+    /// `Question`, once, however many sweeps see the poll.
+    #[tokio::test]
+    async fn closing_a_local_poll_queues_one_question_update() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let state = app_state(&pool);
+        let alice = user(&pool, "cu-alice").await;
+        let bob = user(&pool, "cu-bob").await;
+        let ended = poll_closed_around(&pool, &alice, -1, &[&bob]).await;
+
+        let outcome = handle_end_notify(state.clone(), FIRST_ATTEMPT, json!({})).await;
+        assert_eq!(outcome, Ok(()), "the sweep runs");
+        let rerun = handle_end_notify(state, FIRST_ATTEMPT, json!({})).await;
+        assert_eq!(rerun, Ok(()), "and so does the rerun");
+
+        assert_eq!(
+            publish_facts(&pool).await,
+            vec![(
+                "Question".to_owned(),
+                Some(format!("poll-update:{}", ended.status_id)),
+                true
+            )],
+            "one delayed Update of the Question, keyed by its status"
+        );
     }
 
     #[tokio::test]
