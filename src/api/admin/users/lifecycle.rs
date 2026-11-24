@@ -94,25 +94,11 @@ pub(super) async fn write_activation(
     active: bool,
 ) -> AppResult<Json<AdminAccounts>> {
     let found = admin::resolve_nicknames(&state.db, nicknames).await?;
-    let mut moved = Vec::with_capacity(found.len());
-    for account in &found {
-        if !active && account.id == actor.id {
-            continue;
-        }
-        if let Some(updated) = admin::set_active(&state.db, account.id, active).await? {
-            moved.push(updated);
-        }
-    }
-    let logged = if active {
-        moderation_log::activate(&state.db, actor, &moved).await?
-    } else {
-        moderation_log::deactivate(&state.db, actor, &moved).await?
-    };
-    debug!(
-        log = %logged.id,
-        moved = moved.len(),
-        active, "admin changed account activations"
-    );
+    let subjects: Vec<User> = found
+        .into_iter()
+        .filter(|account| active || account.id != actor.id)
+        .collect();
+    let moved = helpers::set_activation(state, actor, &subjects, active).await?;
     Ok(Json(AdminAccounts::from_users(&moved, &state.config)))
 }
 
@@ -179,17 +165,11 @@ pub(super) async fn toggle_activation(
         return Err(AppError::Forbidden(SELF_DEACTIVATION.to_owned()));
     }
     let activate = !found.is_active.get();
-    let updated = admin::set_active(&state.db, found.id, activate)
+    let updated = helpers::set_activation(&state, &admin.0, slice::from_ref(&found), activate)
         .await?
+        .pop()
         .ok_or(AppError::RouteNotFound)?;
-    let subjects = slice::from_ref(&found);
-    let logged = if activate {
-        moderation_log::activate(&state.db, &admin.0, subjects).await?
-    } else {
-        moderation_log::deactivate(&state.db, &admin.0, subjects).await?
-    };
     debug!(
-        log = %logged.id,
         id = %found.id,
         nickname = %found.nickname,
         activated = activate,

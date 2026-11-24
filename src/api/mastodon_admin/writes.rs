@@ -54,7 +54,7 @@ pub(super) async fn delete_account(
 }
 
 /// `POST /api/v1/admin/accounts/{id}/enable` — Pleroma's `enable`:
-/// [`admin::set_active`] with the flag set, the fresh row's entity as the
+/// [`helpers::set_activation`] with the flag set, the fresh row's entity as the
 /// answer and the `activate` entry Pleroma's own action writes.
 ///
 /// The flag is the whole gate: the deactivation revoked no token and stamped
@@ -75,15 +75,11 @@ pub(super) async fn enable_account(
 ) -> AppResult<Json<AdminAccount>> {
     admin.require(CLASS_WRITE, AREA_ACCOUNTS)?;
     let account = named_account(&state, &raw).await?;
-    let updated = admin::set_active(&state.db, account.id, true)
+    let updated = helpers::set_activation(&state, &admin.0, slice::from_ref(&account), true)
         .await?
+        .pop()
         .ok_or(AppError::NotFound)?;
-    let logged = moderation_log::activate(&state.db, &admin.0, slice::from_ref(&account)).await?;
-    debug!(
-        log = %logged.id,
-        account = %account.id,
-        "admin enabled an account"
-    );
+    debug!(account = %account.id, "admin enabled an account");
     Ok(Json(AdminAccount::from_user(&updated, &state.config)))
 }
 
