@@ -13,8 +13,7 @@
 //! <name> does not exist"}` — and the install routes of WBE-216: the
 //! remote listing relay, the pack download from a mock remote instance
 //! (shared, fallback and refused), the uploaded-zip install and the
-//! filesystem import, under `admin:read` for the GETs and `admin:write`
-//! for the POSTs. The reads answer without authentication and unknown
+//! filesystem import, all under `admin:write`. The reads answer without authentication and unknown
 //! or unsafe pack names answer the reads' shared 404; every write
 //! demands an admin bearer token.
 //!

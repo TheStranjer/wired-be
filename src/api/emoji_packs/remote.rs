@@ -12,7 +12,7 @@ use tracing::debug;
 use url::{Url, form_urlencoded};
 
 use super::{
-    AREA_EMOJI, CLASS_READ, COULD_NOT_FETCH, INVALID_URL, MAX_FETCH_STATUS, MAX_REMOTE_LIST_BYTES,
+    AREA_EMOJI, CLASS_WRITE, COULD_NOT_FETCH, INVALID_URL, MAX_FETCH_STATUS, MAX_REMOTE_LIST_BYTES,
     MIN_FETCH_STATUS, NAME_EMPTY, REMOTE_PACK_PATH, REMOTE_PACKS_PATH, params::PackParams,
 };
 use crate::{
@@ -205,13 +205,12 @@ pub(super) async fn fetch_pack_listing(
 /// relayed as it answered. A `url` that is no http(s) address is the
 /// 400; a remote that is down, answers a non-2xx or talks non-JSON is
 /// the 500 `{"error":"Could not fetch the pack list"}`. An admin with
-/// `admin:read` (the ticket's grant for the GETs; Pleroma itself asks
-/// `admin:write`).
+/// `admin:write` (as Pleroma demands; `admin:read` is refused).
 ///
 /// # Errors
 ///
 /// [`AppError::Unauthorized`] / [`AppError::Forbidden`] from [`AdminUser`]
-/// and its `admin:read` gate; [`AppError::BadRequest`] for a `url` no
+/// and its `admin:write` gate; [`AppError::BadRequest`] for a `url` no
 /// client may call ([`INVALID_URL`]); [`AppError::InternalMessage`] for
 /// every remote failure; other read failures arrive unchanged.
 pub(super) async fn remote(
@@ -219,7 +218,7 @@ pub(super) async fn remote(
     admin: AdminUser,
     params: PackParams,
 ) -> AppResult<Json<Value>> {
-    admin.require(CLASS_READ, AREA_EMOJI)?;
+    admin.require(CLASS_WRITE, AREA_EMOJI)?;
     let page = params.page.to_string();
     let page_size = params.page_size.to_string();
     let url = instance_api_url(
