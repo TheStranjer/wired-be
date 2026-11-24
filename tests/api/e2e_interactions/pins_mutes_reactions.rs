@@ -6,8 +6,8 @@ use serde_json::{Value, json};
 
 use super::support::{
     ACCOUNTS, PARTY, PARTY_SEGMENT, PLEROMA, STATUSES, THUMB, THUMB_SEGMENT, acted,
-    app_with_pin_limit, assert_every, created, entity_id, follows, get, ids_of, pick, post,
-    reacted, representations, user, withdrawn,
+    app_with_pin_limit, assert_every, created, follows, get, pick, post, reacted, representations,
+    user, withdrawn,
 };
 use crate::common;
 
@@ -23,8 +23,8 @@ async fn pins_flag_the_owner_and_order_the_profile() {
     let app = app_with_pin_limit(&pool, 5);
     let (alice, alice_token) = user(&pool, "alice").await;
     let account_id = alice.id.to_string();
-    let first = entity_id(&post(&app, &alice_token, "pin me first").await);
-    let second = entity_id(&post(&app, &alice_token, "and me second").await);
+    let first = common::id_of(&post(&app, &alice_token, "pin me first").await);
+    let second = common::id_of(&post(&app, &alice_token, "and me second").await);
 
     let pinned = acted(&app, &alice_token, &format!("{STATUSES}/{first}/pin")).await;
     assert_eq!(pinned["pinned"], json!(true), "the pin flags the answer");
@@ -47,7 +47,7 @@ async fn pins_flag_the_owner_and_order_the_profile() {
     .await
     .json_value();
     assert_eq!(
-        ids_of(&page),
+        common::ids_of(&page),
         vec![second.clone(), first.clone()],
         "the featured page answers newest pin first"
     );
@@ -87,7 +87,7 @@ async fn pins_flag_the_owner_and_order_the_profile() {
     .await
     .json_value();
     assert_eq!(
-        ids_of(&rest),
+        common::ids_of(&rest),
         vec![second],
         "the page keeps the standing pin alone"
     );
@@ -104,8 +104,8 @@ async fn a_thread_mute_flags_the_whole_thread_until_the_unmute() {
     let pool = db.pool().clone();
     let app = common::test_app(pool.clone());
     let (_alice, alice_token) = user(&pool, "alice").await;
-    let id = entity_id(&post(&app, &alice_token, "a thread to mute").await);
-    let answer = entity_id(
+    let id = common::id_of(&post(&app, &alice_token, "a thread to mute").await);
+    let answer = common::id_of(
         &created(
             &app,
             &alice_token,
@@ -184,7 +184,7 @@ async fn reactions_step_the_rollup_and_the_reactions_endpoint() {
     let app = common::test_app(pool.clone());
     let (alice, alice_token) = user(&pool, "alice").await;
     let (bob, bob_token) = user(&pool, "bob").await;
-    let id = entity_id(&post(&app, &alice_token, "react to me").await);
+    let id = common::id_of(&post(&app, &alice_token, "react to me").await);
     let bob_id = bob.id.to_string();
     follows(&app, &bob_token, &alice.id.to_string()).await;
 

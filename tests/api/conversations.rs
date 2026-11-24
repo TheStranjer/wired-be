@@ -24,7 +24,7 @@
 #![cfg(test)]
 
 use axum::{Router, http::StatusCode};
-use serde_json::{Value, json};
+use serde_json::json;
 use sqlx::PgPool;
 use uuid::Uuid;
 use wired_be::{
@@ -165,16 +165,6 @@ async fn pleroma_get(app: &Router, token: &str, path: &str) -> common::TestRespo
         .await
 }
 
-/// The `id` strings of the entities of a listed answer, in order.
-fn ids_of(entities: &Value) -> Vec<String> {
-    entities
-        .as_array()
-        .expect("an array of entities")
-        .iter()
-        .map(|entity| entity["id"].as_str().expect("an id string").to_owned())
-        .collect()
-}
-
 /// The listing answers one entity per owned participation: id, `unread`
 /// the inverted row flag, `accounts` the thread's other participants
 /// (never the viewer), and `last_status` the rendered newest post — and
@@ -195,7 +185,7 @@ async fn the_listing_orders_newest_activity_first_and_renders_the_entity() {
     common::assert_answer(&page, StatusCode::OK, "bob's listing");
     let entities = page.json_value();
     assert_eq!(
-        ids_of(&entities),
+        common::ids_of(&entities),
         vec![
             participation_for(&pool, &bob, &first).await,
             participation_for(&pool, &bob, &second).await,
@@ -230,7 +220,7 @@ async fn the_listing_orders_newest_activity_first_and_renders_the_entity() {
 
     let for_alice = list(&app, &alice_token, "").await.json_value();
     assert_eq!(
-        ids_of(&for_alice),
+        common::ids_of(&for_alice),
         vec![
             participation_for(&pool, &alice, &first).await,
             participation_for(&pool, &alice, &second).await,
@@ -279,7 +269,7 @@ async fn the_listing_pages_by_participation_id_under_a_link_header() {
     );
 
     let older = list(&app, &bob_token, &format!("?limit=2&max_id={oldest}")).await;
-    let older_ids = ids_of(&older.json_value());
+    let older_ids = common::ids_of(&older.json_value());
     assert_eq!(older_ids.len(), 1, "one thread walks out past the cursor");
     assert!(older_ids[0] < oldest, "and it is older than the cursor");
 
@@ -324,7 +314,7 @@ async fn the_listing_filters_by_recipients() {
 
     let filtered = list(&app, &bob_token, &format!("?recipients[]={}", carol.id)).await;
     assert_eq!(
-        ids_of(&filtered.json_value()),
+        common::ids_of(&filtered.json_value()),
         vec![pair_id],
         "only the thread whose list also names carol stands"
     );
@@ -439,7 +429,11 @@ async fn delete_withdraws_the_participation_and_keeps_the_statuses() {
         "bob no longer lists the thread"
     );
     let still = list(&app, &alice_token, "").await.json_value();
-    assert_eq!(ids_of(&still), vec![hers], "alice keeps her own side of it");
+    assert_eq!(
+        common::ids_of(&still),
+        vec![hers],
+        "alice keeps her own side of it"
+    );
     assert_eq!(
         still[0]["last_status"]["id"],
         post.id.to_string(),
@@ -649,7 +643,7 @@ async fn pleroma_read_all_marks_the_unread_side_of_every_thread() {
         .await;
     common::assert_answer(&swept, StatusCode::OK, "the sweep");
     assert_eq!(
-        ids_of(&swept.json_value()),
+        common::ids_of(&swept.json_value()),
         vec![second_id, first_id],
         "exactly bob's two unread rows, newest first, his read own-post out"
     );
@@ -677,7 +671,7 @@ async fn pleroma_read_all_marks_the_unread_side_of_every_thread() {
         .send(&app)
         .await;
     assert_eq!(
-        ids_of(&for_alice.json_value()),
+        common::ids_of(&for_alice.json_value()),
         vec![participation_for(&pool, &alice, &own).await],
         "alice's only unread side is the thread bob posted into (her own \
          `first`/`second` posts read); bob's sweep touched none of her rows"

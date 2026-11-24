@@ -9,7 +9,7 @@ use wired_be::models::block;
 
 use super::support::{
     ACCOUNTS_SEARCH, BASE, INVALID_TOKEN, NO_READ_ACCOUNTS, OFFSET_UNAUTHENTICATED, V1_SEARCH,
-    V2_SEARCH, fixture, follow_pair, get, listed_ids,
+    V2_SEARCH, fixture, follow_pair, get,
 };
 use crate::common;
 
@@ -29,7 +29,10 @@ async fn accounts_search_answers_prefix_matches_anonymously() {
 
     let found = get(&app, None, &format!("{ACCOUNTS_SEARCH}?q=bo")).await;
     common::assert_answer(&found, StatusCode::OK, "an anonymous prefix search");
-    assert_eq!(listed_ids(&found.json_value()), vec![bob.id.to_string()]);
+    assert_eq!(
+        common::ids_of(&found.json_value()),
+        vec![bob.id.to_string()]
+    );
     let entity = &found.json_value()[0];
     assert_eq!(entity["acct"], "bob", "the handle clients know");
     assert_eq!(entity["username"], "bob", "the nickname part");
@@ -37,7 +40,7 @@ async fn accounts_search_answers_prefix_matches_anonymously() {
 
     let by_name = get(&app, None, &format!("{ACCOUNTS_SEARCH}?q=bobby")).await;
     assert_eq!(
-        listed_ids(&by_name.json_value()),
+        common::ids_of(&by_name.json_value()),
         vec![bob.id.to_string()],
         "the display-name prefix finds the account the nickname prefix misses"
     );
@@ -55,7 +58,7 @@ async fn accounts_search_matches_typos_and_normalises_the_query() {
 
     let typo = get(&app, None, &format!("{ACCOUNTS_SEARCH}?q=ALCE")).await;
     assert_eq!(
-        listed_ids(&typo.json_value()),
+        common::ids_of(&typo.json_value()),
         vec![alice.id.to_string()],
         "the trigram arm finds the misspelled nickname"
     );
@@ -71,7 +74,7 @@ async fn accounts_search_matches_typos_and_normalises_the_query() {
         "the typed handle matches the remote mirror's stored nickname first"
     );
     assert_eq!(
-        listed_ids(&typed.json_value()),
+        common::ids_of(&typed.json_value()),
         vec![eve.id.to_string()],
         "and nothing else answers it"
     );
@@ -94,7 +97,7 @@ async fn accounts_search_ranks_and_pages() {
 
     let ranked = get(&app, Some(&token), &format!("{ACCOUNTS_SEARCH}?q=%40SO")).await;
     assert_eq!(
-        listed_ids(&ranked.json_value()),
+        common::ids_of(&ranked.json_value()),
         vec![
             exact.id.to_string(),
             followed.id.to_string(),
@@ -111,7 +114,7 @@ async fn accounts_search_ranks_and_pages() {
     )
     .await;
     assert_eq!(
-        listed_ids(&first.json_value()),
+        common::ids_of(&first.json_value()),
         vec![exact.id.to_string(), followed.id.to_string()],
         "the caller's limit sizes the page"
     );
@@ -122,7 +125,7 @@ async fn accounts_search_ranks_and_pages() {
     )
     .await;
     assert_eq!(
-        listed_ids(&tail.json_value()),
+        common::ids_of(&tail.json_value()),
         vec![local.id.to_string(), mirror.id.to_string()],
         "and the offset walks the ranking"
     );
@@ -152,7 +155,7 @@ async fn accounts_search_following_filter() {
 
     let open = get(&app, Some(&token), &format!("{ACCOUNTS_SEARCH}?q=car")).await;
     assert_eq!(
-        listed_ids(&open.json_value()).len(),
+        common::ids_of(&open.json_value()).len(),
         2,
         "unrestricted, both car-accounts answer (the followed one first)"
     );
@@ -169,7 +172,7 @@ async fn accounts_search_following_filter() {
     )
     .await;
     assert_eq!(
-        listed_ids(&restricted.json_value()),
+        common::ids_of(&restricted.json_value()),
         vec![carol.id.to_string()],
         "the restriction keeps only the followed account"
     );
@@ -222,7 +225,7 @@ async fn accounts_search_excludes_blocks_and_deactivated() {
 
     let seen = get(&app, Some(&token), &format!("{ACCOUNTS_SEARCH}?q=b")).await;
     assert_eq!(
-        listed_ids(&seen.json_value()),
+        common::ids_of(&seen.json_value()),
         vec![blithe.id.to_string()],
         "the account that blocked the viewer, the one the viewer blocked, \
          and the deactivated one are all out"
@@ -234,7 +237,7 @@ async fn accounts_search_excludes_blocks_and_deactivated() {
         blithe.id.to_string(),
     ] {
         assert!(
-            listed_ids(&stranger.json_value()).contains(&visible),
+            common::ids_of(&stranger.json_value()).contains(&visible),
             "an anonymous request sees every live match whatever the viewer's blocks are"
         );
     }

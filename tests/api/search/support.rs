@@ -70,28 +70,14 @@ pub(super) async fn follow_pair(pool: &PgPool, follower: &User, target: &User) {
     );
 }
 
-/// The `id` of every entity of an array response, in order.
-pub(super) fn listed_ids(body: &Value) -> Vec<String> {
-    body.as_array()
-        .expect("the body is a JSON array")
-        .iter()
-        .map(|entry| {
-            entry["id"]
-                .as_str()
-                .expect("an entity carries its id")
-                .to_owned()
-        })
-        .collect()
-}
-
 /// The `accounts` array of a search document, as ids.
 pub(super) fn accounts_of(body: &Value) -> Vec<String> {
-    listed_ids(&body["accounts"])
+    common::ids_of(&body["accounts"])
 }
 
 /// The `statuses` array of a search document, as ids.
 pub(super) fn statuses_of(body: &Value) -> Vec<String> {
-    listed_ids(&body["statuses"])
+    common::ids_of(&body["statuses"])
 }
 
 /// Whether the search document's `list` is empty, with the body shown on

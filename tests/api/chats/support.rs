@@ -302,20 +302,6 @@ pub(super) fn message_delete_path(chat: &str, message: &str) -> String {
     format!("{ROOT}/{chat}/messages/{message}")
 }
 
-/// The `id` strings of a rendered entity array, in order.
-pub(super) fn entity_ids(list: &Value) -> Vec<String> {
-    list.as_array()
-        .expect("the list is an array")
-        .iter()
-        .map(|entity| {
-            entity["id"]
-                .as_str()
-                .expect("entities carry their id")
-                .to_owned()
-        })
-        .collect()
-}
-
 /// `GET`s `path` with no credential at all.
 pub(super) async fn get_anonymous(app: &Router, path: &str) -> common::TestResponse {
     common::TestRequest::get(path).send(app).await
@@ -329,20 +315,6 @@ pub(super) fn open_path(account: &str) -> String {
 /// `GET` `path` as `token`.
 pub(super) async fn get_as(app: &Router, token: &str, path: &str) -> common::TestResponse {
     common::TestRequest::get(path).bearer(token).send(app).await
-}
-
-/// The ids of the chats in a rendered list, in the order they came back.
-pub(super) fn listed_ids(list: &Value) -> Vec<String> {
-    list.as_array()
-        .expect("the list is an array")
-        .iter()
-        .map(|chat| {
-            chat["id"]
-                .as_str()
-                .expect("chat entities carry their id")
-                .to_owned()
-        })
-        .collect()
 }
 
 /// The `Link` header Pleroma's `add_link_headers` puts on a page whose first

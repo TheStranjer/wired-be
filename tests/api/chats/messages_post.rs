@@ -9,8 +9,8 @@ use wired_be::util::id::new_id;
 
 use super::messages_support::{post_message, poster};
 use super::support::{
-    MESSAGE_KEYS, claim_media, count_messages, entity_ids, error_message, get_as, insert_media,
-    json_keys, messages_path, open_chat,
+    MESSAGE_KEYS, claim_media, count_messages, error_message, get_as, insert_media, json_keys,
+    messages_path, open_chat,
 };
 use crate::common;
 
@@ -82,7 +82,7 @@ async fn posting_a_message_answers_the_senders_entity() {
         .await
         .json_value();
     assert_eq!(
-        entity_ids(&listed),
+        common::ids_of(&listed),
         vec![value["id"].as_str().expect("a reference id")],
         "the entity carries the reference id the list reads back by"
     );

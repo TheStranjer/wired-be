@@ -7,7 +7,7 @@ use wired_be::util::format::text_to_html;
 
 use super::support::{
     ALL_ADMIN, FUTURE, NOTICE_KEYS, NOTICES, PAST, USER_NOTICES, a_notice, admin, app,
-    create_notice, destroy, entity_id, get, ids_of, json_keys, log_entry, patch,
+    create_notice, destroy, get, json_keys, log_entry, patch,
 };
 use crate::common;
 
@@ -62,7 +62,12 @@ async fn a_created_notice_answers_the_entity_with_its_raw_content() {
         "a fresh row is stamped once"
     );
 
-    let shown = get(&app, &token, &format!("{NOTICES}/{}", entity_id(&created))).await;
+    let shown = get(
+        &app,
+        &token,
+        &format!("{NOTICES}/{}", common::id_of(&created)),
+    )
+    .await;
     common::assert_answer(&shown, StatusCode::OK, "reading one notice");
     assert_eq!(
         shown.json_value(),
@@ -124,7 +129,7 @@ async fn a_notice_patch_changes_only_the_fields_it_names() {
         &json!({"content": "before", "starts_at": PAST, "ends_at": FUTURE, "all_day": true}),
     )
     .await;
-    let id = entity_id(&stored);
+    let id = common::id_of(&stored);
 
     let typed = "New <script>alert(1)</script> text";
     let rendered = "<p>New &lt;script&gt;alert(1)&lt;/script&gt; text</p>";
@@ -197,7 +202,7 @@ async fn a_deleted_notice_answers_an_empty_object() {
     let read = common::create_app_and_token(&pool, &alice, "read:accounts").await;
     let keeper = a_notice(&app, &token, "keeper").await;
     let doomed = a_notice(&app, &token, "doomed").await;
-    let id = entity_id(&doomed);
+    let id = common::id_of(&doomed);
 
     let gone = destroy(&app, &token, &format!("{NOTICES}/{id}")).await;
     common::assert_answer(&gone, StatusCode::OK, "deleting a notice");
@@ -215,8 +220,8 @@ async fn a_deleted_notice_answers_an_empty_object() {
     );
     common::assert_error(&missing, "Not found", "the deleted notice is gone");
     assert_eq!(
-        ids_of(&get(&app, &read, USER_NOTICES).await.json_value()),
-        vec![entity_id(&keeper)],
+        common::ids_of(&get(&app, &read, USER_NOTICES).await.json_value()),
+        vec![common::id_of(&keeper)],
         "the user's list keeps only what was not deleted"
     );
 
@@ -247,27 +252,27 @@ async fn the_announcement_listing_windows_by_limit_and_offset() {
     let mut made = Vec::new();
     for number in 0..4 {
         let entity = a_notice(&app, &token, &format!("notice {number}")).await;
-        made.push(entity_id(&entity));
+        made.push(common::id_of(&entity));
     }
     let newest_first: Vec<String> = made.iter().rev().cloned().collect();
 
     let head = get(&app, &token, &format!("{NOTICES}?limit=2&offset=1")).await;
     common::assert_answer(&head, StatusCode::OK, "a windowed listing");
     assert_eq!(
-        ids_of(&head.json_value()),
+        common::ids_of(&head.json_value()),
         vec![newest_first[1].clone(), newest_first[2].clone()],
         "the second and third rows of the newest-first list"
     );
 
     let whole = get(&app, &token, NOTICES).await.json_value();
     assert_eq!(
-        ids_of(&whole),
+        common::ids_of(&whole),
         newest_first,
         "no parameters: the whole list"
     );
     let junk = get(&app, &token, &format!("{NOTICES}?limit=no&offset=-3")).await;
     assert_eq!(
-        ids_of(&junk.json_value()),
+        common::ids_of(&junk.json_value()),
         newest_first,
         "an unusable pair falls back to the default window"
     );
@@ -279,7 +284,7 @@ async fn the_announcement_listing_windows_by_limit_and_offset() {
         "an offset past the last row answers nothing"
     );
     assert_eq!(
-        ids_of(
+        common::ids_of(
             &get(&app, &token, &format!("{NOTICES}?limit=100000"))
                 .await
                 .json_value()
@@ -312,8 +317,12 @@ async fn the_admin_sees_notices_whose_window_excludes_the_present() {
 
     let listed = get(&app, &token, NOTICES).await.json_value();
     assert_eq!(
-        ids_of(&listed),
-        vec![entity_id(&live), entity_id(&expired), entity_id(&upcoming)],
+        common::ids_of(&listed),
+        vec![
+            common::id_of(&live),
+            common::id_of(&expired),
+            common::id_of(&upcoming)
+        ],
         "all three, newest first, window aside"
     );
 
@@ -348,15 +357,15 @@ async fn a_user_facing_list_follows_the_admin_writes() {
     let opened = patch(
         &app,
         &token,
-        &format!("{NOTICES}/{}", entity_id(&upcoming)),
+        &format!("{NOTICES}/{}", common::id_of(&upcoming)),
         &json!({"starts_at": PAST}),
     )
     .await;
     common::assert_answer(&opened, StatusCode::OK, "opening the upcoming notice");
     let after = get(&app, &read, USER_NOTICES).await.json_value();
     assert_eq!(
-        ids_of(&after),
-        vec![entity_id(&live), entity_id(&upcoming)],
+        common::ids_of(&after),
+        vec![common::id_of(&live), common::id_of(&upcoming)],
         "both active now, newest first"
     );
     assert_eq!(
@@ -364,11 +373,11 @@ async fn a_user_facing_list_follows_the_admin_writes() {
         "with the text the admin sent"
     );
 
-    let gone = destroy(&app, &token, &format!("{NOTICES}/{}", entity_id(&live))).await;
+    let gone = destroy(&app, &token, &format!("{NOTICES}/{}", common::id_of(&live))).await;
     common::assert_answer(&gone, StatusCode::OK, "deleting the live notice");
     assert_eq!(
-        ids_of(&get(&app, &read, USER_NOTICES).await.json_value()),
-        vec![entity_id(&upcoming)],
+        common::ids_of(&get(&app, &read, USER_NOTICES).await.json_value()),
+        vec![common::id_of(&upcoming)],
         "and it leaves the user's list with it"
     );
 }

@@ -5,8 +5,8 @@ use axum::{body::Bytes, http::StatusCode};
 use serde_json::Value;
 
 use super::support::{
-    SCOPE, TEXT, V1, V2, entity_id, entries_in, file_part, jpeg, mime_of, png, row_count,
-    storage_key, stored_row, upload, upload_file, uploader, uploads_dir, url_of,
+    SCOPE, TEXT, V1, V2, entries_in, file_part, jpeg, mime_of, png, row_count, storage_key,
+    stored_row, upload, upload_file, uploader, uploads_dir, url_of,
 };
 use crate::common::{self, MultipartPart};
 /// The two versions are one endpoint: same status, same entity keys, same
@@ -70,7 +70,7 @@ async fn v1_and_v2_answer_the_same() {
 
     let ids: Vec<String> = entities
         .iter()
-        .map(|(_, entity)| entity_id(entity))
+        .map(|(_, entity)| common::id_of(entity))
         .collect();
     for id in &ids {
         let row = stored_row(&pool, id).await;
@@ -119,7 +119,7 @@ async fn a_client_thumbnail_is_ignored_for_the_generated_preview() {
     );
     assert_eq!(mime_of(&entity), "image/png", "and one type for one file");
 
-    let id = entity_id(&entity);
+    let id = common::id_of(&entity);
     let row = stored_row(&pool, &id).await;
     let key = row.storage_key.clone().expect("a storage key");
     assert_eq!(

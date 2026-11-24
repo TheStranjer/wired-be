@@ -14,7 +14,7 @@ use super::reports_enforcement::{
     admin_edits_and_deletes, deactivation_blinds_then_restores, resolve_reopen_resolve,
 };
 use super::support::{
-    Account, M_ADMIN_REPORTS, P_ADMIN, REPORTS, V0_REPORTS, World, assert_log, get_array, id_of,
+    Account, M_ADMIN_REPORTS, P_ADMIN, REPORTS, V0_REPORTS, World, assert_log, get_array,
     post_status,
 };
 use crate::common;
@@ -29,9 +29,9 @@ async fn a_report_walks_both_admin_apis_and_the_staff_actions() {
     let target = world.register("target").await;
 
     let flagged = post_status(&world, &target, "the reported post").await;
-    let flagged_id = id_of(&flagged);
+    let flagged_id = common::id_of(&flagged);
     let survivor = post_status(&world, &target, "the survivor").await;
-    let survivor_id = id_of(&survivor);
+    let survivor_id = common::id_of(&survivor);
 
     let filed = common::api_post(
         &world.app,
@@ -46,7 +46,7 @@ async fn a_report_walks_both_admin_apis_and_the_staff_actions() {
     )
     .await;
     common::assert_answer(&filed, StatusCode::OK, "the filing");
-    let report_id = id_of(&filed.json_value());
+    let report_id = common::id_of(&filed.json_value());
     assert_eq!(
         filed.json_value()["action_taken"],
         json!(false),

@@ -73,7 +73,7 @@ fn assert_create_delivered(delivery: &ReceivedPost, alice: &User, status: &Value
     assert_eq!(delivery.body["type"], json!("Create"), "the activity type");
     assert_eq!(
         delivery.body["id"],
-        json!(format!("{BASE}/activities/{}", id_of(status))),
+        json!(format!("{BASE}/activities/{}", common::id_of(status))),
         "decision 6's local activity id"
     );
     assert_eq!(

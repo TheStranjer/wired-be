@@ -5,7 +5,7 @@ use serde_json::json;
 use wired_be::models::user::Flag;
 
 use super::support::{
-    BASE, INVALID_TOKEN, backdate, deactivate, directory, discoverable, fixture, get, listed_ids,
+    BASE, INVALID_TOKEN, backdate, deactivate, directory, discoverable, fixture, get,
     make_discoverable,
 };
 use crate::common;
@@ -27,7 +27,7 @@ async fn directory_lists_discoverable_accounts_without_auth() {
 
     let listed = directory(&app, "").await;
     assert_eq!(
-        listed_ids(&listed),
+        common::ids_of(&listed),
         vec![
             newest.id.to_string(),
             older.id.to_string(),
@@ -36,11 +36,11 @@ async fn directory_lists_discoverable_accounts_without_auth() {
         "newest status first, the account that never posted last"
     );
     assert!(
-        !listed_ids(&listed).contains(&private.id.to_string()),
+        !common::ids_of(&listed).contains(&private.id.to_string()),
         "an account that never opted into discovery is not listed"
     );
     assert!(
-        !listed_ids(&listed).contains(&closed.id.to_string()),
+        !common::ids_of(&listed).contains(&closed.id.to_string()),
         "and neither is a deactivated one"
     );
 }
@@ -96,17 +96,17 @@ async fn directory_order_and_local_flags_narrow_the_listing() {
     ];
 
     assert_eq!(
-        listed_ids(&directory(&app, "").await),
+        common::ids_of(&directory(&app, "").await),
         by_activity,
         "with no `order` the activity sort runs, and it lists the mirror too"
     );
     assert_eq!(
-        listed_ids(&directory(&app, "?order=bogus").await),
+        common::ids_of(&directory(&app, "?order=bogus").await),
         by_activity,
         "an unrecognised spelling is the default order"
     );
     assert_eq!(
-        listed_ids(&directory(&app, "?order=new").await),
+        common::ids_of(&directory(&app, "?order=new").await),
         vec![
             mirror.id.to_string(),
             fresh.id.to_string(),
@@ -116,12 +116,12 @@ async fn directory_order_and_local_flags_narrow_the_listing() {
          fresh mirror, then the year-old veteran"
     );
     assert_eq!(
-        listed_ids(&directory(&app, "?local=true").await),
+        common::ids_of(&directory(&app, "?local=true").await),
         vec![veteran.id.to_string(), fresh.id.to_string()],
         "`local=true` answers this instance's own accounts only"
     );
     assert_eq!(
-        listed_ids(&directory(&app, "?local=false").await),
+        common::ids_of(&directory(&app, "?local=false").await),
         by_activity,
         "and `local=false` is the default: mirrors stay in"
     );
@@ -142,22 +142,22 @@ async fn directory_pages_by_limit_and_offset() {
     let app = common::test_app(pool);
 
     assert_eq!(
-        listed_ids(&directory(&app, "?limit=2").await),
+        common::ids_of(&directory(&app, "?limit=2").await),
         expected[..2],
         "`limit=2` answers the head of the listing"
     );
     assert_eq!(
-        listed_ids(&directory(&app, "?limit=2&offset=2").await),
+        common::ids_of(&directory(&app, "?limit=2&offset=2").await),
         expected[2..],
         "and `offset=2` picks up where it stopped"
     );
     assert_eq!(
-        listed_ids(&directory(&app, "?offset=99").await),
+        common::ids_of(&directory(&app, "?offset=99").await),
         Vec::<String>::new(),
         "an offset past the end answers nothing"
     );
     assert_eq!(
-        listed_ids(&directory(&app, "?limit=-3").await),
+        common::ids_of(&directory(&app, "?limit=-3").await),
         expected,
         "an unusable limit falls back to the default page of 40"
     );
@@ -176,7 +176,7 @@ async fn directory_accepts_an_anonymous_request_and_refuses_a_bad_token() {
     let open = get(&app, None, "/api/v1/directory").await;
     common::assert_answer(&open, StatusCode::OK, "the directory with no token");
     assert_eq!(
-        listed_ids(&open.json_value()),
+        common::ids_of(&open.json_value()),
         vec![listed.id.to_string()],
         "the anonymous listing is the listing"
     );
@@ -188,8 +188,8 @@ async fn directory_accepts_an_anonymous_request_and_refuses_a_bad_token() {
         "a token the directory does not need",
     );
     assert_eq!(
-        listed_ids(&with_token.json_value()),
-        listed_ids(&open.json_value()),
+        common::ids_of(&with_token.json_value()),
+        common::ids_of(&open.json_value()),
         "a viewer who is not in the listing sees the same accounts"
     );
     common::assert_all_refused(

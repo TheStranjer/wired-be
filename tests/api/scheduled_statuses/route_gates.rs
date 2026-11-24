@@ -9,8 +9,8 @@ use serde_json::json;
 use wired_be::util::time::mastodon_time;
 
 use super::routes_support::{
-    NO_READ, SCHEDULES, assert_one_fire, cancel, day, entity_ids, list, manager, move_to, parked,
-    seeded_text, show,
+    NO_READ, SCHEDULES, assert_one_fire, cancel, day, list, manager, move_to, parked, seeded_text,
+    show,
 };
 use super::support::{NO_TOKEN, NO_WRITE, NOT_FOUND, scheduled_count, stored_schedule};
 use crate::common;
@@ -29,7 +29,7 @@ async fn one_account_cannot_reach_anothers_schedule() {
     let id = row.id.to_string();
 
     assert!(
-        entity_ids(&list(&app, &bob_read, "").await.json_value()).is_empty(),
+        common::ids_of(&list(&app, &bob_read, "").await.json_value()).is_empty(),
         "bob's listing does not carry alice's schedule"
     );
     common::assert_all_refused(
@@ -61,7 +61,7 @@ async fn one_account_cannot_reach_anothers_schedule() {
     );
     assert_one_fire(&pool, row.id, day(3)).await;
     assert_eq!(
-        entity_ids(&list(&app, &bob_read, "").await.json_value()).len(),
+        common::ids_of(&list(&app, &bob_read, "").await.json_value()).len(),
         0,
         "still nothing of alice's in bob's page"
     );
@@ -125,7 +125,7 @@ async fn the_routes_refuse_anonymous_and_out_of_scope_tokens() {
         "every refusal above stopped at its gate: the schedule still stands"
     );
     assert_eq!(
-        entity_ids(&list(&app, &read, "").await.json_value()).len(),
+        common::ids_of(&list(&app, &read, "").await.json_value()).len(),
         1,
         "and the token that does hold the scope still reads it"
     );
@@ -153,7 +153,7 @@ async fn the_root_scopes_reach_their_own_accounts_schedules() {
     let listed = list(&app, &dora_read, "").await;
     common::assert_answer(&listed, StatusCode::OK, "a root `read` token listing");
     assert_eq!(
-        entity_ids(&listed.json_value()),
+        common::ids_of(&listed.json_value()),
         vec![dora_row.id.to_string()],
         "and it lists only what its own account owns"
     );

@@ -23,7 +23,7 @@ use uuid::Uuid;
 use wired_be::services::{vapid, web_push};
 
 use super::server::{BASE, SCOPES, Server, Verb, call, expect, write_ok};
-use super::sockets::{favourite, follow, id_of, named_account, post_status};
+use super::sockets::{favourite, follow, named_account, post_status};
 use crate::common;
 
 /// The fallback push icon: the same default the `Account` entity renders,
@@ -307,7 +307,7 @@ async fn alert_flags_gate_the_wake_and_the_put_reopens_them() {
     let spec = follow_spec(&alice_token, &url, &keys);
     let _registered = register_subscription(&srv, &spec).await;
 
-    let liked = id_of(&post_status(&srv, &alice_token, "pushed body text", "public").await);
+    let liked = common::id_of(&post_status(&srv, &alice_token, "pushed body text", "public").await);
     favourite(&srv, &bob_token, &liked).await;
     let _ran_dark = common::run_all_jobs(&srv.state).await;
     assert_eq!(mock.count(), 0, "the off favourite alert sends nothing");
@@ -353,8 +353,8 @@ async fn the_followed_policy_wakes_only_for_accounts_the_owner_follows() {
         policy: Some("followed"),
     };
     let _registered = register_subscription(&srv, &spec).await;
-    let first = id_of(&post_status(&srv, &alice_token, "one", "public").await);
-    let second = id_of(&post_status(&srv, &alice_token, "two", "public").await);
+    let first = common::id_of(&post_status(&srv, &alice_token, "one", "public").await);
+    let second = common::id_of(&post_status(&srv, &alice_token, "two", "public").await);
 
     favourite(&srv, &dave_token, &first).await;
     let _ran_dark = common::run_all_jobs(&srv.state).await;

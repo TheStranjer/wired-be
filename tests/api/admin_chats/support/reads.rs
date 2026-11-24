@@ -29,7 +29,7 @@ async fn the_admin_lists_a_users_chats_newest_first_under_link_headers() {
     common::assert_answer(&listed, StatusCode::OK, "listing alice's chats");
     let value = listed.json_value();
     assert_eq!(
-        entity_ids(&value),
+        common::ids_of(&value),
         vec![
             alice_dave.chat_id.to_string(),
             alice_carol.chat_id.to_string(),
@@ -71,14 +71,14 @@ async fn the_admin_lists_a_users_chats_newest_first_under_link_headers() {
     )
     .await;
     assert_eq!(
-        entity_ids(&walked.json_value()),
+        common::ids_of(&walked.json_value()),
         vec![alice_bob.chat_id.to_string()],
         "max_id visits what the first page left out"
     );
 
     let bobs_side = get(&app, &token, &user_chats_path("bob")).await;
     assert_eq!(
-        entity_ids(&bobs_side.json_value()),
+        common::ids_of(&bobs_side.json_value()),
         vec![bobs_copy.chat_id.to_string()],
         "bob's listing is HIS own row of the same conversation"
     );
@@ -226,7 +226,7 @@ async fn the_admin_lists_a_chats_messages_newest_first_without_the_withdrawn() {
     common::assert_answer(&listed, StatusCode::OK, "listing the chat's messages");
     let newest_first: Vec<String> = refs.iter().map(|r| r.id.to_string()).rev().collect();
     assert_eq!(
-        entity_ids(&listed.json_value()),
+        common::ids_of(&listed.json_value()),
         newest_first,
         "newest reference id first"
     );
@@ -244,7 +244,7 @@ async fn the_admin_lists_a_chats_messages_newest_first_without_the_withdrawn() {
     )
     .await;
     assert_eq!(
-        entity_ids(&tail.json_value()),
+        common::ids_of(&tail.json_value()),
         vec![refs[0].id.to_string()],
         "max_id pages back through the chat"
     );
@@ -263,7 +263,7 @@ async fn the_admin_lists_a_chats_messages_newest_first_without_the_withdrawn() {
     common::assert_answer(&withdrawn, StatusCode::OK, "the withdrawal itself");
     let after = get(&app, &token, &path).await;
     assert_eq!(
-        entity_ids(&after.json_value()),
+        common::ids_of(&after.json_value()),
         vec![refs[2].id.to_string(), refs[0].id.to_string()],
         "the withdrawn message is gone from the admin's read too"
     );

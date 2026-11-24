@@ -97,39 +97,16 @@ async fn read(app: &Router, token: &str, path: &str) -> common::TestResponse {
     common::TestRequest::get(path).bearer(token).send(app).await
 }
 
-/// The ids of a rendered status array, in the order it came back.
-fn ids_of(listing: &Value) -> Vec<String> {
-    listing
-        .as_array()
-        .expect("a status listing is an array")
-        .iter()
-        .map(|status| {
-            status["id"]
-                .as_str()
-                .expect("every status has a string id")
-                .to_owned()
-        })
-        .collect()
-}
-
 /// The answered listing's ids, newest first.
 fn page_ids(response: &common::TestResponse) -> Vec<String> {
     common::assert_answer(response, StatusCode::OK, "the timeline reads");
-    ids_of(&response.json_value())
+    common::ids_of(&response.json_value())
 }
 
 /// The `statuses` arm of an answered search document.
 fn searched(response: &common::TestResponse) -> Vec<String> {
     common::assert_answer(response, StatusCode::OK, "the search answers");
-    ids_of(&response.json_value()["statuses"])
-}
-
-/// The `id` of a created status entity.
-fn id_of(entity: &Value) -> String {
-    entity["id"]
-        .as_str()
-        .expect("the entity has a string id")
-        .to_owned()
+    common::ids_of(&response.json_value()["statuses"])
 }
 
 /// A local follow of `target` by the holder of `token`.

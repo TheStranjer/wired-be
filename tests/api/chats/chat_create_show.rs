@@ -11,8 +11,8 @@ use wired_be::{
 };
 
 use super::support::{
-    CHAT_KEYS, READ_SCOPE, ROOT, SCOPE, error_message, fixture, get_as, json_keys, listed_ids,
-    open_path, post_empty, send,
+    CHAT_KEYS, READ_SCOPE, ROOT, SCOPE, error_message, fixture, get_as, json_keys, open_path,
+    post_empty, send,
 };
 use crate::common;
 
@@ -83,7 +83,7 @@ async fn creating_a_chat_gets_the_same_row_every_time() {
 
     let listed = get_as(&app, &alice_read, ROOT).await.json_value();
     assert_eq!(
-        listed_ids(&listed),
+        common::ids_of(&listed),
         vec![chat.clone()],
         "alice lists her own chat, not bob's"
     );

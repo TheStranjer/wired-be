@@ -25,11 +25,11 @@ async fn the_home_filter_hides_matches_from_home_alone() {
     let own = published(&app, &bob_token, "my own spam diary", "public").await;
     let every = || {
         vec![
-            id_of(&own),
-            id_of(&clean),
-            id_of(&glued),
-            id_of(&today),
-            id_of(&digest),
+            common::id_of(&own),
+            common::id_of(&clean),
+            common::id_of(&glued),
+            common::id_of(&today),
+            common::id_of(&digest),
         ]
     };
     assert_eq!(
@@ -46,7 +46,11 @@ async fn the_home_filter_hides_matches_from_home_alone() {
     .await;
     assert_eq!(
         page_ids(&read(&app, &bob_token, HOME).await),
-        vec![id_of(&own), id_of(&clean), id_of(&glued)],
+        vec![
+            common::id_of(&own),
+            common::id_of(&clean),
+            common::id_of(&glued)
+        ],
         "the home filter drops the whole-word matches; the glued word and \
          the exempt own post stand"
     );
@@ -57,7 +61,12 @@ async fn the_home_filter_hides_matches_from_home_alone() {
     );
     assert_eq!(
         page_ids(&read(&app, &alice_token, HOME).await),
-        vec![id_of(&clean), id_of(&glued), id_of(&today), id_of(&digest)],
+        vec![
+            common::id_of(&clean),
+            common::id_of(&glued),
+            common::id_of(&today),
+            common::id_of(&digest)
+        ],
         "filters are per-user: alice's home page never heard of bob's"
     );
 }
@@ -94,7 +103,7 @@ async fn the_public_filters_drop_and_their_removal_restores() {
     let hidden_page = read(&app, &bob_token, PUBLIC).await;
     assert_eq!(
         page_ids(&hidden_page),
-        vec![id_of(&kept), id_of(&thread)],
+        vec![common::id_of(&kept), common::id_of(&thread)],
         "the irreversible filter drops its match; the warn filter's match \
          stays on the page, annotated"
     );
@@ -103,7 +112,7 @@ async fn the_public_filters_drop_and_their_removal_restores() {
         .as_array()
         .expect("a status listing is an array")
         .iter()
-        .find(|status| status["id"] == json!(id_of(&thread)))
+        .find(|status| status["id"] == json!(common::id_of(&thread)))
         .expect("the warned row rides the page")
         .clone();
     assert!(
@@ -128,7 +137,7 @@ async fn the_public_filters_drop_and_their_removal_restores() {
     let after_removal = page_ids(&read(&app, &bob_token, PUBLIC).await);
     assert_eq!(
         after_removal,
-        vec![id_of(&kept), id_of(&thread)],
+        vec![common::id_of(&kept), common::id_of(&thread)],
         "deleting the warn filter changes the page nothing: its match never left"
     );
 
@@ -143,7 +152,7 @@ async fn the_public_filters_drop_and_their_removal_restores() {
     let after_expiry = page_ids(&read(&app, &bob_token, PUBLIC).await);
     assert_eq!(
         after_expiry,
-        vec![id_of(&kept), id_of(&thread), id_of(&digest)],
+        [&kept, &thread, &digest].map(common::id_of),
         "the expired filter hides nothing any more"
     );
     assert_eq!(
@@ -189,7 +198,7 @@ async fn the_notifications_filter_hides_matching_mentions() {
          hidden from home"
     );
     assert!(
-        !page_ids(&read(&app, &bob_token, HOME).await).contains(&id_of(&alert)),
+        !page_ids(&read(&app, &bob_token, HOME).await).contains(&common::id_of(&alert)),
         "the same filter does hide it from the home page"
     );
 

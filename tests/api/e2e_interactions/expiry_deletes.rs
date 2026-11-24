@@ -8,8 +8,7 @@ use wired_be::jobs::statuses::KIND_EXPIRE;
 
 use super::support::{
     ACCOUNTS, BAD_TOKEN, HOME, NO_TOKEN, NO_WRITE, NOT_FOUND, PUBLIC, SCOPES, STATUSES, UNKNOWN_ID,
-    USER_REQUIRED, acted, actor, app_and_state, assert_gone, created, entity_id, follows, get,
-    ids_of, post, user,
+    USER_REQUIRED, acted, actor, app_and_state, assert_gone, created, follows, get, post, user,
 };
 use crate::common;
 
@@ -73,16 +72,16 @@ async fn an_expiring_status_leaves_every_surface_when_its_fire_drains() {
         json!({"status": "here today", "expires_in": 3600}),
     )
     .await;
-    let doomed_id = entity_id(&doomed);
+    let doomed_id = common::id_of(&doomed);
     assert!(
         doomed["pleroma"]["expires_at"].is_string(),
         "the answer states the expiry: {doomed}"
     );
-    let keeper = entity_id(&post(&app, &alice_token, "and stays").await);
+    let keeper = common::id_of(&post(&app, &alice_token, "and stays").await);
 
     let riding = get(&app, None, PUBLIC).await.json_value();
     assert_eq!(
-        ids_of(&riding),
+        common::ids_of(&riding),
         vec![keeper.clone(), doomed_id.clone()],
         "both posts ride the public timeline"
     );
@@ -104,14 +103,14 @@ async fn an_expiring_status_leaves_every_surface_when_its_fire_drains() {
     assert_gone(&app, None, &doomed_id, "the expired status, anonymously").await;
     let public = get(&app, None, PUBLIC).await.json_value();
     assert_eq!(
-        ids_of(&public),
+        common::ids_of(&public),
         vec![keeper.clone()],
         "the expired post is off the public timeline"
     );
     for viewer in [&alice_token, &bob_token] {
         let home = get(&app, Some(viewer.as_str()), HOME).await.json_value();
         assert_eq!(
-            ids_of(&home),
+            common::ids_of(&home),
             vec![keeper.clone()],
             "and off every home that carried it"
         );
@@ -212,15 +211,15 @@ async fn a_delete_guards_answers_and_takes_the_boost_with_it() {
     let (_carol, carol_token) = user(&pool, "carol").await;
     let reader = actor(&pool, "reader", "read").await.1;
     let app_only = common::create_app_only_token(&pool, SCOPES).await;
-    let id = entity_id(&post(&app, &alice_token, "boost me then lose me").await);
+    let id = common::id_of(&post(&app, &alice_token, "boost me then lose me").await);
 
     assert_delete_guards(&app, &id, &carol_token, &reader, &app_only).await;
 
     follows(&app, &carol_token, &bob.id.to_string()).await;
-    let boost = entity_id(&acted(&app, &bob_token, &format!("{STATUSES}/{id}/reblog")).await);
+    let boost = common::id_of(&acted(&app, &bob_token, &format!("{STATUSES}/{id}/reblog")).await);
     let riding = get(&app, Some(&carol_token), HOME).await.json_value();
     assert_eq!(
-        ids_of(&riding),
+        common::ids_of(&riding),
         vec![boost.clone()],
         "the boost rides carol's home once"
     );
@@ -248,12 +247,12 @@ async fn a_delete_guards_answers_and_takes_the_boost_with_it() {
     .await;
     let public = get(&app, None, PUBLIC).await.json_value();
     assert!(
-        ids_of(&public).is_empty(),
+        common::ids_of(&public).is_empty(),
         "both left the public timeline: {public}"
     );
     let settled = get(&app, Some(&carol_token), HOME).await.json_value();
     assert!(
-        ids_of(&settled).is_empty(),
+        common::ids_of(&settled).is_empty(),
         "and the follower's home with them"
     );
     assert_eq!(

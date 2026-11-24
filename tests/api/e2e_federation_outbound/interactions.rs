@@ -7,8 +7,7 @@ use serde_json::json;
 use wired_be::config::TEST_BASE_URL;
 
 use super::expectations::{
-    Expected, assert_delivered, assert_flags, count_delivered, create_id_of, delivered_for, id_of,
-    uri_of,
+    Expected, assert_delivered, assert_flags, count_delivered, create_id_of, delivered_for, uri_of,
 };
 use super::support::{
     AS_PUBLIC, BOB, DAVE, PARTY, delivery_job, followers_of, local, peer_follows, personal, post,
@@ -31,12 +30,19 @@ async fn a_boost_and_its_withdrawal_travel_with_the_original_author_in_cc() {
     peer_follows(&app, &state, &peer, BOB, &alice).await;
 
     let original = post(&app, &carol_token, json!({"status": "boost me"})).await;
-    let boost = status_action(&app, &alice_token, &id_of(&original), "reblog", None).await;
+    let boost = status_action(
+        &app,
+        &alice_token,
+        &common::id_of(&original),
+        "reblog",
+        None,
+    )
+    .await;
     let quiet_source = post(&app, &carol_token, json!({"status": "quietly boost me"})).await;
     let _quiet = status_action(
         &app,
         &alice_token,
-        &id_of(&quiet_source),
+        &common::id_of(&quiet_source),
         "reblog",
         Some(json!({"visibility": "unlisted"})),
     )
@@ -74,7 +80,8 @@ async fn a_boost_and_its_withdrawal_travel_with_the_original_author_in_cc() {
         "and still carries the followers with the original author in `cc`"
     );
 
-    let _withdrawn = status_action(&app, &alice_token, &id_of(&boost), "unreblog", None).await;
+    let _withdrawn =
+        status_action(&app, &alice_token, &common::id_of(&boost), "unreblog", None).await;
     let _withdrawal_delivered = common::run_all_jobs(&state).await;
     let undos = peer.delivered("Undo");
     assert_eq!(undos.len(), 1, "the withdrawal is announced once");
@@ -116,7 +123,7 @@ async fn a_favourite_and_its_withdrawal_name_the_author_and_the_followers() {
     peer_follows(&app, &state, &peer, BOB, &alice).await;
 
     let open = post(&app, &carol_token, json!({"status": "favourite me"})).await;
-    let _liked = status_action(&app, &alice_token, &id_of(&open), "favourite", None).await;
+    let _liked = status_action(&app, &alice_token, &common::id_of(&open), "favourite", None).await;
     let _drained = common::run_all_jobs(&state).await;
 
     let posts = peer.received();
@@ -146,7 +153,14 @@ async fn a_favourite_and_its_withdrawal_name_the_author_and_the_followers() {
         json!({"status": "quietly yours", "visibility": "unlisted"}),
     )
     .await;
-    let _quiet_like = status_action(&app, &alice_token, &id_of(&hidden), "favourite", None).await;
+    let _quiet_like = status_action(
+        &app,
+        &alice_token,
+        &common::id_of(&hidden),
+        "favourite",
+        None,
+    )
+    .await;
     let _drained_again = common::run_all_jobs(&state).await;
     assert_eq!(
         peer.received().len(),
@@ -154,7 +168,14 @@ async fn a_favourite_and_its_withdrawal_name_the_author_and_the_followers() {
         "a like of an unlisted post with a local author announces nothing new"
     );
 
-    let _unliked = status_action(&app, &alice_token, &id_of(&open), "unfavourite", None).await;
+    let _unliked = status_action(
+        &app,
+        &alice_token,
+        &common::id_of(&open),
+        "unfavourite",
+        None,
+    )
+    .await;
     let _drained_thrice = common::run_all_jobs(&state).await;
     let undos = peer.delivered("Undo");
     assert_eq!(undos.len(), 1, "the unfavourite is announced once");
@@ -190,7 +211,7 @@ async fn an_emoji_reaction_and_its_withdrawal_federate_without_the_public_addres
     peer_follows(&app, &state, &peer, BOB, &alice).await;
 
     let open = post(&app, &carol_token, json!({"status": "react to me"})).await;
-    reaction_write(&app, &alice_token, &id_of(&open), "PUT", PARTY).await;
+    reaction_write(&app, &alice_token, &common::id_of(&open), "PUT", PARTY).await;
     let _drained = common::run_all_jobs(&state).await;
 
     let posts = peer.received();
@@ -215,7 +236,7 @@ async fn an_emoji_reaction_and_its_withdrawal_federate_without_the_public_addres
     );
     let react_id = react.activity()["id"].as_str().expect("the stored id");
 
-    reaction_write(&app, &alice_token, &id_of(&open), "DELETE", PARTY).await;
+    reaction_write(&app, &alice_token, &common::id_of(&open), "DELETE", PARTY).await;
     let _drained_again = common::run_all_jobs(&state).await;
     let undos = peer.delivered("Undo");
     assert_eq!(undos.len(), 1, "the withdrawal is announced once");
@@ -281,8 +302,8 @@ async fn followers_sharing_one_inbox_cost_one_delivery_per_activity() {
     );
 
     let restated = post(&app, &alice_token, json!({"status": "restated fact"})).await;
-    reaction_write(&app, &alice_token, &id_of(&restated), "PUT", PARTY).await;
-    reaction_write(&app, &alice_token, &id_of(&restated), "PUT", PARTY).await;
+    reaction_write(&app, &alice_token, &common::id_of(&restated), "PUT", PARTY).await;
+    reaction_write(&app, &alice_token, &common::id_of(&restated), "PUT", PARTY).await;
     let _drained_again = common::run_all_jobs(&state).await;
     assert_eq!(
         peer.delivered("EmojiReact").len(),

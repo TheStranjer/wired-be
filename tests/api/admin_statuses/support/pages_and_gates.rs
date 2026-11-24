@@ -209,7 +209,7 @@ async fn a_moderator_cannot_read_the_ledger_but_an_admin_can() {
     let godmode = "godmode=true";
     let ledger = listed(&app, &format!("{LEDGER}?{godmode}"), &admin_token).await;
     assert_eq!(
-        ids_of(&ledger),
+        common::ids_of(&ledger),
         vec![dm.id.to_string()],
         "the admin sees the DM"
     );
@@ -281,7 +281,7 @@ async fn the_reads_ask_their_own_area() {
 
     let ledger = listed(&app, LEDGER, &narrow).await;
     assert_eq!(
-        ids_of(&ledger),
+        common::ids_of(&ledger),
         vec![row.id.to_string()],
         "the narrow read scope reads the ledger"
     );

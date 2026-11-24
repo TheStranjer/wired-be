@@ -40,7 +40,7 @@ async fn the_listing_answers_accounts_with_their_expiry() {
 
     let listed = get(&app, Some(&token), MUTES).await;
     assert_eq!(
-        listed_ids(&listed.json_value()),
+        common::ids_of(&listed.json_value()),
         muted_ids(&stored),
         "the muted accounts, newest mute first"
     );
@@ -91,7 +91,7 @@ async fn the_listing_pages_by_mute_row_id() {
 
     let first = get(&app, Some(&token), &format!("{MUTES}?limit=2")).await;
     assert_eq!(
-        listed_ids(&first.json_value()),
+        common::ids_of(&first.json_value()),
         vec![stored[0].1.clone(), stored[1].1.clone()],
         "two newest first"
     );
@@ -108,7 +108,7 @@ async fn the_listing_pages_by_mute_row_id() {
     )
     .await;
     assert_eq!(
-        listed_ids(&older.json_value()),
+        common::ids_of(&older.json_value()),
         vec![stored[2].1.clone(), stored[3].1.clone()],
         "max_id continues where the page ended"
     );
@@ -120,7 +120,7 @@ async fn the_listing_pages_by_mute_row_id() {
     )
     .await;
     assert_eq!(
-        listed_ids(&newer.json_value()),
+        common::ids_of(&newer.json_value()),
         vec![stored[0].1.clone(), stored[1].1.clone()],
         "min_id answers the newest-first page just after the cursor"
     );
@@ -180,14 +180,14 @@ async fn the_listing_pages_up_to_eighty_rows() {
 
     let default_page = get(&app, Some(&token), MUTES).await;
     assert_eq!(
-        listed_ids(&default_page.json_value()).len(),
+        common::ids_of(&default_page.json_value()).len(),
         20,
         "Pleroma's default page of twenty"
     );
 
     let big = get(&app, Some(&token), &format!("{MUTES}?limit=41")).await;
     assert_eq!(
-        listed_ids(&big.json_value()).len(),
+        common::ids_of(&big.json_value()).len(),
         41,
         "a page past the global 40 cap gets through: the listing's cap is 80"
     );

@@ -99,21 +99,6 @@ pub(super) async fn delete(app: &Router, token: &str, path: &str) -> common::Tes
         .await
 }
 
-/// The `id` of every entity of an array response, in order: the accounts of
-/// a listing, and the entries of a batch alike.
-pub(super) fn listed_ids(body: &Value) -> Vec<String> {
-    body.as_array()
-        .expect("the answer is an array")
-        .iter()
-        .map(|entry| {
-            entry["id"]
-                .as_str()
-                .expect("an id on every entry")
-                .to_owned()
-        })
-        .collect()
-}
-
 /// The `account.id` of every v2 suggestion entry, in order.
 pub(super) fn wrapped_ids(body: &Value) -> Vec<String> {
     body.as_array()

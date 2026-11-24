@@ -7,8 +7,8 @@ use sqlx::PgPool;
 
 use super::support::{
     ACCOUNTS, BOTH_TIMELINES, CHATS, CONVERSATIONS, MARKERS, NOTIFICATIONS_TIMELINE, PLEROMA_READ,
-    acted, direct_post, entity_id, flat, follow, gate_strangers, got, got_array, ids_of,
-    lock_account, post, posted, sorted, status_action, telling, told, unread, user,
+    acted, direct_post, flat, follow, gate_strangers, got, got_array, ids_of, lock_account, post,
+    posted, sorted, status_action, telling, told, unread, user,
 };
 use super::{
     chats::{chat_messages, chat_unread, open_chat, send_message},
@@ -20,7 +20,7 @@ use crate::common;
 /// mention) and answers the subject id beside the flat page's ids, newest
 /// first.
 async fn seed_three(app: &Router, pool: &PgPool, alice_token: &str) -> (String, Vec<String>) {
-    let subject = entity_id(&post(app, alice_token, "mark me").await);
+    let subject = common::id_of(&post(app, alice_token, "mark me").await);
     let (_bob, bob_token) = user(pool, "bob").await;
     let (_carol, carol_token) = user(pool, "carol").await;
     let (_dave, dave_token) = user(pool, "dave").await;
@@ -152,7 +152,7 @@ async fn the_chat_and_conversation_reads_move_their_own_markers() {
     let (bob, bob_token) = user(&pool, "bob").await;
 
     let _dm = direct_post(&app, &alice_token, "@bob read me").await;
-    let owed = entity_id(&got_array(&app, &bob_token, CONVERSATIONS).await.remove(0));
+    let owed = common::id_of(&got_array(&app, &bob_token, CONVERSATIONS).await.remove(0));
     assert!(
         listed_unread(&app, &bob_token).await,
         "the fresh DM stands unread"
@@ -163,8 +163,8 @@ async fn the_chat_and_conversation_reads_move_their_own_markers() {
         "the read endpoint moved the flag"
     );
 
-    let hers = entity_id(&open_chat(&app, &alice_token, &bob.id.to_string()).await);
-    let his = entity_id(&open_chat(&app, &bob_token, &alice.id.to_string()).await);
+    let hers = common::id_of(&open_chat(&app, &alice_token, &bob.id.to_string()).await);
+    let his = common::id_of(&open_chat(&app, &bob_token, &alice.id.to_string()).await);
     let _first = send_message(&app, &alice_token, &hers, "ping").await;
     assert_eq!(
         chat_unread(&app, &bob_token, &his).await,
@@ -221,7 +221,7 @@ async fn the_stranger_gate_withholds_all_but_the_request() {
         "the own-view renders the stored flag"
     );
 
-    let subject = entity_id(&post(&app, &alice_token, "gate me").await);
+    let subject = common::id_of(&post(&app, &alice_token, "gate me").await);
     let _withheld_like = status_action(&app, &bob_token, &subject, "favourite").await;
     let _withheld_mention = post(&app, &bob_token, "@alice can you hear me").await;
     assert!(
@@ -237,7 +237,7 @@ async fn the_stranger_gate_withholds_all_but_the_request() {
     );
     let dave_id = dave.id.to_string();
     let _told_like = status_action(&app, &dave_token, &subject, "favourite").await;
-    let dave_post = entity_id(&post(&app, &dave_token, "@alice now we talk").await);
+    let dave_post = common::id_of(&post(&app, &dave_token, "@alice now we talk").await);
     assert_eq!(
         sorted(told(&flat(&app, &alice_token, "").await)),
         sorted(vec![
