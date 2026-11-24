@@ -48,8 +48,7 @@ use self::deliver::deliver;
 #[cfg(doc)]
 use crate::services::web_push;
 use crate::{
-    error::AppError,
-    jobs::{AttemptInfo, HandlerFuture, JobError},
+    jobs::{AttemptInfo, HandlerFuture, parse_args},
     state::AppState,
 };
 
@@ -65,7 +64,7 @@ pub const MAX_ATTEMPTS: i32 = 3;
 /// The `{notification_id, subscription_id}` arguments of a delivery job,
 /// as [`job_args`] writes and [`handle_deliver`] reads them.
 #[derive(Debug, Deserialize)]
-pub(super) struct DeliverArgs {
+struct DeliverArgs {
     /// The notification whose facts the payload reports.
     notification_id: Uuid,
     /// The subscription to wake.
@@ -83,18 +82,12 @@ pub fn job_args(notification_id: Uuid, subscription_id: Uuid) -> Value {
     })
 }
 
-/// Reads [`DeliverArgs`] out of a claimed job's payload; arguments this
-/// shape cannot deserialize are permanent — the job is discarded.
-pub(super) fn parse_args(args: &Value) -> Result<DeliverArgs, JobError> {
-    serde_json::from_value::<DeliverArgs>(args.clone())
-        .map_err(|err| JobError::Discard(format!("web push job arguments are unusable: {err}")))
-}
+/// The job name in the discard text of unusable [`DeliverArgs`].
+const DELIVER_JOB: &str = "web push";
 
-/// Lifts a database failure into the queue's retry arm; every read the job
+/// The job name in the retry text of a failed delivery; every read the job
 /// does is idempotent, so another attempt costs nothing but the wait.
-pub(super) fn retry(err: &AppError) -> JobError {
-    JobError::Retry(format!("web push delivery failed: {err}"))
-}
+const PASS_JOB: &str = "web push delivery";
 
 /// The [`JobRegistry`](super::JobRegistry) handler for [`KIND_DELIVER`].
 pub fn handle_deliver(state: AppState, _attempt: AttemptInfo, args: Value) -> HandlerFuture {
@@ -102,7 +95,7 @@ pub fn handle_deliver(state: AppState, _attempt: AttemptInfo, args: Value) -> Ha
         let DeliverArgs {
             notification_id,
             subscription_id,
-        } = parse_args(&args)?;
+        } = parse_args(&args, DELIVER_JOB)?;
         deliver(&state, notification_id, subscription_id).await
     })
 }
@@ -110,6 +103,7 @@ pub fn handle_deliver(state: AppState, _attempt: AttemptInfo, args: Value) -> Ha
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::jobs::JobError;
 
     #[test]
     fn the_job_shape_round_trips_and_bad_args_discard() {
@@ -121,10 +115,12 @@ mod tests {
             "ids travel as decision 4's text"
         );
         assert_eq!(args["subscription_id"], subscription_id.to_string());
-        let parsed = parse_args(&args).expect("the written shape reads back");
+        let parsed =
+            parse_args::<DeliverArgs>(&args, DELIVER_JOB).expect("the written shape reads back");
         assert_eq!(parsed.notification_id, note_id);
         assert_eq!(parsed.subscription_id, subscription_id);
-        let err = parse_args(&json!({})).expect_err("a pair-less payload cannot run");
+        let err = parse_args::<DeliverArgs>(&json!({}), DELIVER_JOB)
+            .expect_err("a pair-less payload cannot run");
         assert!(
             matches!(err, JobError::Discard(_)),
             "unusable arguments are permanent: {err}"

@@ -5,11 +5,14 @@ use serde_json::Value;
 use tracing::debug;
 use uuid::Uuid;
 
+use super::{DELETE_JOB, DeleteArgs, PASS_JOB};
 #[cfg(doc)]
 use super::{KIND_DELETE, KIND_DELETE_REMOTE};
-use super::{parse_args, retry};
 use crate::{
-    jobs::{AttemptInfo, HandlerFuture, JobError, backups::sweep_archive_file, scheduled_statuses},
+    jobs::{
+        AttemptInfo, HandlerFuture, JobError, backups::sweep_archive_file, parse_args, retry,
+        scheduled_statuses,
+    },
     models::{
         backup, bookmark, chat, favourite, follow, job, list, media_attachment, notification,
         scheduled_status, status, user, web_push_subscription,
@@ -26,13 +29,13 @@ use crate::{
 /// work that is idempotent, and retries.
 pub fn handle_delete(state: AppState, _attempt: AttemptInfo, args: Value) -> HandlerFuture {
     Box::pin(async move {
-        let user_id = parse_args(&args)?;
+        let user_id = parse_args::<DeleteArgs>(&args, DELETE_JOB)?.user_id;
         let account = load_account(&state, user_id).await?;
         crate::services::federation_out::after_account_deleted(&state, &account).await;
         clear_data(&state, &account).await?;
         user::purge_personal_data(&state.db, account.id)
             .await
-            .map_err(|err| retry(&err))?;
+            .map_err(|err| retry(PASS_JOB, &err))?;
         debug!(account = %account.nickname, "account deletion finished");
         Ok(())
     })
@@ -52,7 +55,7 @@ pub(super) async fn load_account(state: &AppState, user_id: Uuid) -> Result<user
         Ok(None) => Err(JobError::Discard(format!(
             "the delete job's user {user_id} no longer exists"
         ))),
-        Err(err) => Err(retry(&err)),
+        Err(err) => Err(retry(PASS_JOB, &err)),
     }
 }
 
@@ -70,33 +73,33 @@ async fn clear_data(state: &AppState, account: &user::User) -> Result<(), JobErr
     let id = account.id;
     let statuses = status::soft_delete_all_for_user(db, id)
         .await
-        .map_err(|err| retry(&err))?;
+        .map_err(|err| retry(PASS_JOB, &err))?;
     let chat_messages = chat::withdraw_all_from_sender(db, id)
         .await
-        .map_err(|err| retry(&err))?;
+        .map_err(|err| retry(PASS_JOB, &err))?;
     let follows = follow::delete_all_for_user_with_counts(db, id)
         .await
-        .map_err(|err| retry(&err))?;
+        .map_err(|err| retry(PASS_JOB, &err))?;
     let favourites = favourite::delete_all_for_user(db, id)
         .await
-        .map_err(|err| retry(&err))?;
+        .map_err(|err| retry(PASS_JOB, &err))?;
     let bookmarks = bookmark::delete_all_for_user(db, id)
         .await
-        .map_err(|err| retry(&err))?;
+        .map_err(|err| retry(PASS_JOB, &err))?;
     let notifications = notification::delete_all_for_user(db, id)
         .await
-        .map_err(|err| retry(&err))?;
+        .map_err(|err| retry(PASS_JOB, &err))?;
     let lists = list::delete_all_for_user(db, id)
         .await
-        .map_err(|err| retry(&err))?;
+        .map_err(|err| retry(PASS_JOB, &err))?;
     let media = media_attachment::delete_all_for_user(db, id)
         .await
-        .map_err(|err| retry(&err))?;
+        .map_err(|err| retry(PASS_JOB, &err))?;
     let scheduled = clear_scheduled(state, id).await?;
     let backups = clear_backups(state, id).await?;
     let push_subscriptions = web_push_subscription::delete_all_for_user(db, id)
         .await
-        .map_err(|err| retry(&err))?;
+        .map_err(|err| retry(PASS_JOB, &err))?;
     debug!(
         account = %account.nickname,
         statuses, chat_messages, follows, favourites, bookmarks, notifications, lists, media,
@@ -116,11 +119,11 @@ async fn clear_data(state: &AppState, account: &user::User) -> Result<(), JobErr
 async fn clear_scheduled(state: &AppState, user_id: Uuid) -> Result<usize, JobError> {
     let ids = scheduled_status::delete_all_for_user(&state.db, user_id)
         .await
-        .map_err(|err| retry(&err))?;
+        .map_err(|err| retry(PASS_JOB, &err))?;
     for id in &ids {
         let _cancelled = job::cancel_pending(&state.db, &scheduled_statuses::unique_key(*id))
             .await
-            .map_err(|err| retry(&err))?;
+            .map_err(|err| retry(PASS_JOB, &err))?;
     }
     Ok(ids.len())
 }
@@ -136,7 +139,7 @@ async fn clear_scheduled(state: &AppState, user_id: Uuid) -> Result<usize, JobEr
 async fn clear_backups(state: &AppState, user_id: Uuid) -> Result<usize, JobError> {
     let rows = backup::list_for_user(&state.db, user_id)
         .await
-        .map_err(|err| retry(&err))?;
+        .map_err(|err| retry(PASS_JOB, &err))?;
     for row in &rows {
         if let Some(key) = row.storage_key.as_deref()
             && !sweep_archive_file(state, row, key).await
@@ -147,7 +150,7 @@ async fn clear_backups(state: &AppState, user_id: Uuid) -> Result<usize, JobErro
         }
         let _swept = backup::delete(&state.db, row.id)
             .await
-            .map_err(|err| retry(&err))?;
+            .map_err(|err| retry(PASS_JOB, &err))?;
     }
     Ok(rows.len())
 }

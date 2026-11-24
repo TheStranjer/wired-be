@@ -67,7 +67,8 @@ mod test_support;
 pub use local::handle_delete;
 pub use remote::handle_delete_remote;
 
-use crate::{error::AppError, jobs::JobError};
+#[cfg(doc)]
+use crate::jobs::JobError;
 
 /// The job kind of an account deletion, handled by [`handle_delete`] on
 /// [`QUEUE_BACKGROUND`](super::QUEUE_BACKGROUND).
@@ -97,22 +98,12 @@ pub fn job_args(user_id: Uuid) -> Value {
     json!({ "user_id": user_id })
 }
 
-/// Reads [`DeleteArgs`] out of a claimed job's payload; arguments this
-/// shape cannot deserialize are permanent — the job is discarded, never
-/// retried.
-fn parse_args(args: &Value) -> Result<Uuid, JobError> {
-    serde_json::from_value::<DeleteArgs>(args.clone())
-        .map(|parsed| parsed.user_id)
-        .map_err(|err| {
-            JobError::Discard(format!("account delete job arguments are unusable: {err}"))
-        })
-}
+/// The job name in the discard text of unusable [`DeleteArgs`].
+const DELETE_JOB: &str = "account delete";
 
-/// Lifts a database failure into the queue's retry arm; every step is
+/// The job name in the retry text of a failed pass; every step is
 /// idempotent, so another pass costs nothing but the wait.
-fn retry(err: &AppError) -> JobError {
-    JobError::Retry(format!("account delete pass failed: {err}"))
-}
+const PASS_JOB: &str = "account delete pass";
 
 #[cfg(test)]
 mod tests {

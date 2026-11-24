@@ -6,9 +6,9 @@ use tracing::debug;
 
 #[cfg(doc)]
 use super::KIND_DELETE_REMOTE;
-use super::{local::load_account, parse_args, retry};
+use super::{DELETE_JOB, DeleteArgs, PASS_JOB, local::load_account};
 use crate::{
-    jobs::{AttemptInfo, HandlerFuture, JobError},
+    jobs::{AttemptInfo, HandlerFuture, JobError, parse_args, retry},
     models::{bookmark, chat, emoji_reaction, favourite, follow, notification, status, user},
     state::AppState,
 };
@@ -26,7 +26,7 @@ use crate::{
 /// retries, the writes being idempotent.
 pub fn handle_delete_remote(state: AppState, _attempt: AttemptInfo, args: Value) -> HandlerFuture {
     Box::pin(async move {
-        let user_id = parse_args(&args)?;
+        let user_id = parse_args::<DeleteArgs>(&args, DELETE_JOB)?.user_id;
         let account = load_account(&state, user_id).await?;
         clear_remote_data(&state, &account).await?;
         debug!(account = %account.nickname, "remote account deletion finished");
@@ -50,25 +50,25 @@ async fn clear_remote_data(state: &AppState, account: &user::User) -> Result<(),
     let id = account.id;
     let statuses = status::soft_delete_all_for_user(db, id)
         .await
-        .map_err(|err| retry(&err))?;
+        .map_err(|err| retry(PASS_JOB, &err))?;
     let chat_messages = chat::withdraw_all_from_sender(db, id)
         .await
-        .map_err(|err| retry(&err))?;
+        .map_err(|err| retry(PASS_JOB, &err))?;
     let follows = follow::delete_all_for_user_with_counts(db, id)
         .await
-        .map_err(|err| retry(&err))?;
+        .map_err(|err| retry(PASS_JOB, &err))?;
     let favourites = favourite::delete_all_for_user(db, id)
         .await
-        .map_err(|err| retry(&err))?;
+        .map_err(|err| retry(PASS_JOB, &err))?;
     let reactions = emoji_reaction::delete_all_for_user(db, id)
         .await
-        .map_err(|err| retry(&err))?;
+        .map_err(|err| retry(PASS_JOB, &err))?;
     let bookmarks = bookmark::delete_all_for_user(db, id)
         .await
-        .map_err(|err| retry(&err))?;
+        .map_err(|err| retry(PASS_JOB, &err))?;
     let notifications = notification::delete_all_for_user(db, id)
         .await
-        .map_err(|err| retry(&err))?;
+        .map_err(|err| retry(PASS_JOB, &err))?;
     debug!(
         account = %account.nickname,
         statuses, chat_messages, follows, favourites, reactions, bookmarks, notifications,

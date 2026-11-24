@@ -5,10 +5,10 @@ use sqlx::PgPool;
 use tracing::debug;
 use uuid::Uuid;
 
-use super::{retry, text::body_text};
+use super::{PASS_JOB, text::body_text};
 use crate::{
     entities::account::{DEFAULT_AVATAR_PATH, plain_display_name, profile_image},
-    jobs::JobError,
+    jobs::{JobError, retry},
     models::{
         follow,
         notification::{self, Notification},
@@ -34,7 +34,7 @@ pub(super) async fn deliver(
 ) -> Result<(), JobError> {
     let found = web_push_subscription::find_by_id(&state.db, subscription_id)
         .await
-        .map_err(|err| retry(&err))?;
+        .map_err(|err| retry(PASS_JOB, &err))?;
     let Some(subscription) = found else {
         debug!(subscription = %subscription_id, "push subscription is already gone");
         return Ok(());
@@ -61,7 +61,7 @@ async fn deliver_for(
     };
     let found = notification::get_visible(&state.db, recipient_id, notification_id)
         .await
-        .map_err(|err| retry(&err))?;
+        .map_err(|err| retry(PASS_JOB, &err))?;
     let Some(note) = found else {
         debug!(
             notification = %notification_id,
@@ -106,10 +106,10 @@ async fn policy_permits(
         "all" => Ok(true),
         "followed" => follow::has_accepted_follow(pool, recipient_id, actor_id)
             .await
-            .map_err(|err| retry(&err)),
+            .map_err(|err| retry(PASS_JOB, &err)),
         "follower" => follow::has_accepted_follow(pool, actor_id, recipient_id)
             .await
-            .map_err(|err| retry(&err)),
+            .map_err(|err| retry(PASS_JOB, &err)),
         _ => Ok(false),
     }
 }
@@ -132,20 +132,20 @@ async fn send_note(
     let pool = &state.db;
     let Some(actor) = user::get_by_id(pool, note.from_account_id)
         .await
-        .map_err(|err| retry(&err))?
+        .map_err(|err| retry(PASS_JOB, &err))?
     else {
         debug!(account = %note.from_account_id, "the notification's actor is gone");
         return Ok(());
     };
     let Some(recipient) = user::get_by_id(pool, recipient_id)
         .await
-        .map_err(|err| retry(&err))?
+        .map_err(|err| retry(PASS_JOB, &err))?
     else {
         return Ok(());
     };
     let found = oauth_token::get_by_id(pool, subscription.token_id)
         .await
-        .map_err(|err| retry(&err))?;
+        .map_err(|err| retry(PASS_JOB, &err))?;
     let Some(token) = found else {
         debug!(token = %subscription.token_id, "the subscription's token is gone");
         return Ok(());
@@ -179,7 +179,7 @@ async fn send_note(
         Err(web_push::PushError::Gone) => {
             let deleted = web_push_subscription::delete_for_token(pool, subscription.token_id)
                 .await
-                .map_err(|err| retry(&err))?;
+                .map_err(|err| retry(PASS_JOB, &err))?;
             debug!(
                 subscription = %subscription.id,
                 deleted,
@@ -205,10 +205,10 @@ async fn vapid_authorization(state: &AppState, endpoint: &str) -> Result<String,
 
     let public_key = vapid::vapid_public_key(&state.db)
         .await
-        .map_err(|err| retry(&err))?;
+        .map_err(|err| retry(PASS_JOB, &err))?;
     let stored = instance_secret::get(&state.db, vapid::VAPID_PRIVATE_NAME)
         .await
-        .map_err(|err| retry(&err))?;
+        .map_err(|err| retry(PASS_JOB, &err))?;
     let private_pem = stored.ok_or_else(|| {
         JobError::Discard("the instance has no VAPID private key to sign with".to_owned())
     })?;
