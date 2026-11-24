@@ -264,17 +264,17 @@ impl Finger {
     }
 }
 
-/// The `OStatus` subscribe link: Pleroma's follow-intent template, this
-/// instance's `/ostatus_subscribe` page with the literal `{uri}` macro
-/// left for the remote server to fill in.
+/// The `OStatus` subscribe link: the follow-intent template naming the
+/// frontend's `/authorize_interaction` page (Mastodon's shape), with the
+/// literal `{uri}` macro left for the remote server to fill in.
 fn subscribe_link(config: &Config) -> FingerLink {
     FingerLink {
         rel: SUBSCRIBE_REL,
         link_type: None,
         href: None,
         template: Some(format!(
-            "{}/ostatus_subscribe?acct={{uri}}",
-            config.base_url
+            "{}/authorize_interaction?uri={{uri}}",
+            config.frontend_base_url
         )),
     }
 }
@@ -353,6 +353,52 @@ mod tests {
             drop(previous);
         }
         headers
+    }
+
+    #[test]
+    fn the_subscribe_template_names_the_frontend_authorize_interaction_page() {
+        let mut config = Config::for_tests();
+        config.frontend_base_url = "https://fe.example".to_owned();
+        let link = subscribe_link(&config);
+        assert_eq!(
+            link.template.as_deref(),
+            Some("https://fe.example/authorize_interaction?uri={uri}"),
+            "the JRD template points at the frontend"
+        );
+        assert_eq!(
+            xrd_link(&link),
+            r#"<Link rel="http://ostatus.org/schema/1.0/subscribe" template="https://fe.example/authorize_interaction?uri={uri}"/>"#,
+            "the XRD carries the same template"
+        );
+    }
+
+    #[test]
+    fn the_subscribe_template_defaults_onto_the_base_url() {
+        let config = Config::for_tests();
+        let link = subscribe_link(&config);
+        let want = format!("{}/authorize_interaction?uri={{uri}}", config.base_url);
+        assert_eq!(
+            link.template.as_deref(),
+            Some(want.as_str()),
+            "with the default config the frontend is the backend"
+        );
+        assert!(
+            !xrd_link(&link).contains("ostatus_subscribe"),
+            "no WebFinger link mentions the login form"
+        );
+    }
+
+    #[test]
+    fn the_xrd_subscribe_template_is_xml_escaped() {
+        let mut config = Config::for_tests();
+        config.frontend_base_url = "https://fe.example/a&b".to_owned();
+        let xml = xrd_link(&subscribe_link(&config));
+        assert!(
+            xml.contains(
+                r#"template="https://fe.example/a&amp;b/authorize_interaction?uri={uri}""#
+            ),
+            "the ampersand is escaped: {xml}"
+        );
     }
 
     #[test]

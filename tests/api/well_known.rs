@@ -61,7 +61,7 @@ fn alice_jrd() -> Value {
             },
             {
                 "rel": "http://ostatus.org/schema/1.0/subscribe",
-                "template": "https://test.example/ostatus_subscribe?acct={uri}",
+                "template": "https://test.example/authorize_interaction?uri={uri}",
             },
         ],
     })
@@ -71,7 +71,7 @@ fn alice_jrd() -> Value {
 /// and the three `Link` elements, in order.
 fn alice_xrd() -> String {
     format!(
-        r#"<XRD xmlns="{XRD_NS}"><Subject>acct:alice@test.example</Subject><Alias>{ALICE_AP_ID}</Alias><Link rel="http://webfinger.net/rel/profile-page" type="text/html" href="{ALICE_AP_ID}"/><Link rel="self" type="application/activity+json" href="{ALICE_AP_ID}"/><Link rel="http://ostatus.org/schema/1.0/subscribe" template="{BASE}/ostatus_subscribe?acct={{uri}}"/></XRD>"#
+        r#"<XRD xmlns="{XRD_NS}"><Subject>acct:alice@test.example</Subject><Alias>{ALICE_AP_ID}</Alias><Link rel="http://webfinger.net/rel/profile-page" type="text/html" href="{ALICE_AP_ID}"/><Link rel="self" type="application/activity+json" href="{ALICE_AP_ID}"/><Link rel="http://ostatus.org/schema/1.0/subscribe" template="{BASE}/authorize_interaction?uri={{uri}}"/></XRD>"#
     )
 }
 
