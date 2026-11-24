@@ -3,7 +3,6 @@
 
 use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
-use uuid::Uuid;
 
 use super::{
     TYPE_ACCEPT, TYPE_ADD, TYPE_BLOCK, TYPE_FLAG, TYPE_FOLLOW, TYPE_MOVE, TYPE_REJECT, TYPE_REMOVE,
@@ -15,35 +14,58 @@ use super::{
 };
 use crate::config::Config;
 
-/// The `Follow` behind the follow row `id`: `follower_ap_id` asks to
+/// The `Follow` whose activity id is `id`: `follower_ap_id` asks to
 /// follow `target_ap_id`, who is the activity's object and the only
 /// address `to` names — Pleroma's `FollowView`.
 ///
-/// The row's stored `ap_id` (decision 6) is [`activity_id`] of `config`
-/// and `id`, and `published` is the follow's creation moment.
+/// `id` is the follow row's stored `ap_id` (decision 6) — [`activity_id`]
+/// of a uuid for a document minted now — and `published` is the follow's
+/// creation moment.
 #[must_use]
 pub fn follow_json(
     config: &Config,
-    id: Uuid,
+    id: &str,
     follower_ap_id: &str,
     target_ap_id: &str,
     published: &DateTime<Utc>,
 ) -> Value {
+    follow_json_to(
+        config,
+        id,
+        follower_ap_id,
+        target_ap_id,
+        &[target_ap_id],
+        published,
+    )
+}
+
+/// [`follow_json`] addressed to `to` instead of the followed actor: the
+/// relay handshake names the relay's *inbox*, the endpoint that must
+/// receive the `Follow`.
+#[must_use]
+pub fn follow_json_to(
+    config: &Config,
+    id: &str,
+    follower_ap_id: &str,
+    target_ap_id: &str,
+    to: &[&str],
+    published: &DateTime<Utc>,
+) -> Value {
     document_json(ActivityDocument {
         config,
-        id: activity_id(config, id),
+        id: id.to_owned(),
         type_name: TYPE_FOLLOW,
         actor_ap_id: follower_ap_id,
         object: json!(target_ap_id),
-        to: vec![json!(target_ap_id)],
+        to: address_values(to),
         cc: Vec::new(),
         published,
         extra: Vec::new(),
     })
 }
 
-/// The `Block` behind the block row `id`: `blocker_ap_id` blocks
-/// `target_ap_id`.
+/// The `Block` whose activity id is `id` (the block row's stored
+/// `ap_id`): `blocker_ap_id` blocks `target_ap_id`.
 ///
 /// Pleroma's `BlockView`: the blocked actor is the activity's object and
 /// the only address `to` names, so the blocked peer learns of the block
@@ -51,14 +73,14 @@ pub fn follow_json(
 #[must_use]
 pub fn block_json(
     config: &Config,
-    id: Uuid,
+    id: &str,
     blocker_ap_id: &str,
     target_ap_id: &str,
     published: &DateTime<Utc>,
 ) -> Value {
     document_json(ActivityDocument {
         config,
-        id: activity_id(config, id),
+        id: id.to_owned(),
         type_name: TYPE_BLOCK,
         actor_ap_id: blocker_ap_id,
         object: json!(target_ap_id),
@@ -185,7 +207,7 @@ mod tests {
 
     #[test]
     fn a_follow_addresses_the_followed_actor_alone() {
-        let document = follow_json(&config(), activity_uuid(), BOB_AP, ALICE_AP, &published());
+        let document = follow_json(&config(), &stored_id(), BOB_AP, ALICE_AP, &published());
         assert_eq!(
             document,
             json!({
@@ -204,8 +226,33 @@ mod tests {
     }
 
     #[test]
+    fn a_follow_renders_the_id_it_is_given_and_an_overriding_to() {
+        let stored = "https://stored.example/activities/follow-row";
+        let document = follow_json_to(
+            &config(),
+            stored,
+            BOB_AP,
+            ALICE_AP,
+            &["https://relay.example/inbox"],
+            &published(),
+        );
+        assert_eq!(document["id"], json!(stored), "the stored id, verbatim");
+        assert_eq!(
+            document["object"],
+            json!(ALICE_AP),
+            "the object is unchanged"
+        );
+        assert_eq!(
+            document["to"],
+            json!(["https://relay.example/inbox"]),
+            "to is exactly the override"
+        );
+        assert_eq!(json_keys(&document), ACTIVITY_KEYS, "and nothing else");
+    }
+
+    #[test]
     fn a_block_addresses_the_blocked_actor_alone() {
-        let document = block_json(&config(), activity_uuid(), ALICE_AP, BOB_AP, &published());
+        let document = block_json(&config(), &stored_id(), ALICE_AP, BOB_AP, &published());
         assert_eq!(
             document,
             json!({

@@ -108,7 +108,13 @@ pub(super) fn expected_context() -> Value {
 /// The `Follow` of `BOB_AP` asking to follow `ALICE_AP`, the document
 /// `Accept`, `Reject` and `Undo` embed.
 pub(super) fn follow_of_bob() -> Value {
-    follow_json(&config(), follow_uuid(), BOB_AP, ALICE_AP, &published())
+    follow_json(
+        &config(),
+        &activity_id(&config(), follow_uuid()),
+        BOB_AP,
+        ALICE_AP,
+        &published(),
+    )
 }
 
 /// The stored id every fixture document carries: [`activity_id`] of
