@@ -38,6 +38,7 @@ use std::sync::LazyLock;
 
 use chrono::{DateTime, Utc};
 use regex::Regex;
+use unicode_normalization::UnicodeNormalization as _;
 use uuid::Uuid;
 
 use crate::util::entities::MAX_HASHTAG_LEN;
@@ -97,6 +98,7 @@ static NAME_RE: LazyLock<Option<Regex>> = LazyLock::new(|| Regex::new(NAME_PATTE
 
 /// The normalized form of one written tag name, or `None` when it is not a
 /// usable tag: trimmed, leading `#`s dropped, lowercased — and non-empty,
+/// NFKC-normalized (full-width and composed forms fold together),
 /// at most [`MAX_HASHTAG_LEN`] characters once normalized, made only of the
 /// characters [`NAME_PATTERN`] allows, and not all digits.
 ///
@@ -109,9 +111,12 @@ pub(crate) fn normalize_name(name: &str) -> Option<String> {
     if trimmed.is_empty() {
         return None;
     }
-    let tag = trimmed.to_lowercase();
+    // NFKC first (Mastodon's `HashtagNormalizer`), so full-width and
+    // decomposed spellings meet the canonical one; no ASCII folding, which
+    // would merge distinct non-Latin tags.
+    let tag = trimmed.nfkc().collect::<String>().to_lowercase();
     // The length bound is on the stored tag, so it is checked after the
-    // lowercase (which can change a character count at the margins).
+    // NFKC fold and lowercase (which can change a character count).
     if tag.chars().count() > MAX_HASHTAG_LEN {
         return None;
     }
@@ -156,15 +161,34 @@ mod tests {
             Some("日本語".to_owned()),
             "letters of any script"
         );
-        for name in [
-            "เก็บ",
-            "e\u{301}",
-            "a\u{00B7}b",
-            "カ\u{30FB}カ",
-            "a\u{200C}b",
-        ] {
+        for name in ["เก็บ", "\u{e9}", "a\u{00B7}b", "カ\u{30FB}カ", "a\u{200C}b"] {
             assert_eq!(normalize_name(name), Some(name.to_owned()), "`{name}`");
         }
+    }
+
+    #[test]
+    fn names_are_folded_with_nfkc() {
+        assert_eq!(
+            normalize_name("ｒｕｓｔ"),
+            Some("rust".to_owned()),
+            "full-width letters fold to ASCII"
+        );
+        assert_eq!(
+            normalize_name("#ＲＵＳＴ"),
+            Some("rust".to_owned()),
+            "full-width capitals fold and lowercase"
+        );
+        assert_eq!(
+            normalize_name("cafe\u{301}"),
+            normalize_name("caf\u{e9}"),
+            "decomposed and composed forms agree"
+        );
+        assert_eq!(normalize_name("caf\u{e9}"), Some("caf\u{e9}".to_owned()));
+        assert_ne!(
+            normalize_name("caf\u{e9}"),
+            normalize_name("cafe"),
+            "accents are not ASCII-folded"
+        );
     }
 
     #[test]

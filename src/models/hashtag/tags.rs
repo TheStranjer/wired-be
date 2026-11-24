@@ -161,6 +161,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn upsert_folds_nfkc_equivalent_spellings_into_one_row() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let stored = upsert_many(&pool, &tags(&["ＲＵＳＴ", "rust"]))
+            .await
+            .expect("the upsert runs");
+        assert_eq!(names(&stored), vec!["rust"], "one row, the folded name");
+        assert_eq!(stored_tags(&pool).await.len(), 1, "and one stored tag");
+
+        let composed = upsert_many(&pool, &tags(&["cafe\u{301}", "caf\u{e9}"]))
+            .await
+            .expect("the accent upsert runs");
+        assert_eq!(composed.len(), 1, "composed and decomposed are one tag");
+    }
+
+    #[tokio::test]
     async fn upsert_keeps_order_by_name_and_drops_the_unusable() {
         let db = crate::test_db::test_db().await.expect("test database slot");
         let pool = db.pool().clone();
