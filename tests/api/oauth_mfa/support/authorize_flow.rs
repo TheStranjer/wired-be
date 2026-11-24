@@ -53,10 +53,7 @@ async fn the_authorize_flow_detours_through_the_mfa_page() {
     let (_challenge_id, _authorization_id) =
         assert_challenge_stored(&pool, &token, &fix.user).await;
     assert_eq!(
-        oauth_token::list_for_user(&pool, fix.user.id)
-            .await
-            .expect("the lookup reaches the database")
-            .len(),
+        token_count(&pool, fix.user.id).await,
         0,
         "no token and no client-visible code yet"
     );

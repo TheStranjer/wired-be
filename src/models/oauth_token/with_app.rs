@@ -96,9 +96,9 @@ impl TokenWithAppRow {
 /// issued it, exactly as stored.
 ///
 /// **No validity filter**: an expired row is still returned, leaving
-/// expiry and account activity to the caller (unlike
-/// [`get_valid_token`](super::get_valid_token), which hides both). [`crate::auth`] uses it to
-/// tell an expired token (401) from a deactivated owner (403).
+/// expiry and account status to the caller. [`crate::auth`] applies the
+/// validity rule on top of it, telling an expired token (401) from a
+/// deactivated owner (403).
 ///
 /// # Errors
 ///
@@ -136,7 +136,7 @@ pub async fn get_by_refresh_token(
 #[cfg(test)]
 mod tests {
     use super::super::test_support::*;
-    use super::super::{NewToken, create_token, get_valid_token};
+    use super::super::{NewToken, create_token};
     use super::*;
 
     #[tokio::test]
@@ -264,13 +264,6 @@ mod tests {
         assert!(
             get_with_app(&pool, &token.token).await.unwrap().is_some(),
             "an expired row still arrives (expiry is the caller's call)"
-        );
-        assert!(
-            get_valid_token(&pool, &token.token)
-                .await
-                .unwrap()
-                .is_none(),
-            "whereas the validity-filtered lookup hides it"
         );
         deactivate_user(&pool, oscar.id).await;
         assert!(

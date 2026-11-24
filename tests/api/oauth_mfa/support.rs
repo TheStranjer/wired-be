@@ -189,6 +189,19 @@ async fn authorization_by_id(pool: &PgPool, id: Uuid) -> OauthAuthorization {
         .expect("the authorization row is stored")
 }
 
+/// How many `oauth_tokens` rows user `user_id` owns, expired ones included.
+///
+/// # Panics
+///
+/// If the query fails.
+async fn token_count(pool: &PgPool, user_id: Uuid) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM oauth_tokens WHERE user_id = $1")
+        .bind(user_id)
+        .fetch_one(pool)
+        .await
+        .expect("the token count reaches the database")
+}
+
 /// The current 6-digit TOTP code of `secret`, as an authenticator app
 /// would produce it right now.
 fn current_code(secret: &str) -> String {
