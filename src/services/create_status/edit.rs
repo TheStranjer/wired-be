@@ -222,6 +222,7 @@ pub async fn edit_status(
         media_ids,
         edited_at: None,
         media_attributes,
+        media_refresh: Vec::new(),
     };
     let Some(updated) = status_edit::update_status(&state.db, row.id, edit).await? else {
         return Ok(None);

@@ -201,6 +201,13 @@ pub struct EditParams {
     /// whole edit with [`media_attributes::UNKNOWN_ATTRIBUTE_MEDIA`], and one that alters
     /// something counts as a change to the version.
     pub media_attributes: Vec<media_attributes::MediaAttributeChange>,
+    /// What a remote edit's document restates about attachments it kept:
+    /// each entry replaces the whole stored metadata (alt text, blurhash,
+    /// dimensions, focal point) of an attachment the post wears once the
+    /// edit lands, and one that alters something counts as a change to the
+    /// version, like [`media_attributes`](Self::media_attributes). Local
+    /// edits leave it empty.
+    pub media_refresh: Vec<media_attributes::MediaRefresh>,
 }
 
 /// Snapshots the current state of `status` as a revision row on `conn`.
@@ -290,7 +297,13 @@ pub async fn update_status(
         None => None,
     };
     let final_media = new_media.as_deref().unwrap_or(&current_media);
-    let attributes = media_attributes::plan(&mut tx, final_media, &params.media_attributes).await?;
+    let attributes = media_attributes::plan(
+        &mut tx,
+        final_media,
+        &params.media_attributes,
+        &params.media_refresh,
+    )
+    .await?;
     let changed = edit_changes_a_version(
         &row,
         &params,
@@ -513,6 +526,7 @@ mod tests {
             media_ids: None,
             edited_at: None,
             media_attributes: Vec::new(),
+            media_refresh: Vec::new(),
         }
     }
 

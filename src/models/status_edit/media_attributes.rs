@@ -17,13 +17,14 @@ use crate::error::{AppError, AppResult};
 pub const UNKNOWN_ATTRIBUTE_MEDIA: &str = "Validation failed";
 
 /// [`plan`]'s read: the stored metadata of every attachment named.
-const STORED_SQL: &str = "SELECT id, description, focus_x, focus_y
+const STORED_SQL: &str = "SELECT id, description, blurhash, width, height, focus_x, focus_y
      FROM media_attachments
     WHERE id = ANY($1)";
 
 /// [`write`]: one attachment's new metadata.
 const WRITE_SQL: &str = "UPDATE media_attachments
-     SET description = $2, focus_x = $3, focus_y = $4, updated_at = now()
+     SET description = $2, blurhash = $3, width = $4, height = $5,
+         focus_x = $6, focus_y = $7, updated_at = now()
    WHERE id = $1";
 
 /// What an entry does to an attachment's focal point.
@@ -51,6 +52,29 @@ pub struct MediaAttributeChange {
     pub focus: Option<FocusChange>,
 }
 
+/// What a remote edit's document states about one attachment it kept.
+///
+/// Unlike a [`MediaAttributeChange`], which says only what moves, this is
+/// the whole state: an absent part clears the stored value, because the
+/// remote's document is the truth about its own media.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MediaRefresh {
+    /// The attachment the document restates.
+    pub id: Uuid,
+    /// The alt text.
+    pub description: Option<String>,
+    /// The blurhash placeholder.
+    pub blurhash: Option<String>,
+    /// The width in pixels.
+    pub width: Option<i32>,
+    /// The height in pixels.
+    pub height: Option<i32>,
+    /// The horizontal axis of the focal point.
+    pub focus_x: Option<f32>,
+    /// The vertical axis of the focal point.
+    pub focus_y: Option<f32>,
+}
+
 /// The metadata of one attachment an edit may rewrite.
 #[derive(Clone, Debug, PartialEq, sqlx::FromRow)]
 pub(super) struct Metadata {
@@ -58,6 +82,12 @@ pub(super) struct Metadata {
     id: Uuid,
     /// Its alt text.
     description: Option<String>,
+    /// Its blurhash placeholder.
+    blurhash: Option<String>,
+    /// Its width in pixels.
+    width: Option<i32>,
+    /// Its height in pixels.
+    height: Option<i32>,
     /// The horizontal axis of its focal point.
     focus_x: Option<f32>,
     /// The vertical axis of its focal point.
@@ -65,6 +95,16 @@ pub(super) struct Metadata {
 }
 
 impl Metadata {
+    /// Replaces every part of this metadata with what `refresh` states.
+    fn replace(&mut self, refresh: &MediaRefresh) {
+        self.description.clone_from(&refresh.description);
+        self.blurhash.clone_from(&refresh.blurhash);
+        self.width = refresh.width;
+        self.height = refresh.height;
+        self.focus_x = refresh.focus_x;
+        self.focus_y = refresh.focus_y;
+    }
+
     /// Applies `change` over this metadata, present parts only.
     fn apply(&mut self, change: &MediaAttributeChange) {
         if let Some(text) = &change.description {
@@ -90,7 +130,8 @@ impl Metadata {
 /// Every entry must name one of `allowed`, the attachments the post wears
 /// once the edit lands; later entries for one id build on earlier ones. An
 /// entry that restates what is stored alters nothing and is left out, so an
-/// unchanged description records no revision.
+/// unchanged description records no revision. `refreshes` (a remote edit's
+/// restated attachments) apply first, whole, then `changes` over them.
 ///
 /// # Errors
 ///
@@ -100,29 +141,41 @@ pub(super) async fn plan(
     conn: &mut PgConnection,
     allowed: &[Uuid],
     changes: &[MediaAttributeChange],
+    refreshes: &[MediaRefresh],
 ) -> AppResult<Vec<Metadata>> {
-    if changes.is_empty() {
+    if changes.is_empty() && refreshes.is_empty() {
         return Ok(Vec::new());
     }
-    if changes.iter().any(|change| !allowed.contains(&change.id)) {
+    let ids: Vec<Uuid> = changes
+        .iter()
+        .map(|change| change.id)
+        .chain(refreshes.iter().map(|refresh| refresh.id))
+        .collect();
+    if ids.iter().any(|id| !allowed.contains(id)) {
         return Err(AppError::Unprocessable(UNKNOWN_ATTRIBUTE_MEDIA.to_owned()));
     }
-    let ids: Vec<Uuid> = changes.iter().map(|change| change.id).collect();
     let stored = sqlx::query_as::<_, Metadata>(STORED_SQL)
         .bind(ids)
         .fetch_all(&mut *conn)
         .await?;
     let mut working = stored.clone();
+    for refresh in refreshes {
+        row_of(&mut working, refresh.id)?.replace(refresh);
+    }
     for change in changes {
-        let Some(row) = working.iter_mut().find(|row| row.id == change.id) else {
-            return Err(AppError::Unprocessable(UNKNOWN_ATTRIBUTE_MEDIA.to_owned()));
-        };
-        row.apply(change);
+        row_of(&mut working, change.id)?.apply(change);
     }
     Ok(working
         .into_iter()
         .filter(|row| !stored.contains(row))
         .collect())
+}
+
+/// The working row for `id`, or the unknown-attachment refusal.
+fn row_of(rows: &mut [Metadata], id: Uuid) -> AppResult<&mut Metadata> {
+    rows.iter_mut()
+        .find(|row| row.id == id)
+        .ok_or_else(|| AppError::Unprocessable(UNKNOWN_ATTRIBUTE_MEDIA.to_owned()))
 }
 
 /// Stores the metadata [`plan`] resolved.
@@ -135,6 +188,9 @@ pub(super) async fn write(conn: &mut PgConnection, planned: &[Metadata]) -> AppR
         sqlx::query(WRITE_SQL)
             .bind(row.id)
             .bind(row.description.as_deref())
+            .bind(row.blurhash.as_deref())
+            .bind(row.width)
+            .bind(row.height)
             .bind(row.focus_x)
             .bind(row.focus_y)
             .execute(&mut *conn)
@@ -153,9 +209,31 @@ mod tests {
         Metadata {
             id: Uuid::now_v7(),
             description: Some("old".to_owned()),
+            blurhash: Some("LEHV6nWB2yk8".to_owned()),
+            width: Some(640),
+            height: Some(480),
             focus_x: Some(0.5),
             focus_y: Some(-0.5),
         }
+    }
+
+    #[test]
+    fn a_refresh_replaces_every_part_and_an_absent_one_clears() {
+        let mut row = stored();
+        let id = row.id;
+        row.replace(&MediaRefresh {
+            id,
+            description: Some("new".to_owned()),
+            blurhash: None,
+            width: Some(800),
+            height: None,
+            focus_x: None,
+            focus_y: Some(0.25),
+        });
+        assert_eq!(row.description.as_deref(), Some("new"), "the text replaced");
+        assert_eq!(row.blurhash, None, "an unstated blurhash clears");
+        assert_eq!((row.width, row.height), (Some(800), None), "dimensions");
+        assert_eq!((row.focus_x, row.focus_y), (None, Some(0.25)), "the focus");
     }
 
     /// A change for `id` carrying only the parts given.

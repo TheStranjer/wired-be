@@ -8,7 +8,7 @@ use serde_json::Value;
 use tracing::debug;
 use uuid::Uuid;
 
-use super::media_poll::{media_replacement_needed, refresh_poll, replace_media, stored_media};
+use super::media_poll::{MediaPlan, plan_media, refresh_poll, replace_media, stored_media};
 #[cfg(doc)]
 use super::update_note;
 use crate::{
@@ -127,12 +127,12 @@ async fn fold_edit(
     let media = stored_media(&state.db, stored.id)
         .await
         .map_err(|err| FederationError::transient("the attachment read failed", &err))?;
-    let media_changed = media_replacement_needed(&media, &parsed.attachments);
+    let media_plan = plan_media(&media, &parsed.attachments);
     let params = edit_params(
         &parsed,
         stored,
         &mentioned,
-        media_changed,
+        &media_plan,
         update_time(object, now),
     );
     let Some(updated) = status_edit::update_status(&state.db, stored.id, params)
@@ -141,12 +141,12 @@ async fn fold_edit(
     else {
         return Ok(Outcome::Ignored("the status was deleted under its edit"));
     };
-    if media_changed {
-        let old_ids: Vec<Uuid> = media.into_iter().map(|(id, _url)| id).collect();
+    if media_plan.replaces() {
+        let old_ids: Vec<Uuid> = media.into_iter().map(|row| row.id).collect();
         replace_media(state, stored.id, &old_ids, &parsed.attachments).await?;
     }
     refresh_poll(state, stored.id, parsed.poll.as_ref()).await?;
-    if !text_unchanged || media_changed {
+    if !text_unchanged || media_plan.changes_media() {
         after_status_edited(state, stored).await;
     }
     debug!(
@@ -160,17 +160,20 @@ async fn fold_edit(
 /// content, source text, warning, sensitive flag, mentions and hashtags —
 /// beside the two the ticket leaves the row's own: the language tag an
 /// edit's document is not asked to restate, and everything the update's
-/// parse cannot see. `media_changed` is the [module doc](self)'s attachment
-/// replacement: an empty submitted set, which [`status_edit::update_status`]
-/// reads as "detach everything the post wears now" — the rows the remote
-/// named are nobody's uploads, so the fold rewrites them itself beside the
-/// versioned write. `edited_at` is the author's own [`update_time`], the
-/// stamp the row wears so the next stale check compares like with like.
+/// parse cannot see. A [`MediaPlan::Replace`] is the [module doc](self)'s
+/// attachment replacement: an empty submitted set, which
+/// [`status_edit::update_status`] reads as "detach everything the post wears
+/// now" — the rows the remote named are nobody's uploads, so the fold
+/// rewrites them itself beside the versioned write. A [`MediaPlan::Refresh`]
+/// rides in `media_refresh`, so the in-place metadata write shares the
+/// versioned write's transaction and revision. `edited_at` is the author's
+/// own [`update_time`], the stamp the row wears so the next stale check
+/// compares like with like.
 fn edit_params(
     parsed: &ParsedNote,
     stored: &Status,
     mentioned: &[User],
-    media_changed: bool,
+    media_plan: &MediaPlan,
     edited_at: Option<DateTime<Utc>>,
 ) -> EditParams {
     EditParams {
@@ -182,9 +185,10 @@ fn edit_params(
         language: stored.language.clone(),
         mentioned_user_ids: mentioned.iter().map(|account| account.id).collect(),
         hashtags: parsed.hashtags.clone(),
-        media_ids: media_changed.then(Vec::new),
+        media_ids: media_plan.replaces().then(Vec::new),
         edited_at,
         media_attributes: Vec::new(),
+        media_refresh: media_plan.refreshes().to_vec(),
     }
 }
 
