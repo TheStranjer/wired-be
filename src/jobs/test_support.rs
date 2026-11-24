@@ -185,6 +185,15 @@ pub(super) fn panicking_handler(
     })
 }
 
+/// A handler that never finishes.
+pub(super) fn pending_handler(
+    _state: AppState,
+    _attempt: AttemptInfo,
+    _args: Value,
+) -> HandlerFuture {
+    Box::pin(std::future::pending())
+}
+
 /// A handler that announces its start and then runs for a moment.
 pub(super) fn slow_handler(_state: AppState, _attempt: AttemptInfo, _args: Value) -> HandlerFuture {
     Box::pin(async {
