@@ -7,7 +7,7 @@ use uuid::Uuid;
 
 use crate::models::{block::push_not_blocked, mute::push_not_muted, user::User};
 
-use super::{ACCEPTED_FOLLOW_STATE, REBLOG_AUTHOR_SQL, ReplyVisibility};
+use super::{ACCEPTED_FOLLOW_STATE, REBLOG_AUTHOR_SQL, ReplyVisibility, TimelineSource};
 
 /// Appends the `reply_visibility` group for `visibility`, judged by the
 /// reply's stored target (`in_reply_to_account_id`) and @-mentions;
@@ -76,11 +76,20 @@ fn push_following_arms(builder: &mut QueryBuilder<Postgres>, viewer_id: Uuid) {
 /// author's side of a block — applies alongside.
 ///
 /// [`push_visibility_clause`]: crate::models::status_visibility::push_visibility_clause
-pub(super) fn push_block_exclusions(builder: &mut QueryBuilder<Postgres>, viewer: Option<&User>) {
+pub(super) fn push_block_exclusions(
+    builder: &mut QueryBuilder<Postgres>,
+    source: &TimelineSource,
+    viewer: Option<&User>,
+) {
     let Some(viewer_id) = viewer.map(|user| user.id) else {
         return;
     };
     push_author_edge_exclusion(builder, viewer_id);
+    let own_account =
+        matches!(source, TimelineSource::Account { user_id } if *user_id == viewer_id);
+    if !own_account {
+        push_addressee_exclusion(builder, viewer_id);
+    }
     let _domain: &mut _ = builder
         .push(
             " AND NOT EXISTS (SELECT 1 FROM user_domain_blocks udb \
@@ -120,6 +129,25 @@ fn push_author_edge_exclusion(builder: &mut QueryBuilder<Postgres>, viewer_id: U
     push_not_blocked(builder, viewer_id, &["s.user_id", REBLOG_AUTHOR_SQL]);
 }
 
+/// The addressee arm: unless the viewer wrote the row, it may not reply to
+/// an account the viewer blocks, nor (for a reblog, the original it boosts)
+/// @-mention one — Mastodon's mention/reply-target filter and Pleroma's
+/// blocked-recipient drop.
+fn push_addressee_exclusion(builder: &mut QueryBuilder<Postgres>, viewer_id: Uuid) {
+    let _addressed: &mut _ = builder
+        .push(" AND (s.user_id = ")
+        .push_bind(viewer_id)
+        .push(" OR (NOT EXISTS (SELECT 1 FROM blocks b2 WHERE b2.blocker_id = ")
+        .push_bind(viewer_id)
+        .push(
+            " AND b2.blocked_id = s.in_reply_to_account_id) \
+               AND NOT EXISTS (SELECT 1 FROM status_mentions smb \
+               JOIN blocks b3 ON b3.blocked_id = smb.user_id AND b3.blocker_id = ",
+        )
+        .push_bind(viewer_id)
+        .push(" WHERE smb.status_id = COALESCE(s.reblog_of_id, s.id))))");
+}
+
 /// The mute arm, [`push_author_edge_exclusion`]'s shape with the
 /// live-mutes test on: an expired mute hides nothing, the same way it counts
 /// for nothing in every other read of [`crate::models::mute`].
@@ -134,7 +162,7 @@ mod tests {
         models::{
             block, conversation_mute, domain_block, follow,
             mute::{self, MuteOptions},
-            status::{Status, Visibility},
+            status::{self, NewStatus, Status, Visibility},
             user::Flag,
         },
         services::timeline::{
@@ -373,6 +401,134 @@ mod tests {
         assert!(
             anonymous.contains(&boost_blocked.id),
             "an anonymous request has no domain blocks"
+        );
+    }
+
+    /// What [`addressing_world`] seeds: alice follows bob and blocks mallory.
+    struct AddressingWorld {
+        /// The viewer, who follows `bob` and blocks mallory.
+        alice: User,
+        /// The followed author of every row that addresses the blocked account.
+        bob: User,
+        /// A stranger's public root, visible on Public only.
+        carol_root: Status,
+        /// Bob's post that has nothing to do with the blocked account.
+        unrelated: Status,
+        /// Alice's own reply to (and mention of) the blocked account.
+        alice_to_mallory: Status,
+        /// Bob's reply to, @-mention of, and boost of a mention of mallory.
+        addressing: [Status; 4],
+    }
+
+    /// Seeds [`AddressingWorld`]: bob replies to mallory, @-mentions her in a
+    /// reply and in a root post, and boosts that root; he also posts something
+    /// unrelated, and alice replies to mallory herself.
+    async fn addressing_world(pool: &sqlx::PgPool) -> AddressingWorld {
+        let alice = local(pool, "alice").await;
+        let bob = local(pool, "bob").await;
+        let carol = local(pool, "carol").await;
+        let mallory = local(pool, "mallory").await;
+        let _follow = follow::follow(pool, BASE, &alice, &bob)
+            .await
+            .expect("alice follows bob");
+        let _accepted = sqlx::query("UPDATE follows SET state = 'accepted'")
+            .execute(pool)
+            .await
+            .expect("the follow is accepted");
+        let _blocked = block::block(pool, BASE, &alice, &mallory)
+            .await
+            .expect("alice blocks mallory");
+        let carol_root = post(pool, &carol, Visibility::Public, "carol root").await;
+        let mallory_root = post(pool, &mallory, Visibility::Public, "mallory root").await;
+        let to_mallory = reply(pool, &bob, &mallory_root, &[], "bob to mallory").await;
+        let cc_mallory = reply(pool, &bob, &carol_root, &[&mallory], "bob cc mallory").await;
+        let new = NewStatus {
+            mentioned_user_ids: vec![mallory.id],
+            ..NewStatus::local(&bob, "hi mallory")
+        };
+        let mentions_mallory = status::insert(pool, BASE, &new)
+            .await
+            .expect("the mention fixture inserts");
+        let boost_of_mention = reblog(pool, &bob, &mentions_mallory).await;
+        let unrelated = post(pool, &bob, Visibility::Public, "bob unrelated").await;
+        let alice_to_mallory = reply(pool, &alice, &mallory_root, &[&mallory], "alice reply").await;
+        AddressingWorld {
+            alice,
+            bob,
+            carol_root,
+            unrelated,
+            alice_to_mallory,
+            addressing: [to_mallory, cc_mallory, mentions_mallory, boost_of_mention],
+        }
+    }
+
+    /// The ids `source` answers `viewer`, newest first.
+    async fn page_as(pool: &sqlx::PgPool, viewer: &User, source: TimelineSource) -> Vec<Uuid> {
+        page_ids(pool, &timeline(Some(as_viewer(pool, viewer).await), source)).await
+    }
+
+    /// A followed author's reply to a blocked account, their post
+    /// @-mentioning one and their boost of a post mentioning one all leave
+    /// Home and Public; their unrelated post stays, and so does the viewer's
+    /// own reply to the blocked account.
+    #[tokio::test]
+    async fn replies_to_and_mentions_of_blocked_accounts_leave_home_and_public() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let world = addressing_world(&pool).await;
+
+        let home = page_as(&pool, &world.alice, TimelineSource::Home).await;
+        assert_eq!(
+            home,
+            newest_first(&[&world.unrelated, &world.alice_to_mallory]),
+            "bob's replies, mentions and boost of the blocked account are out of Home; \
+             his unrelated post and alice's own reply stay"
+        );
+        let public = page_as(&pool, &world.alice, TimelineSource::Public).await;
+        assert_eq!(
+            public,
+            newest_first(&[&world.carol_root, &world.unrelated, &world.alice_to_mallory]),
+            "and out of Public, where a stranger's root stays"
+        );
+    }
+
+    /// The viewer's own `Account` page keeps their reply to the blocked
+    /// account, another account's page hides what addresses it, and an
+    /// anonymous page hides nothing.
+    #[tokio::test]
+    async fn account_pages_honour_the_addressee_exclusion() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let world = addressing_world(&pool).await;
+
+        let own_source = TimelineSource::Account {
+            user_id: world.alice.id,
+        };
+        assert_eq!(
+            page_as(&pool, &world.alice, own_source).await,
+            newest_first(&[&world.alice_to_mallory]),
+            "the viewer's own account page keeps their reply to the blocked account"
+        );
+        let bob_source = TimelineSource::Account {
+            user_id: world.bob.id,
+        };
+        assert_eq!(
+            page_as(&pool, &world.alice, bob_source.clone()).await,
+            newest_first(&[&world.unrelated]),
+            "another account's page hides what addresses the blocked account"
+        );
+        let anonymous = page_ids(&pool, &timeline(None, bob_source)).await;
+        let [to_mallory, cc_mallory, mentions_mallory, boost_of_mention] = &world.addressing;
+        assert_eq!(
+            anonymous,
+            newest_first(&[
+                to_mallory,
+                cc_mallory,
+                mentions_mallory,
+                boost_of_mention,
+                &world.unrelated
+            ]),
+            "an anonymous request has no blocks to honour"
         );
     }
 
