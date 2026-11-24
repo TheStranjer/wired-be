@@ -14,7 +14,6 @@ use wired_be::{
     config::Config,
     models::{
         oauth_app::{self, AppChanges, NewOauthApp, OauthApp},
-        oauth_login_state,
         user::User,
         user_identity,
     },
@@ -263,13 +262,4 @@ pub(super) async fn count_users(pool: &PgPool) -> i64 {
         .fetch_one(pool)
         .await
         .expect("the user count runs")
-}
-
-/// Writes a `pending` document of the test's choosing onto `state`, the
-/// way an unlinked callback would.
-pub(super) async fn set_pending(pool: &PgPool, state: &str, pending: &Value) {
-    let written = oauth_login_state::set_pending(pool, state, pending)
-        .await
-        .expect("the pending fixture writes");
-    assert!(written, "the state row is live to take the write");
 }

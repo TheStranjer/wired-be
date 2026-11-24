@@ -235,18 +235,6 @@ async fn a_code_reply_is_json() {
 }
 
 #[test]
-fn a_page_reply_is_a_200_page() {
-    let response = AuthorizeReply::Page("<p>ok</p>".to_owned()).into_response();
-    assert_eq!(response.status(), StatusCode::OK, "200");
-    let content_type = response
-        .headers()
-        .get(CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or_default();
-    assert!(content_type.starts_with("text/"), "{content_type}");
-}
-
-#[test]
 fn no_store_sets_and_replaces_the_cache_control() {
     let mut response = StatusCode::OK.into_response();
     let absent: Option<HeaderValue> = response

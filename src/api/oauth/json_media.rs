@@ -1,10 +1,8 @@
 //! How a JSON request is told from a browser's.
 //!
 //! `wants_json` reads the `Accept` header that asks `GET /oauth/authorize`
-//! and `GET /oauth/registration_details` for JSON instead of a redirect or
-//! a page; `is_json_media_type` reads one media type, such as a body's.
-//! Shared by the JSON half of `/oauth/authorize` and
-//! [`crate::api::oauth_external`]'s frontend endpoints.
+//! for JSON instead of a redirect; `is_json_media_type` reads one media
+//! type, such as a body's.
 
 use axum::http::{HeaderMap, header::ACCEPT};
 

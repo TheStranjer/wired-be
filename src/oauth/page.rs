@@ -1,9 +1,8 @@
 //! The HTML scaffolding the server-rendered OAuth pages share:
-//! [`crate::oauth::mfa_page`] (the second-factor code entry) and
-//! [`crate::oauth::registration_page`] (the external-login registration
-//! form).
+//! [`crate::oauth::mfa_page`] (the second-factor code entry).
 //!
-//! The consent screen is not among them: it lives at
+//! The consent and external-login screens are not among them: the consent
+//! screen lives at
 //! `{FRONTEND_BASE_URL}/oauth/authorize`, and `GET /oauth/authorize` only
 //! redirects there. What stays here is plain `String` pushes with no
 //! template engine, and every dynamic value goes through
