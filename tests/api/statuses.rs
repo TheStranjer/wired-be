@@ -168,6 +168,8 @@ mod quotes_create;
 mod quotes_list;
 /// `in_reply_to_id`: the parent's thread, counters, audience and language.
 mod replies;
+/// `RESTRICT_UNAUTHENTICATED` `activities_*`: the anonymous reads it closes.
+mod restricted;
 /// The show route: visibility, tombstones, bad ids and nested reblogs.
 mod show;
 /// Shared consts and fixture helpers every submodule of this area draws on.
