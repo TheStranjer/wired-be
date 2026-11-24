@@ -53,7 +53,10 @@ cite these decisions by number.
    lives at `{FRONTEND_BASE_URL}/oauth/authorize`: a browser `GET
    /oauth/authorize` is validated and redirected there (302, query kept), the
    JSON `GET`/`POST` of the same path is what that page talks to, and the
-   server renders no login or consent HTML on it.
+   server renders no login or consent HTML on it. The second factor is
+   likewise API-only: an MFA-enabled account's password grant answers 403
+   `mfa_required`, and the client finishes it at `POST /oauth/mfa/challenge`;
+   there is no `/oauth/mfa` page.
 
 10. **Request bodies**: Mastodon clients send JSON,
     `application/x-www-form-urlencoded` (with `ids[]=1&ids[]=2` arrays and

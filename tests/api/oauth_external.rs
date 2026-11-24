@@ -33,8 +33,7 @@
 /// The callback's successes: the login, the echo, the oob code and the
 /// unlinked hand-off.
 mod callback;
-/// The callback of an MFA-enabled linked account: the detour and the
-/// verification that delivers the code.
+/// The callback of an MFA-enabled linked account: refused with a 403.
 mod callback_mfa;
 /// The callback's refusals, the provider-call failures and the route edges.
 mod callback_refusals;

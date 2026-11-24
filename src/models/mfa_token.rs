@@ -6,9 +6,9 @@
 //! `Pleroma.MFA.Token.create`, whose `@expires` is 300 seconds) pointing
 //! at the account and, through [`MfaToken::authorization_id`], at the
 //! pending authorization that carries the grant's parameters. The client
-//! presents the token at `POST /oauth/mfa/challenge` or the browser page
-//! completes with it; [`get_valid`] reads it back until it expires, and
-//! the endpoints [`delete`] it the moment the second factor passes.
+//! presents the token at `POST /oauth/mfa/challenge`; [`get_valid`] reads
+//! it back until it expires, and the endpoint [`delete`]s it the moment
+//! the second factor passes.
 //!
 //! The raw token is never stored: the table keeps only its SHA-256 digest
 //! ([`token_digest`]). [`create`] hands the raw text back once, in an

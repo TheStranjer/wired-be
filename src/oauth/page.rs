@@ -1,11 +1,10 @@
 //! The HTML scaffolding the server-rendered OAuth pages share:
-//! [`crate::oauth::mfa_page`] (the second-factor code entry) and
 //! [`crate::oauth::registration_page`] (the external-login registration
 //! form).
 //!
-//! The consent screen is not among them: it lives at
-//! `{FRONTEND_BASE_URL}/oauth/authorize`, and `GET /oauth/authorize` only
-//! redirects there. What stays here is plain `String` pushes with no
+//! The consent screen and the second-factor prompt are not among them: the
+//! consent screen lives at `{FRONTEND_BASE_URL}/oauth/authorize`, and
+//! `GET /oauth/authorize` only redirects there. What stays here is plain `String` pushes with no
 //! template engine, and every dynamic value goes through
 //! [`push_escaped`], so a state, token or URI that holds markup cannot
 //! break out of its attribute or element. The pages are self-contained:
@@ -62,30 +61,6 @@ pub(crate) fn push_error(out: &mut String, message: Option<&str>) {
     out.push_str("</p>\n");
 }
 
-/// Appends a labelled text or password input.
-pub(crate) fn push_field(out: &mut String, id: &str, name: &str, input_type: &str, label: &str) {
-    out.push_str("<div class=\"input\">\n<label for=\"");
-    push_escaped(out, id);
-    out.push_str("\">");
-    push_escaped(out, label);
-    out.push_str("</label>\n<input type=\"");
-    push_escaped(out, input_type);
-    out.push_str("\" id=\"");
-    push_escaped(out, id);
-    out.push_str("\" name=\"");
-    push_escaped(out, name);
-    out.push_str("\">\n</div>\n");
-}
-
-/// Appends a hidden input carrying `value`.
-pub(crate) fn push_hidden(out: &mut String, name: &str, value: &str) {
-    out.push_str("<input type=\"hidden\" name=\"");
-    push_escaped(out, name);
-    out.push_str("\" value=\"");
-    push_escaped(out, value);
-    out.push_str("\">\n");
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -118,25 +93,6 @@ mod tests {
         assert_eq!(
             failed, "<p class=\"alert alert-danger\" role=\"alert\">&lt;b&gt;bad&lt;/b&gt;</p>\n",
             "the line shows, escaped"
-        );
-    }
-
-    #[test]
-    fn fields_escape_every_dynamic_value() {
-        let mut out = String::new();
-        push_field(&mut out, "i\"d", "n&me", "text", "<Label>");
-        assert_eq!(
-            out,
-            "<div class=\"input\">\n<label for=\"i&quot;d\">&lt;Label&gt;</label>\n\
-             <input type=\"text\" id=\"i&quot;d\" name=\"n&amp;me\">\n</div>\n",
-            "id, name and label are escaped"
-        );
-
-        let mut hidden = String::new();
-        push_hidden(&mut hidden, "name", "\"><script>");
-        assert_eq!(
-            hidden, "<input type=\"hidden\" name=\"name\" value=\"&quot;&gt;&lt;script&gt;\">\n",
-            "a hidden value cannot open a tag"
         );
     }
 }

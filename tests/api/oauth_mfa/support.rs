@@ -3,9 +3,9 @@
 //! `use super::*`.
 
 mod attempts;
-mod authorize_flow;
 mod concurrent_recovery;
 mod password_grant;
+mod retired_pages;
 
 use crate::common;
 
@@ -18,8 +18,7 @@ use uuid::Uuid;
 use wired_be::{
     config::DEFAULT_OAUTH_TOKEN_TTL_SECS,
     models::{
-        mfa_token,
-        oauth_app::{self, NewOauthApp, OauthApp},
+        oauth_app::OauthApp,
         oauth_token::{self, OauthAuthorization},
         user::{User, mfa},
     },
@@ -28,16 +27,9 @@ use wired_be::{
 
 /// The password every login fixture shares.
 const PASSWORD: &str = "correct horse battery staple";
-/// The redirect URI the standard app fixture registers.
-const REDIRECT: &str = "https://client.example/callback";
-/// The out-of-band redirect URI: the code is answered as JSON instead of
-/// redirected.
-const OOB: &str = "urn:ietf:wg:oauth:2.0:oob";
 /// The error body every failed challenge shares (Pleroma's
 /// `MFAController.challenge`).
 const INVALID_CODE: &str = "Invalid code";
-/// The flash line above a re-rendered verification form.
-const TWO_FACTOR_FAILED: &str = "Two-factor authentication failed.";
 
 /// An MFA-enabled account beside its TOTP secret and issued backup
 /// codes.
@@ -254,104 +246,6 @@ fn assert_invalid_code(response: &common::TestResponse, what: &str) {
         "the one refusal for {what}"
     );
     assert_no_store(response);
-}
-
-/// Parks what the MFA detour of an external login parks (the `read`
-/// authorization bound to `redirect_uri`, and the challenge linking it for
-/// `user`) and returns the `/oauth/mfa?…` location the browser is sent
-/// to, carrying `state` when given.
-///
-/// # Panics
-///
-/// If either insert fails.
-async fn park_detour(
-    pool: &PgPool,
-    app: &OauthApp,
-    user: &User,
-    redirect_uri: &str,
-    state: Option<&str>,
-) -> String {
-    let scope = "read";
-    let authorization =
-        oauth_token::create_authorization(pool, user.id, app.id, scope, redirect_uri)
-            .await
-            .expect("the authorization parks");
-    let challenge = mfa_token::create(pool, user.id, Some(authorization.id))
-        .await
-        .expect("the challenge parks");
-    let mut params = vec![
-        ("mfa_token", challenge.token.as_str()),
-        ("client_id", app.client_id.as_str()),
-        ("scope", scope),
-        ("redirect_uri", redirect_uri),
-    ];
-    if let Some(client_state) = state {
-        params.push(("state", client_state));
-    }
-    let query = url::form_urlencoded::Serializer::new(String::new())
-        .extend_pairs(params)
-        .finish();
-    format!("/oauth/mfa?{query}")
-}
-
-/// The `POST /oauth/mfa/verify` form: the challenge submission plus the
-/// round-tripped delivery fields.
-fn verify_form<'a>(
-    token: &'a str,
-    challenge_type: &'a str,
-    code: &'a str,
-    redirect_uri: &'a str,
-    state: Option<&'a str>,
-) -> Vec<(&'a str, &'a str)> {
-    let mut fields = vec![
-        ("mfa[mfa_token]", token),
-        ("mfa[challenge_type]", challenge_type),
-        ("mfa[code]", code),
-        ("mfa[redirect_uri]", redirect_uri),
-    ];
-    if let Some(client_state) = state {
-        fields.push(("mfa[state]", client_state));
-    }
-    fields
-}
-
-/// Posts the verification form.
-async fn post_verify(http: &Router, fields: &[(&str, &str)]) -> common::TestResponse {
-    common::TestRequest::post("/oauth/mfa/verify")
-        .form(fields)
-        .send(http)
-        .await
-}
-
-/// The decoded `key` parameter of a URL's query.
-fn query_param(url: &str, key: &str) -> Option<String> {
-    let (_, query) = url.split_once('?').unwrap_or((url, ""));
-    url::form_urlencoded::parse(query.as_bytes())
-        .into_owned()
-        .find(|(name, _)| name == key)
-        .map(|(_, value)| value)
-}
-
-/// Registers an app with the given `redirect_uris` and `scopes` (the
-/// standard [`common::create_app`] fixture registers only
-/// [`REDIRECT`]).
-///
-/// # Panics
-///
-/// If the app insert fails.
-async fn register_app(pool: &PgPool, redirect_uris: &str, scopes: &str) -> OauthApp {
-    oauth_app::create(
-        pool,
-        &NewOauthApp {
-            client_name: "MFA Client".to_owned(),
-            redirect_uris: redirect_uris.to_owned(),
-            scopes: scopes.to_owned(),
-            website: None,
-            user_id: None,
-        },
-    )
-    .await
-    .expect("app registration inserts")
 }
 
 /// Rows in `mfa_tokens` in total.
