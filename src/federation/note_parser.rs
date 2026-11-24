@@ -63,7 +63,7 @@ use attachments::parse_attachments;
 use envelope::{check_containment, check_size, object_id, object_kind, resolve_url};
 use polls::parse_poll;
 use tags::parse_tags;
-use text::{field_reference, parse_sensitive, parse_text, parse_times};
+use text::{field_reference, parse_language, parse_sensitive, parse_text, parse_times};
 
 /// Object `type`s this parser accepts: the eight document kinds Mastodon,
 /// Pleroma and Misskey deliver as createable posts (Pleroma's transmogrifier
@@ -201,6 +201,7 @@ pub fn parse_note(
         edited_at: times.edited_at,
         expires_at: poll.as_ref().and_then(|parsed| parsed.expires_at),
         inserted_at: Some(times.inserted_at),
+        language: parse_language(json),
         ..NewStatus::default()
     };
     Ok(ParsedNote {
