@@ -46,7 +46,7 @@ use crate::{
         follow::{self, FollowPageEntry},
         pinned_status,
         status::{self, Status},
-        user::{User, get_by_id as user_by_id, outbox},
+        user::{User, featured, get_by_id as user_by_id, outbox},
     },
     pagination::{MAX_LIMIT, PageParams},
 };
@@ -61,12 +61,6 @@ const COLLECTION: &str = "Collection";
 const ORDERED_COLLECTION_PAGE: &str = "OrderedCollectionPage";
 /// The `type` of one replies page.
 const COLLECTION_PAGE: &str = "CollectionPage";
-/// Path appended to the actor id for the featured (pinned) collection.
-///
-/// It is the address [`super::actor::actor_json`] advertises and Pleroma's
-/// `UserView` renders, distinct from [`crate::models::user::featured`]'s
-/// column-default path.
-pub const FEATURED_PATH: &str = "/collections/featured";
 /// The value of the `page` parameter that asks for a page rather than the
 /// collection root (Pleroma's outbox action matches `true` / `"true"`).
 const PAGE_TRUE: &str = "true";
@@ -512,11 +506,7 @@ pub async fn featured_document(pool: &PgPool, config: &Config, user: &User) -> A
     for row in &rows {
         objects.extend(featured_object(pool, config, row).await?);
     }
-    Ok(featured_collection(
-        &format!("{}{FEATURED_PATH}", user.ap_id),
-        objects,
-        config,
-    ))
+    Ok(featured_collection(&featured(&user.ap_id), objects, config))
 }
 
 /// One pinned row as its note document; a row that vanished between the

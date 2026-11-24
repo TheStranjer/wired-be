@@ -199,10 +199,13 @@ pub fn following(ap_id: &str) -> String {
     format!("{ap_id}/following")
 }
 
-/// The featured (pinned) collection of actor `ap_id`: `{ap_id}/featured`.
+/// The featured (pinned) collection of actor `ap_id`: `{ap_id}/collections/featured`.
+///
+/// The single source of truth: the actor document advertises it, the router
+/// serves it and a pin's `Add`/`Remove` names it as the `target`.
 #[must_use]
 pub fn featured(ap_id: &str) -> String {
-    format!("{ap_id}/featured")
+    format!("{ap_id}/collections/featured")
 }
 
 #[cfg(test)]
@@ -254,7 +257,7 @@ mod tests {
         );
         assert_eq!(
             featured(&alice),
-            "https://test.example/users/alice/featured",
+            "https://test.example/users/alice/collections/featured",
             "featured"
         );
         assert_eq!(
