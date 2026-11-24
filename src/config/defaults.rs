@@ -236,10 +236,6 @@ pub const DEFAULT_ACCOUNT_ACTIVATION_REQUIRED: bool = false;
 /// `POST /api/pleroma/delete_account` is offered, as Pleroma offers
 /// `UtilController.delete_account`; closing it is the operator's call.
 pub const DEFAULT_ALLOW_ACCOUNT_DELETION: bool = true;
-/// `MongooseIM` auth endpoint state used when `MONGOOSEIM_ENABLED` is
-/// unset: the endpoints answer the standard fallback 404 until an operator
-/// turns them on for their `extauth` backend.
-pub const DEFAULT_MONGOOSEIM_ENABLED: bool = false;
 /// Captcha state used when `CAPTCHA_ENABLED` is unset: no captcha provider
 /// is configured, so `GET /api/v1/pleroma/captcha` reports `{"type":"none"}`
 /// like Pleroma with no captcha plugin.

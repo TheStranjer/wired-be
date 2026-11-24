@@ -415,7 +415,7 @@ mod media_upload;
 /// The MFA endpoints (`/api/pleroma/accounts/mfa`).
 mod mfa;
 
-/// The `MongooseIM` auth endpoints and the small utility endpoints.
+/// The small utility endpoints and the removed auth endpoints' fallback 404.
 mod misc;
 
 /// The mutes endpoints.

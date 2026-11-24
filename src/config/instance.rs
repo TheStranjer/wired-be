@@ -142,8 +142,8 @@ mod tests {
             ACCOUNTS_EMAIL_OPTIONAL_VAR, CAPTCHA_ENABLED_VAR, EMOJI_DIR_VAR,
             HEALTHCHECK_ENABLED_VAR, HTTP_ALLOW_PRIVATE_HOSTS_VAR, MAX_MEDIA_ATTACHMENTS_VAR,
             MAX_POLL_OPTIONS_VAR, MAX_STATUS_CHARS_VAR, MEDIA_BASE_URL_VAR,
-            MIN_PASSWORD_LENGTH_VAR, MONGOOSEIM_ENABLED_VAR, OAUTH_TOKEN_TTL_SECS_VAR,
-            UPLOAD_LIMIT_BYTES_VAR, UPLOAD_MAX_FILES_VAR, UPLOADS_DIR_VAR,
+            MIN_PASSWORD_LENGTH_VAR, OAUTH_TOKEN_TTL_SECS_VAR, UPLOAD_LIMIT_BYTES_VAR,
+            UPLOAD_MAX_FILES_VAR, UPLOADS_DIR_VAR,
         },
     };
 
@@ -242,10 +242,6 @@ mod tests {
             "default OAUTH_TOKEN_TTL_SECS is 30 days"
         );
         assert!(
-            !config.mongooseim_enabled.get(),
-            "the `MongooseIM` auth endpoints are off by default"
-        );
-        assert!(
             !config.captcha_enabled.get(),
             "no captcha provider is configured by default"
         );
@@ -280,7 +276,6 @@ mod tests {
             (ACCOUNTS_EMAIL_OPTIONAL_VAR, "true"),
             (MIN_PASSWORD_LENGTH_VAR, "12"),
             (OAUTH_TOKEN_TTL_SECS_VAR, "3600"),
-            (MONGOOSEIM_ENABLED_VAR, "true"),
             (CAPTCHA_ENABLED_VAR, "true"),
             (HEALTHCHECK_ENABLED_VAR, "true"),
         ]);
@@ -337,7 +332,6 @@ mod tests {
             config.oauth_token_ttl_secs, 3_600,
             "custom OAUTH_TOKEN_TTL_SECS"
         );
-        assert!(config.mongooseim_enabled.get(), "custom MONGOOSEIM_ENABLED");
         assert!(config.captcha_enabled.get(), "custom CAPTCHA_ENABLED");
         assert!(
             config.healthcheck_enabled.get(),

@@ -1,31 +1,17 @@
-//! Tests for the `MongooseIM` auth endpoints and the small utility
-//! endpoints of `src/api/misc.rs` (WBE-166): each endpoint's success
-//! shape, its disabled branch (the fallback 404), the credential
-//! failures of `check_password`, the healthcheck's unhealthy path over a
-//! closed pool, the frontend-configurations document, and the removed PWA
-//! manifest route's fallback 404.
+//! Tests for the small utility endpoints of `src/api/misc.rs` (WBE-166):
+//! each endpoint's success shape and disabled branch (the fallback 404),
+//! the healthcheck's unhealthy path over a closed pool, the
+//! frontend-configurations document, the removed XMPP-server auth
+//! endpoints and the removed PWA manifest route's fallback 404.
 
 #![cfg(test)]
 
 use axum::{Router, http::StatusCode};
 use serde_json::{Value, json};
 use sqlx::PgPool;
-use wired_be::{
-    config::Toggle,
-    models::{
-        instance_setting,
-        user::{Flag, NewUser},
-    },
-};
+use wired_be::{config::Toggle, models::instance_setting};
 
 use crate::common;
-
-/// The real router with the `MongooseIM` auth endpoints enabled.
-fn mongooseim_app(pool: PgPool) -> Router {
-    let mut config = common::test_config();
-    config.mongooseim_enabled = Toggle::new(true);
-    common::test_app_with_config(pool, config)
-}
 
 /// The real router with `CAPTCHA_ENABLED` set to `enabled`.
 fn captcha_app(pool: PgPool, enabled: bool) -> Router {
@@ -44,18 +30,20 @@ fn healthcheck_app(pool: PgPool) -> Router {
 /// The exact body of the standard fallback 404.
 const NOT_FOUND_BODY: &str = r#"{"error":"Not found"}"#;
 
-// ------------------------------------------------------------ user_exists
+// ------------------------------------------------- removed auth endpoints
 
-/// With `MONGOOSEIM_ENABLED` unset (the default), both auth endpoints are
-/// the fallback 404, exact body included.
+/// The XMPP-server auth endpoints are gone: a real user with the correct
+/// password still gets the app-wide fallback 404, exact body and
+/// `x-wired-fallback: 1` marker included.
 #[tokio::test]
-async fn mongooseim_endpoints_are_absent_when_disabled() {
+async fn removed_auth_endpoints_are_the_fallback_404() {
     let db = common::test_db().await;
     let pool = db.pool().clone();
+    let _alice = common::create_user_with_password(&pool, "alice", "a good password").await;
     let app = common::test_app(pool);
     for path in [
         "/user_exists?user=alice",
-        "/check_password?user=alice&pass=x",
+        "/check_password?user=alice&pass=a%20good%20password",
     ] {
         let response = common::TestRequest::get(path).send(&app).await;
         assert_eq!(response.status, StatusCode::NOT_FOUND, "{path} status");
@@ -65,123 +53,11 @@ async fn mongooseim_endpoints_are_absent_when_disabled() {
             "{path} is JSON"
         );
         assert_eq!(response.text(), NOT_FOUND_BODY, "{path} body");
-    }
-}
-
-/// `GET /user_exists?user=<nick>` answers an active local user 200 with
-/// JSON `true`, and the citext nickname answers case-insensitively:
-/// create the fixture, then mount the enabled router, then ask both
-/// spellings.
-#[tokio::test]
-async fn user_exists_round_trip() {
-    let db = common::test_db().await;
-    let pool = db.pool().clone();
-    let _alice = common::create_local_user(&pool, "alice").await;
-    let app = mongooseim_app(pool);
-    for nickname in ["alice", "ALICE"] {
-        let response = common::TestRequest::get(&format!("/user_exists?user={nickname}"))
-            .send(&app)
-            .await;
-        assert_eq!(response.status, StatusCode::OK, "{nickname} exists");
         assert_eq!(
-            response.header("content-type"),
-            Some("application/json"),
-            "the answer is JSON"
+            response.header("x-wired-fallback"),
+            Some("1"),
+            "{path} is the fallback's own 404"
         );
-        assert_eq!(response.text(), "true", "{nickname} body");
-    }
-}
-
-/// Everything that is not an active local user gets 404 with JSON
-/// `false`: an unknown nickname, a deactivated account, a remote mirror
-/// and a request without the `user` parameter.
-#[tokio::test]
-async fn user_exists_false_cases() {
-    let db = common::test_db().await;
-    let pool = db.pool().clone();
-    let _suspended = common::create_local_user_with(&pool, "suspended", |user| NewUser {
-        is_active: Flag::new(false),
-        ..user
-    })
-    .await;
-    let _robo = common::create_remote_user(&pool, "robo", "remote.example").await;
-    let app = mongooseim_app(pool);
-    let cases = [
-        ("/user_exists?user=nobody", "unknown nickname"),
-        ("/user_exists?user=suspended", "deactivated account"),
-        ("/user_exists?user=robo@remote.example", "remote mirror"),
-        ("/user_exists", "missing parameter"),
-    ];
-    for (path, why) in cases {
-        let response = common::TestRequest::get(path).send(&app).await;
-        assert_eq!(response.status, StatusCode::NOT_FOUND, "{why} status");
-        assert_eq!(response.text(), "false", "{why} body");
-    }
-}
-
-// ---------------------------------------------------------- check_password
-
-/// `GET /check_password?user=<nick>&pass=<password>` answers the right
-/// credential for an active local user 200 with JSON `true`.
-#[tokio::test]
-async fn check_password_true_for_valid_credentials() {
-    let db = common::test_db().await;
-    let pool = db.pool().clone();
-    let _gina = common::create_user_with_password(&pool, "gina", "a good password").await;
-    let app = mongooseim_app(pool);
-    let response = common::TestRequest::get("/check_password?user=gina&pass=a%20good%20password")
-        .send(&app)
-        .await;
-    assert_eq!(response.status, StatusCode::OK, "valid credentials");
-    assert_eq!(
-        response.header("content-type"),
-        Some("application/json"),
-        "the answer is JSON"
-    );
-    assert_eq!(response.text(), "true", "the true answer");
-}
-
-/// Every failed credential is one uniform denial: 403 with JSON `false`
-/// — the wrong password, an unknown user, a deactivated account with its
-/// right password, an account with no password at all, the email instead
-/// of the nickname (`MongooseIM` authenticates handles), and either
-/// parameter missing. The disabled branch is covered by
-/// [`mongooseim_endpoints_are_absent_when_disabled`].
-#[tokio::test]
-async fn check_password_denies_every_bad_credential() {
-    let db = common::test_db().await;
-    let pool = db.pool().clone();
-    let _gina = common::create_user_with_password(&pool, "gina", "a good password").await;
-    let _gone =
-        common::create_deactivated_user_with_password(&pool, "gone", "still-my-password").await;
-    let _passless = common::create_local_user(&pool, "passless").await;
-    let app = mongooseim_app(pool);
-    let cases = [
-        (
-            "/check_password?user=gina&pass=wrong%20password",
-            "wrong password",
-        ),
-        ("/check_password?user=nobody&pass=x", "unknown user"),
-        (
-            "/check_password?user=gone&pass=still-my-password",
-            "deactivated account",
-        ),
-        (
-            "/check_password?user=passless&pass=whatever",
-            "no stored hash",
-        ),
-        (
-            "/check_password?user=gina@example.org&pass=a%20good%20password",
-            "email instead of nickname",
-        ),
-        ("/check_password?user=gina", "missing pass"),
-        ("/check_password?pass=x", "missing user"),
-        ("/check_password", "missing both"),
-    ];
-    for (path, why) in cases {
-        let response = common::TestRequest::get(path).send(&app).await;
-        assert_eq!(response.status, StatusCode::FORBIDDEN, "{why} status");
-        assert_eq!(response.text(), "false", "{why} body");
     }
 }
 

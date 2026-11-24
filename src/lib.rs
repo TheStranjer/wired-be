@@ -58,8 +58,7 @@ use crate::{
 /// `/.well-known/nodeinfo` and `/nodeinfo/{version}` ([`api::nodeinfo`]),
 /// `/oauth` ([`api::oauth`]), the `/oauth` provider-login paths
 /// ([`api::oauth_external`]), `POST /auth/password` ([`api::password_reset`],
-/// Pleroma routes the reset request outside `/api`), and the `MongooseIM`
-/// auth endpoints ([`api::misc`]) — are merged at the
+/// Pleroma routes the reset request outside `/api`) — are merged at the
 /// top level.
 /// Paths no route matches get the standard JSON error response (decision 8),
 /// marked with `x-wired-fallback: 1` so a test can tell the fallback's own
@@ -85,7 +84,6 @@ pub fn app(state: AppState) -> Router {
             .merge(media_files::router())
             .merge(media_proxy::router())
             .merge(api::emoji_packs::files_router())
-            .merge(api::misc::router())
             .fallback(not_found)
             .with_state(state),
     )
