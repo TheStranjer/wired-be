@@ -38,10 +38,11 @@
 //!
 //! A delivered `emoji` map is accepted and left unmapped: like the entity's
 //! always-empty `emojis` list, chat shortcode mapping is a later ticket's.
-//! A `Delete` whose object is a *bare id* declares no type and so routes
-//! past this entry to the `Delete` fallback — the actor handler — which
-//! ignores it; id-only deletes are settled where that route's other callers
-//! are, not here.
+//! A `Delete` whose object is a *bare id* (Pleroma's shape) or an embedded
+//! `Tombstone` declares no `ChatMessage` type and so routes past this entry
+//! to the note handler; that handler looks the id up among the stored chat
+//! messages first and hands a hit to `withdraw_chat_message`, so the same
+//! sender check and withdrawal apply.
 //!
 //! The outgoing side — delivering a local user's own chat messages and
 //! their sender's `Delete`s — is the chat federation hooks' other half,
@@ -620,6 +621,26 @@ async fn apply_delete(
             "a chat message this instance never stored",
         ));
     };
+    withdraw_chat_message(&state, &message, &signer).await
+}
+
+/// The withdrawal of an already resolved chat `message` by `signer`: only its
+/// sender is honoured, and then the row becomes a tombstone and the
+/// recipient's `pleroma:chat_mention` telling goes with it.
+///
+/// Shared by the typed `ChatMessage` `Delete` entry and by the note
+/// handler's bare-id and `Tombstone` routes, which find a stored message
+/// under the object id before they would reserve a status tombstone for it.
+///
+/// # Errors
+///
+/// [`FederationError::Transient`] for a database failure; both writes are
+/// idempotent, so the retry completes what it restarts.
+pub(crate) async fn withdraw_chat_message(
+    state: &AppState,
+    message: &chat::ChatMessage,
+    signer: &User,
+) -> Result<Outcome, FederationError> {
     if message.sender_id != signer.id {
         debug!(
             actor = %signer.ap_id,
@@ -649,6 +670,8 @@ async fn apply_delete(
 
 #[cfg(test)]
 mod tests {
+    mod bare_id_delete;
+
     use serde_json::json;
 
     use super::*;
