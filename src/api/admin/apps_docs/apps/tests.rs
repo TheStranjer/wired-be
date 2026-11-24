@@ -254,3 +254,36 @@ fn the_error_halves_render_the_pinned_bodies() {
         "the wrapped arm keeps its status"
     );
 }
+
+/// Registration's length and shape limits apply on the admin path too:
+/// each bad field is refused under its own key, all in one answer.
+#[test]
+fn create_refuses_over_long_and_malformed_fields() {
+    let bad = AppBody {
+        name: Some("a".repeat(61)),
+        redirect_uris: Some(RedirectUris::Single("https://a.example/cb#frag".to_owned())),
+        website: Some("ftp://a.example".to_owned()),
+        ..empty_body()
+    };
+    let err = prepare(bad, true).expect_err("all three refuse");
+    for field in ["name", "redirect_uris", "website"] {
+        assert!(
+            matches!(&err, AppsError::Invalid(refusals)
+                if refusals.iter().any(|(got, _)| *got == field)),
+            "{field} is refused: {err:?}"
+        );
+    }
+
+    let javascript = AppBody {
+        redirect_uris: Some(RedirectUris::Single("javascript:alert(1)".to_owned())),
+        ..body_with(None)
+    };
+    assert!(prepare(javascript, false).is_err(), "update refuses too");
+
+    let custom = AppBody {
+        redirect_uris: Some(RedirectUris::Single("myapp://callback".to_owned())),
+        website: Some("https://a.example".to_owned()),
+        ..body_with(None)
+    };
+    assert!(prepare(custom, true).is_ok(), "custom schemes stay valid");
+}

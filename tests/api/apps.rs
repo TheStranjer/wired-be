@@ -303,6 +303,62 @@ async fn missing_or_empty_redirect_uris_are_unprocessable() {
     assert_eq!(rows.0, 0, "no rejection stored a row");
 }
 
+/// Empty and over-long names, over-long and non-http(s) websites, and
+/// fragment-bearing, relative and `javascript:` redirect URIs are 422s
+/// that store nothing.
+#[tokio::test]
+async fn invalid_name_website_and_redirect_uris_are_unprocessable() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let app = common::test_app(pool.clone());
+    let ok_uri = "https://x.example/cb";
+    let long_website = format!("https://a.example/{}", "a".repeat(1_990));
+    for body in [
+        json!({"client_name": "", "redirect_uris": ok_uri}),
+        json!({"client_name": "   ", "redirect_uris": ok_uri}),
+        json!({"client_name": "a".repeat(61), "redirect_uris": ok_uri}),
+        json!({"client_name": "C", "redirect_uris": ok_uri, "website": long_website}),
+        json!({"client_name": "C", "redirect_uris": ok_uri, "website": "ftp://a.example"}),
+        json!({"client_name": "C", "redirect_uris": "https://a.example/cb#frag"}),
+        json!({"client_name": "C", "redirect_uris": "/relative"}),
+        json!({"client_name": "C", "redirect_uris": "javascript:alert(1)"}),
+        json!({"client_name": "C", "redirect_uris": [ok_uri, "data:text/html,x"]}),
+        json!({"client_name": "C", "redirect_uris": format!("https://a.example/{}", "a".repeat(2_000))}),
+    ] {
+        let response = post_json(&app, &body).await;
+        assert_eq!(
+            response.status,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "{body} must be a 422"
+        );
+    }
+    let rows: (i64,) = sqlx::query_as("SELECT count(*) FROM oauth_apps")
+        .fetch_one(&pool)
+        .await
+        .expect("the count reaches the database");
+    assert_eq!(rows.0, 0, "no rejection stored a row");
+}
+
+/// A 60-character name, a custom-scheme redirect, the OOB URN and two
+/// space-separated https URIs all register.
+#[tokio::test]
+async fn valid_name_and_redirect_uri_shapes_register() {
+    let db = common::test_db().await;
+    let app = common::test_app(db.pool().clone());
+    for uris in [
+        "myapp://callback",
+        "urn:ietf:wg:oauth:2.0:oob",
+        "https://a.example/cb https://b.example/cb",
+    ] {
+        let response = post_json(
+            &app,
+            &json!({"client_name": "a".repeat(60), "redirect_uris": uris, "website": "http://a.example"}),
+        )
+        .await;
+        assert_eq!(response.status, StatusCode::OK, "`{uris}` registers");
+    }
+}
+
 /// An unknown scope is a 422 naming the offender, and nothing is stored.
 #[tokio::test]
 async fn an_unknown_scope_is_unprocessable() {
