@@ -20,14 +20,15 @@
 //! [`attachment_media_id`](crate::models::chat::ChatMessageReference::attachment_media_id)
 //! — `None` when the message carries none or its file has since been deleted.
 //!
-//! Two keys are constants here because nothing behind them is implemented:
-//! `emojis`, which Pleroma builds from the shortcodes in the message text and
-//! which stays `[]` until chat messages map emojis, and `card`, Pleroma's
-//! rich-media preview, always `null` because this instance collects no cards.
-//! `idempotency_key` is the third former constant, retired by the message
-//! posting ticket: the key a client sent is stored on the message row and
-//! renders from there, absent from the JSON only when the message carries no
-//! key.
+//! One key is a constant here because nothing behind it is implemented:
+//! `card`, Pleroma's rich-media preview, always `null` because this instance
+//! collects no cards. `emojis` starts empty and [`ChatMessage::with_emojis`]
+//! fills it from the `custom_emojis` rows the caller found for the message
+//! text under its sender's domain, the way Pleroma builds it from the
+//! shortcodes in the text. `idempotency_key` is a former constant, retired by
+//! the message posting ticket: the key a client sent is stored on the message
+//! row and renders from there, absent from the JSON only when the message
+//! carries no key.
 
 use chrono::{DateTime, Utc};
 use serde::Serialize;
@@ -35,9 +36,10 @@ use serde_json::Value;
 
 use crate::{
     config::Config,
-    entities::{account::Account, media_attachment::MediaAttachment},
+    entities::{account::Account, custom_emoji::CustomEmoji, media_attachment::MediaAttachment},
     models::{
         chat::{Chat as ChatRow, ChatMessageReference},
+        custom_emoji::CustomEmoji as EmojiRow,
         media_attachment::MediaAttachment as AttachmentRow,
         user::User,
     },
@@ -116,9 +118,9 @@ pub struct ChatMessage {
     /// When it was sent, in the Mastodon time format (decision 5).
     #[serde(with = "crate::util::time::serde_mastodon_time")]
     pub created_at: DateTime<Utc>,
-    /// Custom emojis used in the message; always `[]`, because nothing maps
-    /// chat shortcodes to emoji rows yet (see the module docs).
-    pub emojis: Vec<Value>,
+    /// Custom emojis the message text uses; `[]` until
+    /// [`ChatMessage::with_emojis`] adds the rows found for it.
+    pub emojis: Vec<CustomEmoji>,
     /// The media this message carries; `null` when it carries none.
     pub attachment: Option<MediaAttachment>,
     /// Whether the owner of [`chat_id`](Self::chat_id) has still to read this
@@ -163,6 +165,20 @@ impl ChatMessage {
             card: None,
             idempotency_key: row.idempotency_key.clone(),
         }
+    }
+
+    /// This message with `emojis` — the `custom_emojis` rows its text uses —
+    /// rendered as its `emojis`.
+    ///
+    /// `config` renders the emoji URLs through the media proxy, as a status'
+    /// emojis are.
+    #[must_use]
+    pub fn with_emojis(mut self, emojis: &[EmojiRow], config: &Config) -> Self {
+        self.emojis = emojis
+            .iter()
+            .map(|row| CustomEmoji::from_model(row, config))
+            .collect();
+        self
     }
 }
 
@@ -443,6 +459,46 @@ mod tests {
         assert!(
             !has_key(&value, "raw_text"),
             "the source text is not part of the entity"
+        );
+    }
+
+    /// A stored emoji row of the sender's domain.
+    fn emoji_row(shortcode: &str) -> EmojiRow {
+        EmojiRow {
+            id: id(MESSAGE_ID),
+            shortcode: shortcode.to_owned(),
+            domain: Some("remote.example".to_owned()),
+            image_url: format!("https://remote.example/emoji/{shortcode}.png"),
+            static_url: None,
+            category: None,
+            tags: Vec::new(),
+            visible_in_picker: true,
+            disabled: false,
+            inserted_at: at(SENT),
+            updated_at: at(SENT),
+        }
+    }
+
+    #[test]
+    fn a_message_renders_the_emojis_it_is_given() {
+        let config = Config::for_tests();
+        let value = render(
+            &ChatMessage::from_reference(&reference_row(), None, &config)
+                .with_emojis(&[emoji_row("plerofox")], &config),
+        );
+
+        assert_eq!(json_keys(&value), MESSAGE_KEYS, "the key set is unchanged");
+        assert_eq!(
+            value["emojis"],
+            json!([{
+                "shortcode": "plerofox",
+                "url": "https://remote.example/emoji/plerofox.png",
+                "static_url": null,
+                "visible_in_picker": true,
+                "category": null,
+                "tags": [],
+            }]),
+            "the found row renders as a CustomEmoji entity"
         );
     }
 

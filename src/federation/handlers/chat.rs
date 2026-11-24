@@ -36,9 +36,11 @@
 //!   notifications about it go with it. Both writes are idempotent, so a
 //!   retry between them finishes what it restarts.
 //!
-//! A delivered `emoji` map is accepted and left unmapped: like the entity's
-//! always-empty `emojis` list, chat shortcode mapping is a later ticket's.
-//! A `Delete` whose object is a *bare id* (Pleroma's shape) or an embedded
+//! The document's `Emoji` `tag` entries are upserted into `custom_emojis`
+//! under the sender's domain, as a note's are (the `emoji` submodule), once
+//! the recipient gates have passed; the chat API then renders the message's
+//! `emojis` from those rows. A delivered `emoji` map is accepted and left
+//! unmapped. A `Delete` whose object is a *bare id* (Pleroma's shape) or an embedded
 //! `Tombstone` declares no `ChatMessage` type and so routes past this entry
 //! to the note handler; that handler looks the id up among the stored chat
 //! messages first and hands a hit to `withdraw_chat_message`, so the same
@@ -62,7 +64,7 @@ use crate::{
     federation::{
         dispatch::{ActivityView, FederationError, Handlers, Outcome},
         json,
-        note_parser::pixel_dimension,
+        note_parser::{RemoteEmoji, pixel_dimension},
     },
     models::{
         block, chat,
@@ -74,6 +76,8 @@ use crate::{
     state::AppState,
     util::sanitize::{sanitize_html, strip_html},
 };
+
+mod emoji;
 
 /// The object type both of this module's sub-registry entries claim.
 const CHAT_MESSAGE_TYPE: &str = "ChatMessage";
@@ -175,7 +179,8 @@ async fn apply_create(
             return Ok(Outcome::Ignored(reason));
         }
     };
-    deliver(&state, &incoming, &signer).await
+    let emojis = emoji::announced(object, &signer);
+    deliver(&state, &incoming, &signer, &emojis).await
 }
 
 /// What a second sight of a stored object answers: the live row's restatement
@@ -416,11 +421,13 @@ const fn recipient_refusal(recipient: &User) -> Option<&'static str> {
 /// The accepted delivery: the write ([`store`]), then the chat API's
 /// documented hook over the recipient's own reference — the local side of
 /// an inbound pair is the recipient, and the hook federates nothing for a
-/// local one (it is the outbound chat ticket's counterpart).
+/// local one (it is the outbound chat ticket's counterpart). The sender's
+/// announced `emojis` are upserted once the recipient has accepted.
 async fn deliver(
     state: &AppState,
     incoming: &IncomingChat<'_>,
     sender: &User,
+    emojis: &[RemoteEmoji],
 ) -> Result<Outcome, FederationError> {
     let recipient = match recipient_of(state, incoming, sender).await? {
         Decision::Deliver(recipient) => recipient,
@@ -432,6 +439,7 @@ async fn deliver(
             return Ok(Outcome::Ignored(reason));
         }
     };
+    emoji::upsert(state, emojis).await?;
     let written = store(state, incoming, sender, &recipient).await?;
     let view = written
         .recipient_reference

@@ -7,6 +7,8 @@
 //! the moderator's tombstone of a message is [`super::chat_admin_deletes`]'
 //! arm. The row readers and the publisher hand are the root's.
 
+use std::collections::BTreeSet;
+
 use serde_json::{Value, json};
 use tracing::warn;
 use uuid::Uuid;
@@ -14,14 +16,15 @@ use uuid::Uuid;
 use super::queue_activity;
 use crate::{
     config::Config,
-    federation::note,
+    federation::note::{self, tags::emoji_tag},
     models::{
         chat::ChatMessageReference,
+        custom_emoji::{self, CustomEmoji},
         media_attachment::{self, MediaAttachment},
         user::User,
     },
     state::AppState,
-    util::{id::activity_ap_id, time::mastodon_time},
+    util::{emoji::shortcodes_in, id::activity_ap_id, time::mastodon_time},
 };
 
 /// One chat message as the REMOTE counterpart must see it: the stored
@@ -42,6 +45,39 @@ struct ChatDelivery<'a> {
     sender_ap_id: &'a str,
     /// The remote counterpart's actor id: the message's only recipient.
     recipient_ap_id: &'a str,
+    /// The local custom emojis the message text uses: the object's `tag`
+    /// entries, none when empty.
+    emojis: &'a [CustomEmoji],
+}
+
+/// The enabled local emojis whose `:shortcode:` the message's HTML or
+/// source text carries, ordered by shortcode.
+///
+/// Asks the database nothing when the text holds no shortcode, and a failed
+/// read federates the message without tags (it still reaches its recipient
+/// as text).
+async fn chat_emojis(state: &AppState, message: &ChatMessageReference) -> Vec<CustomEmoji> {
+    let codes: Vec<String> = shortcodes_in(&message.content)
+        .into_iter()
+        .chain(shortcodes_in(&message.raw_text))
+        .map(str::to_owned)
+        .collect::<BTreeSet<String>>()
+        .into_iter()
+        .collect();
+    if codes.is_empty() {
+        return Vec::new();
+    }
+    match custom_emoji::get_by_shortcodes(&state.db, &codes, None).await {
+        Ok(rows) => rows.into_iter().filter(|row| !row.disabled).collect(),
+        Err(err) => {
+            warn!(
+                %err,
+                message = %message.message_id,
+                "federation hook could not read the chat emojis"
+            );
+            Vec::new()
+        }
+    }
 }
 
 /// The delivered message's attachment row, read for the federated document
@@ -71,7 +107,9 @@ async fn chat_attachment(
 /// the ticket pins, with the first media riding as `attachment` when the
 /// message carries one (Pleroma's `Builder.chat_message`, with the
 /// object's `attributedTo` spelling this instance's inbound fold — and
-/// decision 6's addressing — read).
+/// decision 6's addressing — read). The custom emojis the text uses ride as
+/// the note builder's `Emoji` entries of a `tag` array, which a message
+/// without emojis omits.
 fn chat_message_object(delivery: &ChatDelivery<'_>, attachment: Option<&MediaAttachment>) -> Value {
     let mut object = json!({
         "id": delivery.ap_id,
@@ -81,8 +119,14 @@ fn chat_message_object(delivery: &ChatDelivery<'_>, attachment: Option<&MediaAtt
         "content": delivery.message.content,
         "published": mastodon_time(&delivery.message.message_inserted_at),
     });
-    if let (Some(media), Some(fields)) = (attachment, object.as_object_mut()) {
-        let _previous = fields.insert("attachment".to_owned(), note::attachment_json(media));
+    if let Some(fields) = object.as_object_mut() {
+        if let Some(media) = attachment {
+            let _previous = fields.insert("attachment".to_owned(), note::attachment_json(media));
+        }
+        if !delivery.emojis.is_empty() {
+            let tags = delivery.emojis.iter().map(emoji_tag).collect();
+            let _previous = fields.insert("tag".to_owned(), Value::Array(tags));
+        }
     }
     object
 }
@@ -164,11 +208,13 @@ pub async fn after_chat_message_created(
         return; // an id-less message has no object to stand behind
     };
     let attachment = chat_attachment(state, message).await;
+    let emojis = chat_emojis(state, message).await;
     let delivery = ChatDelivery {
         ap_id,
         message,
         sender_ap_id: &sender.ap_id,
         recipient_ap_id: &recipient.ap_id,
+        emojis: &emojis,
     };
     let document = chat_create_document(state, &delivery, attachment.as_ref());
     queue_activity(state, sender, &document, "chat message").await;
@@ -259,6 +305,7 @@ mod tests {
             message: &message,
             sender_ap_id: "https://test.example/users/alice",
             recipient_ap_id: "https://remote.example/users/bob",
+            emojis: &[],
         };
         let mut media = fixture_media("https://test.example/media/cat.png", "image/png");
         media.blurhash = Some("UBLHZ;9a".to_owned());
@@ -283,6 +330,118 @@ mod tests {
         assert_eq!(
             schema["@context"]["ChatMessage"], "litepub:ChatMessage",
             "and the type's own term is defined too"
+        );
+    }
+
+    /// A stored local emoji row for `shortcode`.
+    async fn stored_emoji(pool: &PgPool, shortcode: &str, disabled: bool) -> CustomEmoji {
+        custom_emoji::upsert(
+            pool,
+            &custom_emoji::NewCustomEmoji {
+                disabled,
+                ..custom_emoji::NewCustomEmoji::local(
+                    shortcode,
+                    &format!("{TEST_BASE_URL}/emoji/{shortcode}.png"),
+                )
+            },
+        )
+        .await
+        .expect("the emoji fixture stores")
+    }
+
+    /// A message with emojis carries one `Emoji` tag per emoji with the note
+    /// builder's shape; one without carries no `tag` key.
+    #[test]
+    fn the_object_tags_the_emojis_the_text_uses() {
+        let message = message_reference();
+        let wiredcat = CustomEmoji {
+            id: new_id(),
+            shortcode: "wiredcat".to_owned(),
+            domain: None,
+            image_url: format!("{TEST_BASE_URL}/emoji/wiredcat.png"),
+            static_url: None,
+            category: None,
+            tags: Vec::new(),
+            visible_in_picker: true,
+            disabled: false,
+            inserted_at: message.inserted_at,
+            updated_at: message.inserted_at,
+        };
+        let emojis = [wiredcat];
+        let tagged = ChatDelivery {
+            ap_id: "https://test.example/objects/chat",
+            message: &message,
+            sender_ap_id: "https://test.example/users/alice",
+            recipient_ap_id: "https://remote.example/users/bob",
+            emojis: &emojis,
+        };
+
+        let object = chat_message_object(&tagged, None);
+        assert_eq!(
+            object["tag"],
+            json!([{
+                "type": "Emoji",
+                "id": format!("{TEST_BASE_URL}/emoji/wiredcat.png"),
+                "name": ":wiredcat:",
+                "icon": {
+                    "type": "Image",
+                    "url": format!("{TEST_BASE_URL}/emoji/wiredcat.png"),
+                },
+            }]),
+            "the note builder's tag for the emoji"
+        );
+        assert_eq!(
+            undefined_terms(&object),
+            Vec::<String>::new(),
+            "the tag's keys are defined in the served schema"
+        );
+
+        let bare = ChatDelivery {
+            emojis: &[],
+            ..tagged
+        };
+        assert!(
+            chat_message_object(&bare, None).get("tag").is_none(),
+            "no emoji, no tag key"
+        );
+    }
+
+    /// Only the enabled local emojis whose shortcode the text names are
+    /// found; a remote emoji of the same name, a disabled one and an unknown
+    /// shortcode are not, and a text with no shortcode asks nothing.
+    #[tokio::test]
+    async fn the_chat_emojis_are_the_enabled_local_ones_the_text_names() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let state = app_state(&pool);
+        let _wiredcat = stored_emoji(&pool, "wiredcat", false).await;
+        let _hidden = stored_emoji(&pool, "hidden", true).await;
+        let _remote = custom_emoji::upsert(
+            &pool,
+            &custom_emoji::NewCustomEmoji {
+                domain: Some("remote.example".to_owned()),
+                ..custom_emoji::NewCustomEmoji::local("plerofox", "https://remote.example/p.png")
+            },
+        )
+        .await
+        .expect("the remote emoji stores");
+
+        let mut message = message_reference();
+        message.content = "<p>:wiredcat: :hidden: :plerofox: :nothing:</p>".to_owned();
+        message.raw_text = ":wiredcat: :hidden: :plerofox: :nothing:".to_owned();
+        let found = chat_emojis(&state, &message).await;
+        assert_eq!(
+            found
+                .iter()
+                .map(|row| row.shortcode.as_str())
+                .collect::<Vec<_>>(),
+            vec!["wiredcat"],
+            "the one enabled local emoji, once"
+        );
+
+        assert!(
+            chat_emojis(&state, &message_reference()).await.is_empty(),
+            "a text without shortcodes finds none"
         );
     }
 

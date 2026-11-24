@@ -66,6 +66,14 @@ use polls::parse_poll;
 use tags::parse_tags;
 use text::{field_reference, parse_language, parse_sensitive, parse_text, parse_times};
 
+/// The `Emoji` entries of `json`'s `tag` array, in `author`'s domain.
+///
+/// What [`parse_note`] keeps of them, for objects that are no note: a chat
+/// message carries emojis but no mentions or hashtags.
+pub(crate) fn emoji_tags(json: &Value, author: &User) -> Vec<RemoteEmoji> {
+    parse_tags(json, author).emojis
+}
+
 /// Object `type`s this parser accepts: the eight document kinds Mastodon,
 /// Pleroma and Misskey deliver as createable posts (Pleroma's transmogrifier
 /// object arm accepts these plus `Answer` and `ChatMessage`, which this

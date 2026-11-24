@@ -30,7 +30,7 @@ use serde_json::{Value, json};
 use sqlx::PgPool;
 use uuid::Uuid;
 use wired_be::models::{
-    block, chat, media_attachment,
+    block, chat, custom_emoji, media_attachment,
     notification::TYPE_CHAT_MENTION,
     user::{self, User},
 };
@@ -698,4 +698,118 @@ async fn a_sender_that_does_not_match_the_object_delivers_nothing() {
         note_rows(&pool, alice.id).await.is_empty(),
         "and nobody was told"
     );
+}
+
+/// `chat`'s messages as alice's client lists them over HTTP.
+async fn listed_messages(pool: &PgPool, alice: &User, chat_id: Uuid) -> Vec<Value> {
+    let token = common::create_app_and_token(pool, alice, "read:chats").await;
+    let response = common::TestRequest::get(&format!("/api/v1/pleroma/chats/{chat_id}/messages"))
+        .bearer(&token)
+        .send(&common::test_app(pool.clone()))
+        .await;
+    common::assert_answer(
+        &response,
+        axum::http::StatusCode::OK,
+        "the chat messages list",
+    );
+    response
+        .json_value()
+        .as_array()
+        .expect("the listing is an array")
+        .clone()
+}
+
+/// A delivered chat message's `Emoji` tag is stored under the sender's
+/// domain, the messages endpoint renders it in `emojis`, and the emoji an
+/// untagged message names stays plain text.
+#[tokio::test]
+async fn a_delivered_emoji_tag_is_stored_and_rendered() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let (alice, bob) = pair(&pool).await;
+    let state = delivering_state(&pool);
+
+    deliver(
+        &state,
+        &chat_create(
+            &alice.ap_id,
+            "emoji",
+            "<p>hello :plerofox: and :nothing:</p>",
+            json!({"tag": [
+                {
+                    "type": "Emoji",
+                    "name": ":plerofox:",
+                    "icon": {"type": "Image", "url": "https://remote.example/emoji/plerofox.png"},
+                },
+                {"type": "Hashtag", "name": "#ignored", "href": "https://remote.example/tags/ignored"},
+            ]}),
+        ),
+        &bob,
+    )
+    .await;
+
+    let stored =
+        custom_emoji::get_by_shortcodes(&pool, &["plerofox".to_owned()], Some("remote.example"))
+            .await
+            .expect("the emoji reads");
+    assert_eq!(stored.len(), 1, "the Emoji tag upserted one row");
+    assert_eq!(
+        stored[0].image_url, "https://remote.example/emoji/plerofox.png",
+        "with the tag's icon"
+    );
+
+    let alice_chat = chat_row(&pool, alice.id, bob.id)
+        .await
+        .expect("alice's chat row");
+    let listed = listed_messages(&pool, &alice, alice_chat.id).await;
+    assert_eq!(listed.len(), 1, "the one delivered message lists");
+    let emojis = listed[0]["emojis"].as_array().expect("emojis is a list");
+    assert_eq!(emojis.len(), 1, "only the announced emoji renders");
+    assert_eq!(emojis[0]["shortcode"], json!("plerofox"));
+    assert_eq!(
+        emojis[0]["url"],
+        json!("https://remote.example/emoji/plerofox.png")
+    );
+}
+
+/// An emoji row of another domain never renders on a message, and a
+/// message that names no shortcode renders `emojis: []`.
+#[tokio::test]
+async fn emojis_render_only_under_the_senders_domain() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let (alice, bob) = pair(&pool).await;
+    let state = delivering_state(&pool);
+    let _local = custom_emoji::upsert(
+        &pool,
+        &custom_emoji::NewCustomEmoji::local("plerofox", "https://test.example/emoji/p.png"),
+    )
+    .await
+    .expect("the local emoji stores");
+
+    deliver(
+        &state,
+        &chat_create(&alice.ap_id, "untagged", ":plerofox: untagged", json!({})),
+        &bob,
+    )
+    .await;
+    deliver(
+        &state,
+        &chat_create(&alice.ap_id, "plain", "no emoji here", json!({})),
+        &bob,
+    )
+    .await;
+
+    let alice_chat = chat_row(&pool, alice.id, bob.id)
+        .await
+        .expect("alice's chat row");
+    let listed = listed_messages(&pool, &alice, alice_chat.id).await;
+    assert_eq!(listed.len(), 2, "both messages list");
+    for message in &listed {
+        assert_eq!(
+            message["emojis"],
+            json!([]),
+            "the local emoji is not the remote sender's, and plain text has none"
+        );
+    }
 }
