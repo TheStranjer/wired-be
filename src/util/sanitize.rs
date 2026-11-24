@@ -146,7 +146,10 @@ pub fn strip_html(input: &str) -> String {
 /// attribute values: `&`, `<`, `>`, `"` and `'`.
 ///
 /// The result is inert markup: nothing in `s` can open a tag or a
-/// reference.
+/// reference. The apostrophe becomes `&#39;`, a numeric character
+/// reference that is equally valid in XML, so the XRD documents of
+/// [`crate::api::well_known`] use this escaper too, in element text and
+/// quoted attribute values alike.
 #[must_use]
 pub fn escape_html(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
@@ -161,6 +164,12 @@ pub fn escape_html(s: &str) -> String {
         }
     }
     out
+}
+
+/// Appends `text` to `out` with the unsafe HTML characters escaped, as
+/// [`escape_html`] would.
+pub fn push_escaped(out: &mut String, text: &str) {
+    out.push_str(&escape_html(text));
 }
 
 /// Reduces arbitrary user-supplied display-name markup to one line of
@@ -525,6 +534,50 @@ mod tests {
             "safe text is untouched"
         );
         assert_eq!(escape_html(""), "", "empty stays empty");
+    }
+
+    #[test]
+    fn plain_text_and_unicode_pass_through_unescaped() {
+        for value in [
+            "",
+            "alice",
+            "acct:alice@test.example",
+            "https://test.example/users/alice",
+            "héllo wörld — ✓",
+        ] {
+            assert_eq!(escape_html(value), value, "{value:?} needs no escaping");
+        }
+    }
+
+    #[test]
+    fn every_special_character_becomes_its_reference() {
+        assert_eq!(escape_html("&"), "&amp;", "ampersand");
+        assert_eq!(escape_html("<"), "&lt;", "less-than");
+        assert_eq!(escape_html(">"), "&gt;", "greater-than");
+        assert_eq!(escape_html("\""), "&quot;", "double quote");
+        assert_eq!(escape_html("'"), "&#39;", "single quote");
+    }
+
+    #[test]
+    fn text_that_looks_like_references_is_escaped_once() {
+        assert_eq!(
+            escape_html("a<b>&c\"d'e"),
+            "a&lt;b&gt;&amp;c&quot;d&#39;e",
+            "each character is replaced once"
+        );
+        assert_eq!(
+            escape_html("<a href=\"x\">&amp;</a>"),
+            "&lt;a href=&quot;x&quot;&gt;&amp;amp;&lt;/a&gt;",
+            "text that already looks like entities is escaped as literal text"
+        );
+    }
+
+    #[test]
+    fn push_escaped_appends_the_escaped_text() {
+        let mut out = String::from("<p>");
+        push_escaped(&mut out, "a<b & 'c'");
+        push_escaped(&mut out, "");
+        assert_eq!(out, "<p>a&lt;b &amp; &#39;c&#39;", "appended, not replaced");
     }
 
     #[test]

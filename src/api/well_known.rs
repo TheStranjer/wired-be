@@ -14,7 +14,7 @@
 //!
 //! `WebFinger` answers the same document in two representations: the JRD
 //! JSON body by default, `application/jrd+json`, and the XRD XML body —
-//! the same data through [`xml_escape`] —
+//! the same data through [`escape_html`] —
 //! when the client asks with an `Accept` naming `application/xrd+xml` or a
 //! `format=xml` query parameter, Pleroma's `SetFormatPlug` behavior.
 
@@ -32,7 +32,7 @@ use crate::{
     error::{AppError, AppResult},
     models::user::{User, get_by_ap_id, get_by_nickname},
     state::AppState,
-    util::xml::xml_escape,
+    util::sanitize::escape_html,
 };
 
 /// `Content-Type` of the JRD JSON answer, the media type RFC 7033
@@ -122,7 +122,7 @@ async fn host_meta(State(state): State<AppState>) -> Response {
     );
     xrd_body(format!(
         r#"<XRD xmlns="{XRD_NAMESPACE}"><Link rel="lrdd" template="{}"/></XRD>"#,
-        xml_escape(&template)
+        escape_html(&template)
     ))
 }
 
@@ -300,12 +300,12 @@ fn xrd_response(finger: &Finger) -> Response {
     let aliases: Vec<String> = finger
         .aliases
         .iter()
-        .map(|alias| format!("<Alias>{}</Alias>", xml_escape(alias)))
+        .map(|alias| format!("<Alias>{}</Alias>", escape_html(alias)))
         .collect();
     let links: Vec<String> = finger.links.iter().map(xrd_link).collect();
     xrd_body(format!(
         r#"<XRD xmlns="{XRD_NAMESPACE}"><Subject>{}</Subject>{}{}</XRD>"#,
-        xml_escape(&finger.subject),
+        escape_html(&finger.subject),
         aliases.concat(),
         links.concat(),
     ))
@@ -313,18 +313,18 @@ fn xrd_response(finger: &Finger) -> Response {
 
 /// One `<Link/>` element of an XRD document: `rel` first, then whichever of
 /// `type`, `href` and `template` the link carries, every value run
-/// through [`xml_escape`] so a database-sourced URL cannot break out of
+/// through [`escape_html`] so a database-sourced URL cannot break out of
 /// its quotes or its element.
 fn xrd_link(link: &FingerLink) -> String {
-    let mut attributes = vec![format!(r#"rel="{}""#, xml_escape(link.rel))];
+    let mut attributes = vec![format!(r#"rel="{}""#, escape_html(link.rel))];
     if let Some(link_type) = link.link_type {
-        attributes.push(format!(r#"type="{}""#, xml_escape(link_type)));
+        attributes.push(format!(r#"type="{}""#, escape_html(link_type)));
     }
     if let Some(href) = &link.href {
-        attributes.push(format!(r#"href="{}""#, xml_escape(href)));
+        attributes.push(format!(r#"href="{}""#, escape_html(href)));
     }
     if let Some(template) = &link.template {
-        attributes.push(format!(r#"template="{}""#, xml_escape(template)));
+        attributes.push(format!(r#"template="{}""#, escape_html(template)));
     }
     format!("<Link {}/>", attributes.join(" "))
 }

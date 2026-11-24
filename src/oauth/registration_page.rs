@@ -17,7 +17,10 @@
 //! with every dynamic value HTML-escaped, and self-contained: inline CSS,
 //! no scripts (decision 1).
 
-use crate::oauth::page::{push_error, push_escaped, push_head, push_tail};
+use crate::{
+    oauth::page::{push_error, push_head, push_tail},
+    util::sanitize::push_escaped,
+};
 
 /// Where [`render_form`]'s form posts.
 const FORM_ACTION: &str = "/oauth/register";

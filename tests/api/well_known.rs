@@ -15,6 +15,7 @@
 #![cfg(test)]
 
 use axum::http::StatusCode;
+use quick_xml::{XmlVersion, events::Event, reader::Reader};
 use serde_json::{Value, json};
 use sqlx::PgPool;
 use wired_be::models::user::{Flag, NewUser};
@@ -411,6 +412,75 @@ async fn host_meta_advertises_the_webfinger_template() {
     );
 }
 
+/// Every attribute of every element in the XRD `body` as `(name, value)`,
+/// with character references resolved; panics when `body` is not
+/// well-formed XML.
+fn xrd_attributes(body: &str) -> Vec<(String, String)> {
+    let mut reader = Reader::from_str(body);
+    let mut found = Vec::new();
+    loop {
+        match reader.read_event().expect("the XRD is well-formed XML") {
+            Event::Start(element) | Event::Empty(element) => {
+                for attribute in element.attributes() {
+                    let attribute = attribute.expect("a well-formed attribute");
+                    let value = attribute
+                        .normalized_value(XmlVersion::Explicit1_0)
+                        .expect("a resolvable attribute value");
+                    found.push((attribute.key.as_ref().to_owned(), value.into_owned()));
+                }
+            }
+            Event::Eof => break,
+            Event::End(_)
+            | Event::Text(_)
+            | Event::CData(_)
+            | Event::Comment(_)
+            | Event::Decl(_)
+            | Event::PI(_)
+            | Event::DocType(_)
+            | Event::GeneralRef(_) => {}
+        }
+    }
+    found
+}
+
+/// An apostrophe in a stored value is written as `&#39;`, which is a valid
+/// XML character reference: the `WebFinger` XRD still parses with `quick_xml`
+/// and the attribute reads back as the original URL; host-meta parses too.
+#[tokio::test]
+async fn xrd_with_an_apostrophe_parses_as_xml() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let url = "https://test.example/o'brien";
+    let _alice = common::create_local_user_with(&pool, "alice", |new| NewUser {
+        profile_url: Some(url.to_owned()),
+        ..new
+    })
+    .await;
+    let xml = webfinger_with_accept(&pool, ALICE_ACCT, XRD_XML).await;
+    assert_eq!(xml.status, StatusCode::OK, "the XML lookup succeeds");
+    let body = xml.text();
+    assert!(
+        body.contains("https://test.example/o&#39;brien"),
+        "the apostrophe is a numeric character reference: {body}"
+    );
+    assert!(
+        xrd_attributes(&body)
+            .iter()
+            .any(|(name, value)| name == "href" && value == url),
+        "an href attribute reads back as the original URL: {body}"
+    );
+    let app = common::test_app(pool);
+    let host_meta = common::TestRequest::get("/.well-known/host-meta")
+        .send(&app)
+        .await;
+    assert!(
+        xrd_attributes(&host_meta.text())
+            .iter()
+            .any(|(name, _value)| name == "template"),
+        "host-meta parses and carries its template"
+    );
+}
+
 /// Values from the database cannot break out of the XML: every special
 /// character of a stored profile URL arrives escaped in the XRD document
 /// and raw in the JRD one.
@@ -428,7 +498,7 @@ async fn stored_urls_are_escaped_in_xml_and_raw_in_json() {
     assert_eq!(xml.status, StatusCode::OK, "the XML lookup succeeds");
     let body = xml.text();
     assert!(
-        body.contains("https://test.example/&amp;&lt;&gt;a&quot;b&apos;c"),
+        body.contains("https://test.example/&amp;&lt;&gt;a&quot;b&#39;c"),
         "every special character arrives as its entity: {body}"
     );
     assert!(
