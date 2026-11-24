@@ -33,8 +33,8 @@
 //! `GET /api/v1/statuses/{id}/context` (WBE-78) is Pleroma's `context`: the
 //! thread around the named status as `{"ancestors": [...], "descendants":
 //! [...]}`. Ancestors are the reply chain above it, root first; descendants
-//! are every reply below it, across every branch, in flat chronological
-//! order. Both arms carry only what the visibility model admits — an
+//! are every reply below it, across every branch, in thread order (depth
+//! first, siblings by publish time). Both arms carry only what the visibility model admits — an
 //! invisible or deleted link is skipped but walked *past*, so the thread
 //! beyond it still arrives — and descendants additionally drop statuses by
 //! accounts the viewer blocked or muted (the viewer's own excepted). Each

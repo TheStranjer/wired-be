@@ -36,28 +36,40 @@ SELECT s.* FROM chain
  ORDER BY chain.depth DESC";
 
 /// [`descendant_tree`]: the walk *down* from `$1` along replies, one hop per
-/// row, stopped at depth `$2` and cut to `$3` rows. A reply was stored after
-/// its parent, so `ORDER BY s.id` is the flat chronological thread order
-/// (decision 4) Pleroma's context read answers. The base arm is the direct
-/// replies at depth `1`, kept only when the cap admits at least one hop;
-/// the cut runs before any visibility narrowing, so the caller's filters
-/// can only shrink what `$3` kept. As in [`ancestor_chain`], tombstones and
-/// unreadable rows stay in the walk — they are links below them the walk
-/// must pass — and are the caller's to drop.
-const DESCENDANT_TREE_SQL: &str = "WITH RECURSIVE tree(id, depth) AS (
-    SELECT s.id, 1
+/// row, stopped at depth `$2` and cut to `$3` rows. Ids are minted when this
+/// instance *stores* a row, so a backfilled thread (walked upwards from its
+/// newest reply) hands its oldest posts the newest ids; the order is
+/// therefore the thread's own, as Mastodon's `descendants` answers it: depth
+/// first, siblings by `inserted_at` (the author's `published` for a remote
+/// status) with the id only breaking a tie. Each row carries `path`, one
+/// fixed-width `bytea` key per level (the offset microsecond timestamp, then
+/// the uuid bytes), and `ORDER BY path` compares those arrays level by level,
+/// which is exactly that depth-first order; the offset keeps pre-1970
+/// timestamps sorting before later ones. The base arm is the direct replies
+/// at depth `1`, kept only when the cap admits at least one hop; the cut runs
+/// before any visibility narrowing, so the caller's filters can only shrink
+/// what `$3` kept. As in [`ancestor_chain`], tombstones and unreadable rows
+/// stay in the walk — they are links below them the walk must pass — and are
+/// the caller's to drop.
+const DESCENDANT_TREE_SQL: &str = "WITH RECURSIVE tree(id, depth, path) AS (
+    SELECT s.id, 1,
+           ARRAY[int8send((extract(epoch FROM s.inserted_at) * 1000000)::bigint
+                          + 4000000000000000000) || uuid_send(s.id)]
       FROM statuses s
      WHERE s.in_reply_to_id = $1
        AND $2 >= 1
   UNION ALL
-    SELECT c.id, tree.depth + 1
+    SELECT c.id, tree.depth + 1,
+           array_append(tree.path,
+                        int8send((extract(epoch FROM c.inserted_at) * 1000000)::bigint
+                                 + 4000000000000000000) || uuid_send(c.id))
       FROM tree
       JOIN statuses c ON c.in_reply_to_id = tree.id
      WHERE tree.depth < $2
 )
 SELECT s.* FROM tree
   JOIN statuses s ON s.id = tree.id
- ORDER BY s.id
+ ORDER BY tree.path
     LIMIT $3";
 
 /// Every status *above* `status_id`: the walk up its
@@ -91,18 +103,18 @@ pub async fn ancestor_chain(
     Ok(statuses)
 }
 
-/// Every status *below* `status_id`, across all branches, in flat
-/// chronological thread order (id ascending, decision 4).
+/// Every status *below* `status_id`, across all branches, in thread order:
+/// depth first, siblings by `inserted_at` (id breaking a tie).
 ///
 /// The walk descends through every reply of `status_id`, of every reply of
-/// those, and so on — the order Pleroma's context read answers. `status_id`
-/// itself is never in the answer; a status nobody replied to is the empty
-/// `Vec`.
+/// those, and so on — the order Mastodon's `descendants` answers, whatever
+/// order the rows were stored in. `status_id` itself is never in the
+/// answer; a status nobody replied to is the empty `Vec`.
 ///
 /// The walk is cut at `max_depth` hops (at least one for any row to come
-/// back) and to `max_rows` rows before the caller has said which of them
-/// are visible, so a caller that narrows afterwards may answer fewer than
-/// `max_rows`.
+/// back) and to the first `max_rows` rows in thread order before the caller
+/// has said which of them are visible, so a caller that narrows afterwards
+/// may answer fewer than `max_rows`.
 ///
 /// The raw-read contract is [`ancestor_chain`]'s: tombstones and unreadable
 /// rows stay in the walk so it continues past them, and the caller drops
@@ -185,7 +197,7 @@ pub async fn link_backfilled_reply(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::status::{soft_delete, test_support::*};
+    use crate::models::status::{NewStatus, insert, soft_delete, test_support::*};
 
     /// The walk up answers the whole chain above the requested status,
     /// root first, the status itself never; one hop and no hops cut the
@@ -234,13 +246,13 @@ mod tests {
         );
     }
 
-    /// The walk down answers every branch in flat chronological (id-
-    /// ascending) order, the requested status never; the depth cap stops
-    /// the walk after that many hops and the row cap keeps the oldest rows
-    /// of what it walked; a leaf has no tree, and a tombstone inside the
-    /// tree stays in the raw answer for the caller to drop.
+    /// The walk down answers every branch depth first, siblings in creation
+    /// order, the requested status never; the depth cap stops the walk
+    /// after that many hops and the row cap keeps the first rows in thread
+    /// order; a leaf has no tree, and a tombstone inside the tree stays in
+    /// the raw answer for the caller to drop.
     #[tokio::test]
-    async fn descendant_tree_walks_down_every_branch_in_id_order() {
+    async fn descendant_tree_walks_down_every_branch_depth_first() {
         let db = crate::test_db::test_db().await.expect("test database slot");
         let pool = db.pool().clone();
         let alice = user(&pool, "alice").await;
@@ -250,9 +262,9 @@ mod tests {
         let deep = reply(&pool, &alice, &left, "deep").await;
         assert_eq!(
             ids(&descendant_tree(&pool, root.id, 100, 1000).await.unwrap()),
-            vec![left.id, right.id, deep.id],
-            "flat chronological order across branches: the second hop \
-             follows its place in time, not its place in the tree"
+            vec![left.id, deep.id, right.id],
+            "depth first: `deep` follows the `left` it answers, before the \
+             younger sibling `right`"
         );
         assert!(
             descendant_tree(&pool, deep.id, 100, 1000)
@@ -275,8 +287,8 @@ mod tests {
         );
         assert_eq!(
             ids(&descendant_tree(&pool, root.id, 100, 2).await.unwrap()),
-            vec![left.id, right.id],
-            "the row cap keeps the oldest rows of the walk"
+            vec![left.id, deep.id],
+            "the row cap keeps the first rows in thread order"
         );
         let gone = soft_delete(&pool, right.id)
             .await
@@ -284,8 +296,79 @@ mod tests {
             .expect("the right reply was live");
         assert_eq!(
             ids(&descendant_tree(&pool, root.id, 100, 1000).await.unwrap()),
-            vec![left.id, gone.id, deep.id],
+            vec![left.id, deep.id, gone.id],
             "the deleted reply is still a row of the raw tree"
+        );
+    }
+
+    /// A reply chain stored newest-first (what thread backfill does) still
+    /// comes back root-to-leaf, because the order follows `inserted_at`, not
+    /// the ids; siblings sort by time with the id only breaking a tie, and
+    /// the row cap keeps the first rows in thread order.
+    #[tokio::test]
+    async fn descendant_tree_orders_by_inserted_at_not_by_id() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = user(&pool, "alice").await;
+        let root = post(&pool, &alice, "root").await;
+        let base = chrono::Utc::now() - chrono::Duration::hours(1);
+        let unlinked = |minutes: i64, text: &str| NewStatus {
+            inserted_at: Some(base + chrono::Duration::minutes(minutes)),
+            ..NewStatus::local(&alice, text)
+        };
+        // Stored deepest first, so the ids run opposite to the thread.
+        let r3 = insert(&pool, BASE, &unlinked(30, "r3")).await.unwrap();
+        let r2 = insert(&pool, BASE, &unlinked(20, "r2")).await.unwrap();
+        let r1 = insert(&pool, BASE, &unlinked(10, "r1")).await.unwrap();
+        // Backfill then closes the links: r3 under r2, r2 under r1, r1 under the root.
+        for (child, new_parent) in [(&r3, &r2), (&r2, &r1), (&r1, &root)] {
+            let linked = link_backfilled_reply(&pool, child.id, new_parent)
+                .await
+                .unwrap();
+            assert!(linked, "the deferred link closes");
+        }
+        assert!(r3.id < r2.id && r2.id < r1.id, "ids run against the thread");
+        assert_eq!(
+            ids(&descendant_tree(&pool, root.id, 100, 1000).await.unwrap()),
+            vec![r1.id, r2.id, r3.id],
+            "the thread reads root to leaf despite the reversed ids"
+        );
+        assert_eq!(
+            ids(&descendant_tree(&pool, root.id, 100, 2).await.unwrap()),
+            vec![r1.id, r2.id],
+            "the cap keeps the first rows in thread order"
+        );
+    }
+
+    /// Siblings sort by `inserted_at` whatever their ids say, each followed
+    /// by its own subtree: `A` (older, stored last), its child `A1`, then
+    /// `B`.
+    #[tokio::test]
+    async fn descendant_tree_orders_siblings_by_time_then_subtree() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = user(&pool, "alice").await;
+        let root = post(&pool, &alice, "root").await;
+        let base = chrono::Utc::now() - chrono::Duration::hours(1);
+        let child_of = |parent: &Status, minutes: i64, text: &str| NewStatus {
+            in_reply_to_id: Some(parent.id),
+            inserted_at: Some(base + chrono::Duration::minutes(minutes)),
+            ..NewStatus::local(&alice, text)
+        };
+        let newer = insert(&pool, BASE, &child_of(&root, 20, "B"))
+            .await
+            .unwrap();
+        let older = insert(&pool, BASE, &child_of(&root, 10, "A"))
+            .await
+            .unwrap();
+        let grandchild = insert(&pool, BASE, &child_of(&older, 30, "A1"))
+            .await
+            .unwrap();
+        assert!(newer.id < older.id, "the younger sibling has the older id");
+        assert_eq!(
+            ids(&descendant_tree(&pool, root.id, 100, 1000).await.unwrap()),
+            vec![older.id, grandchild.id, newer.id],
+            "A, its child A1, then B"
         );
     }
 }
