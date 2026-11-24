@@ -256,3 +256,91 @@ async fn a_foreign_document_is_not_folded_for_the_delivering_actor() {
     );
     server.abort();
 }
+
+#[tokio::test]
+async fn an_author_on_another_origin_is_never_fetched() {
+    let db = crate::test_db::test_db().await.expect("test database slot");
+    let pool = db.pool().clone();
+    let state = test_state(pool.clone());
+    let listener = bind().await;
+    let base = origin(&listener);
+    let other_listener = bind().await;
+    let other_base = origin(&other_listener);
+    let other = peer_at(&other_base);
+    let other_server = spawn(other_listener, peer_app(other.clone()));
+    let url = object_url(&base, "borrowed");
+    let document = json!({
+        "id": url,
+        "type": "Note",
+        "attributedTo": format!("{other_base}/users/{ALICE}"),
+        "to": [PUBLIC],
+        "content": "<p>claims a stranger wrote it</p>",
+        "published": "2024-03-01T10:00:00.000Z",
+    });
+    let server = spawn(listener, fixed_app("/objects/borrowed", document));
+
+    let resolved = resolve_status(&state, &url).await;
+
+    assert!(
+        matches!(&resolved, Err(FederationError::Permanent(detail))
+            if detail == "attributedTo host differs from object host"),
+        "a foreign author is a permanent refusal: {resolved:?}"
+    );
+    assert_eq!(
+        other.hits.load(Ordering::SeqCst),
+        0,
+        "the foreign author's origin is never contacted"
+    );
+    assert_eq!(rows_for_uri(&pool, &url).await, 0, "nothing is stored");
+    server.abort();
+    other_server.abort();
+}
+
+#[tokio::test]
+async fn an_author_that_is_not_an_http_url_is_refused_before_any_fetch() {
+    let db = crate::test_db::test_db().await.expect("test database slot");
+    let pool = db.pool().clone();
+    let state = test_state(pool.clone());
+    let listener = bind().await;
+    let base = origin(&listener);
+    let url = object_url(&base, "urn");
+    let document = json!({
+        "id": url,
+        "type": "Note",
+        "attributedTo": "urn:uuid:3f1c0a52-0000-4000-8000-000000000000",
+        "to": [PUBLIC],
+        "content": "<p>no usable author</p>",
+    });
+    let server = spawn(listener, fixed_app("/objects/urn", document));
+
+    let resolved = resolve_status(&state, &url).await;
+
+    assert!(
+        matches!(resolved, Err(FederationError::Permanent(_))),
+        "an author without an http host is refused: {resolved:?}"
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn an_author_on_the_object_origin_still_resolves() {
+    let db = crate::test_db::test_db().await.expect("test database slot");
+    let pool = db.pool().clone();
+    let state = test_state(pool.clone());
+    let listener = bind().await;
+    let base = origin(&listener);
+    let peer = peer_at(&base);
+    let server = spawn(listener, peer_app(peer.clone()));
+    let uri = object_url(&base, "home");
+
+    let resolved = resolve_status(&state, &uri)
+        .await
+        .expect("a same-origin author resolves");
+
+    assert_eq!(
+        resolved.map(|row| row.uri),
+        Some(uri),
+        "the note is ingested under its own id"
+    );
+    server.abort();
+}

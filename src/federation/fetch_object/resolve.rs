@@ -20,6 +20,7 @@ use crate::{
     },
     services::ingest::{self, IngestOutcome},
     state::AppState,
+    util::url::{host_with_port, parse_http_url},
 };
 
 /// Human-facing url path segment of a local status (see
@@ -133,6 +134,22 @@ async fn resolve_uri(
         debug!(uri, "a fetched object whose attributedTo names nothing");
         return Ok(None);
     };
+    // Containment before any actor fetch: an author on another origin than
+    // the object would be rejected by the ingest anyway, and fetching it
+    // first would let any peer make this instance mirror an arbitrary actor.
+    let document_origin = document
+        .get("id")
+        .and_then(Value::as_str)
+        .and_then(origin_of);
+    if document_origin.is_none() || document_origin != origin_of(&attributed) {
+        debug!(
+            uri,
+            attributed, "a fetched object whose attributedTo is not on the object's origin"
+        );
+        return Err(FederationError::Permanent(
+            "attributedTo host differs from object host".to_owned(),
+        ));
+    }
     // The as_actor arm refuses before any further fetch: a document the
     // delivering actor did not author is nobody's business but theirs.
     let mirror;
@@ -204,6 +221,14 @@ fn attributed_to(document: &Value) -> Option<String> {
         .get("attributedTo")
         .map(json::as_array)
         .and_then(|entries| entries.iter().find_map(json::value_or_id))
+}
+
+/// The `host[:port]` an `http(s)` URL names, lowercased; `None` for any
+/// other text. The port is part of it: two listeners on one loopback host
+/// are different origins, and a peer's actor never lives on a sibling port
+/// of its objects.
+fn origin_of(text: &str) -> Option<String> {
+    parse_http_url(text).map(|url| host_with_port(&url))
 }
 
 /// The author mirror of an instance-initiated resolve. Any actor-fetch
