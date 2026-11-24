@@ -136,6 +136,8 @@ fn raw_meta_pairs(tags: &[(String, String)]) -> Map<String, Value> {
 
 #[cfg(test)]
 mod tests {
+    use std::fmt::Write as _;
+
     use super::*;
 
     /// A full Open Graph page: every field comes from its `og:*` tag, and
@@ -322,9 +324,11 @@ mod tests {
     /// A page with 100 distinct `og:` tags keeps the first 32 in document order.
     #[test]
     fn caps_the_raw_pair_count() {
-        let metas: String = (0..100)
-            .map(|n| format!(r#"<meta property="og:x{n}" content="v{n}">"#))
-            .collect();
+        let metas = (0..100).fold(String::new(), |mut metas, n| {
+            write!(metas, r#"<meta property="og:x{n}" content="v{n}">"#)
+                .expect("writing to a String cannot fail");
+            metas
+        });
         let html = format!(
             r#"<html><head><meta property="og:title" content="T">{metas}</head><body></body></html>"#
         );
