@@ -152,7 +152,7 @@ impl Config {
             smtp_tls: mail.tls,
             mail_from: mail.from,
             media_proxy: media_proxy_settings(&lookup)?,
-            statics: statics_settings(&lookup)?,
+            statics: statics_settings(&lookup),
             rich_media_ignore_hosts: rich_media_ignore_hosts(&lookup),
             rich_media_remote: rich_media_remote(&lookup)?,
             vapid: vapid_settings(&lookup)?,
