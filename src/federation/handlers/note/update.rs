@@ -6,17 +6,15 @@ use serde_json::Value;
 use tracing::debug;
 use uuid::Uuid;
 
+use super::media_poll::{media_replacement_needed, refresh_poll, replace_media, stored_media};
 #[cfg(doc)]
 use super::update_note;
-use super::{
-    CLOCK_SKEW,
-    media_poll::{media_replacement_needed, refresh_poll, replace_media, stored_media},
-};
 use crate::{
     api::statuses::after_status_edited,
     federation::{
         dispatch::{ActivityView, FederationError, Outcome},
         handlers::create,
+        json::clamped_time,
         note_parser::{self, ParsedNote},
     },
     models::{
@@ -26,7 +24,6 @@ use crate::{
     },
     services::ingest,
     state::AppState,
-    util::time::parse_time,
 };
 
 /// The body of [`update_note`]: the authorship gate, then the edit of the
@@ -179,24 +176,13 @@ fn is_stale(object: &Value, stored: &Status, now: DateTime<Utc>) -> bool {
 
 /// The moment an `Update` claims its document was last changed: its
 /// `updated`, falling back to its `published` for a document that carries
-/// only that, clamped against [`CLOCK_SKEW`] the way the note parse clamps
+/// only that, clamped by [`clamped_time`] the way the note parse clamps
 /// creation times — a stamp from a runaway clock answers `now`, still the
 /// freshest the fold can honestly call it. `None` for a document whose
 /// stamps are unreadable: with nothing to compare, the fold trusts the
 /// sender and edits.
 fn update_time(object: &Value, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
-    let stamp = object
-        .get("updated")
-        .and_then(Value::as_str)
-        .and_then(parse_time)
-        .or_else(|| {
-            object
-                .get("published")
-                .and_then(Value::as_str)
-                .and_then(parse_time)
-        })?;
-    let ceiling = now.checked_add_signed(CLOCK_SKEW).unwrap_or(now);
-    Some(if stamp > ceiling { now } else { stamp })
+    clamped_time(object.get("updated"), now).or_else(|| clamped_time(object.get("published"), now))
 }
 
 #[cfg(test)]

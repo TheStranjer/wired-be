@@ -64,7 +64,6 @@
 //! the announce ticket's, not this module's; nothing here sends anything
 //! anywhere.
 
-use chrono::TimeDelta;
 use futures::future::BoxFuture;
 
 mod delete;
@@ -97,12 +96,6 @@ const EDITED_OBJECT_TYPES: [&str; 4] = ["Note", "Question", "Article", "Page"];
 /// plus the `Tombstone` document Pleroma and Mastodon sometimes deliver
 /// embedded in the `Delete` in place of a bare id.
 const DELETED_OBJECT_TYPES: [&str; 5] = ["Note", "Question", "Article", "Page", "Tombstone"];
-
-/// How far a delivered `updated` may lead this clock before the fold stops
-/// trusting it — the same five minutes [`crate::federation::note_parser`]
-/// grants a note, so a peer's forward clock cannot mark a stored version
-/// stale with a timestamp from next week.
-const CLOCK_SKEW: TimeDelta = TimeDelta::minutes(5);
 
 /// Folds this module's routes into the dispatcher's registry.
 ///

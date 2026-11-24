@@ -1,7 +1,7 @@
 //! The `Announce` fold and its withdrawal: boostability, the relay arm and
 //! the reblog row's own timestamp.
 
-use chrono::{DateTime, TimeDelta, Utc};
+use chrono::{DateTime, Utc};
 use serde_json::Value;
 use sqlx::PgPool;
 use tracing::debug;
@@ -11,6 +11,7 @@ use crate::{
     api::statuses::after_reblog_changed,
     federation::{
         dispatch::{ActivityView, FederationError, Outcome},
+        json::clamped_time,
         note_parser,
     },
     models::{
@@ -19,13 +20,7 @@ use crate::{
         user::User,
     },
     state::AppState,
-    util::time::parse_time,
 };
-
-/// How far an Announce's `published` may lead the local clock before the
-/// row is stamped `now` instead — the same skew the note and chat folds
-/// keep, restated here for the activity's own timestamp.
-const CLOCK_SKEW: TimeDelta = TimeDelta::minutes(5);
 
 /// The body of [`handle_announce`]: the shared target step, the relay arm,
 /// the boostability rule, the duplicate read, and the reblog row the
@@ -197,19 +192,12 @@ async fn boost_stands(
 }
 
 /// The reblog row's creation instant: the `Announce` activity's own
-/// `published` through [`parse_time`], clamped to `now` when it leads the
-/// local clock past [`CLOCK_SKEW`] — a peer's runaway clock moves nobody's
-/// timeline — and answered `now` when the field is absent or unreadable.
+/// `published` through [`clamped_time`], which answers `now` when it leads
+/// the local clock past [`CLOCK_SKEW`](crate::federation::json::CLOCK_SKEW)
+/// — a peer's runaway clock moves nobody's timeline — and so does this
+/// function when the field is absent or unreadable.
 fn announced_at(activity: &Value, now: DateTime<Utc>) -> DateTime<Utc> {
-    let Some(published) = activity
-        .get("published")
-        .and_then(Value::as_str)
-        .and_then(parse_time)
-    else {
-        return now;
-    };
-    let ceiling = now.checked_add_signed(CLOCK_SKEW).unwrap_or(now);
-    if published > ceiling { now } else { published }
+    clamped_time(activity.get("published"), now).unwrap_or(now)
 }
 
 #[cfg(test)]

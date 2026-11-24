@@ -33,7 +33,7 @@
 //! their parts together here. The root keeps the shared constants and
 //! re-exports the whole outside-facing surface.
 
-use chrono::{DateTime, TimeDelta, Utc};
+use chrono::{DateTime, Utc};
 use serde_json::Value;
 
 use crate::{
@@ -143,10 +143,6 @@ const MAX_ATTACHMENTS: usize = 20;
 /// local posting limit (`MAX_POLL_OPTIONS` in the config): Pleroma, Akkoma
 /// and Misskey allow larger polls than this server lets users create.
 const MAX_POLL_OPTIONS: usize = 100;
-/// How far into the future a `published` timestamp may lead [`now`] before
-/// it is treated as clock skew and clamped (Pleroma's
-/// `ObjectValidators.Utils`-style tolerance, the Mastodon-family norm).
-const CLOCK_SKEW: TimeDelta = TimeDelta::minutes(5);
 /// The `content_type` a document without `source.mediaType` describes: AP
 /// `content` is HTML (decision 6 stores what the remote rendered).
 const DEFAULT_HTML_CONTENT_TYPE: &str = "text/html";
