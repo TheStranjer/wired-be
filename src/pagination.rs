@@ -109,10 +109,7 @@ impl PageParams {
         default_limit: i64,
         cap: i64,
     ) -> Result<Self, AppError> {
-        let mut raw = RawParams::default();
-        for (key, value) in form_urlencoded::parse(query.unwrap_or_default().as_bytes()) {
-            raw.record(key.as_ref(), value);
-        }
+        let raw = raw_params(query);
         Ok(Self {
             max_id: id_param(raw.max_id.as_deref())?,
             min_id: id_param(raw.min_id.as_deref())?,
@@ -144,39 +141,12 @@ impl PageParams {
     /// page is read newest-first. Pass the fetched rows through
     /// [`Self::finish`] so a response is always newest-first.
     pub fn apply_keyset(&self, qb: &mut QueryBuilder<Postgres>, id_column: &str) {
-        // sqlx's builder methods hand back `&mut Self` for chaining; dropping
-        // that on the floor would be an unused result (decision 14), so each
-        // append binds it to an `_`-named value and lets the borrow end there.
-        if let Some(max_id) = self.max_id {
-            let _with_max: &mut _ = qb
-                .push(" AND ")
-                .push(id_column)
-                .push(" < ")
-                .push_bind(max_id);
-        }
-        if let Some(min_id) = self.min_id {
-            let _with_min: &mut _ = qb
-                .push(" AND ")
-                .push(id_column)
-                .push(" > ")
-                .push_bind(min_id);
-        }
-        if let Some(since_id) = self.since_id {
-            let _with_since: &mut _ = qb
-                .push(" AND ")
-                .push(id_column)
-                .push(" > ")
-                .push_bind(since_id);
-        }
-        let _ordered: &mut _ =
-            qb.push(" ORDER BY ")
-                .push(id_column)
-                .push(if self.min_id.is_some() {
-                    " ASC"
-                } else {
-                    " DESC"
-                });
-        let _limited: &mut _ = qb.push(" LIMIT ").push_bind(self.limit);
+        let cursors = Cursors {
+            max: self.max_id,
+            min: self.min_id,
+            since: self.since_id,
+        };
+        push_keyset(qb, id_column, cursors, Some(self.limit));
     }
 
     /// Brings rows fetched with a query built by [`Self::apply_keyset`] into
@@ -184,11 +154,8 @@ impl PageParams {
     /// read ascending and comes back reversed, every other page is returned
     /// unchanged.
     #[must_use]
-    pub fn finish<T>(&self, mut rows: Vec<T>) -> Vec<T> {
-        if self.min_id.is_some() {
-            rows.reverse();
-        }
-        rows
+    pub fn finish<T>(&self, rows: Vec<T>) -> Vec<T> {
+        reverse_if_min(self.min_id.is_some(), rows)
     }
 }
 
@@ -301,10 +268,7 @@ impl OrdinalPageParams {
     /// [`AppError::BadRequest`] with `"Invalid id"` when `max_id`, `min_id` or
     /// `since_id` is present but is not a number.
     pub fn from_query(query: Option<&str>, cap: i64) -> Result<Self, AppError> {
-        let mut raw = RawParams::default();
-        for (key, value) in form_urlencoded::parse(query.unwrap_or_default().as_bytes()) {
-            raw.record(key.as_ref(), value);
-        }
+        let raw = raw_params(query);
         Ok(Self {
             max_id: ordinal_param(raw.max_id.as_deref())?,
             min_id: ordinal_param(raw.min_id.as_deref())?,
@@ -319,41 +283,85 @@ impl OrdinalPageParams {
     /// `LIMIT` is appended when [`Self::limit`] is `None`, the `limit=0` page
     /// that answers every row.
     pub fn apply_keyset(&self, qb: &mut QueryBuilder<Postgres>, column: &str) {
-        if let Some(max_id) = self.max_id {
-            let _with_max: &mut _ = qb.push(" AND ").push(column).push(" < ").push_bind(max_id);
-        }
-        if let Some(min_id) = self.min_id {
-            let _with_min: &mut _ = qb.push(" AND ").push(column).push(" > ").push_bind(min_id);
-        }
-        if let Some(since_id) = self.since_id {
-            let _with_since: &mut _ = qb
-                .push(" AND ")
-                .push(column)
-                .push(" > ")
-                .push_bind(since_id);
-        }
-        let _ordered: &mut _ = qb
-            .push(" ORDER BY ")
-            .push(column)
-            .push(if self.min_id.is_some() {
-                " ASC"
-            } else {
-                " DESC"
-            });
-        if let Some(limit) = self.limit {
-            let _limited: &mut _ = qb.push(" LIMIT ").push_bind(limit);
-        }
+        let cursors = Cursors {
+            max: self.max_id,
+            min: self.min_id,
+            since: self.since_id,
+        };
+        push_keyset(qb, column, cursors, self.limit);
     }
 
     /// [`PageParams::finish`] for an ordinal page: a `min_id` fetch came back
     /// ascending and goes out reversed, every other page unchanged.
     #[must_use]
-    pub fn finish<T>(&self, mut rows: Vec<T>) -> Vec<T> {
-        if self.min_id.is_some() {
-            rows.reverse();
-        }
-        rows
+    pub fn finish<T>(&self, rows: Vec<T>) -> Vec<T> {
+        reverse_if_min(self.min_id.is_some(), rows)
     }
+}
+
+/// The three keyset cursors of a page, of whatever type the keyset column is.
+struct Cursors<T> {
+    /// `max_id`: rows strictly before this one.
+    max: Option<T>,
+    /// `min_id`: rows strictly after this one, read ascending.
+    min: Option<T>,
+    /// `since_id`: rows strictly after this one, read descending.
+    since: Option<T>,
+}
+
+/// The keyset SQL both page shapes append: each present cursor narrows
+/// `column` (`max` with `<`, `min` and `since` with `>`), the order is
+/// ascending when `min` is present and descending otherwise, and a `limit`
+/// adds a bound `LIMIT`.
+fn push_keyset<'t, T>(
+    qb: &mut QueryBuilder<Postgres>,
+    column: &str,
+    cursors: Cursors<T>,
+    limit: Option<i64>,
+) where
+    T: sqlx::Encode<'t, Postgres> + sqlx::Type<Postgres>,
+{
+    let Cursors { max, min, since } = cursors;
+    // sqlx's builder methods hand back `&mut Self` for chaining; dropping
+    // that on the floor would be an unused result (decision 14), so each
+    // append binds it to an `_`-named value and lets the borrow end there.
+    let ascending = min.is_some();
+    if let Some(max) = max {
+        let _with_max: &mut _ = qb.push(" AND ").push(column).push(" < ").push_bind(max);
+    }
+    if let Some(min) = min {
+        let _with_min: &mut _ = qb.push(" AND ").push(column).push(" > ").push_bind(min);
+    }
+    if let Some(since) = since {
+        let _with_since: &mut _ = qb.push(" AND ").push(column).push(" > ").push_bind(since);
+    }
+    let _ordered: &mut _ =
+        qb.push(" ORDER BY ")
+            .push(column)
+            .push(if ascending { " ASC" } else { " DESC" });
+    if let Some(limit) = limit {
+        let _limited: &mut _ = qb.push(" LIMIT ").push_bind(limit);
+    }
+}
+
+/// Brings rows fetched by a [`push_keyset`] query into newest-first order: a
+/// `min` page was read ascending and is reversed, any other page is returned
+/// unchanged.
+fn reverse_if_min<T>(min_present: bool, mut rows: Vec<T>) -> Vec<T> {
+    if min_present {
+        rows.reverse();
+    }
+    rows
+}
+
+/// Parses a raw query string (`None` is the empty query) into the pagination
+/// keys it holds, the last occurrence of a repeated key winning.
+fn raw_params(query: Option<&str>) -> RawParams<'_> {
+    let mut raw = RawParams::default();
+    for (key, value) in form_urlencoded::parse(query.unwrap_or_default().as_bytes()) {
+        raw.record(key.as_ref(), value);
+    }
+    raw
 }
 
 /// One ordinal cursor: `None` when absent, the number when it parses, a 400
