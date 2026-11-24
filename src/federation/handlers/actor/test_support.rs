@@ -86,7 +86,7 @@ pub(super) fn view(kind: &str, id: &str, actor: &str, object: Value) -> Activity
 }
 
 /// The stored mirror of [`person`], as a completed fetch leaves it and
-/// then aged past the flood guard: the state an `Update` arrives in.
+/// with its fetch stamp aged: the state an `Update` arrives in.
 pub(super) async fn mirror(pool: &PgPool) -> User {
     let stored = upsert_remote_user(pool, parse_actor(&person()).expect("the fixture parses"))
         .await
