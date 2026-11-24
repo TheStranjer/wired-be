@@ -17,10 +17,12 @@
 //!   domain blocks (always applied) and unexpired mutes and thread mutes
 //!   (applied unless `with_muted` is set);
 //! - what the viewer may see at all: [`push_visibility_clause`], always
-//!   applied, on top of the unconditional `deleted_at IS NULL` and the
-//!   author-`is_active` check of `SELECT_SQL` (a scheduled
-//!   `expires_at` is not a filter: an expired row stays readable until the
-//!   sweep takes it, as everywhere else in this schema).
+//!   applied, on top of the unconditional `deleted_at IS NULL` of
+//!   `SELECT_SQL`. A deactivated author's posts are hidden by that clause
+//!   (rule 1b of [`crate::models::status_visibility`]), not by the head of
+//!   the statement (a scheduled `expires_at` is not a filter: an expired row
+//!   stays readable until the sweep takes it, as everywhere else in this
+//!   schema).
 //!
 //! Finally [`PageParams::apply_keyset`] runs on `statuses.id` (decision 4:
 //! `UUIDv7` text sorts by creation, so the cursors are plain id
@@ -85,8 +87,10 @@ use visibility_arms::{push_block_exclusions, push_mute_exclusions};
 /// (`lib/pleroma/activity.ex`), which `fetch_activities` folds into every
 /// timeline read (`lib/pleroma/web/activity_pub/activity_pub.ex`): a
 /// deactivated account's posts leave every timeline while the flag stands,
-/// and come back with it. The admin surfaces read through
-/// [`crate::models::status::admin`] instead and keep seeing everything.
+/// and come back with it. [`push_visibility_clause`] applies the same rule
+/// (rule 1b of [`crate::models::status_visibility`]) to every other reader.
+/// The admin surfaces read through [`crate::models::status::admin`] instead
+/// and keep seeing everything.
 const SELECT_SQL: &str = "SELECT s.* FROM statuses s WHERE s.deleted_at IS NULL";
 
 /// The author of the original a reblog row boosts, as a scalar subquery over
