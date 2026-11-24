@@ -152,11 +152,7 @@ pub(super) async fn interactable_status(
     let row = status_by_reference(state, &reference)
         .await?
         .ok_or(AppError::NotFound)?;
-    if status_visibility::can_view(&state.db, &row, Some(&auth.0)).await? {
-        Ok(row)
-    } else {
-        Err(AppError::NotFound)
-    }
+    status_visibility::require_visible(&state.db, row, Some(&auth.0)).await
 }
 
 /// The status a boost lands on: `row` itself, or its original when the

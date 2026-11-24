@@ -145,11 +145,7 @@ async fn status_by_uri_or_404(
             return Err(AppError::NotFound);
         }
     };
-    if status_visibility::can_view(&state.db, &found, viewer).await? {
-        Ok(found)
-    } else {
-        Err(AppError::NotFound)
-    }
+    status_visibility::require_visible(&state.db, found, viewer).await
 }
 
 /// `GET /api/v1/statuses/{id}/card` — the stored rich-media card of the
