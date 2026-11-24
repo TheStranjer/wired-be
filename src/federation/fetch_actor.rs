@@ -51,8 +51,7 @@ pub use lookup::{
 pub use signer::Signer;
 
 pub(crate) use self::{
-    containment::{ensure_not_redirected, ensure_same_host, names_served_url},
-    fetch::fetch_document,
+    fetch::{ContainmentRules, CrossHost, fetch_contained_document},
     lookup::is_local_ap_id,
     signer::fetch_signer,
 };
