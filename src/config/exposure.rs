@@ -22,7 +22,7 @@ use super::{
     jobs::{RestSettings, rest_settings},
     limits::ContentLimits,
     mail::{MailerSettings, domain_of},
-    parse::{boolean, comma_list},
+    parse::{boolean, comma_list, trimmed, trimmed_url},
     registration::{registration_modes, restrict_areas, signup_and_mail},
     vars::{
         AVAILABLE_FRONTENDS_VAR, INVITES_ENABLED_VAR, REGISTRATIONS_OPEN_VAR,
@@ -153,12 +153,8 @@ where
     F: Fn(&str) -> Option<String>,
 {
     VapidConfig {
-        private_key: lookup(VAPID_PRIVATE_KEY_VAR)
-            .map(|key| key.trim().to_owned())
-            .filter(|key| !key.is_empty()),
-        public_key: lookup(VAPID_PUBLIC_KEY_VAR)
-            .map(|key| key.trim().to_owned())
-            .filter(|key| !key.is_empty()),
+        private_key: trimmed(lookup, VAPID_PRIVATE_KEY_VAR),
+        public_key: trimmed(lookup, VAPID_PUBLIC_KEY_VAR),
     }
 }
 
@@ -186,12 +182,8 @@ where
     let provider = TranslationProvider::parse(&text).ok_or(
         ConfigError::InvalidTranslationProvider(TRANSLATION_PROVIDER_VAR),
     )?;
-    let api_url = lookup(TRANSLATION_API_URL_VAR)
-        .map(|url| url.trim().trim_end_matches('/').to_owned())
-        .filter(|url| !url.is_empty());
-    let api_key = lookup(TRANSLATION_API_KEY_VAR)
-        .map(|key| key.trim().to_owned())
-        .filter(|key| !key.is_empty());
+    let api_url = trimmed_url(lookup, TRANSLATION_API_URL_VAR);
+    let api_key = trimmed(lookup, TRANSLATION_API_KEY_VAR);
     Ok(TranslationConfig {
         provider,
         api_url,
