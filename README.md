@@ -292,7 +292,7 @@ compares is the host of the activity's `actor`:
 | `federated_timeline_removal` | A matching host's notes lose the public address in `to` and gain it in `cc`: they arrive as unlisted |
 | `followers_only` | The public address goes and the author's followers collection takes it in `to`: the note arrives followers-only |
 | `media_removal` | The `attachment` entries of matching hosts' notes are dropped |
-| `media_nsfw` | Matching hosts' notes that carry attachments are marked `sensitive` |
+| `media_nsfw` | Matching hosts' notes are marked `sensitive`, attachments or not |
 | `report_removal` | `Flag` activities (reports) from matching hosts are dropped |
 | `avatar_removal` / `banner_removal` / `background_removal` | `icon` / `image` / `background` are stripped from matching hosts' actor documents, on fetch and on an inbound `Update` |
 

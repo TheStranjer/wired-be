@@ -395,10 +395,11 @@ mod tests {
         );
     }
 
-    /// [`List::MediaNsfw`](crate::federation::mrf::simple::List::MediaNsfw) marks a note that has attachments sensitive —
-    /// one it already was, and nothing a note without media.
+    /// [`List::MediaNsfw`](crate::federation::mrf::simple::List::MediaNsfw)
+    /// marks every note of a listed host sensitive, attachments or not,
+    /// and leaves other hosts and non-note activities alone.
     #[test]
-    fn media_nsfw_marks_notes_that_carry_media() {
+    fn media_nsfw_marks_every_note_of_a_listed_host() {
         let lists = json!({"media_nsfw": ["peer.example"]});
         let expected = {
             let mut marked = create_with_media();
@@ -411,10 +412,28 @@ mod tests {
             expected,
             "the attachment is flagged as the policy asks"
         );
+        let text_only = accepted(&lists, create());
         assert_eq!(
-            accepted(&lists, create()),
+            text_only["object"]["sensitive"],
+            json!(true),
+            "a text-only note is marked too"
+        );
+        let mut unmarked = text_only;
+        let _flag = unmarked["object"]
+            .as_object_mut()
+            .and_then(|o| o.remove("sensitive"));
+        assert_eq!(unmarked, create(), "and nothing else about it changes");
+        let other = json!({"media_nsfw": ["other.example"]});
+        assert_eq!(
+            accepted(&other, create()),
             create(),
-            "a note with no media gets no flag"
+            "a host on neither list is unchanged"
+        );
+        let announce = reacting("Announce", "https://good.example/notes/1");
+        assert_eq!(
+            accepted(&lists, announce.clone()),
+            announce,
+            "an Announce has no embedded note and is untouched"
         );
         let both = json!({"media_nsfw": [PEER], "media_removal": [PEER]});
         let stripped = accepted(&both, create_with_media());
