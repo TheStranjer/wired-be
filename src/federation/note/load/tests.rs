@@ -13,8 +13,9 @@ use crate::{
         media_attachment::{NewMediaAttachment, insert as insert_media},
         poll::{PollParams, create as create_poll},
         status::{NewStatus, insert as insert_status, soft_delete},
-        user::{NewUser, insert as insert_user, local_ap_id},
+        user::{NewUser, insert as insert_user},
     },
+    test_fixtures::local_user as create_local,
     util::{id::new_id, time::mastodon_time},
 };
 
@@ -45,17 +46,6 @@ fn shortcode_scan_reads_complete_references_only() {
         vec!["ok".to_owned()],
         "a bare inner colon does not start what never closes right"
     );
-}
-
-/// The instance origin rows are stored under — [`BASE`], the same
-/// origin [`Config::for_tests`] serves.
-async fn create_local(pool: &PgPool, nickname: &str) -> User {
-    insert_user(
-        pool,
-        &NewUser::local(nickname, &local_ap_id(BASE, nickname)),
-    )
-    .await
-    .expect("fixture user inserts")
 }
 
 /// A mirror of `nickname` on `host`, for mention fixtures.

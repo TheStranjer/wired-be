@@ -10,7 +10,7 @@ use crate::{
         status::{NewStatus, Visibility, insert as insert_status, soft_delete},
         user::{Flag, NewUser, insert as insert_user},
     },
-    test_fixtures::{local_new, local_user as local},
+    test_fixtures::{local_new, local_user as local, remote_user as remote},
 };
 
 /// Rule 1b: a deactivated author's statuses are visible to nobody.
@@ -31,21 +31,6 @@ async fn locked_local(pool: &PgPool, nickname: &str) -> User {
     )
     .await
     .expect("the locked fixture inserts")
-}
-
-/// Inserts a mirror of the remote actor `nickname` on `remote.example`.
-async fn remote(pool: &PgPool, nickname: &str) -> User {
-    insert_user(
-        pool,
-        &NewUser {
-            nickname: format!("{nickname}@remote.example"),
-            ap_id: format!("https://remote.example/users/{nickname}"),
-            domain: Some("remote.example".to_owned()),
-            ..NewUser::default()
-        },
-    )
-    .await
-    .expect("the remote fixture inserts")
 }
 
 /// Inserts `text` as `author`'s status of `visibility`.

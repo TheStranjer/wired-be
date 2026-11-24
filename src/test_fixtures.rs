@@ -17,7 +17,6 @@ use crate::{
 };
 
 /// The host the remote fixtures mirror their actors from.
-#[cfg(test)]
 const REMOTE_HOST: &str = "remote.example";
 
 /// A local [`NewUser`] named `nickname` on the test instance
@@ -43,9 +42,23 @@ pub async fn local_user(pool: &PgPool, nickname: &str) -> User {
         .expect("the local fixture inserts")
 }
 
-/// Inserts a mirror of the remote actor `nickname` on `remote.example`: its
-/// stored nickname is `nickname@remote.example` (decision 7), its `ap_id`
-/// `https://remote.example/users/{nickname}` and its `domain` the host.
+/// A [`NewUser`] mirroring the remote actor `nickname` on `remote.example`.
+///
+/// Its stored nickname is `nickname@remote.example` (decision 7), its `ap_id`
+/// `https://remote.example/users/{nickname}` and its `domain` the host, for
+/// fixtures that adjust a field before inserting.
+#[must_use]
+pub fn remote_new(nickname: &str) -> NewUser {
+    NewUser {
+        nickname: format!("{nickname}@{REMOTE_HOST}"),
+        ap_id: format!("https://{REMOTE_HOST}/users/{nickname}"),
+        domain: Some(REMOTE_HOST.to_owned()),
+        ..NewUser::default()
+    }
+}
+
+/// Inserts a mirror of the remote actor `nickname` on `remote.example`, as
+/// [`remote_new`] shapes it.
 ///
 /// Compiled for the crate's own unit tests only, like [`local_user`].
 ///
@@ -54,17 +67,9 @@ pub async fn local_user(pool: &PgPool, nickname: &str) -> User {
 /// Panics if the insert fails, as a fixture's failure fails its test.
 #[cfg(test)]
 pub async fn remote_user(pool: &PgPool, nickname: &str) -> User {
-    insert(
-        pool,
-        &NewUser {
-            nickname: format!("{nickname}@{REMOTE_HOST}"),
-            ap_id: format!("https://{REMOTE_HOST}/users/{nickname}"),
-            domain: Some(REMOTE_HOST.to_owned()),
-            ..NewUser::default()
-        },
-    )
-    .await
-    .expect("the remote fixture inserts")
+    insert(pool, &remote_new(nickname))
+        .await
+        .expect("the remote fixture inserts")
 }
 
 /// The keys of the JSON object `value`, sorted: the exact key-set
@@ -123,7 +128,17 @@ mod tests {
     }
 
     #[test]
-    fn json_keys_sorts_the_object_keys() {
+    fn remote_new_is_a_mirror_on_the_remote_host() {
+        let new = remote_new("dora");
+
+        assert!(!new.local.get(), "marked remote");
+        assert_eq!(new.nickname, "dora@remote.example", "nickname");
+        assert_eq!(new.ap_id, "https://remote.example/users/dora", "ap_id");
+        assert_eq!(new.domain.as_deref(), Some("remote.example"), "domain");
+    }
+
+    #[test]
+    fn object_keys_come_back_sorted() {
         let value = json!({"zeta": 1, "alpha": {"inner": 2}, "mid": null});
 
         assert_eq!(
@@ -134,12 +149,12 @@ mod tests {
     }
 
     #[test]
-    fn json_keys_of_an_empty_object_is_empty() {
+    fn an_empty_object_has_no_keys() {
         assert!(json_keys(&json!({})).is_empty(), "no keys");
     }
 
     #[test]
-    fn json_keys_of_a_non_object_is_empty() {
+    fn a_non_object_has_no_keys() {
         assert!(json_keys(&json!([1, 2])).is_empty(), "an array has no keys");
     }
 

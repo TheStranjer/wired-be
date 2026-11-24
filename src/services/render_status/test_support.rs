@@ -8,10 +8,13 @@ use crate::{
     config::{Config, TEST_BASE_URL},
     models::{
         status::{NewStatus, Status as StatusRow, insert},
-        user::{self, NewUser, User, local_ap_id},
+        user::User,
     },
     state::AppState,
 };
+
+// A local user named `nickname`.
+pub(super) use crate::test_fixtures::local_user as user;
 
 /// The instance origin the fixtures post under.
 pub(super) const BASE: &str = TEST_BASE_URL;
@@ -20,16 +23,6 @@ pub(super) const BASE: &str = TEST_BASE_URL;
 /// collaborators the renderer never touches.
 pub(super) fn test_state(pool: &PgPool) -> AppState {
     AppState::for_tests(pool.clone(), Config::for_tests())
-}
-
-/// Inserts a local user named `nickname`.
-pub(super) async fn user(pool: &PgPool, nickname: &str) -> User {
-    user::insert(
-        pool,
-        &NewUser::local(nickname, &local_ap_id(BASE, nickname)),
-    )
-    .await
-    .expect("the fixture user inserts")
 }
 
 /// Inserts `text` as a local public status of `author`.

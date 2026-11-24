@@ -17,6 +17,9 @@ use crate::{
     util::time::parse_time,
 };
 
+// The rendered object's keys, sorted, for exact key-set assertions.
+pub(super) use crate::test_fixtures::json_keys;
+
 /// The hyphenated lowercase id every fixture row carries.
 pub(super) const ACCOUNT_ID: &str = "01934567-89ab-7cde-f012-3456789abcde";
 /// A second id, for a fixture account that must not be the same row as
@@ -245,18 +248,6 @@ pub(super) fn pleroma_block(ap_id: &str, accepts_chat: Option<bool>) -> Value {
         "deactivated": false,
         "ap_id": ap_id,
     })
-}
-
-/// The rendered object's keys, sorted, for exact key-set assertions.
-pub(super) fn json_keys(value: &Value) -> Vec<&str> {
-    let mut keys: Vec<&str> = value
-        .as_object()
-        .unwrap()
-        .keys()
-        .map(String::as_str)
-        .collect();
-    keys.sort_unstable();
-    keys
 }
 
 /// A local `alice` whose Pleroma columns are all set: profile tags, a

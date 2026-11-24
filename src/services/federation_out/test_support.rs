@@ -18,9 +18,10 @@ use crate::{
         poll::{self, Poll as PollRow, PollParams},
         report::{self, Report as ReportRow},
         status::{self, NewStatus, Status, Visibility},
-        user::{Flag, NewUser, User, insert, local_ap_id},
+        user::{NewUser, User, insert, local_ap_id},
     },
     state::AppState,
+    test_fixtures::remote_new,
 };
 use serde_json::Value;
 
@@ -64,14 +65,10 @@ pub(super) async fn remote(pool: &PgPool, nickname: &str) -> User {
     insert(
         pool,
         &NewUser {
-            nickname: format!("{nickname}@remote.example"),
-            ap_id: format!("https://remote.example/users/{nickname}"),
-            local: Flag::new(false),
-            domain: Some("remote.example".to_owned()),
             inbox: Some(format!("https://remote.example/users/{nickname}/inbox")),
             shared_inbox: Some("https://remote.example/inbox".to_owned()),
             public_key: Some("PUB".to_owned()),
-            ..NewUser::default()
+            ..remote_new(nickname)
         },
     )
     .await

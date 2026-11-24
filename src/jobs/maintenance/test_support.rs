@@ -9,12 +9,10 @@ use std::time::Duration;
 use sqlx::{PgPool, postgres::PgPoolOptions, query_scalar};
 use uuid::Uuid;
 
-use crate::{
-    config::{Config, TEST_BASE_URL},
-    jobs::AttemptInfo,
-    models::user::{NewUser, User, insert, local_ap_id},
-    state::AppState,
-};
+use crate::{config::Config, jobs::AttemptInfo, state::AppState};
+
+// Inserts a local user named `nickname`.
+pub(super) use crate::test_fixtures::local_user as user;
 
 /// The period the notification sweep is scheduled on: one day.
 pub(super) const EVERY: Duration = Duration::from_hours(24);
@@ -47,16 +45,6 @@ pub(super) async fn broken_state() -> AppState {
         .expect("a lazy pool needs no database");
     pool.close().await;
     app_state(&pool)
-}
-
-/// Inserts a local user named `nickname`.
-pub(super) async fn user(pool: &PgPool, nickname: &str) -> User {
-    insert(
-        pool,
-        &NewUser::local(nickname, &local_ap_id(TEST_BASE_URL, nickname)),
-    )
-    .await
-    .expect("the local fixture inserts")
 }
 
 /// Whether `table` — one of the swept tables, named by the test — still

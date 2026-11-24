@@ -23,11 +23,12 @@ use crate::{
         oauth_token::{self, NewToken},
         scheduled_status::{self, NewScheduledStatus, ScheduledStatus},
         status::{self, NewStatus, Status},
-        user::{self, Flag, NewUser, User, insert, local_ap_id},
+        user::{self, Flag, NewUser, User, insert},
         web_push_subscription::{self, NewSubscription},
     },
     pagination::{MAX_LIMIT, PageParams},
     state::AppState,
+    test_fixtures::local_new,
     uploads::UploaderBackend,
 };
 
@@ -57,7 +58,7 @@ pub(super) async fn locked_user(pool: &PgPool, nickname: &str) -> User {
         pool,
         &NewUser {
             locked: Flag::new(true),
-            ..NewUser::local(nickname, &local_ap_id(TEST_BASE_URL, nickname))
+            ..local_new(nickname)
         },
     )
     .await
@@ -73,7 +74,7 @@ pub(super) async fn local_user(pool: &PgPool, nickname: &str) -> User {
             email: Some(format!("{nickname}@example.org")),
             password_hash: Some("hash-of-a-secret".to_owned()),
             name: nickname.to_owned(),
-            ..NewUser::local(nickname, &local_ap_id(TEST_BASE_URL, nickname))
+            ..local_new(nickname)
         },
     )
     .await

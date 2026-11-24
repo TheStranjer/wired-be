@@ -307,11 +307,8 @@ mod tests {
     use crate::{
         config::{Config, TEST_BASE_URL, Toggle},
         http_client::HttpClient,
-        models::{
-            job::Job,
-            status::NewStatus,
-            user::{NewUser, User, insert, local_ap_id},
-        },
+        models::{job::Job, status::NewStatus, user::User},
+        test_fixtures::{local_user as user, remote_user},
         util::format::text_to_html,
     };
 
@@ -349,31 +346,6 @@ mod tests {
         let mut config = Config::for_tests();
         config.rich_media_remote = Toggle::new(true);
         state_with(pool, config)
-    }
-
-    /// Inserts a local user named `nickname`.
-    async fn user(pool: &PgPool, nickname: &str) -> User {
-        insert(
-            pool,
-            &NewUser::local(nickname, &local_ap_id(TEST_BASE_URL, nickname)),
-        )
-        .await
-        .expect("the local fixture inserts")
-    }
-
-    /// A remote mirror user named `nickname` on `remote.example`.
-    async fn remote_user(pool: &PgPool, nickname: &str) -> User {
-        insert(
-            pool,
-            &NewUser {
-                nickname: format!("{nickname}@remote.example"),
-                ap_id: format!("https://remote.example/users/{nickname}"),
-                domain: Some("remote.example".to_owned()),
-                ..NewUser::default()
-            },
-        )
-        .await
-        .expect("the remote fixture inserts")
     }
 
     /// A local post by `author` at `visibility`, linking `url`.

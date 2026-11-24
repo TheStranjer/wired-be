@@ -65,13 +65,10 @@ mod tests {
 
     use super::*;
     use crate::{
-        config::{Config, TEST_BASE_URL},
+        config::Config,
         jobs::{JobError, QUEUE_BACKGROUND, scheduler::periodic_jobs},
-        models::{
-            idempotency_key::live_status,
-            status::Status,
-            user::{NewUser, User, insert, local_ap_id},
-        },
+        models::{idempotency_key::live_status, status::Status, user::User},
+        test_fixtures::local_user as user,
     };
 
     /// The period the sweep is scheduled on: ten minutes.
@@ -90,16 +87,6 @@ mod tests {
             .expect("a lazy pool needs no database");
         pool.close().await;
         app_state(&pool)
-    }
-
-    /// Inserts a local user named `nickname`.
-    async fn user(pool: &PgPool, nickname: &str) -> User {
-        insert(
-            pool,
-            &NewUser::local(nickname, &local_ap_id(TEST_BASE_URL, nickname)),
-        )
-        .await
-        .expect("the local fixture inserts")
     }
 
     /// The keys still mapping one account's creates, as `(key, status)`

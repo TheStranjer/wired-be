@@ -107,10 +107,11 @@ mod tests {
         config::{Config, TEST_BASE_URL},
         models::{
             report::{Category, NewReport},
-            user::{NewUser, insert, local_ap_id},
+            user::{NewUser, insert},
             webhook,
         },
         services::webhooks::{EVENT_REPORT_UPDATED, KIND_DELIVER},
+        test_fixtures::local_new,
         util::id::new_id,
     };
 
@@ -120,7 +121,7 @@ mod tests {
             pool,
             &NewUser {
                 email: Some(format!("{nickname}@example.org")),
-                ..NewUser::local(nickname, &local_ap_id(TEST_BASE_URL, nickname))
+                ..local_new(nickname)
             },
         )
         .await

@@ -15,7 +15,7 @@ use crate::{
     util::id::assert_local_activity_id,
 };
 
-pub(super) use crate::test_fixtures::local_user;
+pub(super) use crate::test_fixtures::{local_user, remote_user};
 
 /// Inserts a local user named `nickname` whose account is locked, so a
 /// follow of it waits for an answer.
@@ -29,22 +29,6 @@ pub(super) async fn locked_user(pool: &PgPool, nickname: &str) -> User {
     )
     .await
     .expect("the locked fixture inserts")
-}
-
-/// Inserts a mirror of `nickname` on `remote.example`: the account this
-/// instance does not own, whose `Block` activity id is not ours to mint.
-pub(super) async fn remote_user(pool: &PgPool, nickname: &str) -> User {
-    insert(
-        pool,
-        &NewUser {
-            nickname: format!("{nickname}@remote.example"),
-            ap_id: format!("https://remote.example/users/{nickname}"),
-            domain: Some("remote.example".to_owned()),
-            ..NewUser::default()
-        },
-    )
-    .await
-    .expect("the remote fixture inserts")
 }
 
 /// The row of user `id` as it stands now, for reading counters back.

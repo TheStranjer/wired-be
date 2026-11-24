@@ -249,6 +249,7 @@ mod tests {
         config::Config,
         models::notification::GroupInfo,
         models::user::{Flag, User},
+        test_fixtures::json_keys,
     };
 
     /// A group aggregate of two favouriting actors, for the renders.
@@ -482,18 +483,6 @@ mod tests {
         let account = Account::from_user(&actor(), &Config::for_tests());
         serde_json::to_value(Notification::from_row(row, account, None, None, is_muted))
             .expect("an entity serializes")
-    }
-
-    /// The rendered object's keys, sorted, for exact key-set assertions.
-    fn json_keys(value: &Value) -> Vec<&str> {
-        let mut keys: Vec<&str> = value
-            .as_object()
-            .expect("entities render objects")
-            .keys()
-            .map(String::as_str)
-            .collect();
-        keys.sort_unstable();
-        keys
     }
 
     #[test]
