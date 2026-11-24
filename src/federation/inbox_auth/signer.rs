@@ -21,7 +21,7 @@ use crate::{
         json::{as_array, value_or_id},
         signature::verify::key_id_actor,
     },
-    models::user::{User, get_by_ap_id},
+    models::user::{User, get_by_ap_id, get_by_public_key_id},
     state::AppState,
 };
 
@@ -33,10 +33,12 @@ static KEY_REFETCH_STAMPS: Mutex<BTreeMap<String, Instant>> = Mutex::new(BTreeMa
 
 /// Resolves the `keyId` to the actor whose key must verify the signature.
 ///
-/// This is step 5 of the [module docs](super): the mirror of the
-/// fragment-stripped URL answers; a miss fetches that actor; a fetch that
-/// fails on a document that is not an actor retries the `keyId` itself as a
-/// key object, following its `owner`.
+/// This is step 5 of the [module docs](super): the mirror row that stored the
+/// full `keyId` as its `publicKey.id` answers first (the path-style keys of
+/// `GoToSocial`, which no fragment strip reaches); then the mirror of the
+/// fragment-stripped URL; a miss fetches that actor; a fetch that fails on a
+/// document that is not an actor retries the `keyId` itself as a key object,
+/// following its `owner`.
 ///
 /// # Errors
 ///
@@ -48,6 +50,9 @@ pub async fn resolve_signer(
     key_id: &str,
     json: &Value,
 ) -> Result<User, InboxAuthError> {
+    if let Some(stored) = get_by_public_key_id(&state.db, key_id).await? {
+        return Ok(stored);
+    }
     let actor_url = key_id_actor(key_id);
     if let Some(stored) = get_by_ap_id(&state.db, actor_url).await? {
         return Ok(stored);
