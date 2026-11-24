@@ -28,11 +28,6 @@
 //! channel socket (`/socket`) — are deliberately absent; the README's
 //! "API coverage" section names them.
 //!
-//! One row belongs to no Pleroma router: `GET /api/openapi`, Wired's own
-//! surface document. [`crate::api::openapi`] generates that document from
-//! this table, so the route is inventoried beside the ones it describes and
-//! measured by the same gate.
-//!
 //! The table is stored in sections: one child module per surface, each
 //! holding a `pub(super)` `ROWS` slice of its rows. [`ROUTES`] gathers the
 //! sections in table order and [`routes()`] walks their rows; the unit test
@@ -115,8 +110,8 @@ mod tests {
     use super::{AuthClass, ROUTES, RouteSpec, routes};
 
     /// The assembled table is exactly the one that lived in this file before
-    /// the split: twelve sections, none of them empty, 381 rows, opening
-    /// with the `OpenAPI` document route and closing with the instance's HTML
+    /// the split: twelve sections, none of them empty, 372 rows, opening
+    /// with the instance metadata route and closing with the instance's HTML
     /// pages.
     #[test]
     fn routes_assembles_the_whole_table_in_order() {
@@ -128,17 +123,17 @@ mod tests {
         let rows: Vec<&RouteSpec> = routes().collect();
         assert_eq!(
             rows.len(),
-            381,
+            372,
             "the assembled table holds every row exactly once"
         );
         assert_eq!(
             rows.first(),
             Some(&&RouteSpec {
                 method: "GET",
-                path: "/api/openapi",
+                path: "/api/v1/instance",
                 auth: AuthClass::Public,
             }),
-            "the table opens with the OpenAPI document route"
+            "the table opens with the instance metadata route"
         );
         assert_eq!(
             rows.last(),

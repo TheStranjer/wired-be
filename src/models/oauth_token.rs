@@ -31,9 +31,9 @@ use uuid::Uuid;
 
 /// The one-time authorization codes and their exchange.
 mod authorizations;
-/// Deleting tokens: by id, the expired sweep, per user and the revocations.
+/// Deleting tokens: by id, per user and the revocations.
 mod deletes;
-/// Listing a user's tokens, with and without their app names.
+/// Listing a user's still-valid tokens with their app names.
 mod listing;
 /// The fixtures the children's tests share.
 #[cfg(test)]
@@ -47,11 +47,9 @@ mod with_app;
 pub use authorizations::{
     OauthAuthorization, consume_authorization, create_authorization, get_authorization_by_id,
 };
-pub use deletes::{
-    delete_all_for_user, delete_all_for_user_except, delete_expired, delete_for_user, delete_token,
-};
-pub use listing::{TokenWithAppName, list_for_user, list_valid_with_app_names};
-pub use tokens::{consume_refresh_token, create_token, get_by_id, get_valid_token};
+pub use deletes::{delete_all_for_user, delete_all_for_user_except, delete_for_user, delete_token};
+pub use listing::{TokenWithAppName, list_valid_with_app_names};
+pub use tokens::{consume_refresh_token, create_token, get_by_id};
 pub use with_app::{get_by_refresh_token, get_with_app};
 
 /// How long past its `valid_until` a pair's refresh token stays redeemable.
@@ -81,9 +79,13 @@ pub struct OauthToken {
     pub id: Uuid,
     /// The access token, presented as `Authorization: Bearer`. Never in
     /// `Debug` output.
+    ///
+    /// The database stores only its SHA-256 hex digest, so a row read back
+    /// holds the digest; the raw value exists solely on the row
+    /// [`create_token`] returns, once, for the `/oauth/token` response.
     pub token: String,
     /// The refresh token, exchanged for a fresh pair. Never in `Debug`
-    /// output.
+    /// output. Stored as a SHA-256 hex digest like [`token`](Self::token).
     pub refresh_token: String,
     /// The user this token acts as; `None` for an app-only token from
     /// the `client_credentials` grant.
@@ -93,7 +95,7 @@ pub struct OauthToken {
     /// Granted scopes, space-separated (see
     /// [`crate::oauth::scopes::Scopes`]).
     pub scopes: String,
-    /// Expiry; [`get_valid_token`] refuses tokens at or past it.
+    /// Expiry; `crate::auth` refuses tokens at or past it.
     pub valid_until: DateTime<Utc>,
     /// When the row was inserted.
     pub inserted_at: DateTime<Utc>,
@@ -156,7 +158,7 @@ mod tests {
         let db = crate::test_db::test_db().await.expect("test database slot");
         let pool = db.pool().clone();
         assert!(
-            get_valid_token(&pool, "no-such-token")
+            get_with_app(&pool, "no-such-token")
                 .await
                 .unwrap()
                 .is_none(),

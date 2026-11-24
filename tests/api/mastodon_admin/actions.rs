@@ -1,17 +1,20 @@
 //! The umbrella `POST …/{id}/action` over HTTP (WBE-213): `disable` and
-//! `suspend` with their flag move, sweep and entries, the types with nothing
+//! `suspend` with their flag move and entries (neither queues a job, and
+//! `enable` reverses both), the types with nothing
 //! under them, the `report_id` resolution and its guards, the two 422s of an
 //! unusable `type`, and the urlencoded form of decision 10.
 
 use axum::http::StatusCode;
 use serde_json::json;
+use sqlx::PgPool;
 use uuid::Uuid;
+use wired_be::models::{follow, status::Visibility, user::User};
 
-use super::support::NOT_FOUND;
+use super::support::{BASE, NOT_FOUND};
 use super::write_support::{
-    DISABLED, INVALID_TYPE, MISSING_TYPE, WRONG_TARGET, account_action_path, act, file_against,
-    letters, logged, login, one_entry, post_json, report_state, row_state, seed_writes, sweeps_for,
-    token_count, verify,
+    DISABLED, INVALID_TYPE, MISSING_TYPE, WRONG_TARGET, Writes, account_action_path, act,
+    file_against, job_count, letters, logged, login, one_entry, post_json, report_state, row_state,
+    seed_writes, sweeps_for, token_count, verify,
 };
 use crate::common::{self, TestRequest};
 
@@ -82,14 +85,53 @@ async fn the_action_disables_the_account_it_is_pointed_at() {
     assert_eq!(asked_subjects, vec!["plain"], "naming its account");
 }
 
-/// `suspend` deactivates and queues the `users.delete` sweep, answering 200
-/// `{}`; the three warning parameters the client sent alongside are dropped
-/// without a trace, and the two entries name the move and the ask.
+/// What a suspension test starts from: the bearer token of `plain`, one live
+/// post of theirs, an accepted remote follower, and the job-table size before
+/// anything is asked.
+struct Suspendable {
+    /// `plain`'s own `read` bearer token.
+    token: String,
+    /// The live post `plain` made.
+    post: Uuid,
+    /// How many rows the job table held before the action.
+    jobs_before: i64,
+}
+
+/// Gives `plain` a post and a remote follower and counts the queued jobs.
+async fn seed_suspendable(seeded: &Writes) -> Suspendable {
+    let token = common::create_app_and_token(&seeded.pool, &seeded.plain, "read").await;
+    let post = common::create_status(
+        &seeded.pool,
+        &seeded.plain,
+        "still here",
+        Visibility::Public,
+    )
+    .await;
+    let opened = follow::follow(&seeded.pool, BASE, &seeded.mirror, &seeded.plain)
+        .await
+        .expect("the remote follower follows");
+    assert_eq!(
+        opened.state,
+        follow::FollowState::Accepted,
+        "the follow of an open account is granted on the spot"
+    );
+    Suspendable {
+        token,
+        post: post.id,
+        jobs_before: job_count(&seeded.pool).await,
+    }
+}
+
+/// `suspend` deactivates and nothing else, answering 200 `{}`: no job of any
+/// kind is queued (no `users.delete`, nothing to publish), and the post and
+/// the remote follower stay. The three warning parameters the client sent
+/// alongside are dropped without a trace, and the two entries name the move
+/// and the ask.
 #[tokio::test]
-async fn the_action_suspends_and_queues_the_content_sweep() {
+async fn the_action_suspends_without_deleting_or_federating_anything() {
     let db = common::test_db().await;
     let seeded = seed_writes(&db).await;
-    let mine = common::create_app_and_token(&seeded.pool, &seeded.plain, "read").await;
+    let start = seed_suspendable(&seeded).await;
 
     act(
         &seeded.app,
@@ -106,20 +148,29 @@ async fn the_action_suspends_and_queues_the_content_sweep() {
 
     let (active, _, doomed) = row_state(&seeded.pool, seeded.plain.id)
         .await
-        .expect("the row is still there for the sweep to work on");
+        .expect("the row is still there");
     assert!(!active, "suspension deactivates");
+    assert!(!doomed, "and stamps no deletion");
     assert!(
-        !doomed,
-        "and queues the sweep instead of stamping the deletion itself"
+        sweeps_for(&seeded.pool, &seeded.plain).await.is_empty(),
+        "no `users.delete` sweep is queued"
     );
-    let queued = sweeps_for(&seeded.pool, &seeded.plain).await;
-    assert_eq!(queued.len(), 1, "the content sweep is on the queue");
     assert_eq!(
-        queued[0]["user_id"],
-        json!(seeded.plain.id.to_string()),
-        "and names the account it will clear"
+        job_count(&seeded.pool).await,
+        start.jobs_before,
+        "and no job at all, so no actor `Delete` is published"
     );
-    let denied = verify(&seeded.app, &mine).await;
+    assert_eq!(
+        post_count(&seeded.pool, start.post).await,
+        1,
+        "the account's post is still there, live"
+    );
+    assert_eq!(
+        follower_count(&seeded.pool, &seeded.plain).await,
+        1,
+        "and so is the remote follower"
+    );
+    let denied = verify(&seeded.app, &start.token).await;
     common::assert_answer(
         &denied,
         StatusCode::FORBIDDEN,
@@ -129,7 +180,7 @@ async fn the_action_suspends_and_queues_the_content_sweep() {
     assert_eq!(
         token_count(&seeded.pool, &seeded.plain).await,
         1,
-        "the row's own credential is the sweep's business, not this request's"
+        "the row's own credential is left in place"
     );
     assert!(
         letters(&seeded.pool).await.is_empty(),
@@ -149,6 +200,76 @@ async fn the_action_suspends_and_queues_the_content_sweep() {
         vec!["plain"],
         "and the ask is recorded by its type"
     );
+}
+
+/// `enable` reverses a suspension completely: the account is active again,
+/// its own token works, and its post, follower and (empty) job queue are as
+/// they were.
+#[tokio::test]
+async fn enabling_a_suspended_account_restores_it_with_its_data() {
+    let db = common::test_db().await;
+    let seeded = seed_writes(&db).await;
+    let start = seed_suspendable(&seeded).await;
+    act(
+        &seeded.app,
+        &seeded.token,
+        seeded.plain.id,
+        &json!({"type": "suspend"}),
+    )
+    .await;
+
+    let enabled = post_json(
+        &seeded.app,
+        &seeded.token,
+        &account_action_path(seeded.plain.id, "enable"),
+        &json!({}),
+    )
+    .await;
+
+    common::assert_answer(&enabled, StatusCode::OK, "the enable that reverses it");
+    let (active, _, doomed) = row_state(&seeded.pool, seeded.plain.id)
+        .await
+        .expect("the row is still there");
+    assert!(active && !doomed, "the account is active again");
+    let allowed = verify(&seeded.app, &start.token).await;
+    common::assert_answer(&allowed, StatusCode::OK, "with the token it always had");
+    assert_eq!(
+        post_count(&seeded.pool, start.post).await,
+        1,
+        "its post intact"
+    );
+    assert_eq!(
+        follower_count(&seeded.pool, &seeded.plain).await,
+        1,
+        "and its follower intact"
+    );
+    assert_eq!(
+        job_count(&seeded.pool).await,
+        start.jobs_before,
+        "and the whole round trip queued no job"
+    );
+}
+
+/// How many live (not tombstoned) rows `statuses` holds for `id`.
+async fn post_count(pool: &PgPool, id: Uuid) -> i64 {
+    sqlx::query_scalar::<_, i64>(
+        "SELECT count(*) FROM statuses WHERE id = $1 AND deleted_at IS NULL",
+    )
+    .bind(id)
+    .fetch_one(pool)
+    .await
+    .expect("the status count reads back")
+}
+
+/// How many accepted follows of `account` the follow table holds.
+async fn follower_count(pool: &PgPool, account: &User) -> i64 {
+    sqlx::query_scalar::<_, i64>(
+        "SELECT count(*) FROM follows WHERE followee_id = $1 AND state = 'accepted'",
+    )
+    .bind(account.id)
+    .fetch_one(pool)
+    .await
+    .expect("the follower count reads back")
 }
 
 /// `none`, `sensitive` and `silence` are the types with nothing under them:

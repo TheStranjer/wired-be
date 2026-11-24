@@ -4,7 +4,6 @@
 
 use tracing::debug;
 
-use super::transient;
 use crate::{
     api::statuses::action_target_id,
     federation::{
@@ -53,7 +52,12 @@ pub(super) async fn resolve_target(
     };
     if !status_visibility::can_view(&state.db, &target, Some(actor))
         .await
-        .map_err(|err| transient("the visibility read", &err))?
+        .map_err(|err| {
+            FederationError::transient(
+                "could not fold the remote interaction's the visibility read",
+                &err,
+            )
+        })?
     {
         debug!(
             status = %target.id,
@@ -79,7 +83,12 @@ async fn interaction_target(
     }
     let original = status::get_by_id(&state.db, target_id)
         .await
-        .map_err(|err| transient("the original read", &err))?;
+        .map_err(|err| {
+            FederationError::transient(
+                "could not fold the remote interaction's the original read",
+                &err,
+            )
+        })?;
     if original.is_none() {
         debug!(
             reblog = %found.id,

@@ -9,13 +9,13 @@ use sqlx::PgPool;
 use tracing::debug;
 
 use crate::{
-    error::{AppError, AppResult},
+    error::{AppError, AppResult, io_error},
     models::custom_emoji::{self, NewCustomEmoji},
 };
 
 use super::{
     PACK_IMAGE_EXTENSIONS, Pack, PackMeta, emoji_image_url, file_name_valid, list_packs, load_pack,
-    names::io_error, names::pack_name_valid, save_pack, shortcode_valid,
+    names::pack_name_valid, save_pack, shortcode_valid,
 };
 
 /// Pleroma's `import_from_filesystem`: write the missing pack manifests.

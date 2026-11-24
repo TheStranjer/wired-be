@@ -1,9 +1,9 @@
 //! The emailed invite and the registration link: `POST
 //! /users/email_invite` minting the one-time invite, queueing the
-//! `user_invitation` letter carrying the `{BASE_URL}/registration/{token}`
-//! link and logging the create — and refusing Pleroma's 400 without the
-//! `invites_enabled` setting or the address — beside the auth-free
-//! `GET /registration/{token}` redirect the letters carry.
+//! `user_invitation` letter carrying the
+//! `{FRONTEND_BASE_URL}/registration/{token}` link and logging the create —
+//! and refusing Pleroma's 400 without the `invites_enabled` setting or the
+//! address — beside the 404 the backend answers on `/registration/{token}`.
 
 use axum::http::StatusCode;
 use serde_json::{Value, json};
@@ -38,7 +38,7 @@ async fn queued_letters(pool: &PgPool) -> Vec<Value> {
 
 /// The `POST /users/email_invite` success: 204 with an empty body, a
 /// one-time invite in the table, the `user_invitation` letter on the
-/// mailer queue carrying the `{BASE_URL}/registration/{token}` link —
+/// mailer queue carrying the `{FRONTEND_BASE_URL}/registration/{token}` link —
 /// and the `invite_create` log line it records. The optional `name` is
 /// accepted (Pleroma's recipient display name; this mailer addresses
 /// bare recipients).
@@ -83,7 +83,7 @@ async fn email_invite_letters_the_registration_link() {
              Open the following link to register:\n\n\
              https://test.example/registration/{invite_token}\n"
         )),
-        "the letter with its BASE_URL registration link"
+        "the letter with its registration link (the frontend defaults to BASE_URL)"
     );
     assert_eq!(letters[0]["html_body"], Value::Null, "text only");
 
@@ -150,44 +150,59 @@ async fn email_invite_refuses_without_the_setting_or_the_address() {
     );
 }
 
-/// The `GET /registration/{token}` link: a 302 to the same path on
-/// `FRONTEND_BASE_URL` — no auth, no lookup, so an unknown token rides
-/// the same redirect, a configured frontend splits the target, and the
-/// request's own encoding is echoed verbatim.
+/// With a `FRONTEND_BASE_URL` apart from `BASE_URL` the delivered letter
+/// links to the frontend origin — proving which origin is used — and
+/// never names the backend's own.
 #[tokio::test]
-async fn the_registration_link_redirects_to_the_frontend() {
+async fn the_letter_links_to_the_frontend_origin() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let mut split = invites_open_config();
+    split.frontend_base_url = "https://fe.example".to_owned();
+    let app = common::test_app_with_config(pool.clone(), split);
+    let (_, token) = admin(&pool, "invitefrontend", "admin:read admin:write").await;
+
+    let sent = post_invite(
+        &app,
+        &token,
+        INVITE_EMAIL,
+        json!({"email": "friend@example.org"}),
+    )
+    .await;
+    common::assert_answer(&sent, StatusCode::NO_CONTENT, "the emailed invite");
+
+    let stored = stored_invites(&pool).await;
+    let (_, invite_token, _) = &stored[0];
+    let letters = queued_letters(&pool).await;
+    assert_eq!(letters.len(), 1, "one queued send");
+    let body = letters[0]["text_body"]
+        .as_str()
+        .expect("the letter has a text body");
+    assert!(
+        body.contains(&format!("https://fe.example/registration/{invite_token}")),
+        "the frontend origin carries the link: {body}"
+    );
+    assert!(
+        !body.contains("https://test.example"),
+        "and the backend origin does not: {body}"
+    );
+}
+
+/// The backend serves no `/registration/{token}` route: the request is the
+/// app-wide 404, marked with `x-wired-fallback: 1`.
+#[tokio::test]
+async fn the_registration_path_is_the_app_wide_404() {
     let db = common::test_db().await;
     let pool = db.pool().clone();
     let app = common::test_app(pool.clone());
 
-    let unknown = TestRequest::get(&format!("{REGISTRATION}/no-such-invite"))
+    let response = TestRequest::get(&format!("{REGISTRATION}/x"))
         .send(&app)
         .await;
-    common::assert_answer(&unknown, StatusCode::FOUND, "the unauthenticated link");
+    common::assert_answer(&response, StatusCode::NOT_FOUND, "the removed link route");
     assert_eq!(
-        unknown.header("location"),
-        Some("https://test.example/registration/no-such-invite"),
-        "the frontend serves the page; an unknown token redirects the same"
-    );
-
-    let mut split = common::test_config();
-    split.frontend_base_url = "https://fe.example".to_owned();
-    let fe = common::test_app_with_config(pool.clone(), split);
-    let away = TestRequest::get(&format!("{REGISTRATION}/abc123"))
-        .send(&fe)
-        .await;
-    assert_eq!(
-        away.header("location"),
-        Some("https://fe.example/registration/abc123"),
-        "a separate frontend takes the link"
-    );
-
-    let encoded = TestRequest::get(&format!("{REGISTRATION}/a%2Fb"))
-        .send(&app)
-        .await;
-    assert_eq!(
-        encoded.header("location"),
-        Some("https://test.example/registration/a%2Fb"),
-        "the request's own encoding is echoed, not decoded"
+        response.header("x-wired-fallback"),
+        Some("1"),
+        "no handler is routed here"
     );
 }

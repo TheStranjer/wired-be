@@ -34,8 +34,9 @@ pub(super) const NOT_ADMIN: &str = "User is not an admin.";
 pub(super) const NO_ADMIN_READ: &str = "Insufficient permissions: admin:read.";
 /// The 404 body of the admin API's misses.
 pub(super) const NOT_FOUND: &str = "Not found";
-/// The frontend's default avatar, which an account without one renders.
-pub(super) const DEFAULT_AVATAR: &str = "/images/avi.png";
+/// The backend's default avatar (path under the instance origin), which an
+/// account without one renders.
+pub(super) const DEFAULT_AVATAR: &str = "/media/default/avi.png";
 
 /// What the fixture leaves behind for one test.
 pub(super) struct Seeded {
@@ -218,6 +219,12 @@ pub(super) fn mail_config() -> wired_be::config::Config {
 /// The write-scoped token of the freshly seeded fixture's admin.
 pub(super) async fn write_token(seeded: &Seeded) -> String {
     mint(&seeded.pool, &seeded.root, "admin:write:accounts").await
+}
+
+/// A token of the fixture's admin holding only `admin:write:follows`, the
+/// grant of the forced follow pair.
+pub(super) async fn follows_token(seeded: &Seeded) -> String {
+    mint(&seeded.pool, &seeded.root, "admin:write:follows").await
 }
 
 /// A `PATCH` of `path` as `token` with the JSON `body`.

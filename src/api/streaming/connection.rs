@@ -24,12 +24,13 @@ use tracing::{debug, warn};
 use uuid::Uuid;
 
 use crate::{
+    api::timelines::timeline_area,
     auth,
     error::AppResult,
     models::{list, user::User},
     oauth::scopes::{READ_LISTS, Scopes},
     state::AppState,
-    streaming::hub::{StreamEvent, stream_matches},
+    streaming::hub::{StreamEvent, matched_streams, public_stream_name},
 };
 
 use super::{
@@ -37,8 +38,8 @@ use super::{
     facts::parse_uuid,
     filters::Filters,
     names::{
-        AUTHENTICATE, FILTER_TTL, LIST, STREAM_FIELD, SUBSCRIBE, UNSUBSCRIBE, is_user_stream,
-        public_topic, required_scope,
+        AUTHENTICATE, FILTER_TTL, LIST, PUBLIC_LOCAL, PUBLIC_LOCAL_MEDIA, STREAM_FIELD, SUBSCRIBE,
+        UNSUBSCRIBE, is_user_stream, public_topic, required_scope,
     },
     run::heartbeat_period,
 };
@@ -209,6 +210,13 @@ impl Connection {
     /// list are suffixed with what they are about, exactly as Pleroma's
     /// topics are (`hashtag:<tag>`, `list:<id>`).
     ///
+    /// An anonymous socket may not watch a public stream whose
+    /// `RESTRICT_UNAUTHENTICATED` area the instance lists (Pleroma's
+    /// `can_access_stream`): `public:local` and `public:local:media` fall
+    /// under `timelines_local`, every other public stream under
+    /// `timelines_federated`, as [`timeline_area`] chooses for the REST
+    /// timeline too.
+    ///
     /// [`Audience`]: crate::streaming::hub::Audience
     async fn topic_for(&self, name: &str, args: &StreamArgs) -> Result<String, Refusal> {
         if is_user_stream(name) {
@@ -217,7 +225,16 @@ impl Connection {
         if name == LIST {
             return self.list_topic(args).await;
         }
-        public_topic(name, args).ok_or(Refusal::Unknown)
+        let topic = public_topic(name, args).ok_or(Refusal::Unknown)?;
+        if self.reader.is_none()
+            && self.state.config.restricts(timeline_area(matches!(
+                name,
+                PUBLIC_LOCAL | PUBLIC_LOCAL_MEDIA
+            )))
+        {
+            return Err(Refusal::Unauthorized);
+        }
+        Ok(topic)
     }
 
     /// A private user stream: the socket needs a user whose token grants the
@@ -274,11 +291,15 @@ impl Connection {
         self.reader.as_ref().map(Arc::as_ref)
     }
 
-    /// The frame to write for `event`, `None` when this connection may not
-    /// see it: no subscribed stream, an audience it is outside, a
-    /// `local_only` event with no reader to be local for, a reader whose
-    /// filters suppress the entity, or a [`RenderSpec`] hint this
-    /// socket cannot answer for its own viewer.
+    /// The frames to write for `event`: one per subscription of this socket
+    /// the event belongs to, each naming only that subscription in its
+    /// public form (`["user"]`, `["hashtag","rust"]`, …, see
+    /// [`public_stream_name`]) — never the event's internal routing list.
+    /// Empty when this connection may not see the event: no subscribed
+    /// stream, an audience it is outside, a `local_only` event with no
+    /// reader to be local for, a reader whose filters suppress the entity,
+    /// or a [`RenderSpec`] hint this socket cannot answer for its own
+    /// viewer.
     ///
     /// An event that carries its entity as `payload` is written as it is.
     /// An event that carries a [`RenderSpec`] hint instead — what
@@ -296,29 +317,30 @@ impl Connection {
     /// [`status_created`]: crate::services::streaming::status_created
     /// [`status_edited`]: crate::services::streaming::status_edited
     /// [`RenderSpec`]: crate::streaming::hub::RenderSpec
-    pub(super) async fn frame_for(&self, event: &StreamEvent) -> Option<String> {
-        if !stream_matches(&self.subscriptions, event)
-            || !audience_allows(self, event)
-            || !local_allows(self, event)
-        {
-            return None;
+    pub(super) async fn frames_for(&self, event: &StreamEvent) -> Vec<String> {
+        let matched = matched_streams(&self.subscriptions, event);
+        if matched.is_empty() || !audience_allows(self, event) || !local_allows(self, event) {
+            return Vec::new();
         }
-        let payload = payload_for(self, event).await?;
-        if self.filters.suppresses(payload.as_deref()) {
-            return None;
-        }
-        let frame = Frame {
-            stream: event.streams.as_slice(),
-            event: event.event.as_str(),
-            payload: payload.as_deref(),
+        let Some(payload) = payload_for(self, event).await else {
+            return Vec::new();
         };
-        match serde_json::to_string(&frame) {
-            Ok(text) => Some(text),
-            Err(err) => {
-                warn!(%err, "streaming frame could not be serialized");
-                None
+        if self.filters.suppresses(payload.as_deref()) {
+            return Vec::new();
+        }
+        let mut frames = Vec::with_capacity(matched.len());
+        for internal in matched {
+            let frame = Frame {
+                stream: public_stream_name(internal),
+                event: event.event.as_str(),
+                payload: payload.as_deref(),
+            };
+            match serde_json::to_string(&frame) {
+                Ok(text) => frames.push(text),
+                Err(err) => warn!(%err, "streaming frame could not be serialized"),
             }
         }
+        frames
     }
 }
 
@@ -328,9 +350,13 @@ mod tests {
 
     use crate::{
         api::streaming::{
-            names::{DIRECT, USER, USER_NOTIFICATION, USER_PLEROMA_CHAT},
-            test_support::{account, query, state},
+            names::{
+                DIRECT, HASHTAG, PUBLIC, PUBLIC_MEDIA, PUBLIC_REMOTE, PUBLIC_REMOTE_MEDIA, USER,
+                USER_NOTIFICATION, USER_PLEROMA_CHAT,
+            },
+            test_support::{account, app_state_with, query, state},
         },
+        config::Config,
         models::list::NewList,
         oauth::scopes::{READ, READ_NOTIFICATIONS, READ_STATUSES},
     };
@@ -467,6 +493,117 @@ mod tests {
                 "`{scope}` on `{name}`"
             );
         }
+    }
+
+    /// A connection on a state whose `RESTRICT_UNAUTHENTICATED` lists `area`,
+    /// anonymous unless `reader` is given.
+    async fn restricted_connection(
+        db: &crate::test_db::TestDb,
+        area: &str,
+        reader: Option<Arc<User>>,
+    ) -> Connection {
+        let mut config = Config::for_tests();
+        config.restrict_unauthenticated = std::iter::once(area.to_owned()).collect();
+        let mut connection = Connection::new(app_state_with(db.pool(), config), None)
+            .await
+            .unwrap();
+        connection.reader = reader;
+        connection
+    }
+
+    /// The public stream names the `timelines_local` area covers.
+    const LOCAL_STREAMS: [&str; 2] = [PUBLIC_LOCAL, PUBLIC_LOCAL_MEDIA];
+
+    /// The public stream names the `timelines_federated` area covers.
+    const FEDERATED_STREAMS: [&str; 4] = [PUBLIC, PUBLIC_MEDIA, PUBLIC_REMOTE, PUBLIC_REMOTE_MEDIA];
+
+    #[tokio::test]
+    async fn restricted_federated_timelines_refuse_the_anonymous_non_local_streams() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let anonymous = restricted_connection(&db, "timelines_federated", None).await;
+        let args = StreamArgs::default();
+
+        for name in FEDERATED_STREAMS {
+            assert_eq!(
+                anonymous.topic_for(name, &args).await,
+                Err(Refusal::Unauthorized),
+                "an anonymous `{name}` is refused while timelines_federated is restricted"
+            );
+        }
+        let tag = StreamArgs {
+            tag: Some("rust".to_owned()),
+            ..StreamArgs::default()
+        };
+        assert_eq!(
+            anonymous.topic_for(HASHTAG, &tag).await,
+            Err(Refusal::Unauthorized),
+            "a hashtag stream is under the federated area"
+        );
+        for name in LOCAL_STREAMS {
+            assert_eq!(
+                anonymous.topic_for(name, &args).await,
+                Ok(name.to_owned()),
+                "an anonymous `{name}` is not the federated area's business"
+            );
+        }
+
+        let state = anonymous.state.clone();
+        let reader = account(&state, "federated-restricted-reader").await;
+        let signed_in = restricted_connection(&db, "timelines_federated", Some(reader)).await;
+        for name in FEDERATED_STREAMS.into_iter().chain(LOCAL_STREAMS) {
+            assert_eq!(
+                signed_in.topic_for(name, &args).await,
+                Ok(name.to_owned()),
+                "an authenticated `{name}` is always allowed"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn restricted_local_timelines_refuse_only_the_anonymous_local_streams() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let anonymous = restricted_connection(&db, "timelines_local", None).await;
+        let args = StreamArgs::default();
+
+        for name in LOCAL_STREAMS {
+            assert_eq!(
+                anonymous.topic_for(name, &args).await,
+                Err(Refusal::Unauthorized),
+                "an anonymous `{name}` is refused while timelines_local is restricted"
+            );
+        }
+        for name in FEDERATED_STREAMS {
+            assert_eq!(
+                anonymous.topic_for(name, &args).await,
+                Ok(name.to_owned()),
+                "an anonymous `{name}` is not the local area's business"
+            );
+        }
+
+        let state = anonymous.state.clone();
+        let reader = account(&state, "local-restricted-reader").await;
+        let signed_in = restricted_connection(&db, "timelines_local", Some(reader)).await;
+        for name in LOCAL_STREAMS.into_iter().chain(FEDERATED_STREAMS) {
+            assert_eq!(
+                signed_in.topic_for(name, &args).await,
+                Ok(name.to_owned()),
+                "an authenticated `{name}` is always allowed"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_restricted_instance_refuses_the_anonymous_handshake_stream() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let mut connection = restricted_connection(&db, "timelines_federated", None).await;
+
+        let err = connection
+            .open_initial(&query(&[(STREAM_FIELD, PUBLIC)]))
+            .await
+            .expect_err("the restricted public stream does not open anonymously");
+
+        assert_eq!(err.into_response().status(), StatusCode::UNAUTHORIZED);
+        assert!(connection.subscriptions.is_empty(), "nothing was opened");
     }
 
     #[tokio::test]

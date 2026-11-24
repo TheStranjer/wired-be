@@ -21,7 +21,7 @@ use crate::{
         user::User,
     },
     state::AppState,
-    util::time::mastodon_time,
+    util::{id::activity_ap_id, time::mastodon_time},
 };
 
 /// One chat message as the REMOTE counterpart must see it: the stored
@@ -99,10 +99,7 @@ fn chat_create_document(
 ) -> Value {
     json!({
         "@context": note::json_ld_context(&state.config),
-        "id": format!(
-            "{}/activities/{}",
-            state.config.base_url, delivery.message.message_id
-        ),
+        "id": activity_ap_id(&state.config.base_url, delivery.message.message_id),
         "type": "Create",
         "actor": delivery.sender_ap_id,
         "to": [delivery.recipient_ap_id],
@@ -221,6 +218,7 @@ mod tests {
 
     use crate::{
         config::TEST_BASE_URL,
+        federation::note::test_support::{fixture_media, undefined_terms},
         models::chat::{self, NewChatMessage},
         services::federation_out::{
             after_chat_message_deleted_by_admin,
@@ -228,8 +226,65 @@ mod tests {
                 app_state, job_count, local, publish_jobs, remote, state_with, unfederated,
             },
         },
-        util::id::new_id,
+        util::{id::new_id, time::parse_time},
     };
+
+    /// The stored message a delivery fixture renders.
+    fn message_reference() -> ChatMessageReference {
+        let moment = parse_time("2024-01-31T12:34:56.789Z").expect("a fixed moment parses");
+        ChatMessageReference {
+            id: new_id(),
+            chat_id: new_id(),
+            message_id: new_id(),
+            unread: false,
+            inserted_at: moment,
+            sender_id: new_id(),
+            content: "<p>hi</p>".to_owned(),
+            raw_text: "hi".to_owned(),
+            attachment_media_id: None,
+            ap_id: Some(format!("{TEST_BASE_URL}/objects/chat")),
+            idempotency_key: None,
+            message_inserted_at: moment,
+        }
+    }
+
+    /// Every key of the `ChatMessage` object, with and without an
+    /// attachment, is defined in the served schema — `ChatMessage` the type
+    /// and `blurhash` on the media object included.
+    #[test]
+    fn every_term_a_chat_message_emits_is_defined_in_the_served_schema() {
+        let message = message_reference();
+        let delivery = ChatDelivery {
+            ap_id: "https://test.example/objects/chat",
+            message: &message,
+            sender_ap_id: "https://test.example/users/alice",
+            recipient_ap_id: "https://remote.example/users/bob",
+        };
+        let mut media = fixture_media("https://test.example/media/cat.png", "image/png");
+        media.blurhash = Some("UBLHZ;9a".to_owned());
+
+        let bare = chat_message_object(&delivery, None);
+        assert_eq!(
+            undefined_terms(&bare),
+            Vec::<String>::new(),
+            "the text message's keys are all defined"
+        );
+        let with_media = chat_message_object(&delivery, Some(&media));
+        assert!(
+            with_media["attachment"].get("blurhash").is_some(),
+            "the media object carries the blurhash"
+        );
+        assert_eq!(
+            undefined_terms(&with_media),
+            Vec::<String>::new(),
+            "so are the keys of the media object"
+        );
+        let schema = note::litepub_context_json();
+        assert_eq!(
+            schema["@context"]["ChatMessage"], "litepub:ChatMessage",
+            "and the type's own term is defined too"
+        );
+    }
 
     /// The chat gates beside the local-recipient one: an inbound fold's
     /// landing (a remote sender's message, already delivered here), an

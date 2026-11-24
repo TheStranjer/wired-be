@@ -538,3 +538,153 @@ async fn a_non_direct_note_delivered_to_a_personal_inbox_adds_no_mention() {
         "a public post reaches the owner through follows, not a mention"
     );
 }
+
+/// A tagless direct note by `bob` named `n` addressed to `to`.
+fn addressed_note(n: &str, to: &[&str]) -> Value {
+    json!({
+        "id": format!("https://remote.example/objects/{n}"),
+        "type": "Note",
+        "attributedTo": "https://remote.example/users/bob",
+        "to": to,
+        "tag": [],
+        "content": "<p>for you</p>",
+    })
+}
+
+#[tokio::test]
+async fn a_tagless_direct_note_addressed_to_a_local_user_mentions_them() {
+    let db = crate::test_db::test_db().await.expect("test database slot");
+    let pool = db.pool().clone();
+    let state = app_state(&pool);
+    let bob = author(&pool).await;
+    let alice = local_user(&state, "alice").await;
+    let object = addressed_note("ingest-audience-dm", &[alice.ap_id.as_str()]);
+
+    let outcome = ingest_note(&state, &bob, &object)
+        .await
+        .expect("the note ingests");
+
+    let IngestOutcome::Created(row) = outcome else {
+        panic!("a first-seen note must be created, got {outcome:?}");
+    };
+    assert_eq!(
+        row.visibility,
+        Visibility::Direct,
+        "no public, no followers"
+    );
+    assert_eq!(
+        mention_rows(&pool, row.id).await,
+        vec![alice.id],
+        "the addressed local user is a silent mention"
+    );
+    assert!(
+        crate::models::status_visibility::can_view(&pool, &row, Some(&alice))
+            .await
+            .expect("the visibility check runs"),
+        "so she can read it"
+    );
+}
+
+#[tokio::test]
+async fn an_unstored_remote_recipient_is_ignored_and_not_fetched() {
+    let db = crate::test_db::test_db().await.expect("test database slot");
+    let pool = db.pool().clone();
+    let state = app_state(&pool);
+    let bob = author(&pool).await;
+    let object = addressed_note(
+        "ingest-audience-remote",
+        &["https://elsewhere.example/users/zed"],
+    );
+
+    let outcome = ingest_note(&state, &bob, &object)
+        .await
+        .expect("an unknown recipient is no failure");
+
+    let IngestOutcome::Created(row) = outcome else {
+        panic!("the note still ingests, got {outcome:?}");
+    };
+    assert!(
+        mention_rows(&pool, row.id).await.is_empty(),
+        "nobody is mentioned"
+    );
+    let stored = user::get_by_ap_id(&pool, "https://elsewhere.example/users/zed")
+        .await
+        .expect("the lookup runs");
+    assert!(stored.is_none(), "the recipient was never fetched");
+}
+
+#[tokio::test]
+async fn a_remote_account_in_the_audience_is_not_mentioned() {
+    let db = crate::test_db::test_db().await.expect("test database slot");
+    let pool = db.pool().clone();
+    let state = app_state(&pool);
+    let bob = author(&pool).await;
+    let carol = user::insert(
+        &pool,
+        &NewUser {
+            nickname: "carol@remote.example".to_owned(),
+            ap_id: "https://remote.example/users/carol".to_owned(),
+            local: user::Flag::new(false),
+            domain: Some("remote.example".to_owned()),
+            ..NewUser::default()
+        },
+    )
+    .await
+    .expect("the remote account inserts");
+    let object = addressed_note("ingest-audience-stored-remote", &[carol.ap_id.as_str()]);
+
+    let outcome = ingest_note(&state, &bob, &object)
+        .await
+        .expect("the note ingests");
+
+    let IngestOutcome::Created(row) = outcome else {
+        panic!("the note ingests, got {outcome:?}");
+    };
+    assert!(
+        mention_rows(&pool, row.id).await.is_empty(),
+        "only local accounts are linked"
+    );
+}
+
+#[tokio::test]
+async fn a_public_note_addressing_a_local_user_in_cc_links_them_once() {
+    let db = crate::test_db::test_db().await.expect("test database slot");
+    let pool = db.pool().clone();
+    let state = app_state(&pool);
+    let bob = author(&pool).await;
+    let alice = local_user(&state, "alice").await;
+    let mut object = note("ingest-audience-cc");
+    object["cc"] = json!([
+        "https://remote.example/users/bob/followers",
+        alice.ap_id.clone()
+    ]);
+    object["tag"] = json!([{ "type": "Mention", "href": alice.ap_id.clone(), "name": "@alice" }]);
+
+    let outcome = ingest_note(&state, &bob, &object)
+        .await
+        .expect("the note ingests");
+
+    let IngestOutcome::Created(row) = outcome else {
+        panic!("a first-seen note must be created, got {outcome:?}");
+    };
+    assert_eq!(row.visibility, Visibility::Public, "public in to");
+    assert_eq!(
+        mention_rows(&pool, row.id).await,
+        vec![alice.id],
+        "linked once though both the tag and cc name her"
+    );
+
+    let mut untagged = note("ingest-audience-cc-only");
+    untagged["cc"] = json!([alice.ap_id.clone()]);
+    let IngestOutcome::Created(second) = ingest_note(&state, &bob, &untagged)
+        .await
+        .expect("the untagged note ingests")
+    else {
+        panic!("the untagged note writes");
+    };
+    assert_eq!(
+        mention_rows(&pool, second.id).await,
+        vec![alice.id],
+        "cc alone links her too"
+    );
+}

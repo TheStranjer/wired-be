@@ -15,5 +15,6 @@
 
 mod directory;
 mod familiar_birthdays;
+mod familiar_cap;
 mod suggestions;
 mod support;

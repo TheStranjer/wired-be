@@ -1,6 +1,6 @@
 //! The read routes: the pack listing and its pagination, the single-pack
 //! view, the zip archive download, the util emoji map, the static
-//! `GET /emoji/{pack}/{file}` route and the verbs the routes refuse.
+//! `GET /emoji/{pack}/{*file}` route and the verbs the routes refuse.
 
 use axum::http::StatusCode;
 use serde_json::{Value, json};
@@ -8,9 +8,12 @@ use wired_be::{
     config::TEST_BASE_URL,
     models::custom_emoji::{self, NewCustomEmoji},
     services::emoji_packs,
+    util::token::sha256_hex_bytes,
 };
 
-use super::support::{PNG_BYTES, cats_pack, error_message, pack, pack_names, read_zip, seed_pack};
+use super::support::{
+    GIF_BYTES, PNG_BYTES, cats_pack, error_message, pack, pack_names, read_zip, seed_pack,
+};
 use crate::common;
 
 /// `GET /api/v1/pleroma/emoji/packs` lists every pack keyed by name with
@@ -49,7 +52,7 @@ async fn lists_packs_with_their_total_count() {
     assert_eq!(
         body["packs"]["aa"],
         json!({
-            "pack": {"share-files": false},
+            "pack": {"share-files": false, "can-download": false},
             "files": {"a": "a.png", "a2": "a2.gif"},
             "files_count": 2,
         }),
@@ -124,14 +127,21 @@ async fn shows_one_pack_with_files_paginated() {
         .send(&app)
         .await;
     assert_eq!(page.status, StatusCode::OK, "the second page answers");
+    let served = common::TestRequest::get("/api/v1/pleroma/emoji/packs/archive?name=cats")
+        .send(&app)
+        .await;
     assert_eq!(
         page.json_value(),
         json!({
-            "pack": {"share-files": true},
+            "pack": {
+                "share-files": true,
+                "can-download": true,
+                "download-sha256": sha256_hex_bytes(&served.body).to_uppercase(),
+            },
             "files": {"c": "c.png"},
             "files_count": 3,
         }),
-        "one of three shortcodes, counted whole"
+        "one of three shortcodes, counted whole, advertising the served archive"
     );
 
     for (query, want_status, want_body) in [
@@ -153,6 +163,116 @@ async fn shows_one_pack_with_files_paginated() {
             "body for ?{query}"
         );
     }
+}
+
+/// A shared pack advertises `can-download` and a `download-sha256` equal
+/// to the uppercase hex SHA-256 of the body `/packs/archive` serves, on
+/// both `/pack` and `/packs`; an unshared pack advertises
+/// `can-download: false` and no hash.
+#[tokio::test]
+async fn shared_packs_advertise_the_hash_of_the_served_archive() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let dir = tempfile::TempDir::new().unwrap();
+    seed_pack(dir.path(), "cats", &cats_pack()).await;
+    seed_pack(dir.path(), "dogs", &pack(false, &[("dog", "dog.png")])).await;
+    let app = common::test_app_with_emoji_dir(pool, dir.path());
+
+    let archive = common::TestRequest::get("/api/v1/pleroma/emoji/packs/archive?name=cats")
+        .send(&app)
+        .await;
+    assert_eq!(archive.status, StatusCode::OK, "the archive downloads");
+    let expected = sha256_hex_bytes(&archive.body).to_uppercase();
+
+    let shown = common::TestRequest::get("/api/v1/pleroma/emoji/pack?name=cats")
+        .send(&app)
+        .await
+        .json_value();
+    assert_eq!(
+        shown["pack"]["can-download"],
+        json!(true),
+        "a shared pack is downloadable"
+    );
+    assert_eq!(
+        shown["pack"]["download-sha256"],
+        json!(expected),
+        "/pack advertises the hash of the served archive"
+    );
+
+    let listing = common::TestRequest::get("/api/v1/pleroma/emoji/packs")
+        .send(&app)
+        .await
+        .json_value();
+    assert_eq!(
+        listing["packs"]["cats"]["pack"]["download-sha256"],
+        json!(expected),
+        "/packs advertises the same hash"
+    );
+    assert_eq!(
+        listing["packs"]["cats"]["pack"]["can-download"],
+        json!(true),
+        "/packs marks the shared pack downloadable"
+    );
+
+    for body in [
+        common::TestRequest::get("/api/v1/pleroma/emoji/pack?name=dogs")
+            .send(&app)
+            .await
+            .json_value(),
+        listing["packs"]["dogs"].clone(),
+    ] {
+        assert_eq!(
+            body["pack"]["can-download"],
+            json!(false),
+            "an unshared pack is not downloadable"
+        );
+        assert!(
+            body["pack"].get("download-sha256").is_none(),
+            "an unshared pack advertises no hash: {body}"
+        );
+    }
+}
+
+/// A shared pack whose archive cannot be built (a listed file is off
+/// disk) is `can-download: false`, and a digest left in its stored
+/// manifest is never advertised.
+#[tokio::test]
+async fn unbuildable_and_stale_digests_are_not_advertised() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut broken = pack(true, &[("gone", "gone.png")]);
+    broken.pack.download_sha256 = Some("STALE".to_owned());
+    emoji_packs::save_pack(dir.path(), "broken", &broken)
+        .await
+        .unwrap();
+    let mut stale = cats_pack();
+    stale.pack.download_sha256 = Some("STALE".to_owned());
+    seed_pack(dir.path(), "stale", &stale).await;
+    let app = common::test_app_with_emoji_dir(pool, dir.path());
+
+    let shown = common::TestRequest::get("/api/v1/pleroma/emoji/pack?name=broken")
+        .send(&app)
+        .await
+        .json_value();
+    assert_eq!(
+        shown["pack"],
+        json!({"share-files": true, "can-download": false}),
+        "a missing file makes the pack undownloadable and drops the stored digest"
+    );
+
+    let archive = common::TestRequest::get("/api/v1/pleroma/emoji/packs/archive?name=stale")
+        .send(&app)
+        .await;
+    let current = common::TestRequest::get("/api/v1/pleroma/emoji/pack?name=stale")
+        .send(&app)
+        .await
+        .json_value();
+    assert_eq!(
+        current["pack"]["download-sha256"],
+        json!(sha256_hex_bytes(&archive.body).to_uppercase()),
+        "the live digest replaces the stored one"
+    );
 }
 
 /// The archive download: shared packs come back as a zip holding
@@ -370,8 +490,8 @@ async fn static_route_serves_only_pack_images() {
         .await;
     assert_eq!(
         nested.status,
-        StatusCode::NOT_FOUND,
-        "nested files are outside the one-segment route"
+        StatusCode::OK,
+        "nested pack files are served by the wildcard route"
     );
 
     for path in [
@@ -391,6 +511,45 @@ async fn static_route_serves_only_pack_images() {
             Some("application/json"),
             "misses answer as JSON errors, not as files: {path}"
         );
+    }
+}
+
+/// A pack whose `files` value lives in a subdirectory serves at the nested
+/// address `custom_emojis.image_url` stores, flat files still serve, and
+/// traversal, dot-segment and absent nested names answer 404.
+#[tokio::test]
+async fn static_route_serves_nested_pack_files() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let dir = tempfile::TempDir::new().unwrap();
+    let manifest = pack(
+        true,
+        &[("kitten", "sub/kitten.gif"), ("flat", "kitten.gif")],
+    );
+    seed_pack(dir.path(), "cats", &manifest).await;
+    std::fs::write(dir.path().join("cats/sub/kitten.gif"), GIF_BYTES).unwrap();
+    std::fs::write(dir.path().join("cats/sub/.hidden.png"), PNG_BYTES).unwrap();
+    std::fs::write(dir.path().join("cats/kitten.gif"), GIF_BYTES).unwrap();
+    let app = common::test_app_with_emoji_dir(pool, dir.path());
+
+    for path in ["/emoji/cats/sub/kitten.gif", "/emoji/cats/kitten.gif"] {
+        let response = common::TestRequest::get(path).send(&app).await;
+        assert_eq!(response.status, StatusCode::OK, "{path} serves");
+        assert_eq!(response.body.as_ref(), GIF_BYTES, "{path} byte for byte");
+        assert_eq!(
+            response.header("content-type"),
+            Some("image/gif"),
+            "{path} is typed by its extension"
+        );
+    }
+
+    for path in [
+        "/emoji/cats/sub/../pack.json",
+        "/emoji/cats/sub/.hidden.png",
+        "/emoji/cats/sub/missing.png",
+    ] {
+        let miss = common::TestRequest::get(path).send(&app).await;
+        assert_eq!(miss.status, StatusCode::NOT_FOUND, "{path} is a 404");
     }
 }
 

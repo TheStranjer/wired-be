@@ -17,9 +17,11 @@
 //! 2. its follows go through
 //!    [`delete_all_for_user_with_counts`](crate::models::follow::delete_all_for_user_with_counts),
 //!    which also steps the counters of the live peers, and its favourites,
-//!    bookmarks, notifications, lists and media rows go through the
-//!    per-table `delete_all_for_user` writers, each taking exactly what a
-//!    hard delete of the user row would have cascaded;
+//!    emoji reactions, bookmarks, notifications, lists and media rows go
+//!    through the per-table `delete_all_for_user` writers, each taking
+//!    exactly what a hard delete of the user row would have cascaded; the
+//!    statuses, follows, favourites, reactions, bookmarks and notifications
+//!    are the one sweep both deletion kinds share, `clear_shared`;
 //! 3. its scheduled statuses are deleted and each one's pending
 //!    `scheduled_statuses.publish` job is cancelled, so nothing fires as the
 //!    deleted actor;
@@ -38,10 +40,10 @@
 //! ([`crate::federation::handlers::actor`]) marks the mirror inactive and
 //! queues it. The differences are the ones the mirror forces — there is no
 //! personal data to purge, no list to own and no upload to unlink; the
-//! follow half is the same counted sweep, and the reaction half runs through
-//! [`delete_all_for_user`](crate::models::emoji_reaction::delete_all_for_user)
-//! (a local account's reactions leave with its row's cascade; a kept mirror
-//! row keeps them alive until this sweeps them).
+//! follow half is the same counted sweep, and so is the reaction half
+//! ([`delete_all_for_user`](crate::models::emoji_reaction::delete_all_for_user)).
+//! Neither kind deletes the user row, so no cascade ever fires: a kept row
+//! keeps its reactions alive until `clear_shared` sweeps them.
 //!
 //! Every write is idempotent — tombstoning a tombstone clears nothing,
 //! deleting a missing row deletes nothing — so a retried pass converges on
@@ -53,7 +55,8 @@
 //! [`crate::services::federation_out::after_account_deleted`] runs between
 //! loading the account and clearing its rows, because the fan-out to the
 //! remote followers and followees reads the relationships the clear step
-//! deletes.
+//! deletes. A failure to read the recipients or queue the `Delete` retries
+//! the job before anything is cleared.
 
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -67,7 +70,12 @@ mod test_support;
 pub use local::handle_delete;
 pub use remote::handle_delete_remote;
 
-use crate::{error::AppError, jobs::JobError};
+use crate::{
+    error::AppError,
+    jobs::JobError,
+    models::{bookmark, chat, emoji_reaction, favourite, follow, notification, status, user},
+    state::AppState,
+};
 
 /// The job kind of an account deletion, handled by [`handle_delete`] on
 /// [`QUEUE_BACKGROUND`](super::QUEUE_BACKGROUND).
@@ -112,6 +120,69 @@ fn parse_args(args: &Value) -> Result<Uuid, JobError> {
 /// idempotent, so another pass costs nothing but the wait.
 fn retry(err: &AppError) -> JobError {
     JobError::Retry(format!("account delete pass failed: {err}"))
+}
+
+/// How many rows each step of [`clear_shared`] took, for the debug line of
+/// the job that ran it.
+#[derive(Debug, Clone, Copy)]
+struct SweepCounts {
+    /// Statuses tombstoned.
+    statuses: u64,
+    /// Chat messages withdrawn.
+    chat_messages: u64,
+    /// Follow relationships removed, in either direction.
+    follows: u64,
+    /// Favourites removed.
+    favourites: u64,
+    /// Emoji reactions removed.
+    reactions: u64,
+    /// Bookmarks removed.
+    bookmarks: u64,
+    /// Notifications removed, in either role.
+    notifications: u64,
+}
+
+/// The sweep both deletion kinds share: the account's statuses tombstone, its
+/// chat messages are withdrawn, its follows go with the live peers' counters stepped, and its favourites,
+/// emoji reactions, bookmarks and notifications go. Neither kind deletes the
+/// user row, so no cascade does any of this for them.
+///
+/// # Errors
+///
+/// [`JobError::Retry`] on any database failure (see [`retry`]).
+async fn clear_shared(state: &AppState, account: &user::User) -> Result<SweepCounts, JobError> {
+    let db = &state.db;
+    let id = account.id;
+    let statuses = status::soft_delete_all_for_user(db, id)
+        .await
+        .map_err(|err| retry(&err))?;
+    let chat_messages = chat::withdraw_all_from_sender(db, id)
+        .await
+        .map_err(|err| retry(&err))?;
+    let follows = follow::delete_all_for_user_with_counts(db, id)
+        .await
+        .map_err(|err| retry(&err))?;
+    let favourites = favourite::delete_all_for_user(db, id)
+        .await
+        .map_err(|err| retry(&err))?;
+    let reactions = emoji_reaction::delete_all_for_user(db, id)
+        .await
+        .map_err(|err| retry(&err))?;
+    let bookmarks = bookmark::delete_all_for_user(db, id)
+        .await
+        .map_err(|err| retry(&err))?;
+    let notifications = notification::delete_all_for_user(db, id)
+        .await
+        .map_err(|err| retry(&err))?;
+    Ok(SweepCounts {
+        statuses,
+        chat_messages,
+        follows,
+        favourites,
+        reactions,
+        bookmarks,
+        notifications,
+    })
 }
 
 #[cfg(test)]

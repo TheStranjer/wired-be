@@ -14,7 +14,7 @@ use super::*;
 use crate::{
     config::{Config, TEST_BASE_URL},
     jobs::{
-        QUEUE_BACKGROUND,
+        JobError, QUEUE_BACKGROUND,
         maintenance::test_support::{
             FIRST_ATTEMPT, SIX_HOURS, app_state, broken_state, row_exists, state_with_config, user,
         },
@@ -374,7 +374,7 @@ async fn an_unreachable_database_retries_the_media_sweep() {
 
     match outcome {
         Err(JobError::Retry(detail)) => assert!(
-            detail.starts_with("orphaned media sweep failed"),
+            detail.starts_with("orphaned local media deleted failed"),
             "the retry states what failed: {detail}"
         ),
         Ok(()) => panic!("a closed pool must not read as a successful sweep"),

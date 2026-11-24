@@ -37,7 +37,7 @@ below.
 |---|---|---|---|
 | `DATABASE_URL` | yes | | PostgreSQL URL, e.g. `postgres://user:pass@localhost:5432/wired` |
 | `BASE_URL` | yes | | Public origin of this instance, e.g. `https://social.example` (http(s) with a host, no path or query; trailing slash stripped) |
-| `FRONTEND_BASE_URL` | no | `BASE_URL` | Origin the frontend pages are served from; the source of browser redirects such as `/notice/{id}` and of the default-asset URLs (see "Default assets" below; no trailing slash) |
+| `FRONTEND_BASE_URL` | no | `BASE_URL` | Origin the frontend pages are served from; the source of browser redirects such as `/notice/{id}` and `/oauth/authorize` (the consent screen; no trailing slash; the default-asset URLs do not use it, see "Default assets" below) |
 | `BIND_ADDR` | no | `127.0.0.1:4000` | Address the HTTP server listens on |
 | `INSTANCE_NAME` | no | `Wired` | Instance display name |
 | `INSTANCE_DESCRIPTION` | no | `A Wired instance, compatible with Pleroma clients` | Short instance description |
@@ -75,7 +75,7 @@ below.
 | `REGISTRATIONS_APPROVAL_REQUIRED` | no | `false` | Whether a new account waits for staff approval before it may log in: `POST /api/v1/accounts` then answers 200 `{"message":"…","identifier":"awaiting_approval"}` with no token, and every login is 403 `{"error":"Your account is awaiting approval.","identifier":"awaiting_approval"}`; an invite-token registration skips the wait. Reported as `approval_required` on the instance endpoints (`true`/`false`, or `1`/`0`) |
 | `ACCOUNT_ACTIVATION_REQUIRED` | no | `false` | Whether an account must confirm its email address — a new one before it may log in, a changed one before it is carried as confirmed: `POST /api/v1/accounts` then queues the confirmation email (only while `SMTP_HOST` is set) and answers 200 `{"message":"…","identifier":"missing_confirmed_email"}` with no token, an unconfirmed login is 403 `{"error":"Your login is missing a confirmed e-mail address","identifier":"missing_confirmed_email"}`, and `POST /api/pleroma/change_email` leaves the account unconfirmed and queues a confirmation letter for the new address. Reported as `account_activation_required` on the instance endpoints and `accountActivationRequired` on NodeInfo (`true`/`false`, or `1`/`0`) |
 | `SEARCH_STATUSES_UNAUTHENTICATED` | no | `false` | Whether anonymous requests search statuses at `GET /api/v1/search` and `GET /api/v2/search`; while off an unauthenticated search answers an empty `statuses` list (`true`/`false`, or `1`/`0`) |
-| `RESTRICT_UNAUTHENTICATED` | no | | Comma-separated areas an anonymous request may not read, from `timelines_local`, `timelines_federated`, `profiles_local`, `profiles_remote`, `activities_local`, `activities_remote`; an unknown one refuses startup. `GET /api/v1/accounts/{id}/statuses` closes behind `profiles_local` (a local account) and `profiles_remote` (a mirror) with 403 `{"error":"This API requires an authenticated user"}`; `GET /api/v1/timelines/public` closes behind `timelines_local` (its `local=true` read) and `timelines_federated` (every other) with 403 `{"error":"Authentication is required to access this resource."}`; `activities_local` and `activities_remote` name the status reads the later tickets gate |
+| `RESTRICT_UNAUTHENTICATED` | no | | Comma-separated areas an anonymous request may not read, from `timelines_local`, `timelines_federated`, `profiles_local`, `profiles_remote`, `activities_local`, `activities_remote`; an unknown one refuses startup. `GET /api/v1/accounts/{id}/statuses` closes behind `profiles_local` (a local account) and `profiles_remote` (a mirror) with 403 `{"error":"This API requires an authenticated user"}`; `GET /api/v1/timelines/public` closes behind `timelines_local` (its `local=true` read) and `timelines_federated` (every other) with 403 `{"error":"Authentication is required to access this resource."}`; `activities_local` and `activities_remote` close the anonymous status reads of a local and a remote status (a reblog counts as both itself and its original): `GET /api/v1/statuses/{id}` and its `/context`, `/card`, `/history`, `/favourited_by`, `/reblogged_by` and `/quotes` reads answer 404 `{"error":"Record not found"}`, and `GET /api/v1/statuses?id[]=` and the context and quotes listings leave those statuses out; a presented user token is never refused |
 | `AVAILABLE_FRONTENDS` | no | | Comma-separated frontends clients may pick at `PUT /api/v1/pleroma/preferred_frontend`; while empty, the available list is `[]` and every pick is refused with 422 |
 | `FRONTENDS_DIR` | no | `./frontends` | Directory installed frontends live in: `POST /api/v1/pleroma/admin/frontends/install` lands each build at `<FRONTENDS_DIR>/<name>/<ref>`, and the `installed` flag of `GET /api/v1/pleroma/admin/frontends` reads that path |
 | `FRONTENDS_AVAILABLE` | no | `[]` | JSON array of the installable frontends, `[{"name", "git", "build_url", "ref", "build_dir"}]`, of which only `name` is required; a `build_url` may carry `${ref}`; invalid JSON refuses startup |
@@ -127,8 +127,8 @@ below.
 | `TRANSLATION_PROVIDER` | no | `none` | Status translation: `none` turns it off (`POST /api/v1/statuses/{id}/translate` answers 503), `libretranslate` and `deepl` send the status content to that provider's API |
 | `TRANSLATION_API_URL` | no | | The provider's API base URL (no trailing slash), e.g. `https://translate.example` or `https://api-free.deepl.com`; a selected provider without it is left unused, like `none` |
 | `TRANSLATION_API_KEY` | no | | The provider's API key, redacted in logs; `deepl` has no unauthenticated mode and is left unused without one, a self-hosted `libretranslate` usually needs none |
-| `VAPID_PRIVATE_KEY` | no | | The instance's Web Push signing key (ES256, PKCS#8 PEM), redacted in logs; when set it overwrites the pair generated into `instance_secrets` at startup, and the public half is derived from it unless `VAPID_PUBLIC_KEY` pins one |
-| `VAPID_PUBLIC_KEY` | no | | The instance's Web Push public key (URL-safe base64 of the uncompressed P-256 point); the `server_key` the push endpoints and the `Application` entity advertise, and the `vapid_key` / `vapid_public_key` of the app and instance responses |
+| `VAPID_PRIVATE_KEY` | no | | The instance's Web Push signing key (ES256, PKCS#8 PEM), redacted in logs; when set it overwrites the pair generated into `instance_secrets` at startup, and the public half is derived from it |
+| `VAPID_PUBLIC_KEY` | no | | The instance's Web Push public key (URL-safe base64 of the uncompressed P-256 point); the `server_key` the push endpoints and the `Application` entity advertise, and the `vapid_key` / `vapid_public_key` of the app and instance responses. Optional and only a cross-check: it requires `VAPID_PRIVATE_KEY` (alone it is a startup error) and must equal the key derived from it, or startup fails |
 | `RATE_LIMITS_ENABLED` | no | `true` | Whether routes that mount a rate-limit bucket throttle their requests; while off they answer uncounted and without `x-ratelimit-*` headers (`true`/`false`, or `1`/`0`) |
 | `RATE_LIMITS` | no | Pleroma's defaults | Bucket overrides as a comma-separated list of `bucket=max:window_secs` entries; each replaces its bucket's default and an unknown name joins the table, which otherwise is `authentication=20:5, app_account_creation=5:1800, relations_actions=10:10, relation_id_action=2:60, statuses_actions=10:10, status_id_action=2:60, password_reset=5:1800, account_confirmation_resend=5:8600, search=30:60, imports=1:3600`; a bucket off the table is unlimited |
 | `TRUST_PROXY_HEADERS` | no | `false` | Let `X-Forwarded-For` name the client a rate-limit window counts against — the entry `TRUSTED_PROXY_HOPS` places from the right (by default the rightmost, the hop your reverse proxy appended); while off the socket peer always does (`true`/`false`, or `1`/`0`) |
@@ -136,18 +136,21 @@ below.
 
 ### Default assets
 
-wired-be serves API only and ships no files: the four default assets are
-served by the frontend, so their URLs are built from `FRONTEND_BASE_URL`
-(unset or blank, that is `BASE_URL` — a same-origin deployment whose
-reverse proxy routes `/images/*` to the frontend keeps the URLs it has
-now). The frontend must ship exactly these paths under that origin:
+wired-be serves the four default assets itself, from the `/media` tree
+(`src/default_assets.rs`, answered by `GET /media/{key}` ahead of the
+uploads directory), so no frontend files are needed. They are flat-colour
+placeholders rendered in memory on first use; the URLs are built from
+`MEDIA_BASE_URL` (default `{BASE_URL}/media`). If `MEDIA_BASE_URL` points at
+a separate file host, that host must route `/default/*` to the API. An
+uploaded file cannot shadow them: the `default/` key prefix is answered
+before the uploads directory is read.
 
-| Path | Advertised as |
+| Path under `MEDIA_BASE_URL` | Advertised as |
 |---|---|
-| `/images/avi.png` | Default avatar: the `avatar`/`avatar_static` fallback on accounts, and the `icon` fallback of a Web Push notification |
-| `/images/banner.png` | Default banner: the `header`/`header_static` fallback on accounts |
-| `/images/thumbnail.jpg` | Instance thumbnail on `GET /api/v1/instance` and `GET /api/v2/instance` |
-| `/images/mascot.png` | Default mascot on `GET /api/v1/pleroma/mascot` |
+| `/default/avi.png` | Default avatar: the `avatar`/`avatar_static` fallback on accounts, and the `icon` fallback of a Web Push notification |
+| `/default/banner.png` | Default banner: the `header`/`header_static` fallback on accounts |
+| `/default/thumbnail.jpg` | Instance thumbnail on `GET /api/v1/instance` and `GET /api/v2/instance` |
+| `/default/mascot.png` | Default mascot on `GET /api/v1/pleroma/mascot` |
 
 Every setting in that table is a `pub const NAME_VAR` in `src/config.rs`
 (the one place an environment variable name is spelled), and
@@ -253,8 +256,8 @@ grant or revoke `admin` and `moderator`.
 
 Every activity this instance receives or is about to send runs the policy
 chain configured by the admin config store — the `:mrf` entry's fields plus
-the dedicated `:mrf_simple`, `:mrf_keyword`, `:mrf_hellthread` and
-`:mrf_object_age` entries, all in group `:pleroma`, read cached for 30 s and
+the dedicated `:mrf_simple`, `:mrf_keyword`, `:mrf_hellthread`,
+`:mrf_object_age` and `:mrf_hashtag` entries, all in group `:pleroma`, read cached for 30 s and
 editable at runtime through `POST /api/v1/pleroma/admin/config` — with
 `MRF_POLICIES` as the fallback list of names. Stored as one document, the
 chain looks like this:
@@ -292,7 +295,7 @@ compares is the host of the activity's `actor`:
 | `federated_timeline_removal` | A matching host's notes lose the public address in `to` and gain it in `cc`: they arrive as unlisted |
 | `followers_only` | The public address goes and the author's followers collection takes it in `to`: the note arrives followers-only |
 | `media_removal` | The `attachment` entries of matching hosts' notes are dropped |
-| `media_nsfw` | Matching hosts' notes that carry attachments are marked `sensitive` |
+| `media_nsfw` | Matching hosts' notes are marked `sensitive`, attachments or not |
 | `report_removal` | `Flag` activities (reports) from matching hosts are dropped |
 | `avatar_removal` / `banner_removal` / `background_removal` | `icon` / `image` / `background` are stripped from matching hosts' actor documents, on fetch and on an inbound `Update` |
 
@@ -384,7 +387,8 @@ strictly against two thresholds:
 `Create` activities whose embedded object `published` lies further in the
 past than `threshold` seconds (default `604800`, one week; the comparison is
 strict, and an unreadable or future timestamp is never old), and takes every
-action named in `actions`:
+action named in `actions` (Pleroma's default when the key is absent:
+`["delist", "strip_followers"]`; an explicit `[]` runs nothing):
 
 ```json
 { "policies": ["object_age"], "object_age": { "threshold": 604800, "actions": ["delist", "strip_followers"] } }
@@ -400,6 +404,27 @@ The three policies publish their configured subsets as the `mrf_keyword`,
 `mrf_hellthread` and `mrf_objectage` transparency objects beside their
 `KeywordPolicy`, `HellthreadPolicy` and `ObjectAgePolicy` names in
 `mrf_policies`.
+
+`HashtagPolicy` (Pleroma's
+`lib/pleroma/web/activity_pub/mrf/hashtag_policy.ex`) is not named in
+`policies`: like Pleroma, every chain runs it last. It speaks about
+`Create`/`Update` notes of remote actors and compares the names of the note's
+`Hashtag` tags (lowercased, without the `#`) with three lists under the
+`:mrf_hashtag` entry (`hashtag` key of the document); a list left out keeps
+its default:
+
+```json
+{ "hashtag": { "sensitive": ["nsfw"], "reject": [], "federated_timeline_removal": [] } }
+```
+
+| List | Effect of a match |
+|---|---|
+| `sensitive` (default `["nsfw"]`) | The note's `sensitive` flag is set |
+| `reject` | The activity is refused |
+| `federated_timeline_removal` | The public address moves from `to` into `cc`: the note arrives unlisted |
+
+It publishes the effective lists as the `mrf_hashtag` transparency object
+beside the `HashtagPolicy` name in `mrf_policies`.
 
 ### Transparency: publishing the lists
 
@@ -438,9 +463,15 @@ peer list.
 ## OAuth
 
 Third-party clients use the authorization-code flow at `/oauth/authorize`
-and `POST /oauth/token`. A browser `GET`/`POST` of `/oauth/authorize` still
-gets the server-rendered login and consent page. A frontend that renders the
-consent page itself uses the JSON half of the same path instead:
+and `POST /oauth/token`. The consent screen lives at
+`{FRONTEND_BASE_URL}/oauth/authorize`: a browser `GET` of `/oauth/authorize`
+validates the request (`response_type=code`, a registered `client_id` and
+`redirect_uri`, scopes inside the registration) and answers
+`302 Location: {FRONTEND_BASE_URL}/oauth/authorize?<the same query>`, or the
+JSON 400 error with no redirect when validation fails. The server renders no
+login or consent HTML, and a form `POST` (`authorization[name]` and friends)
+is a 400. The frontend logs in with the password grant and then uses the JSON
+half of the path:
 
 - `GET /oauth/authorize?response_type=code&client_id=…&redirect_uri=…&scope=…&state=…`
   with `Accept: application/json` answers
@@ -507,6 +538,11 @@ Routes Pleroma has and Wired deliberately does not:
 | The SPA fallbacks `GET /:maybe_nickname_or_id` and `GET /*path` (and the `OPTIONS /*path` pair) | They hand an unknown path to the frontend's JavaScript router, or answer its preflight. Wired is API-only (see the top of this file), so an unmatched path is the JSON 404 — under `/api` Pleroma's own `api_not_implemented`, elsewhere its plain "Not found". |
 | `GET /users/:nickname/feed` (and its `.atom`/`.rss` forms) and `GET /tags/:tag` | Atom/RSS syndication, not API. Pleroma serves them from its HTML/XML pipeline; Wired is API-only, so the frontend owns HTML and feeds and these paths fall through to the JSON 404. `GET /users/:nickname` still negotiates the `ActivityPub` actor JSON. |
 | `GET/POST /frontend_switcher` | Pleroma's `FrontendSwitcherController`: an HTML radio-list of installed frontends whose POST sets a year-long `preferred_frontend` cookie and redirects to `/`. Wired is API-only and serves no frontend at `/`, so the cookie would select nothing; both methods fall through to the JSON 404. |
+| `GET /embed/:id` and `GET /notice/:id/embed_player` | Pleroma's `EmbedController.show` and `OStatus.notice_player`: server-rendered HTML pages (a status card and a one-attachment media player) served without `X-Frame-Options` so other sites can iframe them. Wired is API-only and serves no framable page; both paths fall through to the JSON 404 (`x-wired-fallback: 1`). A client that wants an embed renders its own from `GET /api/v1/statuses/:id`. `GET /notice/:id` still negotiates the `ActivityPub` Note JSON. |
+| `GET /registration/:token` | Pleroma's invite-link page, which redirects to its own frontend's registration page. Wired is API-only: the invite letter links straight to `{FRONTEND_BASE_URL}/registration/{token}` (the frontend registers through `POST /api/v1/accounts` with the `token` field), so this path falls through to the JSON 404. |
+| `GET/POST /ostatus_subscribe` | Pleroma's remote-follow login page: it takes a username and password from an anonymous client, with no rate limit and without the second factor the OAuth password grant demands, so it is a credential oracle and an MFA bypass. Wired serves no password form outside the throttled `POST /oauth/token`; remote follow lands on the frontend's `/authorize_interaction` page (`GET /authorize_interaction` redirects there) and follows through `POST /api/v1/accounts/:id/follow` with the user's OAuth token. Both methods fall through to the JSON 404 (`x-wired-fallback: 1`). |
+| `GET/POST /main/ostatus` | Pleroma's server-rendered remote-subscribe form (`router.ex` `/main/ostatus`): an HTML page that takes a local nickname and a remote handle and redirects to the remote instance's subscribe template. Wired is API-only; the same lookup is `POST /api/v1/pleroma/remote_interaction` (JSON) and the page flow lives on the frontend's `/authorize_interaction`. The `pleroma:get:main/ostatus` feature flag is no longer advertised, and both methods fall through to the JSON 404 (`x-wired-fallback: 1`). |
+| `GET /manifest.json` | The PWA manifest (`ManifestController`). It is the frontend's asset and the backend serves no HTML that would link it, so the path falls through to the JSON 404; a frontend that wants to be installable ships its own manifest. |
 | The Shout channels socket (`GET /socket`) | Pleroma's browser-notification WebSocket. Wired delivers the same events on `/api/v1/streaming` and over Web Push. |
 
 ## Development

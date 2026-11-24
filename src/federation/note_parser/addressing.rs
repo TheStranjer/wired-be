@@ -31,6 +31,28 @@ pub(crate) fn parse_visibility(json: &Value, author: &User) -> Visibility {
     }
 }
 
+/// The actor ids a document addresses in `to` and `cc`: every recipient
+/// that is neither a [`PUBLIC_RECIPIENTS`] spelling nor `author`'s
+/// followers collection, each once, `to` first. Mastodon's
+/// `process_audience` and Pleroma's `to` check both grant a known local
+/// account named here access without a `Mention` tag; resolving which of
+/// these are local accounts is the ingest's job.
+pub(crate) fn addressed_actor_ids(json: &Value, author: &User) -> Vec<String> {
+    let followers_url = author.followers_url.as_deref();
+    let mut ids: Vec<String> = Vec::new();
+    for recipient in recipients(json, "to")
+        .into_iter()
+        .chain(recipients(json, "cc"))
+    {
+        let is_public = PUBLIC_RECIPIENTS.contains(&recipient.as_str());
+        let is_followers = followers_url == Some(recipient.as_str());
+        if !is_public && !is_followers && !ids.contains(&recipient) {
+            ids.push(recipient);
+        }
+    }
+    ids
+}
+
 /// The recipient strings of an addressing field: every string, reference
 /// object and array of either, flattened through [`as_array`] and
 /// [`value_or_id`].
@@ -139,6 +161,45 @@ mod tests {
                 Visibility::Direct,
             ),
         ]
+    }
+
+    #[test]
+    fn audience_keeps_only_actor_ids() {
+        let alice = "https://us.example/users/alice";
+        let mut document = minimal_note();
+        document["to"] = json!([alice, "as:Public", PUBLIC, FOLLOWERS]);
+        document["cc"] = json!([{"id": alice}, "https://us.example/users/carol", FOLLOWERS]);
+
+        assert_eq!(
+            addressed_actor_ids(&document, &author()),
+            [alice, "https://us.example/users/carol"],
+            "public spellings and the followers url drop; duplicates collapse"
+        );
+    }
+
+    #[test]
+    fn audience_is_empty_without_recipients() {
+        let mut document = minimal_note();
+        remove(&mut document, "to");
+        remove(&mut document, "cc");
+
+        assert!(
+            addressed_actor_ids(&document, &author()).is_empty(),
+            "no lists, no audience"
+        );
+    }
+
+    #[test]
+    fn audience_keeps_a_foreign_followers_collection() {
+        let foreign = "https://other.example/users/x/followers";
+        let mut document = minimal_note();
+        document["to"] = json!([foreign]);
+
+        assert_eq!(
+            addressed_actor_ids(&document, &author()),
+            [foreign],
+            "only the author's own followers url is filtered"
+        );
     }
 
     #[test]

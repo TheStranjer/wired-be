@@ -360,7 +360,7 @@ async fn assert_webfinger_pair(app: &axum::Router, ap_id: &str) {
             links[2],
             json!({
                 "rel": "http://ostatus.org/schema/1.0/subscribe",
-                "template": format!("{BASE}/ostatus_subscribe?acct={{uri}}"),
+                "template": format!("{BASE}/authorize_interaction?uri={{uri}}"),
             }),
             "the subscribe template a remote follow-intent flows through"
         );

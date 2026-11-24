@@ -21,7 +21,7 @@ use crate::common;
 
 /// The redirect URI the app fixture registers.
 pub(super) const REDIRECT: &str = "https://client.example/callback";
-/// The out-of-band redirect URI: the code is shown on a page instead of
+/// The out-of-band redirect URI: the code is answered as JSON instead of
 /// redirected (Pleroma's `@oob_token_redirect_uri`).
 pub(super) const OOB: &str = "urn:ietf:wg:oauth:2.0:oob";
 /// The provider name the fixture configuration answers.

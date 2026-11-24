@@ -12,7 +12,8 @@
 //! first, under the eight pinned keys (the VAPID public key among them,
 //! since push is always configured here), never the secret of an app the
 //! caller merely holds a token for, and needs `read` or `follow`; and
-//! every route answers 401 to an unauthenticated request.
+//! every route answers 401 to an unauthenticated request; the list needs
+//! `read:security` and the revocation `write:security`.
 
 #![cfg(test)]
 
@@ -50,11 +51,10 @@ fn not_found() -> Value {
 
 /// A local user with a live bearer token acting as them.
 ///
-/// The session token deliberately grants the unrelated `push` scope:
-/// the token endpoints require a user, no particular scope (the apps
-/// listing does, see [`read_token`]). The session's app is owned by the
-/// user, so it also belongs in every fixture math for
-/// `/api/v1/pleroma/apps`.
+/// The session token grants `read write`, which covers the
+/// `read:security` and `write:security` scopes the token endpoints
+/// demand. The session's app is owned by the user, so it also belongs in
+/// every fixture math for `/api/v1/pleroma/apps`.
 struct Session {
     /// The created user.
     user: User,
@@ -73,15 +73,20 @@ impl Session {
 async fn session(pool: &PgPool, nickname: &str) -> Session {
     let user = common::create_local_user(pool, nickname).await;
     let app = common::create_app_named(pool, "Session", Some(&user)).await;
-    let token = common::create_token(pool, &user, &app, "push").await;
+    let token = common::create_token(pool, &user, &app, "read write").await;
     Session { user, token }
 }
 
+/// A second token for the session's user carrying exactly `scopes`.
+async fn token_with(pool: &PgPool, session: &Session, scopes: &str) -> OauthToken {
+    let app = common::create_app_named(pool, "Scoped", None).await;
+    common::create_token(pool, &session.user, &app, scopes).await
+}
+
 /// A second token for the session's user carrying the `read` scope, which
-/// `GET /api/v1/pleroma/apps` requires (the session token has only `push`).
+/// `GET /api/v1/pleroma/apps` requires.
 async fn read_token(pool: &PgPool, session: &Session) -> OauthToken {
-    let app = common::create_app_named(pool, "Reader", None).await;
-    common::create_token(pool, &session.user, &app, "read").await
+    token_with(pool, session, "read").await
 }
 
 /// The sorted JSON keys of `entry`.
@@ -347,9 +352,10 @@ async fn pleroma_apps_demand_read_or_follow_scope() {
     let pool = db.pool().clone();
     let alice = session(&pool, "alice").await;
     let router = common::test_app(pool.clone());
+    let push = token_with(&pool, &alice, "push").await;
 
     let denied = common::TestRequest::get(APPS)
-        .bearer(alice.bearer())
+        .bearer(&push.token)
         .send(&router)
         .await;
     assert_eq!(denied.status, StatusCode::FORBIDDEN, "push alone is out");
@@ -393,4 +399,85 @@ async fn every_route_demands_a_user_token() {
             "{label} carries the no-token wording"
         );
     }
+}
+
+/// `GET /api/oauth_tokens` needs `read:security`: a `read` token (which
+/// covers it) lists, a `read:statuses` token is a 403 naming the scope.
+#[tokio::test]
+async fn token_list_demands_read_security_scope() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let alice = session(&pool, "alice").await;
+    let router = common::test_app(pool.clone());
+
+    let read = token_with(&pool, &alice, "read").await;
+    let allowed = common::TestRequest::get(TOKENS)
+        .bearer(&read.token)
+        .send(&router)
+        .await;
+    assert_eq!(allowed.status, StatusCode::OK, "read covers read:security");
+
+    let narrow = token_with(&pool, &alice, "read:statuses").await;
+    let denied = common::TestRequest::get(TOKENS)
+        .bearer(&narrow.token)
+        .send(&router)
+        .await;
+    assert_eq!(denied.status, StatusCode::FORBIDDEN, "read:statuses is out");
+    assert_eq!(
+        denied.json_value(),
+        json!({"error": "Insufficient permissions: read:security."}),
+        "the wording names the missing scope"
+    );
+}
+
+/// `DELETE /api/oauth_tokens/{id}` needs `write:security`: a `write`
+/// token revokes, a `read` token is a 403 and the target keeps working.
+#[tokio::test]
+async fn revoke_demands_write_security_scope() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let alice = session(&pool, "alice").await;
+    let router = common::test_app(pool.clone());
+    let target = token_with(&pool, &alice, "read").await;
+    let reader = token_with(&pool, &alice, "read").await;
+    let writer = token_with(&pool, &alice, "write").await;
+
+    let denied = common::TestRequest::delete(&format!("{TOKENS}/{}", target.id))
+        .bearer(&reader.token)
+        .send(&router)
+        .await;
+    assert_eq!(denied.status, StatusCode::FORBIDDEN, "read cannot revoke");
+    assert_eq!(
+        denied.json_value(),
+        json!({"error": "Insufficient permissions: write:security."}),
+        "the wording names the missing scope"
+    );
+    let still_works = common::TestRequest::get(TOKENS)
+        .bearer(&target.token)
+        .send(&router)
+        .await;
+    assert_eq!(
+        still_works.status,
+        StatusCode::OK,
+        "the target token still authenticates after the refused revoke"
+    );
+
+    let allowed = common::TestRequest::delete(&format!("{TOKENS}/{}", target.id))
+        .bearer(&writer.token)
+        .send(&router)
+        .await;
+    assert_eq!(
+        allowed.status,
+        StatusCode::OK,
+        "write covers write:security"
+    );
+    let gone = common::TestRequest::get(TOKENS)
+        .bearer(&target.token)
+        .send(&router)
+        .await;
+    assert_eq!(
+        gone.status,
+        StatusCode::UNAUTHORIZED,
+        "the target is revoked"
+    );
 }

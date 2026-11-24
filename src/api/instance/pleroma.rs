@@ -1,20 +1,18 @@
 //! The `pleroma` extension block both instance documents carry: the
 //! capability metadata, the federation state, the profile-field limits and
-//! the markup allowances.
+//! the markup allowances. The federation, field-limit and markup blocks are
+//! the ones `NodeInfo` publishes too, defined in
+//! [`crate::services::instance_meta`].
 
 use serde::Serialize;
-use serde_json::{Map, Value};
+use serde_json::Value;
 
 use crate::{
-    config::{Config, Toggle},
-    federation::mrf,
-    services::instance_meta,
+    config::Config,
+    services::instance_meta::{self, Federation, FieldsLimits, Markup, POST_FORMATS},
 };
 
-use super::{
-    ACCOUNT_FIELD_NAME_LENGTH, ACCOUNT_FIELD_VALUE_LENGTH, MAX_ACCOUNT_FIELDS,
-    MAX_REMOTE_ACCOUNT_FIELDS, MONTHLY_ACTIVE_USERS, POST_FORMATS,
-};
+use super::MONTHLY_ACTIVE_USERS;
 
 /// The `pleroma` extension block: Pleroma's own view of the instance
 /// (its `pleroma_configuration`, `instance_view.ex`, restricted to the
@@ -96,125 +94,7 @@ impl PleromaMetadata {
             fields_limits: FieldsLimits::pleroma_defaults(),
             post_formats: &POST_FORMATS,
             restrict_unauthenticated: instance_meta::restrict_unauthenticated(config),
-            markup: Markup::denying(),
-        }
-    }
-}
-
-/// The `pleroma.metadata.federation` block — the same shape `NodeInfo`
-/// reports: a federating instance beside whatever the live MRF chain
-/// publishes under the operator's transparency settings.
-#[derive(Debug, Serialize)]
-pub(super) struct Federation {
-    /// Whether this instance federates.
-    enabled: bool,
-    /// The moderation filters in force, Pleroma-style names in chain
-    /// order (the [MRF](crate::federation::mrf) chain's
-    /// [`describe`](crate::federation::mrf::describe)); empty when
-    /// transparency is off, which publishes no policy at all.
-    mrf_policies: Vec<String>,
-    /// Instances whose posts are held back; none is configured. Absent
-    /// from the transparency-off answer, which keeps only the three keys
-    /// the switch leaves standing.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    quarantined_instances: Option<Vec<&'static str>>,
-    /// Whether the published lists hold back any host
-    /// (`MRF_TRANSPARENCY_EXCLUSIONS` in use); with transparency off,
-    /// false.
-    exclusions: bool,
-    /// Each policy's transparency blocks under the keys they name
-    /// themselves — `mrf_simple`, `mrf_simple_info`, `mrf_<name>` —
-    /// flattened into this object beside the fixed keys.
-    #[serde(flatten)]
-    mrf_descriptions: Map<String, Value>,
-}
-
-impl Federation {
-    /// A plain federating instance with no moderation filters and
-    /// transparency on: what an empty chain publishes, which is the answer
-    /// `federation_block` collapses to when nothing is configured. Test
-    /// support for the document builders; production always reads the live
-    /// chain and the live settings.
-    #[cfg(test)]
-    pub(super) fn federating() -> Self {
-        let published = mrf::ChainTransparency {
-            published: true,
-            ..mrf::ChainTransparency::default()
-        };
-        Self::with_mrf(&published)
-    }
-
-    /// The block of an instance whose chain published `described` (see
-    /// `federation_block`).
-    pub(super) fn with_mrf(described: &mrf::ChainTransparency) -> Self {
-        Self {
-            enabled: true,
-            mrf_policies: described.policies.clone(),
-            quarantined_instances: described.quarantined_instances(),
-            exclusions: described.exclusions,
-            mrf_descriptions: described.descriptions.clone(),
-        }
-    }
-}
-
-/// The `pleroma.metadata.fields_limits` block; unlike `NodeInfo`'s
-/// camelCase `fieldsLimits`, Pleroma writes this one under its own
-/// `snake_case` config names.
-#[derive(Debug, Serialize)]
-struct FieldsLimits {
-    /// Fields one local account may set.
-    max_fields: usize,
-    /// Fields a remote account may carry before they are dropped.
-    max_remote_fields: usize,
-    /// Characters a field name may hold.
-    name_length: usize,
-    /// Characters a field value may hold.
-    value_length: usize,
-}
-
-impl FieldsLimits {
-    /// Pleroma 2.10.2's shipped values; wired-be enforces no stricter
-    /// profile-field settings.
-    const fn pleroma_defaults() -> Self {
-        Self {
-            max_fields: MAX_ACCOUNT_FIELDS,
-            max_remote_fields: MAX_REMOTE_ACCOUNT_FIELDS,
-            name_length: ACCOUNT_FIELD_NAME_LENGTH,
-            value_length: ACCOUNT_FIELD_VALUE_LENGTH,
-        }
-    }
-}
-
-/// The `pleroma.metadata.markup` block: the formatting this instance
-/// allows, as the ticket documents it. The field names drop Pleroma's
-/// `allow_` config prefix for Clippy's `struct_field_names`; `serde`
-/// restores it on the wire, so consumers still read `allow_inline_images`
-/// and friends.
-#[derive(Debug, Serialize)]
-struct Markup {
-    /// Whether a status may show remote images inline; it may not.
-    #[serde(rename = "allow_inline_images")]
-    inline_images: Toggle,
-    /// Whether heading markup survives; it does not.
-    #[serde(rename = "allow_headings")]
-    headings: Toggle,
-    /// Whether tables survive; they do not.
-    #[serde(rename = "allow_tables")]
-    tables: Toggle,
-    /// Whether font styling survives; it does not.
-    #[serde(rename = "allow_fonts")]
-    fonts: Toggle,
-}
-
-impl Markup {
-    /// The markup this instance's sanitizer lets through per the ticket:
-    /// none of the four optional allowances.
-    const fn denying() -> Self {
-        Self {
-            inline_images: Toggle::new(false),
-            headings: Toggle::new(false),
-            tables: Toggle::new(false),
-            fonts: Toggle::new(false),
+            markup: Markup::sanitizer_allowances(),
         }
     }
 }
@@ -267,12 +147,12 @@ mod tests {
         assert_eq!(
             metadata["markup"],
             json!({
-                "allow_inline_images": false,
-                "allow_headings": false,
+                "allow_inline_images": true,
+                "allow_headings": true,
                 "allow_tables": false,
                 "allow_fonts": false,
             }),
-            "the ticket's markup answer"
+            "what the sanitizer lets through"
         );
     }
 }

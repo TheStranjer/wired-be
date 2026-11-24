@@ -25,7 +25,7 @@
 //! (see [`crate::models::follow::unfollow`]), and so does a block of the
 //! pair, in both directions ([`remove_between`]).
 
-use sqlx::{PgConnection, PgPool, Postgres, QueryBuilder};
+use sqlx::{Executor, PgConnection, PgPool, Postgres, QueryBuilder};
 use uuid::Uuid;
 
 use crate::{error::AppResult, models::user::User, pagination::PageParams, util::id::new_id};
@@ -110,11 +110,14 @@ pub async fn endorse(pool: &PgPool, user_id: Uuid, target_id: Uuid) -> AppResult
 ///
 /// Any database failure (connection, encoding) arrives as
 /// [`AppError::Database`](crate::error::AppError).
-pub async fn unendorse(pool: &PgPool, user_id: Uuid, target_id: Uuid) -> AppResult<()> {
+pub async fn unendorse<'e, E>(executor: E, user_id: Uuid, target_id: Uuid) -> AppResult<()>
+where
+    E: Executor<'e, Database = Postgres>,
+{
     sqlx::query(UNENDORSE_SQL)
         .bind(user_id)
         .bind(target_id)
-        .execute(pool)
+        .execute(executor)
         .await
         .map(drop)?;
     Ok(())
@@ -193,22 +196,7 @@ mod tests {
     use sqlx::PgPool;
 
     use super::*;
-    use crate::{
-        config::TEST_BASE_URL,
-        error::AppError,
-        models::user::{NewUser, insert, local_ap_id},
-        pagination::MAX_LIMIT,
-    };
-
-    /// Inserts a local user named `nickname`.
-    async fn user(pool: &PgPool, nickname: &str) -> User {
-        insert(
-            pool,
-            &NewUser::local(nickname, &local_ap_id(TEST_BASE_URL, nickname)),
-        )
-        .await
-        .expect("the local fixture inserts")
-    }
+    use crate::{error::AppError, pagination::MAX_LIMIT, test_fixtures::local_user as user};
 
     /// The ids of the rows of the table, descending — the expected cursor
     /// order for the pagination assertions, read straight from storage so

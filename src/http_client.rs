@@ -12,7 +12,7 @@
 //! guard is on by default and is disabled only by
 //! `HTTP_ALLOW_PRIVATE_HOSTS` (see [`crate::config`]).
 //!
-//! The module is a tree: `headers` holds the header-map, signing and
+//! The module is a tree: `headers` holds the header-map and
 //! body-reading helpers, `response` the [`HttpResponse`] type and `error`
 //! the [`HttpError`] type. The [`HttpClient`] type keeps its one inherent
 //! `impl` block here, so `send` is the child carrying the request-sending
@@ -38,7 +38,7 @@ use url::Url;
 
 use crate::config::Config;
 
-use self::headers::{ap_headers, header_map, read_body, sign_for_send};
+use self::headers::{header_map, read_body};
 
 pub use self::{error::HttpError, response::HttpResponse, ssrf::is_blocked_ip};
 
@@ -48,13 +48,14 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const TOTAL_TIMEOUT: Duration = Duration::from_secs(20);
 /// Redirects followed before the response is handed back unanswered.
 const MAX_REDIRECTS: usize = 5;
+/// Response-body cap (1 MiB) for callers that parse what the peer answers,
+/// matching Mastodon's default; callers that read only the status pick a
+/// tighter cap of their own.
+pub const DEFAULT_RESPONSE_BYTES: usize = 1024 * 1024;
 /// First status code [`HttpResponse::error_for_status`] reports as an error.
 const ERROR_STATUS_MIN: u16 = 400;
 /// Product name the instance identifies itself with in `User-Agent`.
 const USER_AGENT_NAME: &str = "Wired";
-/// Media type federation peers speak: sent as `Content-Type` on signed
-/// POSTs and asked for via `Accept` on signed GETs.
-const ACTIVITY_JSON: &str = "application/activity+json";
 
 /// Formats the instance `User-Agent` header value:
 /// `Wired (<BASE_URL>)`, with `; contact <CONTACT_EMAIL>` appended when a
@@ -67,10 +68,16 @@ pub fn user_agent(base_url: &str, contact_email: Option<&str>) -> String {
 
 /// The shared outbound HTTP client. Cloning is cheap: every clone drives
 /// the same `reqwest` connection pool.
-#[derive(Clone, Debug, Default)]
+///
+/// There is deliberately no `Default`: every constructor goes through
+/// [`HttpClient::new`] or `From<&Config>`, so no client can exist without
+/// the SSRF guard's connect-time halves.
+#[derive(Clone, Debug)]
 pub struct HttpClient {
-    /// The wrapped `reqwest` client.
-    inner: Client,
+    /// The wrapped `reqwest` client, or [`None`] when `reqwest` rejected
+    /// every configuration. A client without the pinned resolver and the
+    /// redirect policy is never substituted: requests fail instead.
+    inner: Option<Client>,
     /// The SSRF guard, or [`None`] when private hosts are allowed (see
     /// `HTTP_ALLOW_PRIVATE_HOSTS`): pre-flight URL checks consult it, while
     /// connect-time and redirect-time checks are baked into `inner`'s
@@ -131,6 +138,17 @@ impl HttpClient {
         Self::configured(Some(user_agent), true, total, MAX_REDIRECTS)
     }
 
+    /// Test-only client whose `reqwest` build failed: no inner client, with
+    /// the SSRF guard enabled or not per `guarded`.
+    #[cfg(test)]
+    #[must_use]
+    fn unavailable(guarded: bool) -> Self {
+        Self {
+            inner: None,
+            ssrf: guarded.then_some(ssrf::SsrfGuard),
+        }
+    }
+
     /// Assembles the real client for the given knobs, degrading in two
     /// steps rather than panicking if `reqwest` rejects the configuration
     /// (which only happens for a `User-Agent` no header value can carry).
@@ -146,9 +164,9 @@ impl HttpClient {
                 error!(%err, "outbound client rejected its User-Agent; rebuilding without it");
                 Self::try_configured(None, allow_private, total, max_redirects).unwrap_or_else(
                     |fallback| {
-                        error!(%fallback, "outbound client rejected its configuration; using reqwest defaults");
+                        error!(%fallback, "outbound client rejected its configuration; outbound requests will fail");
                         Self {
-                            inner: Client::default(),
+                            inner: None,
                             ssrf: (!allow_private).then_some(ssrf::SsrfGuard),
                         }
                     },
@@ -185,7 +203,7 @@ impl HttpClient {
                 .build()?
         };
         Ok(Self {
-            inner,
+            inner: Some(inner),
             ssrf: (!allow_private).then_some(ssrf::SsrfGuard),
         })
     }
@@ -215,30 +233,32 @@ impl HttpClient {
     }
 
     /// Sends `body` with a `POST` to `url`, plus `headers`, and reads the
-    /// full response. Delivery endpoints mostly care about the status; the
-    /// body is buffered because callers routinely log or parse it.
+    /// response, giving up as soon as more than `max_bytes` of body have
+    /// arrived. Delivery endpoints mostly care about the status; the body
+    /// is buffered because callers routinely log or parse it.
     ///
     /// # Errors
     ///
-    /// Same as [`HttpClient::get_limited`], except that the response body
-    /// is read without a size cap, so [`HttpError::TooLarge`] cannot occur.
+    /// Same as [`HttpClient::get_limited`]: an over-long response body is
+    /// [`HttpError::TooLarge`].
     pub async fn post_bytes(
         &self,
         url: &str,
         headers: &[(&str, &str)],
         body: Vec<u8>,
+        max_bytes: usize,
     ) -> Result<HttpResponse, HttpError> {
         let request = self
             .build_request(Method::POST, url, headers)
             .await?
             .body(body);
-        read_body(request.send().await?, usize::MAX).await
+        read_body(request.send().await?, max_bytes).await
     }
 
     /// Sends `method` to `url` with `headers` and reads the full response:
     /// the generic call behind the verbs this client is not otherwise
     /// spelled for — today the media cache's `PURGE` invalidation request
-    /// (see [`crate::api::admin::ops`]).
+    /// (see [`crate::api::admin::ops`]). The body is capped at `max_bytes`.
     ///
     /// # Errors
     ///
@@ -250,9 +270,10 @@ impl HttpClient {
         method: Method,
         url: &str,
         headers: &[(&str, &str)],
+        max_bytes: usize,
     ) -> Result<HttpResponse, HttpError> {
         let request = self.build_request(method, url, headers).await?;
-        read_body(request.send().await?, usize::MAX).await
+        read_body(request.send().await?, max_bytes).await
     }
 
     /// Validates `url` (`http`/`https` only), passes it through the SSRF
@@ -264,8 +285,10 @@ impl HttpClient {
     ///
     /// [`HttpError::InvalidUrl`] for a non-`http(s)` or unparsable URL,
     /// [`HttpError::Connect`] if a header name or value is one HTTP cannot
-    /// represent, since such a request could never leave this process, and
-    /// [`HttpError::Blocked`] when the SSRF guard refuses the target.
+    /// represent, since such a request could never leave this process,
+    /// [`HttpError::Blocked`] when the SSRF guard refuses the target, and
+    /// [`HttpError::Connect`] when no `reqwest` client could be built at
+    /// all (`inner` is [`None`]).
     async fn build_request(
         &self,
         method: Method,
@@ -278,60 +301,16 @@ impl HttpClient {
         if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
             return Err(HttpError::InvalidUrl);
         }
-        let builder = self
-            .inner
+        let Some(inner) = &self.inner else {
+            return Err(HttpError::Connect("outbound client unavailable".to_owned()));
+        };
+        let builder = inner
             .request(method, parsed.as_str())
             .headers(header_map(headers)?);
         if let Some(guard) = &self.ssrf {
             guard.check_target(&parsed).await?;
         }
         Ok(builder)
-    }
-
-    /// Fetches `url` with a `GET` HTTP-signed by the actor key
-    /// `key_id`/`private_pem` (see [`crate::federation::signature`]):
-    /// `Accept: application/activity+json` plus the signed `Host`, `Date`
-    /// and `Signature` headers. This is the shape of an authorized-fetch
-    /// or remote-actor dereference.
-    ///
-    /// # Errors
-    ///
-    /// [`HttpError::Connect`] if the request cannot be signed (`url` is not
-    /// a signable http(s) URL, or `private_pem` does not parse), otherwise
-    /// the same as [`HttpClient::get_limited`] — except that the response
-    /// body is read without a size cap, so [`HttpError::TooLarge`] cannot
-    /// occur.
-    pub async fn signed_get(
-        &self,
-        url: &str,
-        key_id: &str,
-        private_pem: &str,
-    ) -> Result<HttpResponse, HttpError> {
-        let signed = sign_for_send("GET", url, None, key_id, private_pem)?;
-        self.get_limited(url, &ap_headers(&signed, false), usize::MAX)
-            .await
-    }
-
-    /// Delivers `body` to `url` with a HTTP-signed `POST`:
-    /// `Accept` and `Content-Type` of `application/activity+json` plus the
-    /// signed `Host`, `Date`, `Digest` and `Signature` headers. This is the
-    /// shape of an inbox delivery.
-    ///
-    /// # Errors
-    ///
-    /// Same as [`HttpClient::signed_get`] (with `url` also checked for
-    /// signability before anything is sent), then the same as
-    /// [`HttpClient::post_bytes`].
-    pub async fn signed_post(
-        &self,
-        url: &str,
-        body: &[u8],
-        key_id: &str,
-        private_pem: &str,
-    ) -> Result<HttpResponse, HttpError> {
-        let signed = sign_for_send("POST", url, Some(body), key_id, private_pem)?;
-        self.post_bytes(url, &ap_headers(&signed, true), body.to_vec())
-            .await
     }
 }
 
@@ -463,6 +442,38 @@ mod tests {
             "a degraded client still blocks loopback, got {result:?}"
         );
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn unavailable_client_fails_every_verb_without_a_default_client() {
+        let guarded = HttpClient::unavailable(true);
+        let unguarded = HttpClient::unavailable(false);
+        let expected = HttpError::Connect("outbound client unavailable".to_owned());
+
+        for client in [&guarded, &unguarded] {
+            let got = client.get_limited("https://example.com/", &[], 1024).await;
+            assert_eq!(got.err(), Some(expected.clone()), "get_limited");
+            let posted = client
+                .post_bytes("https://example.com/", &[], Vec::new(), 1024)
+                .await;
+            assert_eq!(posted.err(), Some(expected.clone()), "post_bytes");
+            let other = client
+                .request(Method::DELETE, "https://example.com/", &[], 1024)
+                .await;
+            assert_eq!(other.err(), Some(expected.clone()), "request");
+        }
+    }
+
+    #[tokio::test]
+    async fn unavailable_client_still_rejects_invalid_urls_first() {
+        let result = HttpClient::unavailable(true)
+            .get_limited("ftp://example.com/", &[], 1024)
+            .await;
+
+        assert!(
+            matches!(result, Err(HttpError::InvalidUrl)),
+            "URL validation precedes the missing-client error, got {result:?}"
+        );
     }
 
     #[tokio::test]

@@ -7,24 +7,60 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use super::{
-    ReactionSummary,
+    MAX_SUMMARY_REACTORS, ReactionSummary,
     groups::{ReactionRow, ReactorGroup, group},
 };
 use crate::error::AppResult;
 
-/// [`for_statuses`]: every reaction of a batch of statuses, one row per
-/// reaction. `first_at` is the earliest reaction *of the same emoji on the
-/// same status*, so ordering by it and then by the emoji text puts the groups
-/// in the order the roll-up promises and keeps every row of one group next to
-/// its own — which is what [`group`] relies on. The reaction time and then the
-/// row id break ties inside a group, making the reactor order stable. Only the
-/// four columns [`ReactionRow`] names are read; `first_at` exists to be
-/// ordered by.
-pub(super) const FOR_STATUSES_SQL: &str = "SELECT r.status_id, r.emoji, r.url, r.user_id,
-        min(r.inserted_at) OVER (PARTITION BY r.status_id, r.emoji) AS first_at
-    FROM emoji_reactions r
-   WHERE r.status_id = ANY($1)
-ORDER BY r.status_id, first_at, r.emoji, r.inserted_at, r.id";
+/// [`for_statuses`]: one aggregated row per `(status, emoji)` of a batch of
+/// statuses (`$1`), computed in the database so a status with thousands of
+/// reactions still costs one small row per emoji. `$2` is the viewer (`NULL`:
+/// nobody, so `me` is false), `$3` the most reactor ids to list. `url` is the
+/// image of the emoji's earliest reaction that has one, `account_ids` the
+/// earliest reactors (reaction time, then row id, for a stable order) and
+/// `first_at` the emoji's first reaction time, which together with the emoji
+/// text orders a status's groups the way the roll-up promises.
+pub(super) const FOR_STATUSES_SQL: &str = "SELECT status_id, emoji,
+        (array_agg(url ORDER BY inserted_at) FILTER (WHERE url IS NOT NULL))[1] AS url,
+        count(*) AS count,
+        COALESCE(bool_or(user_id = $2::uuid), false) AS me,
+        (array_agg(user_id ORDER BY inserted_at, id))[1:$3::int4] AS account_ids,
+        min(inserted_at) AS first_at
+    FROM emoji_reactions
+   WHERE status_id = ANY($1)
+GROUP BY status_id, emoji
+ORDER BY status_id, first_at, emoji";
+
+/// One fetched row of [`FOR_STATUSES_SQL`]: the roll-up of one emoji on one
+/// status. `first_at` is only ordered by and is not read.
+#[derive(Debug, sqlx::FromRow)]
+struct SummaryRow {
+    /// The reacted-to status, which keys the result.
+    status_id: Uuid,
+    /// The emoji as stored.
+    emoji: String,
+    /// The custom emoji's image URL, if any.
+    url: Option<String>,
+    /// How many accounts reacted with this emoji.
+    count: i64,
+    /// Whether the viewer is among them.
+    me: bool,
+    /// The earliest reactors, at most [`MAX_SUMMARY_REACTORS`].
+    account_ids: Vec<Uuid>,
+}
+
+impl From<SummaryRow> for ReactionSummary {
+    /// The summary of `row`, its status key dropped.
+    fn from(row: SummaryRow) -> Self {
+        Self {
+            name: row.emoji,
+            count: row.count,
+            me: row.me,
+            url: row.url,
+            account_ids: row.account_ids,
+        }
+    }
+}
 
 /// [`reactors`]: one status's reactions, optionally narrowed to the single
 /// emoji `emoji` names (`$2` is that emoji or `NULL` for all of them), in the
@@ -60,16 +96,18 @@ pub async fn for_statuses(
     if status_ids.is_empty() {
         return Ok(HashMap::new());
     }
-    let rows = sqlx::query_as::<_, ReactionRow>(FOR_STATUSES_SQL)
+    let rows = sqlx::query_as::<_, SummaryRow>(FOR_STATUSES_SQL)
         .bind(status_ids)
+        .bind(viewer_id)
+        .bind(i32::try_from(MAX_SUMMARY_REACTORS).unwrap_or(i32::MAX))
         .fetch_all(pool)
         .await?;
     let mut rollups: HashMap<Uuid, Vec<ReactionSummary>> = HashMap::new();
-    for (status_id, reactions) in group(rows) {
+    for row in rows {
         rollups
-            .entry(status_id)
+            .entry(row.status_id)
             .or_default()
-            .push(reactions.into_summary(viewer_id));
+            .push(ReactionSummary::from(row));
     }
     Ok(rollups)
 }
@@ -140,6 +178,47 @@ mod tests {
             "the listed ids are the earliest reactors, in reaction order"
         );
         assert!(summaries[0].me, "the eighth reactor is still `me`");
+    }
+
+    #[tokio::test]
+    async fn seven_reactors_are_counted_and_five_listed_in_reaction_order() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let status_id = post_by(&pool, "author").await;
+        let bystander = user(&pool, "bystander").await;
+        let mut reactors = Vec::new();
+        for n in 0..7 {
+            let reactor = user(&pool, &format!("reactor{n}")).await;
+            react_with(&pool, &reactor, status_id, CAT, Some(CAT_URL)).await;
+            reactors.push(reactor);
+        }
+
+        let summaries = rollup(&pool, status_id, Some(&reactors[6])).await;
+        assert_eq!(summaries.len(), 1, "one row for the (status, emoji) pair");
+        assert_eq!(summaries[0].count, 7, "all seven are counted");
+        assert_eq!(
+            summaries[0].account_ids,
+            reactors
+                .iter()
+                .take(5)
+                .map(|who| who.id)
+                .collect::<Vec<_>>(),
+            "five ids, the earliest reactors, in reaction order"
+        );
+        assert_eq!(
+            summaries[0].url.as_deref(),
+            Some(CAT_URL),
+            "the image survives the aggregation"
+        );
+        assert!(summaries[0].me, "the unlisted seventh reactor is `me`");
+        assert!(
+            !rollup(&pool, status_id, Some(&bystander)).await[0].me,
+            "a viewer who did not react is not `me`"
+        );
+        assert!(
+            !rollup(&pool, status_id, None).await[0].me,
+            "an anonymous viewer is never `me`"
+        );
     }
 
     #[tokio::test]

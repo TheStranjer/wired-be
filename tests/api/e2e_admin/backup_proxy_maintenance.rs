@@ -20,6 +20,7 @@ use wired_be::{
         job::{self, NewJob},
         user::User,
     },
+    util::token::sha256_hex,
 };
 
 use super::mrf::{admin_entry, create_note, deliver};
@@ -273,7 +274,7 @@ async fn seed_sweep_rows(pool: &PgPool) -> Stale {
     let aged = sqlx::query(
         "UPDATE oauth_tokens SET valid_until = now() - interval '8 days' WHERE token = $1",
     )
-    .bind(&stale_token)
+    .bind(sha256_hex(&stale_token))
     .execute(pool)
     .await
     .expect("one token ages out");
@@ -382,7 +383,8 @@ async fn run_sweeps_and_probe(pool: &PgPool, world: &World, seeds: Stale) -> usi
         ),
         (
             "long-expired token",
-            sqlx::query("SELECT 1 FROM oauth_tokens WHERE token = $1").bind(&seeds.expired),
+            sqlx::query("SELECT 1 FROM oauth_tokens WHERE token = $1")
+                .bind(sha256_hex(&seeds.expired)),
         ),
         (
             "stale job row",
@@ -404,7 +406,8 @@ async fn run_sweeps_and_probe(pool: &PgPool, world: &World, seeds: Stale) -> usi
         ),
         (
             "in-grace token",
-            sqlx::query("SELECT 1 FROM oauth_tokens WHERE token = $1").bind(&seeds.live_token),
+            sqlx::query("SELECT 1 FROM oauth_tokens WHERE token = $1")
+                .bind(sha256_hex(&seeds.live_token)),
         ),
     ];
     for (what, probe) in kept {

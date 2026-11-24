@@ -33,7 +33,7 @@
 //! their parts together here. The root keeps the shared constants and
 //! re-exports the whole outside-facing surface.
 
-use chrono::{DateTime, TimeDelta, Utc};
+use chrono::{DateTime, Utc};
 use serde_json::Value;
 
 use crate::{
@@ -59,11 +59,12 @@ pub use types::{
 pub(crate) use addressing::parse_visibility;
 pub(crate) use attachments::pixel_dimension;
 
+use addressing::addressed_actor_ids;
 use attachments::parse_attachments;
 use envelope::{check_containment, check_size, object_id, object_kind, resolve_url};
 use polls::parse_poll;
 use tags::parse_tags;
-use text::{field_reference, parse_sensitive, parse_text, parse_times};
+use text::{field_reference, parse_language, parse_sensitive, parse_text, parse_times};
 
 /// Object `type`s this parser accepts: the eight document kinds Mastodon,
 /// Pleroma and Misskey deliver as createable posts (Pleroma's transmogrifier
@@ -114,10 +115,10 @@ pub(crate) const PUBLIC_RECIPIENTS: [&str; 3] = [
     "Public",
 ];
 
-/// The quote-reference fields, tried in order: Mastodon's and Fedibird's
-/// `quoteUrl`/`quoteUri` and Misskey's `_misskey_quote` (Pleroma's
-/// `CommonFixes.fix_quote_url`).
-const QUOTE_KEYS: [&str; 3] = ["quoteUrl", "quoteUri", "_misskey_quote"];
+/// The quote-reference fields, tried in order: the FEP-044f `quote`,
+/// Mastodon's and Fedibird's `quoteUrl`/`quoteUri` and Misskey's
+/// `_misskey_quote` (Pleroma's `CommonFixes.fix_quote_url`).
+const QUOTE_KEYS: [&str; 4] = ["quote", "quoteUrl", "quoteUri", "_misskey_quote"];
 
 /// The thread-reference fields, tried in order: `context`, the generic
 /// `conversation`, and the `ostatus:conversation` Pleroma writes (whose
@@ -138,15 +139,11 @@ const MAX_SPOILER_CHARS: usize = 1000;
 const MAX_TAGS: usize = 100;
 /// How many attachments are kept at most; the rest of the array is ignored.
 const MAX_ATTACHMENTS: usize = 20;
-/// The fewest poll options a `Question` may carry (Mastodon's client-side
-/// two-option minimum, enforced here on the remote document).
-const MIN_POLL_OPTIONS: usize = 2;
-/// The most poll options a `Question` may carry.
-const MAX_POLL_OPTIONS: usize = 20;
-/// How far into the future a `published` timestamp may lead [`now`] before
-/// it is treated as clock skew and clamped (Pleroma's
-/// `ObjectValidators.Utils`-style tolerance, the Mastodon-family norm).
-const CLOCK_SKEW: TimeDelta = TimeDelta::minutes(5);
+/// How many poll options of a remote `Question` are kept; the rest of the
+/// list is dropped, not an error. A federated cap, deliberately above the
+/// local posting limit (`MAX_POLL_OPTIONS` in the config): Pleroma, Akkoma
+/// and Misskey allow larger polls than this server lets users create.
+const MAX_POLL_OPTIONS: usize = 100;
 /// The `content_type` a document without `source.mediaType` describes: AP
 /// `content` is HTML (decision 6 stores what the remote rendered).
 const DEFAULT_HTML_CONTENT_TYPE: &str = "text/html";
@@ -169,7 +166,7 @@ const DEFAULT_HTML_CONTENT_TYPE: &str = "text/html";
 /// or not an absolute `http(s)` url; [`ParseError::Containment`] when
 /// `attributedTo` fails the authorship or host rules;
 /// [`ParseError::InvalidPoll`] when a `Question`'s option list is missing or
-/// holds fewer than two or more than twenty options.
+/// holds no usable option. A list past the option cap is truncated.
 pub fn parse_note(
     json: &Value,
     author: &User,
@@ -201,12 +198,14 @@ pub fn parse_note(
         edited_at: times.edited_at,
         expires_at: poll.as_ref().and_then(|parsed| parsed.expires_at),
         inserted_at: Some(times.inserted_at),
+        language: parse_language(json),
         ..NewStatus::default()
     };
     Ok(ParsedNote {
         status,
         hashtags: tags.hashtags,
         mention_hrefs: tags.mention_hrefs,
+        audience: addressed_actor_ids(json, author),
         emojis: tags.emojis,
         attachments: parse_attachments(json),
         reply_to_uri: json.get("inReplyTo").and_then(value_or_id),
@@ -218,6 +217,8 @@ pub fn parse_note(
 
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+
     use crate::{federation::note_parser::test_support::*, models::status::Visibility};
 
     #[test]
@@ -345,6 +346,63 @@ mod tests {
         assert_eq!(
             parsed.emojis[0].shortcode, "plainname",
             "colons are optional"
+        );
+    }
+
+    #[test]
+    fn the_fep_044f_quote_feeds_the_quote() {
+        let mut note = minimal_note();
+        note["quote"] = json!("https://a.example/x");
+        assert_eq!(
+            parse(&note).quote_uri.as_deref(),
+            Some("https://a.example/x"),
+            "a bare quote property is the reference"
+        );
+    }
+
+    #[test]
+    fn the_fep_044f_quote_wins_over_the_legacy_keys() {
+        let mut note = minimal_note();
+        note["quote"] = json!("https://a.example/new");
+        note["quoteUrl"] = json!("https://a.example/old");
+        assert_eq!(
+            parse(&note).quote_uri.as_deref(),
+            Some("https://a.example/new"),
+            "quote is tried first"
+        );
+    }
+
+    #[test]
+    fn a_tombstone_quote_falls_back_to_the_next_key() {
+        let mut note = minimal_note();
+        note["quote"] = json!({"type": "Tombstone", "id": "https://a.example/gone"});
+        note["quoteUrl"] = json!("https://a.example/live");
+        assert_eq!(
+            parse(&note).quote_uri.as_deref(),
+            Some("https://a.example/live"),
+            "the Tombstone is skipped for quoteUrl"
+        );
+    }
+
+    #[test]
+    fn a_tombstone_quote_alone_references_nothing() {
+        let mut note = minimal_note();
+        note["quote"] = json!({"type": ["Tombstone"], "id": "https://a.example/gone"});
+        assert_eq!(
+            parse(&note).quote_uri,
+            None,
+            "a Tombstone (even typed by array) is no quote"
+        );
+    }
+
+    #[test]
+    fn a_non_tombstone_quote_object_reads_its_id() {
+        let mut note = minimal_note();
+        note["quote"] = json!({"type": "Note", "id": "https://a.example/obj"});
+        assert_eq!(
+            parse(&note).quote_uri.as_deref(),
+            Some("https://a.example/obj"),
+            "an embedded object references its id"
         );
     }
 }

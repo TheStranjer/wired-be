@@ -12,9 +12,9 @@ use super::{
     ACTOR_FIELDS, DELETE_TYPE, FLAG_TYPE, SimpleConfig, SimplePolicy,
     lists::{List, Reason},
     rewrite::{
-        activity_host, activity_type, actor_document_host, followers_collection, has_attachments,
-        is_note_activity, limit_document, note_object_mut, object_reference_host,
-        rewrite_each_document, unlist_document,
+        activity_host, activity_type, actor_document_host, followers_collection, is_note_activity,
+        limit_document, note_object_mut, object_reference_host, rewrite_each_document,
+        unlist_document,
     },
 };
 
@@ -76,7 +76,8 @@ impl SimplePolicy {
     }
 
     /// `media_removal` strips a note's `attachment` entries; `media_nsfw`
-    /// marks a note that had any `sensitive`.
+    /// marks every note `sensitive`, with or without attachments, as
+    /// Pleroma's `check_media_nsfw` does.
     fn rewrite_media(&self, activity: &mut Value, host: &str) {
         let strip = self.config.matches(List::MediaRemoval, host);
         let mark = self.config.matches(List::MediaNsfw, host);
@@ -86,11 +87,10 @@ impl SimplePolicy {
         let Some(object) = note_object_mut(activity) else {
             return;
         };
-        let had_media = has_attachments(object);
         if strip {
             let _gone = object.remove("attachment");
         }
-        if mark && had_media {
+        if mark {
             let _previous = object.insert("sensitive".to_owned(), Value::Bool(true));
         }
     }

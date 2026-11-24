@@ -23,8 +23,8 @@ pub enum ParseError {
     /// `attributedTo` is unusable or names someone else, or its host differs
     /// from the object id's host (Pleroma's `validate_host_match`).
     Containment(String),
-    /// A `Question` whose `oneOf`/`anyOf` is absent or holds fewer than
-    /// two or more than twenty options.
+    /// A `Question` whose `oneOf`/`anyOf` is absent or holds no option with
+    /// a name. A list that is merely too long is truncated, not rejected.
     InvalidPoll(String),
     /// The document, serialized, is larger than two mebibytes.
     TooLarge,
@@ -64,6 +64,10 @@ pub struct ParsedNote {
     /// The `href`s of the `Mention` tags, in document order; resolving them
     /// to user ids is the dispatcher's job.
     pub mention_hrefs: Vec<String>,
+    /// The actor ids addressed in `to` and `cc` — neither a public
+    /// spelling nor the author's followers collection — whether or not a
+    /// `Mention` tag names them; the dispatcher keeps the local accounts.
+    pub audience: Vec<String>,
     /// The `Emoji` tags as remote custom emojis to upsert.
     pub emojis: Vec<RemoteEmoji>,
     /// The `attachment` entries kept as media to store, in document order.

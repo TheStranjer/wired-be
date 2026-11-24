@@ -6,25 +6,11 @@ use chrono::{DateTime, TimeZone as _, Utc};
 use serde_json::Value;
 use sqlx::PgPool;
 
-use crate::{
-    config::TEST_BASE_URL,
-    models::user::{NewUser, User, insert as insert_user, local_ap_id},
-};
+use crate::models::user::User;
 
 use super::{NewScheduledStatus, ScheduledStatus, insert};
 
-/// The instance origin the fixtures create users under.
-pub(super) const BASE: &str = TEST_BASE_URL;
-
-/// A local user named `nickname`.
-pub(super) async fn user(pool: &PgPool, nickname: &str) -> User {
-    insert_user(
-        pool,
-        &NewUser::local(nickname, &local_ap_id(BASE, nickname)),
-    )
-    .await
-    .expect("the fixture user inserts")
-}
+pub(super) use crate::test_fixtures::local_user as user;
 
 /// A schedule for `who`, due `when`, with `params` stored as given.
 pub(super) async fn schedule(

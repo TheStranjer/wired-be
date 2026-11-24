@@ -11,8 +11,8 @@ use axum::{Json, extract::State};
 use tracing::debug;
 
 use super::{
-    AREA_EMOJI, CLASS_READ, CLASS_WRITE, COULD_NOT_DOWNLOAD, FILE_FIELD, INVALID_CHECKSUM,
-    MISSING_FILE, OK_BODY, PACK_NOT_SHAREABLE, REMOTE_ARCHIVE_PATH,
+    AREA_EMOJI, CLASS_WRITE, COULD_NOT_DOWNLOAD, FILE_FIELD, INVALID_CHECKSUM, MISSING_FILE,
+    OK_BODY, PACK_NOT_SHAREABLE, REMOTE_ARCHIVE_PATH,
     pack_writes::{resync, trimmed_name},
     params::PackParams,
     remote::{
@@ -21,7 +21,6 @@ use super::{
     },
 };
 use crate::{
-    api::instance::sha256_hex_bytes,
     auth::admin::AdminUser,
     error::{AppError, AppResult},
     extract::{
@@ -30,6 +29,7 @@ use crate::{
     },
     services::emoji_packs,
     state::AppState,
+    util::token::sha256_hex_bytes,
 };
 
 /// Where the archive of `request`'s remote pack comes from, Pleroma's
@@ -309,18 +309,18 @@ pub(super) async fn download_zip(
 /// imported answer as a JSON array; already-valid packs, hidden names
 /// and loose files under the root are left alone. The custom emojis
 /// resync afterwards, so an imported pack serves at once. An admin with
-/// `admin:read` (the ticket's grant; Pleroma asks `admin:write`).
+/// `admin:write` (as Pleroma demands; `admin:read` is refused).
 ///
 /// # Errors
 ///
 /// [`AppError::Unauthorized`] / [`AppError::Forbidden`] from [`AdminUser`]
-/// and its `admin:read` gate; [`AppError::Internal`] for a filesystem
+/// and its `admin:write` gate; [`AppError::Internal`] for a filesystem
 /// failure; [`AppError::Database`] from the resync.
 pub(super) async fn import(
     State(state): State<AppState>,
     admin: AdminUser,
 ) -> AppResult<Json<Vec<String>>> {
-    admin.require(CLASS_READ, AREA_EMOJI)?;
+    admin.require(CLASS_WRITE, AREA_EMOJI)?;
     let names = emoji_packs::import_packs(&state.config.emoji_dir).await?;
     resync(&state).await?;
     debug!(packs = names.len(), "emoji pack manifests imported");

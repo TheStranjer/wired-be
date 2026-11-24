@@ -21,7 +21,13 @@ use std::sync::LazyLock;
 
 use regex::{Captures, Regex};
 
-use crate::{models::hashtag::normalize_name, util::sanitize::escape_html};
+use crate::{
+    models::hashtag::normalize_name,
+    util::{
+        format::urls::{is_url_byte, scheme_len},
+        sanitize::escape_html,
+    },
+};
 
 /// The mention pattern: a leading start-of-text, whitespace or one of `(`,
 /// `[`, `{`, then `@` and a nickname of `[A-Za-z0-9_.-]` whose last character
@@ -44,12 +50,6 @@ const HASHTAG_PATTERN: &str = r"(?<lead>^|[^\p{L}\p{N}])#(?<tag>[\p{L}\p{N}_]+)"
 /// a longer word is cut to this many characters. Also the ceiling a stored
 /// hashtag name may hold (`src/models/hashtag.rs` ignores longer names).
 pub(crate) const MAX_HASHTAG_LEN: usize = 100;
-
-/// The `http://` scheme text, as bytes, for [`has_http_scheme`].
-const HTTP_SCHEME: &[u8] = b"http://";
-
-/// The `https://` scheme text, as bytes, for [`has_http_scheme`].
-const HTTPS_SCHEME: &[u8] = b"https://";
 
 /// The close tag whose end bounds an anchor region in [`linkify_entities`].
 const ANCHOR_CLOSE: &str = "</a>";
@@ -104,6 +104,25 @@ impl MentionRef {
         self.domain
             .as_ref()
             .map_or_else(|| nickname.clone(), |domain| format!("{nickname}@{domain}"))
+    }
+
+    /// The key one mention is looked up and recorded under: the account it
+    /// names, case-folded — `nick` for a bare reference, `nick@domain` when
+    /// the text spelled the domain out. It is the identity
+    /// [`extract_mentions`] deduplicates by.
+    #[must_use]
+    pub fn key(&self) -> String {
+        self.acct().to_lowercase()
+    }
+
+    /// Whether this mention names an account of `domain`: a bare `@nick`
+    /// always does, a `@nick@host` only when `host` equals `domain`
+    /// ignoring ASCII case.
+    #[must_use]
+    pub fn names_domain(&self, domain: &str) -> bool {
+        self.domain
+            .as_deref()
+            .is_none_or(|own| own.eq_ignore_ascii_case(domain))
     }
 }
 
@@ -335,52 +354,8 @@ fn inside_url(text: &str, at: usize) -> bool {
         }
         start -= 1;
     }
-    has_http_scheme(bytes.get(start..at).unwrap_or_default())
-}
-
-/// Whether a byte run begins with the case-insensitive `http(s)://` scheme.
-fn has_http_scheme(candidate: &[u8]) -> bool {
-    candidate
-        .get(..HTTP_SCHEME.len())
-        .is_some_and(|head| head.eq_ignore_ascii_case(HTTP_SCHEME))
-        || candidate
-            .get(..HTTPS_SCHEME.len())
-            .is_some_and(|head| head.eq_ignore_ascii_case(HTTPS_SCHEME))
-}
-
-/// Whether byte `b` may continue a bare URL: the same RFC 3986 set
-/// [`crate::util::format`]'s scanner uses, so whatever it would linkify
-/// counts as a URL here too.
-const fn is_url_byte(b: u8) -> bool {
-    matches!(
-        b,
-        b'a'..=b'z'
-            | b'A'..=b'Z'
-            | b'0'..=b'9'
-            | b'-'
-            | b'.'
-            | b'_'
-            | b'~'
-            | b'%'
-            | b':'
-            | b'/'
-            | b'?'
-            | b'#'
-            | b'['
-            | b']'
-            | b'@'
-            | b'!'
-            | b'$'
-            | b'&'
-            | b'\''
-            | b'('
-            | b')'
-            | b'*'
-            | b'+'
-            | b','
-            | b';'
-            | b'='
-    )
+    text.get(start..at)
+        .is_some_and(|candidate| scheme_len(candidate, 0).is_some())
 }
 
 /// The byte range of the first `<a` tag through `</a>` in `text`: an `<a`
@@ -430,6 +405,32 @@ mod tests {
             mention("bob", Some("example.com")).acct(),
             "bob@example.com",
             "remote acct"
+        );
+    }
+
+    #[test]
+    fn mention_keys_fold_case_across_domains() {
+        assert_eq!(mention("Alice", None).key(), "alice", "a bare nick");
+        assert_eq!(
+            mention("Bob", Some("Peer.Example")).key(),
+            "bob@peer.example",
+            "the spelled-out domain joins the key, lowercased"
+        );
+    }
+
+    #[test]
+    fn names_domain_accepts_bare_and_own_domain_in_any_case() {
+        assert!(
+            mention("alice", None).names_domain("test.example"),
+            "a bare nick names any instance's local user"
+        );
+        assert!(
+            mention("alice", Some("TEST.example")).names_domain("test.EXAMPLE"),
+            "the own domain matches in any case"
+        );
+        assert!(
+            !mention("bob", Some("elsewhere.example")).names_domain("test.example"),
+            "another domain never matches"
         );
     }
 
@@ -548,6 +549,14 @@ mod tests {
             extract_mentions("https://example.com/ @user"),
             vec![mention("user", None)],
             "once the URL run breaks at whitespace the mention is real"
+        );
+    }
+
+    #[test]
+    fn mentions_inside_uppercase_scheme_urls_are_ignored() {
+        assert!(
+            extract_mentions("HTTPS://x.example/@bob").is_empty(),
+            "the scheme check is case-insensitive"
         );
     }
 

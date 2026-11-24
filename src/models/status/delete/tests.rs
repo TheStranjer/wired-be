@@ -310,7 +310,7 @@ async fn deleting_a_status_takes_every_reblog_of_it() {
     let untouched = boost(&pool, &bob, other.id).await;
     let attachment = attach(&pool, &alice, original.id).await;
 
-    let tombstone = soft_delete_with_reblogs(&pool, original.id)
+    let (tombstone, tombstoned_reblogs) = soft_delete_with_reblogs(&pool, original.id)
         .await
         .unwrap()
         .expect("the original was live");
@@ -318,6 +318,20 @@ async fn deleting_a_status_takes_every_reblog_of_it() {
     assert_eq!(tombstone.id, original.id, "the answer is the status");
     assert!(tombstone.deleted_at.is_some(), "and it is a tombstone");
     assert_eq!(tombstone.content, "", "its text is cleared");
+    let mut answered: Vec<_> = tombstoned_reblogs.iter().map(|row| row.id).collect();
+    answered.sort();
+    let mut expected = vec![mine.id, theirs.id];
+    expected.sort();
+    assert_eq!(
+        answered, expected,
+        "the answer names exactly the reblogs it tombstoned"
+    );
+    assert!(
+        tombstoned_reblogs
+            .iter()
+            .all(|row| row.deleted_at.is_some() && row.reblog_of_id == Some(original.id)),
+        "each of them as a tombstone still linked to the original"
+    );
     for reblog in [&mine, &theirs] {
         assert!(
             get_by_id(&pool, reblog.id).await.unwrap().is_none(),

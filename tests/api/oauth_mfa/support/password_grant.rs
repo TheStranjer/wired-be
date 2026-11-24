@@ -23,11 +23,9 @@ async fn the_password_grant_of_an_mfa_user_answers_mfa_required() {
     assert_eq!(parked.scopes, "read write", "carrying the requested scopes");
     assert!(!parked.used, "and waiting unused for the second factor");
 
-    assert!(
-        oauth_token::list_for_user(&pool, fix.user.id)
-            .await
-            .expect("the token lookup reaches the database")
-            .is_empty(),
+    assert_eq!(
+        token_count(&pool, fix.user.id).await,
+        0,
         "no token is issued before the second factor"
     );
 
@@ -92,11 +90,9 @@ async fn a_totp_challenge_mints_the_token_pair() {
         stored_challenge(&pool, &token).await.is_some(),
         "a wrong code does not retire the challenge"
     );
-    assert!(
-        oauth_token::list_for_user(&pool, fix.user.id)
-            .await
-            .expect("the lookup reaches the database")
-            .is_empty(),
+    assert_eq!(
+        token_count(&pool, fix.user.id).await,
+        0,
         "and issues nothing"
     );
 
@@ -351,10 +347,7 @@ async fn accounts_without_mfa_are_unaffected() {
         "the pair is issued, not a challenge"
     );
     assert_eq!(
-        oauth_token::list_for_user(&pool, plain.id)
-            .await
-            .expect("the lookup reaches the database")
-            .len(),
+        token_count(&pool, plain.id).await,
         1,
         "and the row stands behind it"
     );

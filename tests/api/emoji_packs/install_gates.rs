@@ -1,6 +1,6 @@
-//! The admin gates of the install routes: the `admin:read` GETs and the
-//! `admin:write` POSTs of WBE-216 refuse weaker credentials and wrong
-//! scopes.
+//! The admin gates of the install routes: all four routes of WBE-216
+//! demand `admin:write` and refuse weaker credentials and wrong scopes,
+//! `admin:read` included.
 
 use axum::http::StatusCode;
 use serde_json::{Value, json};
@@ -95,70 +95,88 @@ async fn install_routes_refuse_weaker_credentials() {
     }
 }
 
-/// The class the ticket pins per route: `admin:write` never grants the
-/// GETs and `admin:read` never grants the POSTs, each refusal naming the
-/// root it lacks; the narrow `admin:read:emoji` and `admin:write:emoji`
-/// aliases pass the gate and reach the endpoints' own work — an answer
-/// from past the gate on every one of them.
+/// All four install routes demand `admin:write`, as Pleroma does: both
+/// `admin:read` and its narrow `admin:read:emoji` alias are refused with
+/// the 403 naming the root they lack, the GETs included.
 #[tokio::test]
-async fn install_routes_enforce_their_admin_class() {
+async fn install_routes_refuse_read_only_tokens() {
     let db = common::test_db().await;
     let pool = db.pool().clone();
     let dir = tempfile::TempDir::new().unwrap();
     let app = common::test_app_with_emoji_dir(pool.clone(), dir.path());
     let reader = admin_token(&pool, "installreader", "admin:read").await;
-    let writer = admin_token(&pool, "installwriter", "admin:write").await;
-
-    for path in &INSTALL_GETS {
-        let refused = common::TestRequest::get(path)
-            .bearer(&writer)
-            .send(&app)
-            .await;
-        common::assert_answer(&refused, StatusCode::FORBIDDEN, "a writer on a reader");
-        common::assert_error(
-            &refused,
-            "Insufficient permissions: admin:read.",
-            "a writer on a reader",
-        );
-    }
-    for (path, body) in &install_posts() {
-        let refused = common::TestRequest::post(path)
-            .bearer(&reader)
-            .json(body)
-            .send(&app)
-            .await;
-        common::assert_answer(&refused, StatusCode::FORBIDDEN, "a reader on a writer");
-        common::assert_error(
-            &refused,
-            "Insufficient permissions: admin:write.",
-            "a reader on a writer",
-        );
-    }
-
     let narrow_read = admin_token(&pool, "installnarrowr", "admin:read:emoji").await;
-    let imported = common::TestRequest::get("/api/v1/pleroma/emoji/packs/import")
-        .bearer(&narrow_read)
+
+    for token in [&reader, &narrow_read] {
+        for path in &INSTALL_GETS {
+            let refused = common::TestRequest::get(path)
+                .bearer(token)
+                .send(&app)
+                .await;
+            common::assert_answer(&refused, StatusCode::FORBIDDEN, "a reader on a GET");
+            common::assert_error(
+                &refused,
+                "Insufficient permissions: admin:write.",
+                "a reader on a GET",
+            );
+        }
+        for (path, body) in &install_posts() {
+            let refused = common::TestRequest::post(path)
+                .bearer(token)
+                .json(body)
+                .send(&app)
+                .await;
+            common::assert_answer(&refused, StatusCode::FORBIDDEN, "a reader on a POST");
+            common::assert_error(
+                &refused,
+                "Insufficient permissions: admin:write.",
+                "a reader on a POST",
+            );
+        }
+    }
+    assert!(
+        dir.path().read_dir().unwrap().next().is_none(),
+        "the refused requests touched nothing"
+    );
+}
+
+/// `admin:write` and the narrow `admin:write:emoji` alias pass the gate
+/// of every install route and reach the endpoints' own work — an answer
+/// from past the gate on each one of them.
+#[tokio::test]
+async fn install_routes_accept_write_tokens() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let dir = tempfile::TempDir::new().unwrap();
+    let app = common::test_app_with_emoji_dir(pool.clone(), dir.path());
+    let writer = admin_token(&pool, "installwriter", "admin:write").await;
+    let narrow_write = admin_token(&pool, "installnarroww", "admin:write:emoji").await;
+
+    for (token, who) in [(&writer, "write"), (&narrow_write, "narrow write")] {
+        let imported = common::TestRequest::get("/api/v1/pleroma/emoji/packs/import")
+            .bearer(token)
+            .send(&app)
+            .await;
+        common::assert_answer(&imported, StatusCode::OK, &format!("the {who} import"));
+        assert_eq!(
+            imported.json_value(),
+            json!([]),
+            "the empty directory imports nothing for the {who} token"
+        );
+        let relayed = common::TestRequest::get(
+            "/api/v1/pleroma/emoji/packs/remote?url=https://remote.invalid",
+        )
+        .bearer(token)
         .send(&app)
         .await;
-    common::assert_answer(&imported, StatusCode::OK, "the narrow read alias imports");
-    assert_eq!(
-        imported.json_value(),
-        json!([]),
-        "the empty directory imports nothing"
-    );
-    let relayed =
-        common::TestRequest::get("/api/v1/pleroma/emoji/packs/remote?url=https://remote.invalid")
-            .bearer(&narrow_read)
-            .send(&app)
-            .await;
-    common::assert_answer(
-        &relayed,
-        StatusCode::INTERNAL_SERVER_ERROR,
-        "the narrow read relay",
-    );
-    common::assert_error(&relayed, COULD_NOT_FETCH, "the narrow read relay");
+        common::assert_answer(
+            &relayed,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("the {who} relay"),
+        );
+        common::assert_error(&relayed, COULD_NOT_FETCH, &format!("the {who} relay"));
+    }
 
-    let narrow_write = admin_token(&pool, "installnarroww", "admin:write:emoji").await;
     let pulled = common::TestRequest::post("/api/v1/pleroma/emoji/packs/download")
         .bearer(&narrow_write)
         .json(&json!({"url": "https://remote.invalid", "name": "ghost"}))

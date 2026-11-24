@@ -9,7 +9,9 @@ use axum::http::StatusCode;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde_json::json;
 use uuid::Uuid;
-use wired_be::{config::DEFAULT_OAUTH_TOKEN_TTL_SECS, models::oauth_token};
+use wired_be::{
+    config::DEFAULT_OAUTH_TOKEN_TTL_SECS, models::oauth_token, util::token::sha256_hex,
+};
 
 use super::support::{PASSWORD, assert_no_store, error_text, fixtures, grant_body, post_json};
 use crate::common;
@@ -79,8 +81,14 @@ async fn json_password_grant_returns_a_token_pair() {
         .expect("the token row was stored");
     assert_eq!(stored.id, id, "the response id is the stored primary key");
     assert_eq!(
-        stored.refresh_token, refresh,
-        "the refresh secret round trips"
+        stored.refresh_token,
+        sha256_hex(refresh),
+        "the refresh secret is stored as its digest"
+    );
+    assert_eq!(
+        stored.token,
+        sha256_hex(access),
+        "the access token is stored as its digest"
     );
     assert_eq!(stored.user_id, Some(user.id), "the token acts as the user");
     assert_eq!(stored.app_id, app.id, "issued for the validated app");

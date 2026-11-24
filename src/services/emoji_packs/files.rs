@@ -7,9 +7,9 @@ use std::{io, path::Path};
 
 use tracing::debug;
 
-use crate::error::{AppError, AppResult};
+use crate::error::{AppError, AppResult, io_error};
 
-use super::names::{check_file_name, check_pack_name, io_error, pack_dir};
+use super::names::{check_file_name, check_pack_name, pack_dir};
 
 /// Reads `file` of pack `name` from the packs root `dir`.
 ///

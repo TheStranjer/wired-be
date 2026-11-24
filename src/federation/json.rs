@@ -15,7 +15,16 @@
 //! references, and [`http_host`] for the host of an id that containment
 //! checks compare.
 
+use chrono::{DateTime, TimeDelta, Utc};
 use serde_json::{Map, Value};
+
+use crate::util::time::parse_time;
+
+/// How far a remote timestamp may lead the local clock before
+/// [`clamped_time`] treats it as clock skew and answers `now` instead
+/// (Pleroma's `ObjectValidators.Utils`-style tolerance, the Mastodon-family
+/// norm).
+pub const CLOCK_SKEW: TimeDelta = TimeDelta::minutes(5);
 
 /// Object keys that name a reference on a link or `Image` object, in the
 /// order [`value_or_id`] and [`first_string`] try them: `id` (the
@@ -105,6 +114,20 @@ pub fn references(value: &Value) -> Vec<String> {
 /// definition lives in [`crate::util::url`].
 pub use crate::util::url::http_host;
 
+/// A remote timestamp read from a JSON value and clamped against the local
+/// clock.
+///
+/// The value must be a string [`parse_time`] reads; anything else (absent,
+/// not a string, unparseable) is `None`. A stamp later than
+/// `now` plus [`CLOCK_SKEW`] is answered `now` — a remote clock cannot move
+/// anything into the future — and any other stamp is returned as parsed.
+#[must_use]
+pub fn clamped_time(value: Option<&Value>, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+    let stamp = value.and_then(Value::as_str).and_then(parse_time)?;
+    let ceiling = now.checked_add_signed(CLOCK_SKEW).unwrap_or(now);
+    Some(if stamp > ceiling { now } else { stamp })
+}
+
 /// The first [`REFERENCE_KEYS`] entry of `map` that holds a string, resolved
 /// recursively so a `{"url": [...]}` object reaches into its array.
 fn reference_key_in(map: &Map<String, Value>) -> Option<String> {
@@ -118,6 +141,65 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    /// A fixed local clock for the clamp tests.
+    fn now() -> DateTime<Utc> {
+        parse_time("2024-06-01T12:00:00Z").expect("the fixture time parses")
+    }
+
+    #[test]
+    fn clamped_time_passes_a_past_stamp() {
+        let past = json!("2024-05-31T08:30:00Z");
+        assert_eq!(
+            clamped_time(Some(&past), now()),
+            parse_time("2024-05-31T08:30:00Z"),
+            "a past stamp is returned as parsed"
+        );
+    }
+
+    #[test]
+    fn clamped_time_clamps_a_far_future_stamp_to_now() {
+        let future = json!("2024-06-08T12:00:00Z");
+        assert_eq!(
+            clamped_time(Some(&future), now()),
+            Some(now()),
+            "a stamp past the skew answers now"
+        );
+    }
+
+    #[test]
+    fn clamped_time_keeps_a_stamp_inside_the_skew() {
+        let inside = json!("2024-06-01T12:04:59Z");
+        assert_eq!(
+            clamped_time(Some(&inside), now()),
+            parse_time("2024-06-01T12:04:59Z"),
+            "just inside the skew is kept"
+        );
+        let edge = json!("2024-06-01T12:05:00Z");
+        assert_eq!(
+            clamped_time(Some(&edge), now()),
+            parse_time("2024-06-01T12:05:00Z"),
+            "exactly at the ceiling is kept"
+        );
+        let beyond = json!("2024-06-01T12:05:01Z");
+        assert_eq!(
+            clamped_time(Some(&beyond), now()),
+            Some(now()),
+            "one second past the ceiling is clamped"
+        );
+    }
+
+    #[test]
+    fn clamped_time_is_none_for_garbage() {
+        assert_eq!(clamped_time(None, now()), None, "absent");
+        for value in [json!("not a timestamp"), json!(1_717_236_000), Value::Null] {
+            assert_eq!(
+                clamped_time(Some(&value), now()),
+                None,
+                "{value} is no stamp"
+            );
+        }
+    }
 
     #[test]
     fn as_array_views_arrays_and_wraps_scalars() {

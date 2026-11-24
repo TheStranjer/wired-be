@@ -8,6 +8,22 @@ use crate::{error::AppResult, util::id::new_id};
 
 use super::{ChatMessage, ChatMessageReference, messages::withdraw};
 
+/// The one column list [`ChatMessageReference`] decodes from, and the
+/// `FROM … JOIN chat_messages m` it reads, as a string literal with no
+/// trailing clause. Every reference read builds its statement from this, so a
+/// field added to the entity is added here and nowhere else.
+macro_rules! reference_select {
+    () => {
+        "SELECT r.id, r.chat_id, r.message_id, r.unread, r.inserted_at,
+           m.sender_id, m.content, m.raw_text, m.attachment_media_id, m.ap_id,
+           m.idempotency_key, m.inserted_at AS message_inserted_at
+      FROM chat_message_references r
+      JOIN chat_messages m ON m.id = r.message_id"
+    };
+}
+
+pub(super) use reference_select;
+
 /// The joined shape of a reference and its message: the reference's own
 /// columns first — its `id` is what a client pages a chat by, and what the
 /// entity reports as the message's id — then the message's, with `m.inserted_at`
@@ -21,26 +37,19 @@ use super::{ChatMessage, ChatMessageReference, messages::withdraw};
 /// Only ids are bound, so nothing supplied by a client ever reaches the text.
 ///
 /// [`messages_page`]: super::messages_page
-pub(super) const REFERENCE_SELECT_SQL: &str =
-    "SELECT r.id, r.chat_id, r.message_id, r.unread, r.inserted_at,
-           m.sender_id, m.content, m.raw_text, m.attachment_media_id, m.ap_id,
-           m.idempotency_key, m.inserted_at AS message_inserted_at
-      FROM chat_message_references r
-      JOIN chat_messages m ON m.id = r.message_id
-     WHERE ";
+pub(super) const REFERENCE_SELECT_SQL: &str = concat!(reference_select!(), "\n     WHERE ");
 
 /// [`message_reference_for_user`]: one participant's view of a message named
 /// by the message's own id rather than by the reference's — Pleroma's
 /// `MessageReference.for_chat_and_object`, whose `chat` is read as "the
 /// viewer's chat holding this message" instead of by id. The columns are
 /// [`REFERENCE_SELECT_SQL`]'s, with the `chats` join added for the owner.
-const USER_REFERENCE_SQL: &str = "SELECT r.id, r.chat_id, r.message_id, r.unread, r.inserted_at,
-           m.sender_id, m.content, m.raw_text, m.attachment_media_id, m.ap_id,
-           m.idempotency_key, m.inserted_at AS message_inserted_at
-      FROM chat_message_references r
-      JOIN chat_messages m ON m.id = r.message_id
+const USER_REFERENCE_SQL: &str = concat!(
+    reference_select!(),
+    "
       JOIN chats uc ON uc.id = r.chat_id
-     WHERE uc.user_id = $1 AND r.message_id = $2";
+     WHERE uc.user_id = $1 AND r.message_id = $2"
+);
 
 /// One side's link between a chat and a message. `ON CONFLICT DO NOTHING` keeps
 /// a redelivered message from being listed twice in the same chat; the row is

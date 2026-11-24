@@ -7,7 +7,7 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use super::OauthToken;
-use crate::{error::AppResult, models::oauth_app::OauthApp};
+use crate::{error::AppResult, models::oauth_app::OauthApp, util::token::sha256_hex};
 
 /// The `SELECT` behind [`get_with_app`]: the `oauth_tokens` row
 /// verbatim, then every `oauth_apps` column but its `id` aliased under
@@ -96,9 +96,9 @@ impl TokenWithAppRow {
 /// issued it, exactly as stored.
 ///
 /// **No validity filter**: an expired row is still returned, leaving
-/// expiry and account activity to the caller (unlike
-/// [`get_valid_token`](super::get_valid_token), which hides both). [`crate::auth`] uses it to
-/// tell an expired token (401) from a deactivated owner (403).
+/// expiry and account status to the caller. [`crate::auth`] applies the
+/// validity rule on top of it, telling an expired token (401) from a
+/// deactivated owner (403).
 ///
 /// # Errors
 ///
@@ -106,7 +106,7 @@ impl TokenWithAppRow {
 /// [`AppError::Database`](crate::error::AppError).
 pub async fn get_with_app(pool: &PgPool, token: &str) -> AppResult<Option<(OauthToken, OauthApp)>> {
     let row = sqlx::query_as::<_, TokenWithAppRow>(TOKEN_WITH_APP_SQL)
-        .bind(token)
+        .bind(sha256_hex(token))
         .fetch_optional(pool)
         .await?;
     Ok(row.map(TokenWithAppRow::into_parts))
@@ -127,7 +127,7 @@ pub async fn get_by_refresh_token(
     refresh_token: &str,
 ) -> AppResult<Option<(OauthToken, OauthApp)>> {
     let row = sqlx::query_as::<_, TokenWithAppRow>(TOKEN_BY_REFRESH_WITH_APP_SQL)
-        .bind(refresh_token)
+        .bind(sha256_hex(refresh_token))
         .fetch_optional(pool)
         .await?;
     Ok(row.map(TokenWithAppRow::into_parts))
@@ -136,7 +136,7 @@ pub async fn get_by_refresh_token(
 #[cfg(test)]
 mod tests {
     use super::super::test_support::*;
-    use super::super::{NewToken, create_token, get_valid_token};
+    use super::super::{NewToken, create_token};
     use super::*;
 
     #[tokio::test]
@@ -160,7 +160,11 @@ mod tests {
             .unwrap()
             .expect("a stored token is found with its app");
         assert_eq!(found.id, token.id, "the token row comes back");
-        assert_eq!(found.token, token.token, "the secret round trips");
+        assert_eq!(
+            found.token,
+            sha256_hex(&token.token),
+            "the row holds the digest of the secret"
+        );
         assert_eq!(found.scopes, "write follow", "the token keeps its scopes");
         assert_eq!(found_app.id, app.id, "the app id is the join target");
         assert_eq!(found_app.client_name, app.client_name, "name round trips");
@@ -264,13 +268,6 @@ mod tests {
         assert!(
             get_with_app(&pool, &token.token).await.unwrap().is_some(),
             "an expired row still arrives (expiry is the caller's call)"
-        );
-        assert!(
-            get_valid_token(&pool, &token.token)
-                .await
-                .unwrap()
-                .is_none(),
-            "whereas the validity-filtered lookup hides it"
         );
         deactivate_user(&pool, oscar.id).await;
         assert!(

@@ -114,8 +114,15 @@ fn pack_missing(name: &str) -> AppError {
 /// for a name [`emoji_packs::pack_name_valid`] rejects — into
 /// [`pack_missing`]; every other failure arrives unchanged.
 fn write_miss(name: &str, err: AppError) -> AppError {
+    fold_miss(err, || pack_missing(name))
+}
+
+/// Replaces a service refusal that means "nothing here to write" —
+/// [`AppError::NotFound`] or [`AppError::BadRequest`] — with the error
+/// `miss` builds; every other failure arrives unchanged.
+pub(super) fn fold_miss(err: AppError, miss: impl FnOnce() -> AppError) -> AppError {
     if matches!(err, AppError::NotFound | AppError::BadRequest(_)) {
-        return pack_missing(name);
+        return miss();
     }
     err
 }
@@ -373,6 +380,22 @@ mod tests {
         assert!(
             matches!(internal, AppError::Internal(_)),
             "a real server failure is not a 404"
+        );
+    }
+
+    #[test]
+    fn fold_miss_replaces_only_the_miss_errors() {
+        let miss = || AppError::Conflict("missed".to_owned());
+        assert!(
+            matches!(fold_miss(AppError::NotFound, miss), AppError::Conflict(_)),
+            "an absent target folds"
+        );
+        let bad = fold_miss(AppError::BadRequest("bad".to_owned()), miss);
+        assert!(matches!(bad, AppError::Conflict(_)), "a 400 folds");
+        let internal = fold_miss(AppError::Internal("disk full".to_owned()), miss);
+        assert!(
+            matches!(&internal, AppError::Internal(message) if message == "disk full"),
+            "an internal error arrives unchanged"
         );
     }
 

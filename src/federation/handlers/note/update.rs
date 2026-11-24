@@ -6,18 +6,15 @@ use serde_json::Value;
 use tracing::debug;
 use uuid::Uuid;
 
+use super::media_poll::{media_replacement_needed, refresh_poll, replace_media, stored_media};
 #[cfg(doc)]
 use super::update_note;
-use super::{
-    CLOCK_SKEW,
-    media_poll::{media_replacement_needed, refresh_poll, replace_media, stored_media},
-    permanent, transient,
-};
 use crate::{
     api::statuses::after_status_edited,
     federation::{
         dispatch::{ActivityView, FederationError, Outcome},
         handlers::create,
+        json::clamped_time,
         note_parser::{self, ParsedNote},
     },
     models::{
@@ -27,7 +24,6 @@ use crate::{
     },
     services::ingest,
     state::AppState,
-    util::time::parse_time,
 };
 
 /// The body of [`update_note`]: the authorship gate, then the edit of the
@@ -56,7 +52,7 @@ pub(super) async fn apply_update(
     };
     let stored = status::get_by_uri(&state.db, uri)
         .await
-        .map_err(|err| transient("the status uri read", &err))?;
+        .map_err(|err| FederationError::transient("the status uri read failed", &err))?;
     match stored.filter(|row| row.user_id == signer.id && row.deleted_at.is_none()) {
         Some(row) => fold_edit(&state, object, &signer, &row).await,
         None => ingest_the_rest(&state, &signer, object).await,
@@ -113,16 +109,20 @@ async fn fold_edit(
         ));
     }
     let parsed = note_parser::parse_note(object, signer, now)
-        .map_err(|err| permanent("the updated object is not parseable", &err))?;
-    let mentioned = ingest::resolve_mentions(state, &parsed.mention_hrefs).await?;
+        .map_err(|err| FederationError::permanent("the updated object is not parseable", &err))?;
+    let mut mentioned = ingest::resolve_mentions(state, &parsed.mention_hrefs).await?;
+    ingest::merge_accounts(
+        &mut mentioned,
+        ingest::resolve_local_audience(state, &parsed.audience).await?,
+    );
     let media = stored_media(&state.db, stored.id)
         .await
-        .map_err(|err| transient("the attachment read", &err))?;
+        .map_err(|err| FederationError::transient("the attachment read failed", &err))?;
     let media_changed = media_replacement_needed(&media, &parsed.attachments);
     let params = edit_params(&parsed, stored, &mentioned, media_changed);
     let Some(updated) = status_edit::update_status(&state.db, stored.id, params)
         .await
-        .map_err(|err| transient("the status edit", &err))?
+        .map_err(|err| FederationError::transient("the status edit failed", &err))?
     else {
         return Ok(Outcome::Ignored("the status was deleted under its edit"));
     };
@@ -180,24 +180,13 @@ fn is_stale(object: &Value, stored: &Status, now: DateTime<Utc>) -> bool {
 
 /// The moment an `Update` claims its document was last changed: its
 /// `updated`, falling back to its `published` for a document that carries
-/// only that, clamped against [`CLOCK_SKEW`] the way the note parse clamps
+/// only that, clamped by [`clamped_time`] the way the note parse clamps
 /// creation times — a stamp from a runaway clock answers `now`, still the
 /// freshest the fold can honestly call it. `None` for a document whose
 /// stamps are unreadable: with nothing to compare, the fold trusts the
 /// sender and edits.
 fn update_time(object: &Value, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
-    let stamp = object
-        .get("updated")
-        .and_then(Value::as_str)
-        .and_then(parse_time)
-        .or_else(|| {
-            object
-                .get("published")
-                .and_then(Value::as_str)
-                .and_then(parse_time)
-        })?;
-    let ceiling = now.checked_add_signed(CLOCK_SKEW).unwrap_or(now);
-    Some(if stamp > ceiling { now } else { stamp })
+    clamped_time(object.get("updated"), now).or_else(|| clamped_time(object.get("published"), now))
 }
 
 #[cfg(test)]
@@ -292,6 +281,58 @@ mod tests {
             .await,
             1,
             "and the attachment the update named"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_edit_links_a_local_user_addressed_without_a_mention_tag() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let state = app_state(&pool);
+        let author = author(&pool).await;
+        let alice = crate::models::user::insert(
+            &pool,
+            &crate::models::user::NewUser::local(
+                "alice",
+                &crate::models::user::local_ap_id(&state.config.base_url, "alice"),
+            ),
+        )
+        .await
+        .expect("the local account inserts");
+        let uri = "https://remote.example/users/bob/statuses/edit-audience";
+        let row = mirrored(&pool, &author, uri, "first words").await;
+
+        let outcome = update_note(
+            state,
+            view_of(
+                "Update",
+                note(
+                    uri,
+                    json!({
+                        "content": "<p>second words</p>",
+                        "updated": "2024-05-01T12:00:00.000Z",
+                        "to": [alice.ap_id],
+                        "tag": [],
+                    }),
+                ),
+                None,
+            ),
+            author_again(&pool).await,
+        )
+        .await
+        .expect("the fold completes");
+
+        assert_eq!(outcome, Outcome::Handled, "the edit is folded");
+        let mentioned: Vec<Uuid> =
+            sqlx::query_scalar("SELECT user_id FROM status_mentions WHERE status_id = $1")
+                .bind(row.id)
+                .fetch_all(&pool)
+                .await
+                .expect("the mention rows read");
+        assert_eq!(
+            mentioned,
+            vec![alice.id],
+            "the addressed local user is linked"
         );
     }
 

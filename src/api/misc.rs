@@ -6,8 +6,7 @@
 //! - [`router`], merged by [`crate::app`]: the `MongooseIM` auth endpoints
 //!   `GET /user_exists` and `GET /check_password` (Pleroma's
 //!   `lib/pleroma/web/mongoose_im/mongoose_im_controller.ex`, served at
-//!   the root for an `extauth` HTTP backend) and `GET /manifest.json`,
-//!   the PWA manifest (Pleroma's `lib/pleroma/web/manifest_controller.ex`).
+//!   the root for an `extauth` HTTP backend).
 //! - [`util_router`], nested at `/pleroma` by [`crate::api::v1`]:
 //!   `GET /api/v1/pleroma/captcha` and `GET /api/v1/pleroma/healthcheck`
 //!   (Pleroma's `lib/pleroma/web/pleroma_api/controllers/util_controller.ex`).
@@ -37,7 +36,7 @@ use std::time::Duration;
 use axum::{
     Json, Router,
     extract::{Query, State},
-    http::{HeaderValue, StatusCode, header},
+    http::StatusCode,
     response::{IntoResponse as _, Response},
     routing::get,
 };
@@ -47,9 +46,11 @@ use sqlx::PgPool;
 use tracing::warn;
 
 use crate::{
-    config::Config,
     error::{AppError, AppResult},
-    models::{instance_setting, user::get_by_nickname},
+    models::{
+        instance_setting,
+        user::{User, get_by_nickname},
+    },
     state::AppState,
     util::password::verify_password,
 };
@@ -68,28 +69,16 @@ const CAPTCHA_NOT_IMPLEMENTED: &str = "Captcha is not implemented";
 /// [`frontend_configurations`] serves (Pleroma's `:frontend_configurations`
 /// runtime config key).
 const FRONTEND_CONFIGURATIONS_KEY: &str = "frontend_configurations";
-/// `Content-Type` of the PWA manifest, the media type the Web App Manifest
-/// spec registers.
-const MANIFEST_CONTENT_TYPE: &str = "application/manifest+json";
-/// Manifest `display` value: the installed app runs standalone, no
-/// browser chrome (Pleroma's `manifest.json.eex`).
-const MANIFEST_DISPLAY: &str = "standalone";
-/// Manifest `theme_color`: Mastodon/Pleroma's dark header grey.
-const MANIFEST_THEME_COLOR: &str = "#282c37";
-/// Manifest `background_color`: Mastodon/Pleroma's dark page background.
-const MANIFEST_BACKGROUND_COLOR: &str = "#191b22";
 
 /// The root-level router, merged by [`crate::app`]: the two `MongooseIM`
-/// auth endpoints and the PWA manifest.
+/// auth endpoints.
 ///
-/// All three live outside `/api`, at addresses fixed by the `MongooseIM`
-/// `extauth` http contract and by the manifest's `<link rel="manifest">`
-/// convention.
+/// Both live outside `/api`, at addresses fixed by the `MongooseIM`
+/// `extauth` http contract.
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/user_exists", get(user_exists))
         .route("/check_password", get(check_password))
-        .route("/manifest.json", get(manifest))
 }
 
 /// The `/api/v1/pleroma` utility router ([`crate::api::v1`] nests it at
@@ -130,7 +119,7 @@ struct PasswordQuery {
 /// `true` when `user` names a local, active account, 404 with JSON `false`
 /// for everything else (unknown nickname, remote mirror, deactivated
 /// account, missing parameter). Disabled by
-/// [`mongooseim_enabled`](Config::mongooseim_enabled): then the endpoint
+/// [`mongooseim_enabled`](crate::config::Config::mongooseim_enabled): then the endpoint
 /// is the standard fallback 404.
 ///
 /// # Errors
@@ -154,7 +143,7 @@ async fn user_exists(
 /// the local, *active* user named by `user`, 403 with JSON `false`
 /// otherwise (wrong password, unknown nickname, deactivated account,
 /// missing parameter). Disabled by
-/// [`mongooseim_enabled`](Config::mongooseim_enabled): then the endpoint
+/// [`mongooseim_enabled`](crate::config::Config::mongooseim_enabled): then the endpoint
 /// is the standard fallback 404.
 ///
 /// Unlike Pleroma's controller — which answers an unknown user 404 and a
@@ -182,7 +171,7 @@ async fn check_password(
 /// `GET /api/v1/pleroma/captcha` — the captcha handshake (Pleroma's
 /// `UtilController.captcha/2`, which renders `Pleroma.Captcha.new/0`).
 /// No captcha is implemented here: unless
-/// [`captcha_enabled`](Config::captcha_enabled) says a provider is
+/// [`captcha_enabled`](crate::config::Config::captcha_enabled) says a provider is
 /// configured, the answer is `{"type":"none"}`; when one is, this
 /// instance cannot serve it and answers 501 with the standard error
 /// shape.
@@ -205,7 +194,7 @@ async fn captcha(State(state): State<AppState>) -> Response {
 /// `GET /api/v1/pleroma/healthcheck` — Pleroma's `UtilController.healthcheck/2`:
 /// the pool's connection counts and a `SELECT 1` liveness probe, 200 when
 /// healthy and 503 when not. Disabled by
-/// [`healthcheck_enabled`](Config::healthcheck_enabled): Pleroma answers
+/// [`healthcheck_enabled`](crate::config::Config::healthcheck_enabled): Pleroma answers
 /// 503 `"Healthcheck disabled"` then; the ticket makes it the standard
 /// fallback 404 instead, and the endpoint never fails on its own — a dead
 /// database is the 503 body's `healthy: false`.
@@ -236,29 +225,7 @@ async fn frontend_configurations(State(state): State<AppState>) -> AppResult<Jso
     Ok(Json(configured.unwrap_or_else(|| json!({}))))
 }
 
-/// `GET /manifest.json` — the PWA manifest (Pleroma's
-/// `ManifestController.show/2`): the instance's name and description in
-/// the fixed document, served as `application/manifest+json`. The only
-/// failure is the manifest refusing to encode, which it cannot; it is
-/// still a 500 rather than a panic.
-///
-/// # Errors
-///
-/// [`AppError::Internal`] if the manifest failed to serialize.
-async fn manifest(State(state): State<AppState>) -> AppResult<Response> {
-    let body = serde_json::to_vec(&Manifest::new(&state.config))
-        .map_err(|err| AppError::Internal(format!("could not encode the PWA manifest: {err}")))?;
-    Ok((
-        [(
-            header::CONTENT_TYPE,
-            HeaderValue::from_static(MANIFEST_CONTENT_TYPE),
-        )],
-        body,
-    )
-        .into_response())
-}
-
-/// The `MongooseIM` gate: unless [`mongooseim_enabled`](Config::mongooseim_enabled)
+/// The `MongooseIM` gate: unless [`mongooseim_enabled`](crate::config::Config::mongooseim_enabled)
 /// is set, the auth endpoints do not exist — the standard fallback 404,
 /// which is what an unconfigured instance answers an unknown path with.
 ///
@@ -283,7 +250,8 @@ fn require_mongooseim(state: &AppState) -> AppResult<()> {
 async fn local_active_user_exists(pool: &PgPool, nickname: &str) -> AppResult<bool> {
     Ok(get_by_nickname(pool, nickname)
         .await?
-        .is_some_and(|found| found.local.get() && found.is_active.get()))
+        .as_ref()
+        .is_some_and(User::is_local_active))
 }
 
 /// Whether `password` is the credential of the local, active user named
@@ -299,7 +267,7 @@ async fn valid_credentials(pool: &PgPool, nickname: &str, password: &str) -> App
     let Some(found) = get_by_nickname(pool, nickname).await? else {
         return Ok(false);
     };
-    if !(found.local.get() && found.is_active.get()) {
+    if !found.is_local_active() {
         return Ok(false);
     }
     let Some(stored) = found.password_hash.as_deref() else {
@@ -345,7 +313,7 @@ struct CaptchaConfig {
     captcha_type: &'static str,
 }
 
-/// The 501 body [`captcha`] answers when [`captcha_enabled`](Config::captcha_enabled)
+/// The 501 body [`captcha`] answers when [`captcha_enabled`](crate::config::Config::captcha_enabled)
 /// claims a provider: the standard error shape (`{"error": ...}`) with the
 /// ticket's message, spelled out here because [`AppError`] has no 501
 /// variant and this is not a server failure to route through it.
@@ -394,65 +362,6 @@ impl HealthReport {
     }
 }
 
-/// One `icons` entry of the PWA manifest.
-#[derive(Debug, Serialize)]
-struct ManifestIcon {
-    /// Where the icon lives.
-    src: &'static str,
-    /// What sizes it covers: an SVG scales to any.
-    sizes: &'static str,
-    /// Its media type.
-    #[serde(rename = "type")]
-    icon_type: &'static str,
-}
-
-/// The PWA manifest [`manifest`] serves: Pleroma's
-/// `lib/pleroma/web/templates/manifest/manifest.json.eex` document, whose
-/// only dynamic parts are the instance name and description. Field
-/// declaration order is the ticket's body order.
-#[derive(Debug, Serialize)]
-struct Manifest {
-    /// The instance display name.
-    name: String,
-    /// The instance display name again (no separate short form exists).
-    short_name: String,
-    /// The instance description.
-    description: String,
-    /// [`MANIFEST_DISPLAY`].
-    display: &'static str,
-    /// The URL scope of the installed app: the whole origin.
-    scope: &'static str,
-    /// What a launch opens: the site root.
-    start_url: &'static str,
-    /// The available icons: the instance logo, one scalable SVG.
-    icons: [ManifestIcon; 1],
-    /// [`MANIFEST_THEME_COLOR`].
-    theme_color: &'static str,
-    /// [`MANIFEST_BACKGROUND_COLOR`].
-    background_color: &'static str,
-}
-
-impl Manifest {
-    /// The manifest document for this instance's `config`.
-    fn new(config: &Config) -> Self {
-        Self {
-            name: config.instance_name.clone(),
-            short_name: config.instance_name.clone(),
-            description: config.instance_description.clone(),
-            display: MANIFEST_DISPLAY,
-            scope: "/",
-            start_url: "/",
-            icons: [ManifestIcon {
-                src: "/static/logo.svg",
-                sizes: "any",
-                icon_type: "image/svg+xml",
-            }],
-            theme_color: MANIFEST_THEME_COLOR,
-            background_color: MANIFEST_BACKGROUND_COLOR,
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -479,30 +388,6 @@ mod tests {
         assert_eq!(
             body, r#"{"error":"Captcha is not implemented"}"#,
             "the 501 body"
-        );
-    }
-
-    /// The manifest serializes with the ticket's keys in the ticket's
-    /// order, the config's name and description in place, and the fixed
-    /// colors and icon.
-    #[test]
-    fn manifest_is_the_ticket_document() {
-        let mut config = Config::for_tests();
-        config.instance_name = "Snatter".to_owned();
-        config.instance_description = "Where we all chatter".to_owned();
-        let body = serde_json::to_string(&Manifest::new(&config)).unwrap();
-        assert_eq!(
-            body,
-            r##"{"name":"Snatter","short_name":"Snatter","description":"Where we all chatter","display":"standalone","scope":"/","start_url":"/","icons":[{"src":"/static/logo.svg","sizes":"any","type":"image/svg+xml"}],"theme_color":"#282c37","background_color":"#191b22"}"##,
-            "the exact manifest body, in order"
-        );
-        let default = serde_json::to_string(&Manifest::new(&Config::for_tests())).unwrap();
-        assert!(
-            default.contains(r#""name":"Wired""#)
-                && default.contains(
-                    r#""description":"A Wired instance, compatible with Pleroma clients""#
-                ),
-            "the document reads name and description from config: {default}"
         );
     }
 

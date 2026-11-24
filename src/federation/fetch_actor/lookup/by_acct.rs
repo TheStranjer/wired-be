@@ -104,7 +104,10 @@ fn subject_vouches(resolved: &Resolved, user: &User, acct: &str) -> bool {
 /// non-standard port) is resolvable end to end. Every other handle keeps
 /// the spec's `https://{domain}` base; production, with the flag off,
 /// never returns one.
-fn dev_webfinger_base(config: &Config, acct: &str) -> Option<String> {
+pub(in crate::federation::fetch_actor) fn dev_webfinger_base(
+    config: &Config,
+    acct: &str,
+) -> Option<String> {
     if !config.fetch.http_allow_private_hosts {
         return None;
     }

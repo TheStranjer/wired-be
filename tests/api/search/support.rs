@@ -25,6 +25,12 @@ pub(super) const V2_SEARCH: &str = "/api/v2/search";
 pub(super) const INVALID_TOKEN: &str = "The access token is invalid";
 /// The 403 body of a search whose presented token lacks `read:accounts`.
 pub(super) const NO_READ_ACCOUNTS: &str = "Insufficient permissions: read:accounts.";
+/// The 401 body of an anonymous search that pages by `offset`.
+pub(super) const OFFSET_UNAUTHENTICATED: &str =
+    "Search queries pagination is not supported without authentication";
+/// The 403 body of a combined search whose presented token lacks
+/// `read:search`.
+pub(super) const NO_READ_SEARCH: &str = "Insufficient permissions: read:search.";
 /// The 400 body of an unreadable pagination cursor.
 pub(super) const INVALID_ID: &str = "Invalid id";
 /// The 429 body of the spent `search` bucket.

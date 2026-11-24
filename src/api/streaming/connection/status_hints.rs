@@ -127,8 +127,8 @@ mod tests {
         api::streaming::{
             names::{PUBLIC, USER},
             test_support::{
-                account, for_reader, frame_payload, hinted_update, inactive_account, phrase_filter,
-                state, watching,
+                FrameFor as _, account, for_reader, frame_payload, hinted_update, inactive_account,
+                phrase_filter, state, watching,
             },
         },
         config::TEST_BASE_URL,

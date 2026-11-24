@@ -44,7 +44,10 @@ use uuid::Uuid;
 
 use crate::{
     api::{
-        helpers::{QueryPairs, is_true, requested_status_ids, status_for_viewer_or_404},
+        helpers::{
+            QueryPairs, is_true, requested_status_ids, retain_open_to_viewer,
+            status_for_viewer_or_404,
+        },
         pleroma_account_settings::looks_like_ap_id,
     },
     auth::MaybeAuthUser,
@@ -142,11 +145,7 @@ async fn status_by_uri_or_404(
             return Err(AppError::NotFound);
         }
     };
-    if status_visibility::can_view(&state.db, &found, viewer).await? {
-        Ok(found)
-    } else {
-        Err(AppError::NotFound)
-    }
+    status_visibility::require_visible(&state.db, found, viewer).await
 }
 
 /// `GET /api/v1/statuses/{id}/card` — the stored rich-media card of the
@@ -225,6 +224,7 @@ pub(super) async fn list_statuses(
     // `filter_visible` keeps whatever order it was handed).
     let live = status::get_many(&state.db, &requested).await?;
     let visible = status_visibility::filter_visible(&state.db, live, viewer).await?;
+    let visible = retain_open_to_viewer(&state, viewer, visible).await?;
     let rows = in_requested_order(&requested, visible);
     Ok(Json(
         render_statuses(&state, ViewerMode::User(viewer), &rows).await?,

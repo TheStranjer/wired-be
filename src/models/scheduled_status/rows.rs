@@ -8,7 +8,7 @@
 //! sweep and the media gate are [`limits_due`](super::limits_due)'s.
 
 use chrono::{DateTime, Utc};
-use sqlx::PgPool;
+use sqlx::{PgConnection, PgPool};
 use uuid::Uuid;
 
 use crate::{error::AppResult, util::id::new_id};
@@ -53,12 +53,27 @@ const DELETE_OWNED_SQL: &str = "DELETE FROM scheduled_statuses WHERE id = $1 AND
 /// [`AppError::Database`](crate::error::AppError). The `user_id` foreign key
 /// is the failure reachable here: an unknown account.
 pub async fn insert(pool: &PgPool, new_status: &NewScheduledStatus) -> AppResult<ScheduledStatus> {
+    let mut conn = pool.acquire().await?;
+    insert_conn(&mut conn, new_status).await
+}
+
+/// [`insert`] on a connection the caller holds, so the write can share a
+/// transaction with the limit counts that gate it (see
+/// [`lock_user`](super::lock_user)).
+///
+/// # Errors
+///
+/// The same as [`insert`].
+pub async fn insert_conn(
+    conn: &mut PgConnection,
+    new_status: &NewScheduledStatus,
+) -> AppResult<ScheduledStatus> {
     let stored = sqlx::query_as::<_, ScheduledStatus>(INSERT_SQL)
         .bind(new_id())
         .bind(new_status.user_id)
         .bind(new_status.scheduled_at)
         .bind(&new_status.params)
-        .fetch_one(pool)
+        .fetch_one(conn)
         .await?;
     Ok(stored)
 }

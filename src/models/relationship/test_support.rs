@@ -5,13 +5,15 @@ use sqlx::PgPool;
 
 use super::*;
 use crate::{
-    config::TEST_BASE_URL,
     models::{
         follow::{self, FollowToggles},
-        user::{Flag, NewUser, User, insert, local_ap_id},
+        user::{Flag, NewUser, User, insert},
     },
+    test_fixtures::local_new,
     util::id::new_id,
 };
+
+pub(super) use crate::test_fixtures::local_user;
 
 /// The two per-follow toggles [`set_toggles`] stores, passed as a
 /// struct so the helper does not read as a pair of switch parameters.
@@ -23,16 +25,6 @@ pub(super) struct Toggles {
     pub(super) notify: bool,
 }
 
-/// Inserts a local, unlocked user named `nickname`.
-pub(super) async fn local_user(pool: &PgPool, nickname: &str) -> User {
-    insert(
-        pool,
-        &NewUser::local(nickname, &local_ap_id(TEST_BASE_URL, nickname)),
-    )
-    .await
-    .expect("the local fixture inserts")
-}
-
 /// Inserts a local user named `nickname` whose account is locked, so a
 /// follow of it waits for an answer.
 pub(super) async fn locked_user(pool: &PgPool, nickname: &str) -> User {
@@ -40,7 +32,7 @@ pub(super) async fn locked_user(pool: &PgPool, nickname: &str) -> User {
         pool,
         &NewUser {
             locked: Flag::new(true),
-            ..NewUser::local(nickname, &local_ap_id(TEST_BASE_URL, nickname))
+            ..local_new(nickname)
         },
     )
     .await

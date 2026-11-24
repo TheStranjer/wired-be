@@ -23,7 +23,7 @@ pub(super) const INVITE_LIST: &str = "/api/v1/pleroma/admin/users/invites";
 pub(super) const INVITE_REVOKE: &str = "/api/v1/pleroma/admin/users/revoke_invite";
 /// The emailed-invite route.
 pub(super) const INVITE_EMAIL: &str = "/api/v1/pleroma/admin/users/email_invite";
-/// The registration-link route, merged at the app root.
+/// The registration-link path: no backend route answers it.
 pub(super) const REGISTRATION: &str = "/registration";
 /// The 400 body of the email route while `INVITES_ENABLED` is off.
 pub(super) const INVITES_DISABLED: &str =

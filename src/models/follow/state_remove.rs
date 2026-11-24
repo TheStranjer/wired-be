@@ -1,20 +1,20 @@
 //! Removing a relationship from the followed account's side:
 //! [`remove_follower`] takes one follower back, [`sever_between`] takes the
-//! open rows of a newly blocked pair, [`sever_with_domain`] takes every row
-//! between one account and a blocked domain, and [`uncount_removed_follower`]
-//! steps down the counters every removed accepted row fed.
+//! open rows of a newly blocked pair, and [`sever_with_domain`] takes every row
+//! between one account and a blocked domain. Every removed accepted row steps
+//! its counters down through [`step_counters`].
 
 use std::collections::HashMap;
 
 use sqlx::{PgConnection, PgPool};
 use uuid::Uuid;
 
-use crate::{
-    error::AppResult,
-    models::user::{CountDelta, User, update_counts},
-};
+use crate::{error::AppResult, models::user::User};
 
-use super::types::{Follow, FollowState};
+use super::{
+    counters::step_counters,
+    types::{Follow, FollowState},
+};
 
 /// [`remove_follower`]: the follower is gone, and only an *accepted* row ever
 /// counted, so the removed row is what decides whether the counters step down
@@ -115,7 +115,7 @@ pub async fn remove_follower(
         // does the same).
         return Ok(None);
     };
-    uncount_removed_follower(&mut tx, &follow).await?;
+    step_counters(&mut tx, &follow, -1).await?;
     tx.commit().await?;
     Ok(Some(follow))
 }
@@ -130,7 +130,7 @@ pub async fn remove_follower(
 /// pair and withdrawing both directions' pending requests before it stores
 /// the block. Every removed row that had been *accepted* steps both
 /// denormalised counters down through the module's
-/// `uncount_removed_follower`, a `pending` request moves nothing, and a
+/// `step_counters`, a `pending` request moves nothing, and a
 /// mirrored `rejected` row is left exactly where it was, because it is
 /// nobody's active relationship (see [`unfollow`](super::unfollow)'s same rule).
 ///
@@ -148,7 +148,7 @@ pub async fn sever_between(conn: &mut PgConnection, first: Uuid, second: Uuid) -
         .iter()
         .filter(|row| row.state == FollowState::Accepted)
     {
-        uncount_removed_follower(conn, follow).await?;
+        step_counters(conn, follow, -1).await?;
     }
     Ok(())
 }
@@ -200,7 +200,7 @@ pub async fn sever_with_domain(
         .chain(&outgoing)
         .filter(|row| row.state == FollowState::Accepted)
     {
-        uncount_removed_follower(&mut tx, follow).await?;
+        step_counters(&mut tx, follow, -1).await?;
     }
     let outgoing_ids: Vec<Uuid> = outgoing.iter().map(|row| row.followee_id).collect();
     sqlx::query(SEVER_LIST_MEMBERSHIPS_SQL)
@@ -248,33 +248,6 @@ fn open_with_peers(
             Some((row, peer))
         })
         .collect()
-}
-
-/// Steps the two counters an accepted relationship fed back down on `conn`,
-/// inside an open transaction: the same pair [`step_counters`] writes, one
-/// step of `-1` each, committed together with the row's `DELETE` so a crash
-/// never leaves a counted relationship without its row (or the other way
-/// round). [`remove_follower`], [`sever_between`] and [`sever_with_domain`]
-/// run every accepted row they deleted through it.
-async fn uncount_removed_follower(conn: &mut PgConnection, follow: &Follow) -> AppResult<()> {
-    update_counts(
-        &mut *conn,
-        follow.followee_id,
-        CountDelta {
-            followers: -1,
-            ..CountDelta::default()
-        },
-    )
-    .await?;
-    update_counts(
-        &mut *conn,
-        follow.follower_id,
-        CountDelta {
-            following: -1,
-            ..CountDelta::default()
-        },
-    )
-    .await
 }
 
 #[cfg(test)]

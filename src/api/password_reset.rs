@@ -32,9 +32,9 @@
 //! with the message instead.
 //!
 //! Every dynamic value on the pages goes through
-//! [`escape_html`]: the nickname and the round-tripped token are
-//! client-influenced text and must never break out of their attribute or
-//! element.
+//! [`escape_html`](crate::util::sanitize::escape_html): the nickname and
+//! the round-tripped token are client-influenced text and must never break
+//! out of their attribute or element.
 
 use std::{fmt, time::Duration};
 
@@ -58,7 +58,7 @@ use crate::{
         user::{self, User},
     },
     state::AppState,
-    util::{password::hash_password, sanitize::escape_html},
+    util::{password::hash_password, sanitize::push_escaped},
 };
 
 /// The path the emailed link names and the reset form posts to, under the
@@ -141,8 +141,8 @@ async fn enqueue_reset_mail(state: &AppState, target: &User) -> AppResult<()> {
     let Some(address) = target.email.as_deref() else {
         return Ok(());
     };
-    let token = password_reset::create_for_user(&state.db, target.id).await?;
-    let link = format!("{RESET_PATH}/{}", token.token);
+    let issued = password_reset::create_for_user(&state.db, target.id).await?;
+    let link = format!("{RESET_PATH}/{}", issued.token);
     debug!(account = %target.nickname, "password reset: token issued and letter queued");
     mailer::deliver_later(
         state,
@@ -161,7 +161,7 @@ async fn reset_page(
 ) -> AppResult<Html<String>> {
     let page = match password_reset::get_valid(&state.db, &token, token_ttl(&state)).await? {
         Some(record) => match user::get_by_id(&state.db, record.user_id).await? {
-            Some(target) => reset_form_page(Some(&target.nickname), &record.token, None),
+            Some(target) => reset_form_page(Some(&target.nickname), &token, None),
             None => invalid_token_page(),
         },
         None => invalid_token_page(),
@@ -425,11 +425,6 @@ fn push_error(out: &mut String, message: &str) {
     out.push_str("</p>\n");
 }
 
-/// Appends `text` with the unsafe HTML characters escaped.
-fn push_escaped(out: &mut String, text: &str) {
-    out.push_str(&escape_html(text));
-}
-
 #[cfg(test)]
 mod tests {
     use serde_json::json;
@@ -642,12 +637,12 @@ mod tests {
 
         // The rival completion lands its spend after this one's lookup.
         assert!(
-            password_reset::mark_used(&state.db, record.id)
+            password_reset::mark_used(&state.db, record.row.id)
                 .await
                 .expect("the rival spend runs"),
             "the rival wins the spend"
         );
-        let landed = complete_reset(&state, &target, record.id, "$argon2id$loser")
+        let landed = complete_reset(&state, &target, record.row.id, "$argon2id$loser")
             .await
             .expect("the losing completion runs");
         assert!(!landed, "the loser is told the token is spent");

@@ -45,7 +45,6 @@ use self::{delete::apply_delete, update::apply_update};
 #[cfg(doc)]
 use crate::federation::remote_actor::parse_actor;
 use crate::{
-    error::AppError,
     federation::dispatch::{ActivityView, FederationError, Handlers, Outcome},
     models::user::User,
     state::AppState,
@@ -112,11 +111,4 @@ pub fn delete_actor(
     signer: User,
 ) -> BoxFuture<'static, Result<Outcome, FederationError>> {
     Box::pin(async move { apply_delete(state, view, signer).await })
-}
-
-/// The retry arm every database failure in these handlers maps onto: the
-/// writes here are idempotent, so the queue's next attempt can run the same
-/// activity again.
-fn transient(what: &str, err: &AppError) -> FederationError {
-    FederationError::Transient(format!("could not store the remote actor's {what}: {err}"))
 }

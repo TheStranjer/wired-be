@@ -44,7 +44,7 @@
 use std::collections::{HashMap, HashSet};
 
 use chrono::{DateTime, Utc};
-use sqlx::{FromRow, PgPool, Postgres, QueryBuilder, postgres::PgRow};
+use sqlx::{PgPool, Postgres, QueryBuilder};
 use uuid::Uuid;
 
 use crate::{
@@ -53,8 +53,8 @@ use crate::{
         status::{self, Counter, Status},
         user::User,
     },
-    pagination::PageParams,
-    util::id::new_id,
+    pagination::{PageParams, keyset_page_by},
+    util::id::{new_activity_ap_id, new_id},
 };
 
 /// [`favourite`]: the write, idempotent on `(user_id, status_id)`. A pair
@@ -83,11 +83,13 @@ const FLAGGED_IDS_SQL: &str = "SELECT status_id FROM favourites
 /// [`users_for_status`]: the accounts that favourited one status, each
 /// entry led by the `favourite_id` of the like behind it — the id the page
 /// keys on. The text stops where its one placeholder belongs, because that
-/// is where [`page_rows`] pushes its bind and the builder is what numbers
+/// is where [`keyset_page_by`] pushes its bind and the builder is what numbers
 /// it `$1`; the keyset it then appends runs on the favourite id `f.id`.
+/// Deactivated accounts (`u.is_active` false) are left out, the way
+/// Mastodon's `without_suspended` scope drops them.
 const USERS_PAGE_SQL: &str = "SELECT f.id AS favourite_id, u.* FROM favourites f
     JOIN users u ON u.id = f.user_id
-     WHERE f.status_id = ";
+     WHERE u.is_active AND f.status_id = ";
 
 /// [`page_for_user`]: one account's favourites, the full [`Favourite`]
 /// row leading — the id the page keys on, which the endpoint's `Link`
@@ -174,7 +176,7 @@ pub async fn favourite(
     user_id: Uuid,
     status_id: Uuid,
 ) -> AppResult<Option<Favourite>> {
-    favourite_like(pool, user_id, status_id, &local_activity_id(base_url)).await
+    favourite_like(pool, user_id, status_id, &new_activity_ap_id(base_url)).await
 }
 
 /// Records `user_id`'s like of `status_id` standing for one `Like` activity
@@ -362,7 +364,7 @@ pub async fn users_for_status(
     status_id: Uuid,
     page: PageParams,
 ) -> AppResult<Vec<FavouritePageEntry>> {
-    page_rows(pool, USERS_PAGE_SQL, status_id, &page).await
+    keyset_page_by(pool, USERS_PAGE_SQL, status_id, "f.id", &page).await
 }
 
 /// `user_id`'s favourited statuses, newest favourite first and `page`'s
@@ -391,7 +393,8 @@ pub async fn page_for_user(
     user_id: Uuid,
     page: PageParams,
 ) -> AppResult<Vec<(Favourite, Status)>> {
-    let favourites: Vec<Favourite> = page_rows(pool, FAVOURITES_PAGE_SQL, user_id, &page).await?;
+    let favourites: Vec<Favourite> =
+        keyset_page_by(pool, FAVOURITES_PAGE_SQL, user_id, "f.id", &page).await?;
     let status_ids: Vec<Uuid> = favourites.iter().map(|row| row.status_id).collect();
     let live = status::get_many(pool, &status_ids).await?;
     let mut by_id: HashMap<Uuid, Status> = live.into_iter().map(|row| (row.id, row)).collect();
@@ -439,37 +442,6 @@ pub async fn backup_page(
         .fetch_all(pool)
         .await?;
     Ok(rows)
-}
-
-/// One keyset page of `sql` with `bound_id` as its leading placeholder:
-/// [`users_for_status`] and [`page_for_user`] share the builder walk, the
-/// same shape [`crate::models::follow`] uses — the statement text stops at
-/// the bind, the keyset runs on the favourite id `f.id`, and a `min_id`
-/// page comes back flipped to newest-first.
-async fn page_rows<T>(
-    pool: &PgPool,
-    sql: &str,
-    bound_id: Uuid,
-    page: &PageParams,
-) -> AppResult<Vec<T>>
-where
-    T: for<'r> FromRow<'r, PgRow> + Send + Unpin,
-{
-    let mut builder = QueryBuilder::<Postgres>::new(sql);
-    // The builder's push methods hand back `&mut Self` for chaining; binding
-    // it keeps the statement from having an unused result (decision 14).
-    let _bound: &mut _ = builder.push_bind(bound_id);
-    page.apply_keyset(&mut builder, "f.id");
-    let rows = builder.build_query_as::<T>().fetch_all(pool).await?;
-    Ok(page.finish(rows))
-}
-
-/// The `ap_id` [`favourite`] stores: a freshly minted
-/// `{base_url}/activities/{uuid}` (decision 6). Every favourite this model
-/// writes comes from a local account through the API; the federation
-/// ticket that mirrors a remote `Like` records that activity's own id.
-fn local_activity_id(base_url: &str) -> String {
-    format!("{base_url}/activities/{}", new_id())
 }
 
 #[cfg(test)]

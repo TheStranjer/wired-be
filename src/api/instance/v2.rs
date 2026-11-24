@@ -6,12 +6,14 @@ use serde_json::Value;
 
 use crate::{
     config::{Config, Toggle},
+    default_assets,
     entities::account::Account,
     models::{instance_rule::InstanceRule, user::User},
+    services::instance_meta::SOURCE_URL,
 };
 
 use super::{
-    MAX_FEATURED_TAGS, MAX_PINNED_STATUSES, MONTHLY_ACTIVE_USERS, SOURCE_URL, THUMBNAIL_PATH,
+    MAX_FEATURED_TAGS, MAX_PINNED_STATUSES, MONTHLY_ACTIVE_USERS, THUMBNAIL_PATH,
     handlers::{streaming_api_url, version_string},
     pleroma::PleromaBlock,
     v1::{MediaAttachmentsConfiguration, PollsConfiguration, Rule, StatusesConfiguration},
@@ -121,15 +123,15 @@ struct UsageUsers {
 #[derive(Debug, Serialize)]
 struct Thumbnail {
     /// The instance thumbnail URL ([`THUMBNAIL_PATH`] under
-    /// [`Config::frontend_base_url`]).
+    /// [`Config::media_base_url`]).
     url: String,
 }
 
 impl Thumbnail {
-    /// The thumbnail block for `config`'s frontend origin.
+    /// The thumbnail block for `config`'s media base URL.
     fn for_config(config: &Config) -> Self {
         Self {
-            url: format!("{}{THUMBNAIL_PATH}", config.frontend_base_url),
+            url: default_assets::url(config, THUMBNAIL_PATH),
         }
     }
 }

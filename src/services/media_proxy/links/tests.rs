@@ -79,9 +79,8 @@ fn enabled_rewrites_remote_urls_and_decode_round_trips() {
 fn the_signature_is_base64url_hmac_sha256_over_the_encoded_url() {
     let config = enabled_config(&[]);
     let encoded = URL_SAFE_NO_PAD.encode(REMOTE.as_bytes());
-    let mut mac = HmacSha256::new_from_slice(TEST_SECRET.as_bytes()).unwrap();
-    mac.update(encoded.as_bytes());
-    let sig = URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes());
+    let digest = hmac_sha256(TEST_SECRET.as_bytes(), encoded.as_bytes()).unwrap();
+    let sig = URL_SAFE_NO_PAD.encode(digest);
     assert_eq!(
         proxy_url(&config, REMOTE),
         format!("https://test.example/proxy/{sig}/{encoded}/cat.gif"),

@@ -19,8 +19,6 @@ use crate::{
     state::AppState,
 };
 
-use super::transient;
-
 /// The `Move` route: an account moved to a new actor; mirror the target
 /// and migrate this instance's local followers.
 ///
@@ -82,7 +80,9 @@ async fn apply_move(
     }
     user::set_moved_to(&state.db, signer.id, Some(&target.ap_id))
         .await
-        .map_err(|err| transient("move target", &err))?;
+        .map_err(|err| {
+            FederationError::transient("could not fold the remote activity's move target", &err)
+        })?;
     migrate_followers(&state, &signer, &target).await?;
     debug!(
         from = %signer.nickname,
@@ -127,7 +127,9 @@ async fn migrate_followers(
 ) -> Result<(), FederationError> {
     let followers = follow::move_followers_of(&state.db, origin.id)
         .await
-        .map_err(|err| transient("follower list", &err))?;
+        .map_err(|err| {
+            FederationError::transient("could not fold the remote activity's follower list", &err)
+        })?;
     for follower in &followers {
         migrate_one_follower(state, follower, origin, target).await?;
         notify::on_move(state, follower, origin).await;
@@ -150,7 +152,9 @@ async fn migrate_one_follower(
 ) -> Result<(), FederationError> {
     if block::blocked_between(&state.db, follower.id, target.id)
         .await
-        .map_err(|err| transient("block check", &err))?
+        .map_err(|err| {
+            FederationError::transient("could not fold the remote activity's block check", &err)
+        })?
     {
         debug!(
             follower = %follower.nickname,
@@ -160,17 +164,29 @@ async fn migrate_one_follower(
     }
     let opened = follow::follow(&state.db, &state.config.base_url, follower, target)
         .await
-        .map_err(|err| transient("migrated follow", &err))?;
+        .map_err(|err| {
+            FederationError::transient("could not fold the remote activity's migrated follow", &err)
+        })?;
     federation_out::after_follow_changed(state, follower, target, Some(&opened), true).await;
     // The row the delete removes is read while it still exists: the `Undo`
     // names the stored `Follow` activity, and `unfollow` answers only
     // whether a row was there.
     let previous = follow::get(&state.db, follower.id, origin.id)
         .await
-        .map_err(|err| transient("migrated unfollow lookup", &err))?;
+        .map_err(|err| {
+            FederationError::transient(
+                "could not fold the remote activity's migrated unfollow lookup",
+                &err,
+            )
+        })?;
     let lifted = follow::unfollow(&state.db, follower, origin)
         .await
-        .map_err(|err| transient("migrated unfollow", &err))?;
+        .map_err(|err| {
+            FederationError::transient(
+                "could not fold the remote activity's migrated unfollow",
+                &err,
+            )
+        })?;
     let removed = previous.filter(|_| lifted);
     federation_out::after_follow_changed(state, follower, origin, removed.as_ref(), false).await;
     Ok(())

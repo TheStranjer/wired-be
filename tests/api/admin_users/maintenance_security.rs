@@ -9,7 +9,9 @@ use serde_json::{Value, json};
 use sqlx::PgPool;
 use wired_be::models::user::{Flag, NewUser, User};
 
-use super::support::{DISABLE_MFA, FOLLOW, UNFOLLOW, logged, one_entry, plain, seed, write_token};
+use super::support::{
+    DISABLE_MFA, FOLLOW, UNFOLLOW, follows_token, logged, one_entry, plain, seed, write_token,
+};
 use crate::common::{self, TestRequest};
 
 /// The state of the `follows` row of one pair, `None` without one.
@@ -92,7 +94,7 @@ async fn disable_mfa_resets_the_settings_and_answers_the_nickname() {
 async fn the_admin_follow_pair_connects_reports_and_disconnects() {
     let db = common::test_db().await;
     let seeded = seed(&db).await;
-    let token = write_token(&seeded).await;
+    let token = follows_token(&seeded).await;
     let lockedy = common::create_local_user_with(&seeded.pool, "lockedy", |user| NewUser {
         locked: Flag::new(true),
         ..user
@@ -179,7 +181,7 @@ async fn the_admin_follow_pair_connects_reports_and_disconnects() {
 async fn the_admin_follow_pair_refuses_the_impossible() {
     let db = common::test_db().await;
     let seeded = seed(&db).await;
-    let token = write_token(&seeded).await;
+    let token = follows_token(&seeded).await;
 
     let miss = TestRequest::post(FOLLOW)
         .bearer(&token)

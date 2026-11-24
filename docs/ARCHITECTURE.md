@@ -49,7 +49,11 @@ cite these decisions by number.
 9. **Auth**: OAuth2 bearer tokens. Extractors in `src/auth.rs`: `AuthUser`
    (required), `MaybeAuthUser` (optional). Scope checks follow Mastodon rules
    (`read`, `write`, `follow`, `push`, `admin:read`, `admin:write` and
-   sub-scopes like `read:accounts`).
+   sub-scopes like `read:accounts`). The authorization-code consent screen
+   lives at `{FRONTEND_BASE_URL}/oauth/authorize`: a browser `GET
+   /oauth/authorize` is validated and redirected there (302, query kept), the
+   JSON `GET`/`POST` of the same path is what that page talks to, and the
+   server renders no login or consent HTML on it.
 
 10. **Request bodies**: Mastodon clients send JSON,
     `application/x-www-form-urlencoded` (with `ids[]=1&ids[]=2` arrays and

@@ -85,10 +85,10 @@ fn retry_after(headers: &HeaderMap) -> Option<Duration> {
 pub(super) fn transport_error(err: &HttpError) -> JobError {
     match err {
         HttpError::InvalidUrl | HttpError::Blocked(_) => JobError::Discard(err.to_string()),
-        // `Status` and `TooLarge` cannot come out of a delivery `POST`
-        // (statuses are classified by `delivery_outcome` and the response
-        // body is uncapped), so they are treated like the transport
-        // hiccups they would be if they ever did.
+        // `Status` cannot come out of a delivery `POST` (statuses are
+        // classified by `delivery_outcome`). `TooLarge` can: a peer whose
+        // answer outgrows the response cap is misbehaving, so it retries
+        // like any other transport hiccup.
         HttpError::Timeout | HttpError::Connect(_) | HttpError::Status(_) | HttpError::TooLarge => {
             JobError::Retry(err.to_string())
         }

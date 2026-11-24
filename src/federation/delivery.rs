@@ -79,7 +79,7 @@ mod send_signing;
 mod test_support;
 
 pub use enqueue::{best_inbox, enqueue_delivery};
-pub use send::handle;
+pub use send::{handle, is_local_inbox};
 
 /// The job kind of one inbox delivery, on
 /// [`QUEUE_FEDERATOR_OUTGOING`].
@@ -96,10 +96,6 @@ pub const MAX_ATTEMPTS: i32 = 7;
 
 /// The media type a delivery POST carries and asks for.
 const ACTIVITY_JSON: &str = "application/activity+json";
-
-/// The key fragment appended to an actor id to form its `keyId`, the
-/// convention both Mastodon and Pleroma use.
-const KEY_ID_SUFFIX: &str = "#main-key";
 
 /// The prefix of a delivery's deduplication key.
 const UNIQUE_KEY_PREFIX: &str = "deliver";

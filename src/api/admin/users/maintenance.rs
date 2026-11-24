@@ -11,7 +11,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use tracing::debug;
 
-use super::{AREA_ACCOUNTS, CLASS_WRITE, OK, local_account};
+use super::{AREA_ACCOUNTS, AREA_FOLLOWS, CLASS_WRITE, OK, local_account};
 use crate::{
     api::{accounts::after_follow_changed, password_reset::RESET_PATH},
     auth::admin::AdminUser,
@@ -307,7 +307,7 @@ pub(super) async fn resolve_pair(state: &AppState, body: &FollowBody) -> AppResu
 /// # Errors
 ///
 /// [`AppError::Unauthorized`] / [`AppError::Forbidden`] from [`AdminUser`]
-/// and its `admin:write` gate; [`AppError::Unprocessable`] from the
+/// and its `admin:write:follows` gate; [`AppError::Unprocessable`] from the
 /// extractor for an incomplete body or from the model for the self-follow;
 /// [`AppError::RouteNotFound`] from [`resolve_pair`];
 /// [`AppError::Forbidden`] from the model when a block stands between the
@@ -317,7 +317,7 @@ pub(super) async fn follow_users(
     admin: AdminUser,
     body: ApiBody<FollowBody>,
 ) -> AppResult<Json<&'static str>> {
-    admin.require(CLASS_WRITE, AREA_ACCOUNTS)?;
+    admin.require(CLASS_WRITE, AREA_FOLLOWS)?;
     let (follower, target) = resolve_pair(&state, &body.0).await?;
     let started = follow::follow(&state.db, &state.config.base_url, &follower, &target).await?;
     let accepted = if started.state == FollowState::Pending {
@@ -351,7 +351,7 @@ pub(super) async fn unfollow_users(
     admin: AdminUser,
     body: ApiBody<FollowBody>,
 ) -> AppResult<Json<&'static str>> {
-    admin.require(CLASS_WRITE, AREA_ACCOUNTS)?;
+    admin.require(CLASS_WRITE, AREA_FOLLOWS)?;
     let (follower, target) = resolve_pair(&state, &body.0).await?;
     let previous = follow::get(&state.db, follower.id, target.id).await?;
     let removed = follow::unfollow(&state.db, &follower, &target).await?;

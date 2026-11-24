@@ -12,14 +12,17 @@ use std::{
 use tracing::debug;
 use zip::{CompressionMethod, ZipWriter, write::SimpleFileOptions};
 
-use crate::error::{AppError, AppResult};
+use crate::{
+    error::{AppError, AppResult, io_error},
+    uploads,
+};
 
 use super::{
     ACCEPTED_EMOJI_TYPES, ARCHIVE_ENTRY_TOO_LARGE, ARCHIVE_TOO_LARGE, ARCHIVE_TOO_MANY_FILES,
     ARCHIVE_UNREADABLE, ARCHIVE_UNSAFE_PATH, MAX_PACK_ARCHIVE_BYTES, MAX_PACK_ARCHIVE_ENTRIES,
     MAX_PACK_EXTRACTED_BYTES, PACK_FILE, file_name_valid,
     files::create_parent,
-    names::{io_error, not_shared, pack_dir},
+    names::{not_shared, pack_dir},
     packs::load_pack,
 };
 
@@ -46,7 +49,7 @@ pub async fn pack_archive(dir: &Path, name: &str) -> AppResult<Vec<u8>> {
         .await
         .map_err(|err| io_error("read pack manifest", &pack_dir.join(PACK_FILE), &err))?;
     let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
-    let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+    let options = deterministic_options();
     zip_write(&mut writer, PACK_FILE, options, &manifest)?;
     for file in pack.files.values() {
         let bytes = read_archive_entry(&pack_dir, file).await?;
@@ -61,6 +64,17 @@ pub async fn pack_archive(dir: &Path, name: &str) -> AppResult<Vec<u8>> {
         "built emoji pack archive"
     );
     Ok(cursor.into_inner())
+}
+
+/// Entry options that make [`pack_archive`] reproducible: deflate with the
+/// zip epoch (1980-01-01) as every entry's timestamp and fixed Unix
+/// permissions, so the same pack always zips to the same bytes and the
+/// `download-sha256` a listing advertises matches the download.
+fn deterministic_options() -> SimpleFileOptions {
+    SimpleFileOptions::default()
+        .compression_method(CompressionMethod::Deflated)
+        .last_modified_time(zip::DateTime::default())
+        .unix_permissions(0o644)
 }
 
 /// The bytes of one archive entry, missing or unsafe files answered as
@@ -112,7 +126,7 @@ fn path_traversal(file: &str) -> bool {
 /// bytes like the file routes do — never from the name or a
 /// `content-type` the archive's author claimed.
 fn is_emoji_image(bytes: &[u8]) -> bool {
-    infer::get(bytes).is_some_and(|kind| ACCEPTED_EMOJI_TYPES.contains(&kind.mime_type()))
+    uploads::sniff_allowed(bytes, &ACCEPTED_EMOJI_TYPES).is_ok()
 }
 
 /// Installs a pack archive the way Pleroma's `SafeZip.unzip_data` must:
@@ -315,6 +329,32 @@ mod tests {
             payload
         };
         assert_eq!(image, PNG_BYTES, "nested files keep their path and bytes");
+    }
+
+    #[tokio::test]
+    async fn the_archive_bytes_are_reproducible() {
+        let dir = temp_dir();
+        seed_pack(
+            dir.path(),
+            "shared",
+            &[("cat", "cat.png"), ("dog", "sub/dog.png")],
+        )
+        .await;
+        let first = pack_archive(dir.path(), "shared").await.unwrap();
+        let second = pack_archive(dir.path(), "shared").await.unwrap();
+        assert_eq!(first, second, "the same pack zips to the same bytes");
+
+        let mut archive = ZipArchive::new(Cursor::new(first)).unwrap();
+        for index in 0..archive.len() {
+            let entry = archive.by_index(index).unwrap();
+            assert_eq!(
+                entry.last_modified(),
+                Some(zip::DateTime::default()),
+                "entry {index} carries the fixed timestamp"
+            );
+        }
+        let first_name = archive.by_index(0).unwrap().name().unwrap().into_owned();
+        assert_eq!(first_name, PACK_FILE, "the manifest leads the entries");
     }
 
     #[tokio::test]

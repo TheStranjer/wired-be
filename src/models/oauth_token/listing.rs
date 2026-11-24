@@ -1,31 +1,11 @@
-//! Listing a user's tokens: every row for [`list_for_user`], and the
-//! still-valid ones with their app names for
-//! [`list_valid_with_app_names`], which backs `GET /api/oauth_tokens`.
+//! Listing a user's still-valid tokens with their app names:
+//! [`list_valid_with_app_names`] backs `GET /api/oauth_tokens`.
 
 use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use super::OauthToken;
 use crate::error::AppResult;
-
-/// Fetches every token (expired included) belonging to user `user_id`,
-/// newest first by creation order (`UUIDv7` ids sort by mint time,
-/// decision 4). A user with no tokens yields an empty `Vec`.
-///
-/// # Errors
-///
-/// Any database failure (connection, encoding) arrives as
-/// [`AppError::Database`](crate::error::AppError).
-pub async fn list_for_user(pool: &PgPool, user_id: Uuid) -> AppResult<Vec<OauthToken>> {
-    let tokens = sqlx::query_as::<_, OauthToken>(
-        "SELECT * FROM oauth_tokens WHERE user_id = $1 ORDER BY id",
-    )
-    .bind(user_id)
-    .fetch_all(pool)
-    .await?;
-    Ok(tokens)
-}
 
 /// One row of [`list_valid_with_app_names`]: a still-valid token joined
 /// with the name of the application that issued it.
@@ -77,45 +57,6 @@ mod tests {
     use super::super::test_support::*;
     use super::*;
     use crate::util::id::new_id;
-
-    #[tokio::test]
-    async fn list_for_user_only_shows_that_users_tokens() {
-        let db = crate::test_db::test_db().await.expect("test database slot");
-        let pool = db.pool().clone();
-        let grace = insert_user(&pool, "grace").await;
-        let heidi = insert_user(&pool, "heidi").await;
-        let app = insert_app(&pool, "Listed").await;
-        let mine = create_token(&pool, &new_token(Some(grace.id), app.id))
-            .await
-            .unwrap();
-        let expired = create_token(&pool, &new_token(Some(grace.id), app.id))
-            .await
-            .unwrap();
-        expire_token(&pool, expired.id).await;
-        let hers = create_token(&pool, &new_token(Some(heidi.id), app.id))
-            .await
-            .unwrap();
-
-        let listed = list_for_user(&pool, grace.id).await.unwrap();
-        assert_eq!(listed.len(), 2, "both of grace's tokens, expired included");
-        let ids: Vec<Uuid> = listed.iter().map(|token| token.id).collect();
-        assert!(
-            ids.contains(&mine.id) && ids.contains(&expired.id),
-            "grace's rows are the ones listed"
-        );
-        assert!(
-            !ids.contains(&hers.id),
-            "heidi's token is not in grace's list"
-        );
-        assert!(
-            ids.first().is_some_and(|first| *first == mine.id),
-            "creation order (decision 4): the older row leads"
-        );
-        assert!(
-            list_for_user(&pool, new_id()).await.unwrap().is_empty(),
-            "an unknown user has no tokens"
-        );
-    }
 
     #[tokio::test]
     async fn list_valid_with_app_names_skips_expired_and_sorts_newest_first() {

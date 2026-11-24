@@ -13,11 +13,14 @@
 //! "sign in to connect an existing account" — has no analogue here: an
 //! existing account links itself through the provider callback, which is
 //! the flow that sent the browser to this page in the first place. Like
-//! [`crate::oauth::authorize_page`] the pages are plain `String` pushes
+//! [`crate::oauth::page`] the pages are plain `String` pushes
 //! with every dynamic value HTML-escaped, and self-contained: inline CSS,
 //! no scripts (decision 1).
 
-use crate::oauth::authorize_page::{push_error, push_escaped, push_head, push_tail};
+use crate::{
+    oauth::page::{push_error, push_head, push_tail},
+    util::sanitize::push_escaped,
+};
 
 /// Where [`render_form`]'s form posts.
 const FORM_ACTION: &str = "/oauth/register";
@@ -100,7 +103,7 @@ pub fn render_form(form: &RegistrationForm<'_>) -> String {
         value: form.bio,
     };
     let mut out = String::new();
-    push_head(&mut out, None, PAGE_TITLE);
+    push_head(&mut out, PAGE_TITLE);
     push_opening(&mut out);
     push_error(&mut out, form.error);
     out.push_str("<p>");
@@ -133,7 +136,7 @@ pub fn render_form(form: &RegistrationForm<'_>) -> String {
 #[must_use]
 pub fn render_message(message: &str) -> String {
     let mut out = String::new();
-    push_head(&mut out, None, PAGE_TITLE);
+    push_head(&mut out, PAGE_TITLE);
     push_opening(&mut out);
     out.push_str("<p class=\"alert\" role=\"status\">");
     push_escaped(&mut out, message);

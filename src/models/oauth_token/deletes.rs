@@ -1,5 +1,4 @@
-//! Deleting tokens: one by id, the expired sweep, one a user owns, and the
-//! revocation of every token of a user with or without sparing the
+//! Deleting tokens: one by id, one a user owns, and the revocation of every token of a user with or without sparing the
 //! credential that asked.
 
 use sqlx::{Executor, PgPool, Postgres};
@@ -21,25 +20,6 @@ pub async fn delete_token(pool: &PgPool, id: Uuid) -> AppResult<()> {
         .await
         .map(drop)?;
     Ok(())
-}
-
-/// Deletes every token whose `valid_until` has passed, reporting how
-/// many rows went.
-///
-/// The sweep Pleroma schedules per token
-/// (`Pleroma.Workers.PurgeExpiredToken`) is a batch delete here; a later
-/// ticket runs it on a cadence. User-bound rows are also removed by the
-/// `ON DELETE CASCADE` from `users` long before they expire.
-///
-/// # Errors
-///
-/// Any database failure (connection, encoding) arrives as
-/// [`AppError::Database`](crate::error::AppError).
-pub async fn delete_expired(pool: &PgPool) -> AppResult<u64> {
-    let deleted = sqlx::query("DELETE FROM oauth_tokens WHERE valid_until <= now()")
-        .execute(pool)
-        .await?;
-    Ok(deleted.rows_affected())
 }
 
 /// Deletes the token `id` only when it belongs to user `user_id`,
@@ -130,7 +110,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::super::test_support::*;
-    use super::super::{create_authorization, create_token, get_valid_token};
+    use super::super::{create_authorization, create_token, get_with_app};
     use super::*;
     use crate::util::id::new_id;
 
@@ -146,49 +126,8 @@ mod tests {
         delete_token(&pool, token.id).await.unwrap();
         assert_eq!(token_rows(&pool, token.id).await, 0, "the row is gone");
         assert!(
-            get_valid_token(&pool, &token.token)
-                .await
-                .unwrap()
-                .is_none(),
-            "a deleted token no longer validates"
-        );
-    }
-
-    #[tokio::test]
-    async fn delete_expired_sweeps_only_expired_rows() {
-        let db = crate::test_db::test_db().await.expect("test database slot");
-        let pool = db.pool().clone();
-        let frank = insert_user(&pool, "frank").await;
-        let app = insert_app(&pool, "Janitor").await;
-        let stale = create_token(&pool, &new_token(Some(frank.id), app.id))
-            .await
-            .unwrap();
-        let also_stale = create_token(&pool, &new_token(Some(frank.id), app.id))
-            .await
-            .unwrap();
-        let fresh = create_token(&pool, &new_token(Some(frank.id), app.id))
-            .await
-            .unwrap();
-        expire_token(&pool, stale.id).await;
-        expire_token(&pool, also_stale.id).await;
-
-        let swept = delete_expired(&pool).await.unwrap();
-        assert_eq!(swept, 2, "exactly the two expired rows went");
-        assert_eq!(
-            token_rows(&pool, stale.id).await,
-            0,
-            "the stale row is gone"
-        );
-        assert_eq!(
-            token_rows(&pool, fresh.id).await,
-            1,
-            "the fresh row survived the sweep"
-        );
-
-        let nothing = delete_expired(&pool).await.unwrap();
-        assert_eq!(
-            nothing, 0,
-            "a second sweep with nothing due deletes zero rows"
+            get_with_app(&pool, &token.token).await.unwrap().is_none(),
+            "a deleted token is no longer found"
         );
     }
 

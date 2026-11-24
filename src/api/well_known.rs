@@ -14,7 +14,7 @@
 //!
 //! `WebFinger` answers the same document in two representations: the JRD
 //! JSON body by default, `application/jrd+json`, and the XRD XML body —
-//! the same data through [`xml_escape`] —
+//! the same data through [`escape_html`] —
 //! when the client asks with an `Accept` naming `application/xrd+xml` or a
 //! `format=xml` query parameter, Pleroma's `SetFormatPlug` behavior.
 
@@ -32,7 +32,7 @@ use crate::{
     error::{AppError, AppResult},
     models::user::{User, get_by_ap_id, get_by_nickname},
     state::AppState,
-    util::xml::xml_escape,
+    util::sanitize::escape_html,
 };
 
 /// `Content-Type` of the JRD JSON answer, the media type RFC 7033
@@ -122,7 +122,7 @@ async fn host_meta(State(state): State<AppState>) -> Response {
     );
     xrd_body(format!(
         r#"<XRD xmlns="{XRD_NAMESPACE}"><Link rel="lrdd" template="{}"/></XRD>"#,
-        xml_escape(&template)
+        escape_html(&template)
     ))
 }
 
@@ -169,7 +169,7 @@ async fn find_local_active_user(state: &AppState, resource: &str) -> AppResult<O
         Resource::Nickname(nickname) => get_by_nickname(&state.db, nickname).await?,
         Resource::ActorId(ap_id) => get_by_ap_id(&state.db, ap_id).await?,
     };
-    Ok(user.filter(|found| found.local.get() && found.is_active.get()))
+    Ok(user.filter(User::is_local_active))
 }
 
 /// Whether the client asked for the XRD XML representation: a `format`
@@ -264,17 +264,17 @@ impl Finger {
     }
 }
 
-/// The `OStatus` subscribe link: Pleroma's follow-intent template, this
-/// instance's `/ostatus_subscribe` page with the literal `{uri}` macro
-/// left for the remote server to fill in.
+/// The `OStatus` subscribe link: the follow-intent template naming the
+/// frontend's `/authorize_interaction` page (Mastodon's shape), with the
+/// literal `{uri}` macro left for the remote server to fill in.
 fn subscribe_link(config: &Config) -> FingerLink {
     FingerLink {
         rel: SUBSCRIBE_REL,
         link_type: None,
         href: None,
         template: Some(format!(
-            "{}/ostatus_subscribe?acct={{uri}}",
-            config.base_url
+            "{}/authorize_interaction?uri={{uri}}",
+            config.frontend_base_url
         )),
     }
 }
@@ -300,12 +300,12 @@ fn xrd_response(finger: &Finger) -> Response {
     let aliases: Vec<String> = finger
         .aliases
         .iter()
-        .map(|alias| format!("<Alias>{}</Alias>", xml_escape(alias)))
+        .map(|alias| format!("<Alias>{}</Alias>", escape_html(alias)))
         .collect();
     let links: Vec<String> = finger.links.iter().map(xrd_link).collect();
     xrd_body(format!(
         r#"<XRD xmlns="{XRD_NAMESPACE}"><Subject>{}</Subject>{}{}</XRD>"#,
-        xml_escape(&finger.subject),
+        escape_html(&finger.subject),
         aliases.concat(),
         links.concat(),
     ))
@@ -313,18 +313,18 @@ fn xrd_response(finger: &Finger) -> Response {
 
 /// One `<Link/>` element of an XRD document: `rel` first, then whichever of
 /// `type`, `href` and `template` the link carries, every value run
-/// through [`xml_escape`] so a database-sourced URL cannot break out of
+/// through [`escape_html`] so a database-sourced URL cannot break out of
 /// its quotes or its element.
 fn xrd_link(link: &FingerLink) -> String {
-    let mut attributes = vec![format!(r#"rel="{}""#, xml_escape(link.rel))];
+    let mut attributes = vec![format!(r#"rel="{}""#, escape_html(link.rel))];
     if let Some(link_type) = link.link_type {
-        attributes.push(format!(r#"type="{}""#, xml_escape(link_type)));
+        attributes.push(format!(r#"type="{}""#, escape_html(link_type)));
     }
     if let Some(href) = &link.href {
-        attributes.push(format!(r#"href="{}""#, xml_escape(href)));
+        attributes.push(format!(r#"href="{}""#, escape_html(href)));
     }
     if let Some(template) = &link.template {
-        attributes.push(format!(r#"template="{}""#, xml_escape(template)));
+        attributes.push(format!(r#"template="{}""#, escape_html(template)));
     }
     format!("<Link {}/>", attributes.join(" "))
 }
@@ -353,6 +353,52 @@ mod tests {
             drop(previous);
         }
         headers
+    }
+
+    #[test]
+    fn the_subscribe_template_names_the_frontend_authorize_interaction_page() {
+        let mut config = Config::for_tests();
+        config.frontend_base_url = "https://fe.example".to_owned();
+        let link = subscribe_link(&config);
+        assert_eq!(
+            link.template.as_deref(),
+            Some("https://fe.example/authorize_interaction?uri={uri}"),
+            "the JRD template points at the frontend"
+        );
+        assert_eq!(
+            xrd_link(&link),
+            r#"<Link rel="http://ostatus.org/schema/1.0/subscribe" template="https://fe.example/authorize_interaction?uri={uri}"/>"#,
+            "the XRD carries the same template"
+        );
+    }
+
+    #[test]
+    fn the_subscribe_template_defaults_onto_the_base_url() {
+        let config = Config::for_tests();
+        let link = subscribe_link(&config);
+        let want = format!("{}/authorize_interaction?uri={{uri}}", config.base_url);
+        assert_eq!(
+            link.template.as_deref(),
+            Some(want.as_str()),
+            "with the default config the frontend is the backend"
+        );
+        assert!(
+            !xrd_link(&link).contains("ostatus_subscribe"),
+            "no WebFinger link mentions the login form"
+        );
+    }
+
+    #[test]
+    fn the_xrd_subscribe_template_is_xml_escaped() {
+        let mut config = Config::for_tests();
+        config.frontend_base_url = "https://fe.example/a&b".to_owned();
+        let xml = xrd_link(&subscribe_link(&config));
+        assert!(
+            xml.contains(
+                r#"template="https://fe.example/a&amp;b/authorize_interaction?uri={uri}""#
+            ),
+            "the ampersand is escaped: {xml}"
+        );
     }
 
     #[test]

@@ -302,6 +302,29 @@ async fn birthdays_default_to_today_in_utc() {
     );
 }
 
+/// An empty `day` or `month` is absent, not a 400: the listing falls back to
+/// today, the same answer a request without the parameter gets.
+#[tokio::test]
+async fn an_empty_birthday_part_is_treated_as_absent() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let (alice, token) = fixture(&pool, "alice", "read:accounts").await;
+    let today = Utc::now().date_naive();
+    let party = born(&pool, "party", today.year(), today.month(), today.day()).await;
+    seed_follow(&pool, &alice, &party).await;
+    let app = common::test_app(pool);
+
+    for query in ["day=", "month=", "month=&day="] {
+        let asked = get(&app, Some(&token), &format!("{BIRTHDAYS_PATH}?{query}")).await;
+        common::assert_answer(&asked, StatusCode::OK, query);
+        assert_eq!(
+            listed_ids(&asked.json_value()),
+            vec![party.id.to_string()],
+            "`?{query}` asks about today, as no parameter at all does"
+        );
+    }
+}
+
 /// A `29 February` birthday matches `month=2&day=29` and nothing else: no
 /// other year, month or day ever finds it.
 #[tokio::test]

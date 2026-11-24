@@ -8,7 +8,11 @@
 //! (required, a string or a list), `scopes` (default `read`, validated
 //! per `docs/ARCHITECTURE.md` decision 9) and `website` (optional), all
 //! read through the [`ApiBody`] extractor (decision 10). Missing or
-//! empty required fields, and unknown scopes, are 422s (decision 8).
+//! empty required fields, unknown scopes, and over-long or malformed
+//! values are 422s (decision 8): the name is at most 60 characters, the
+//! website an `http(s)` URL of at most 2000, and the redirect URIs at most
+//! 2000 characters in total, each the OOB URN or an absolute URI with no
+//! fragment and no `javascript`, `data` or `vbscript` scheme.
 //!
 //! `GET /api/v1/apps/verify_credentials` is the same
 //! [`Application`] entity without its secrets, so a client can confirm
@@ -66,23 +70,30 @@ pub fn router(state: &AppState) -> Router<AppState> {
 /// # Errors
 ///
 /// [`AppError::Unprocessable`] when `client_name` or `redirect_uris` is
-/// missing or empty, or a requested scope is unknown. Any database
+/// missing, empty, too long or malformed, `website` is too long or no
+/// `http(s)` URL, or a requested scope is unknown. Any database
 /// failure arrives through `?` as [`AppError::Database`].
 async fn create_app(
     State(state): State<AppState>,
     ApiBody(params): ApiBody<CreateAppParams>,
 ) -> AppResult<Json<Application>> {
     let scopes = resolve_scopes(params.scopes.as_deref())?;
+    let client_name = params.client_name.trim().to_owned();
+    check_name(&client_name).map_err(|reason| field_error("client_name", &reason))?;
+    if let Some(website) = params.website.as_deref() {
+        check_website(website).map_err(|reason| field_error("website", &reason))?;
+    }
     let redirect_uris = normalize_redirect_uris(params.redirect_uris);
     if redirect_uris.trim().is_empty() {
         return Err(AppError::Unprocessable(
             "redirect_uris must not be empty".to_owned(),
         ));
     }
+    check_redirect_uris(&redirect_uris).map_err(|reason| field_error("redirect_uris", &reason))?;
     let app = oauth_app::create(
         &state.db,
         &NewOauthApp {
-            client_name: params.client_name,
+            client_name,
             redirect_uris,
             scopes: scopes.to_string(),
             website: params.website,
@@ -157,6 +168,92 @@ pub(crate) fn normalize_redirect_uris(input: RedirectUris) -> String {
     }
 }
 
+/// Longest application name, in characters (Mastodon's `APP_NAME_LIMIT`).
+pub(crate) const APP_NAME_LIMIT: usize = 60;
+/// Longest stored `redirect_uris` text, in characters (Mastodon's
+/// `APP_REDIRECT_URI_LIMIT`).
+pub(crate) const APP_REDIRECT_URI_LIMIT: usize = 2_000;
+/// Longest application website, in characters (Mastodon's
+/// `APP_WEBSITE_LIMIT`).
+pub(crate) const APP_WEBSITE_LIMIT: usize = 2_000;
+/// The out-of-band redirect URI, valid although it is no hierarchical URL.
+const OOB_REDIRECT_URI: &str = "urn:ietf:wg:oauth:2.0:oob";
+/// Schemes a redirect URI must never use: the browser would run or render
+/// the `Location` instead of navigating to a client.
+const FORBIDDEN_REDIRECT_SCHEMES: [&str; 3] = ["javascript", "data", "vbscript"];
+
+/// A 422 naming `field` and the `reason` it was refused.
+fn field_error(field: &str, reason: &str) -> AppError {
+    AppError::Unprocessable(format!("{field} {reason}"))
+}
+
+/// Checks an already-trimmed application name: non-empty and at most
+/// [`APP_NAME_LIMIT`] characters.
+///
+/// # Errors
+///
+/// The reason the name is refused, phrased to follow the field name.
+pub(crate) fn check_name(name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err("must not be empty".to_owned());
+    }
+    if name.chars().count() > APP_NAME_LIMIT {
+        return Err(format!("must be at most {APP_NAME_LIMIT} characters"));
+    }
+    Ok(())
+}
+
+/// Checks a website: a blank one is "no website"; otherwise at most
+/// [`APP_WEBSITE_LIMIT`] characters and an `http` or `https` URL.
+///
+/// # Errors
+///
+/// The reason the website is refused, phrased to follow the field name.
+pub(crate) fn check_website(website: &str) -> Result<(), String> {
+    let trimmed = website.trim();
+    if trimmed.is_empty() {
+        return Ok(());
+    }
+    if trimmed.chars().count() > APP_WEBSITE_LIMIT {
+        return Err(format!("must be at most {APP_WEBSITE_LIMIT} characters"));
+    }
+    match url::Url::parse(trimmed) {
+        Ok(parsed) if matches!(parsed.scheme(), "http" | "https") => Ok(()),
+        _ => Err("must be an http or https URL".to_owned()),
+    }
+}
+
+/// Checks stored-form `redirect_uris`: at most [`APP_REDIRECT_URI_LIMIT`]
+/// characters in total, and every whitespace-separated entry either the
+/// OOB URN or an absolute URL without a fragment whose scheme is not one
+/// of [`FORBIDDEN_REDIRECT_SCHEMES`]. Custom schemes stay allowed.
+///
+/// # Errors
+///
+/// The reason the text is refused, phrased to follow the field name.
+pub(crate) fn check_redirect_uris(uris: &str) -> Result<(), String> {
+    if uris.chars().count() > APP_REDIRECT_URI_LIMIT {
+        return Err(format!(
+            "must be at most {APP_REDIRECT_URI_LIMIT} characters"
+        ));
+    }
+    for uri in uris.split_whitespace() {
+        if uri == OOB_REDIRECT_URI {
+            continue;
+        }
+        let Ok(parsed) = url::Url::parse(uri) else {
+            return Err("must be absolute URIs separated by whitespace".to_owned());
+        };
+        if parsed.fragment().is_some() {
+            return Err("must not contain a fragment".to_owned());
+        }
+        if FORBIDDEN_REDIRECT_SCHEMES.contains(&parsed.scheme()) {
+            return Err(format!("must not use the {} scheme", parsed.scheme()));
+        }
+    }
+    Ok(())
+}
+
 /// The scopes to register: parsed from the request with
 /// [`Scopes::parse`], defaulting to [`Scopes::default`] (`read`) when
 /// absent or blank.
@@ -229,6 +326,52 @@ mod tests {
             "",
             "nothing left to store, which the endpoint rejects"
         );
+    }
+
+    #[test]
+    fn names_are_non_empty_and_at_most_sixty_characters() {
+        assert!(check_name("Client").is_ok(), "an ordinary name");
+        assert!(check_name(&"a".repeat(60)).is_ok(), "60 is the limit");
+        assert!(check_name("").is_err(), "empty refuses");
+        assert!(check_name(&"a".repeat(61)).is_err(), "61 refuses");
+        assert!(check_name(&"é".repeat(60)).is_ok(), "characters, not bytes");
+    }
+
+    #[test]
+    fn websites_are_bounded_http_urls() {
+        assert!(check_website("https://a.example").is_ok(), "https");
+        assert!(check_website("http://a.example/x").is_ok(), "http");
+        assert!(check_website("  ").is_ok(), "blank is no website");
+        assert!(check_website("ftp://a.example").is_err(), "ftp refuses");
+        assert!(check_website("not a url").is_err(), "junk refuses");
+        let long = format!("https://a.example/{}", "a".repeat(1_990));
+        assert!(check_website(&long).is_err(), "over 2000 refuses");
+    }
+
+    #[test]
+    fn redirect_uris_must_be_absolute_fragmentless_and_safe() {
+        for good in [
+            "https://a.example/cb",
+            "myapp://callback",
+            "urn:ietf:wg:oauth:2.0:oob",
+            "https://a.example/cb\nhttps://b.example/cb",
+            "https://a.example/cb https://b.example/cb",
+        ] {
+            assert!(check_redirect_uris(good).is_ok(), "`{good}` is valid");
+        }
+        for bad in [
+            "https://a.example/cb#frag",
+            "https://a.example/cb#",
+            "/relative",
+            "javascript:alert(1)",
+            "data:text/html,x",
+            "VBScript:x",
+            "https://a.example/cb /relative",
+        ] {
+            assert!(check_redirect_uris(bad).is_err(), "`{bad}` is refused");
+        }
+        let long = format!("https://a.example/{}", "a".repeat(2_000));
+        assert!(check_redirect_uris(&long).is_err(), "over 2000 refuses");
     }
 
     #[test]

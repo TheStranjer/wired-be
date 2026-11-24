@@ -80,31 +80,15 @@ pub(super) fn rendered_fields(
 ) -> RenderedFields {
     let urls: HashMap<String, String> = found
         .iter()
-        .map(|(mention, account)| (mention_key(mention), profile_url(account)))
+        .map(|(mention, account)| (mention.key(), account.profile_url_or_ap_id().to_owned()))
         .collect();
-    let link = |mention: &MentionRef| urls.get(&mention_key(mention)).cloned();
+    let link = |mention: &MentionRef| urls.get(&mention.key()).cloned();
     let html = render_content(text, content_type);
     RenderedFields {
         content: linkify_entities(&html, &link, &state.config.base_url),
         mentioned_user_ids: found.iter().map(|(_, account)| account.id).collect(),
         hashtags: extract_hashtags(text),
     }
-}
-
-/// The URL a mention links to: the stored [`profile_url`](User::profile_url)
-/// that Pleroma's `Formatter.mention_from_user` prefers as `user.uri`, or the
-/// actor id every row is guaranteed to carry — the same fallback the
-/// [`Mention`](crate::entities::mention::Mention) entity renders.
-fn profile_url(user: &User) -> String {
-    user.profile_url
-        .clone()
-        .unwrap_or_else(|| user.ap_id.clone())
-}
-
-/// The lookup key of one mention: the account it names, case-folded — `nick`
-/// for a bare reference, `nick@domain` when the text spelled the domain out.
-fn mention_key(mention: &MentionRef) -> String {
-    mention.acct().to_lowercase()
 }
 
 /// [`NewStatus`] of one checked body: a `local` post by `user` with its

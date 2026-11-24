@@ -46,7 +46,7 @@
 //! share its files, 400 for a missing `name` parameter (Pleroma's `"pack
 //! name cannot be empty"`), which the writes share.
 //!
-//! [`files_router`] is the separate top-level `GET /emoji/{pack}/{file}`:
+//! [`files_router`] is the separate top-level `GET /emoji/{pack}/{*file}`:
 //! the address [`emoji_image_url`](crate::services::emoji_packs::emoji_image_url)
 //! stores in `custom_emojis.image_url`. Like [`crate::api::media_files`] it
 //! serves from the instance's own origin, so the type comes from the
@@ -79,9 +79,11 @@
 //!
 //! The four install routes (WBE-216) are the controller's `remote`,
 //! `download`, `download_zip` and `import_from_filesystem` actions.
-//! [`AdminUser`] gates them all; the ticket grants the two GETs the
-//! `admin:read` class and the two POSTs `admin:write` (Pleroma itself
-//! demands `admin:write` for all four).
+//! [`AdminUser`] gates them all with the `admin:write` class (or its
+//! narrow `admin:write:emoji` alias), as Pleroma does: the two GETs
+//! (`remote` makes the server fetch an admin-supplied URL, `import`
+//! writes `pack.json` files and rewrites `custom_emojis`) are not
+//! reads, so an `admin:read` token is refused on all four.
 //!
 //! - `GET /packs/remote?url=…&page=…&page_size=…` — relay another
 //!   instance's `{"count","packs"}` listing, fetched from
@@ -195,10 +197,6 @@ const MIN_FETCH_STATUS: u16 = 200;
 /// with.
 const MAX_FETCH_STATUS: u16 = 300;
 
-/// The read class of [`AdminUser::require`]: the ticket grants the two
-/// GET install routes `admin:read` (and its narrow `admin:read:emoji`
-/// alias), where Pleroma demands `admin:write`.
-const CLASS_READ: &str = "read";
 /// Largest remote listing response the install routes read: the
 /// ticket's 5 MiB.
 const MAX_REMOTE_LIST_BYTES: usize = 5 * 1024 * 1024;
@@ -258,8 +256,9 @@ pub fn router(config: &Config) -> Router<AppState> {
         )
 }
 
-/// The static `GET /emoji/{pack}/{file}` router, merged at the top level of
-/// [`crate::app`]: synced `custom_emojis.image_url` values point there.
+/// The static `GET /emoji/{pack}/{*file}` router, merged at the top level of
+/// [`crate::app`]: synced `custom_emojis.image_url` values point there. The
+/// wildcard captures nested names such as `sub/kitten.gif`.
 pub fn files_router() -> Router<AppState> {
-    Router::new().route("/emoji/{pack}/{file}", get(serve_emoji_file))
+    Router::new().route("/emoji/{pack}/{*file}", get(serve_emoji_file))
 }

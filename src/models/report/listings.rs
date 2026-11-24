@@ -7,7 +7,10 @@
 use sqlx::{PgPool, Postgres, QueryBuilder};
 use uuid::Uuid;
 
-use crate::{error::AppResult, pagination::PageParams};
+use crate::{
+    error::AppResult,
+    pagination::{PageParams, keyset_page},
+};
 
 use super::{Report, ReportState};
 
@@ -79,10 +82,7 @@ pub struct AdminListPage {
 /// Any database failure (connection, encoding) arrives as
 /// [`AppError::Database`](crate::error::AppError).
 pub async fn list(pool: &PgPool, page: PageParams) -> AppResult<Vec<Report>> {
-    let mut builder = QueryBuilder::<Postgres>::new(LIST_SQL);
-    page.apply_keyset(&mut builder, "id");
-    let rows = builder.build_query_as::<Report>().fetch_all(pool).await?;
-    Ok(page.finish(rows))
+    keyset_page(pool, QueryBuilder::<Postgres>::new(LIST_SQL), "id", &page).await
 }
 
 /// Every report matching `params`' filters, newest filing first, one

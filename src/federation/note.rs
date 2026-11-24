@@ -48,7 +48,7 @@ pub mod fields;
 pub mod load;
 pub mod tags;
 #[cfg(test)]
-mod test_support;
+pub mod test_support;
 
 pub use activities::{
     NoteDeletion, announce_activity_json, create_activity_json, delete_activity_json,
@@ -70,7 +70,10 @@ pub const LITEPUB_SCHEMA_PATH: &str = "/schemas/litepub-0.1.jsonld";
 /// that means "everyone".
 const AS_PUBLIC: &str = "https://www.w3.org/ns/activitystreams#Public";
 /// The `ActivityStreams` core vocabulary, first entry of every `@context`.
-const AS_VOCABULARY: &str = "https://www.w3.org/ns/activitystreams";
+pub(crate) const AS_VOCABULARY: &str = "https://www.w3.org/ns/activitystreams";
+/// The `security` vocabulary that defines an actor's `publicKey`, second
+/// entry of an actor document's `@context`.
+pub(crate) const SECURITY_VOCABULARY: &str = "https://w3id.org/security/v1";
 /// The object type of a plain status.
 const TYPE_NOTE: &str = "Note";
 /// The object type of a status carrying a poll.
@@ -99,7 +102,7 @@ const TYPE_DOCUMENT: &str = "Document";
 const TYPE_COLLECTION: &str = "Collection";
 /// What Pleroma writes as the object language in the `@context` language
 /// map of a document that declares none: `und`etermined.
-const LANGUAGE_UNDETERMINED: &str = "und";
+pub(crate) const LANGUAGE_UNDETERMINED: &str = "und";
 
 /// Everything [`note_json`] renders one status's document from: the row,
 /// its author, and the satellites the addressing and the object body read,

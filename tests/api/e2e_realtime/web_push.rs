@@ -28,7 +28,7 @@ use crate::common;
 
 /// The fallback push icon: the same default the `Account` entity renders,
 /// spelled here because the constant is crate-private.
-const DEFAULT_AVATAR: &str = "/images/avi.png";
+const DEFAULT_AVATAR: &str = "/media/default/avi.png";
 
 // ──────────────────────────  Scenario 2: Web Push  ──────────────────────────
 
@@ -202,13 +202,18 @@ fn follow_spec<'a>(token: &'a str, endpoint: &'a str, keys: &'a ClientKeys) -> P
     }
 }
 
-/// The delivered document's shape asserted as a whole: the token, the
-/// type, the display-name title, the plain-text body and the locale.
+/// The delivered document's shape asserted as a whole: no credential (the
+/// subscriber's bearer `token` appears nowhere, since the token table keeps
+/// only digests), the type, the display-name title, the plain-text body and
+/// the locale.
 fn assert_wake(payload: &Value, token: &str, kind: &str, title: &str, body: &str) {
-    assert_eq!(
-        payload["access_token"],
-        json!(token),
-        "the wake token is the subscription's own"
+    assert!(
+        payload.get("access_token").is_none(),
+        "the payload carries no access token: {payload}"
+    );
+    assert!(
+        !payload.to_string().contains(token),
+        "the subscriber's bearer token never rides in the payload"
     );
     assert_eq!(payload["notification_type"], json!(kind), "the type");
     assert!(
@@ -228,9 +233,9 @@ fn assert_wake(payload: &Value, token: &str, kind: &str, title: &str, body: &str
 /// The wake end to end: a subscription registered over HTTP with a fresh
 /// browser key pair, a follow written over HTTP, the delivery job drained
 /// against the mock — and the captured body decrypting with that key to
-/// the Mastodon-shaped document: the subscriber's own access token, the
-/// notification id and type, the default-avatar icon, the display-name
-/// title, and the transport headers (`aes128gcm`, the four-week `TTL`, the
+/// the Mastodon-shaped document without its access token (only digests are
+/// stored, so there is none to send): the notification id and type, the
+/// default-avatar icon, the display-name title, and the transport headers (`aes128gcm`, the four-week `TTL`, the
 /// VAPID `Authorization` naming the instance's stored key).
 #[tokio::test]
 async fn a_follow_over_http_delivers_a_decryptable_push_payload() {

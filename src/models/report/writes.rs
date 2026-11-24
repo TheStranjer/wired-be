@@ -10,10 +10,10 @@ use uuid::Uuid;
 use crate::{
     error::{AppError, AppResult},
     models::user::User,
-    util::id::new_id,
+    util::id::{new_activity_ap_id, new_id},
 };
 
-use super::{NewReport, Report, SELF_REPORT, local_activity_id};
+use super::{NewReport, Report, SELF_REPORT};
 
 /// [`create`]: the id this module mints (decision 4), what the reporter
 /// filed, and the `ActivityPub` id of the `Flag` this report will federate as
@@ -98,7 +98,14 @@ pub async fn create(
         .bind(new.category)
         .bind(new.forwarded)
         .bind(&new.rule_ids)
-        .bind(local_activity_id(base_url, reporter).as_deref())
+        // A remote reporter's own `Flag` id is recorded by the federation layer.
+        .bind(
+            reporter
+                .local
+                .get()
+                .then(|| new_activity_ap_id(base_url))
+                .as_deref(),
+        )
         .fetch_one(&mut *tx)
         .await?;
     if !new.status_ids.is_empty() {

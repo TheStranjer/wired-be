@@ -3,7 +3,8 @@
 //! taken from the stored list row, the `only_media` and `with_muted`
 //! narrows, the blocked member and the memberless empty page, the one 404
 //! for a foreign, unknown or malformed id, and the user-token gate
-//! demanding `read:lists`. Owns the `owned_list` and `add_member` fixtures
+//! demanding `read:lists`, and the `home`-context phrase filters applied to
+//! the page. Owns the `owned_list` and `add_member` fixtures
 //! every test here seeds through [`wired_be::models::list`].
 
 use axum::http::StatusCode;
@@ -12,6 +13,7 @@ use sqlx::PgPool;
 use uuid::Uuid;
 use wired_be::models::{
     block,
+    filter::{self, NewFilter},
     list::{self, NewList},
     media_attachment::{self, NewMediaAttachment},
     mute::{self, MuteOptions},
@@ -387,5 +389,96 @@ async fn a_blocked_member_leaves_the_list_page_and_an_empty_list_answers_empty()
         empty.header("link"),
         None,
         "an empty page sends no Link header"
+    );
+}
+
+/// The list timeline renders in the `home` filter context ("Home and lists"):
+/// an irreversible home filter drops the matching member post, a warn filter
+/// keeps it with a non-empty `filtered`, and a `public`-only filter changes
+/// nothing.
+#[tokio::test]
+async fn list_timeline_applies_the_home_context_filters() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let alice = common::create_local_user(&pool, "alice").await;
+    let bob = common::create_local_user(&pool, "bob").await;
+    let circle = owned_list(&pool, &alice, "list").await;
+    add_member(&pool, circle.id, &bob).await;
+    let spoiler = common::create_status(&pool, &bob, "a spoiler inside", Visibility::Public).await;
+    let clean = common::create_status(&pool, &bob, "nothing to see", Visibility::Public).await;
+    let token = common::create_app_and_token(&pool, &alice, "read:lists").await;
+    let app = common::test_app(pool.clone());
+    let path = format!("{LIST}/{}", circle.id);
+    let filter_for = |contexts: &[&str], irreversible: bool| NewFilter {
+        phrase: "spoiler".to_owned(),
+        context: contexts.iter().map(|name| (*name).to_owned()).collect(),
+        irreversible,
+        ..NewFilter::default()
+    };
+
+    let public_only = filter::create(&pool, alice.id, &filter_for(&["public"], true))
+        .await
+        .expect("the public-only filter creates");
+    let untouched = get(&app, Some(&token), &path).await;
+    assert_eq!(
+        ids(&untouched.json_value()),
+        newest_first(&[&spoiler, &clean]),
+        "a `public`-only filter does not reach the list timeline"
+    );
+    for entry in untouched
+        .json_value()
+        .as_array()
+        .expect("a page is an array")
+    {
+        assert_eq!(
+            entry["filtered"],
+            serde_json::json!([]),
+            "and flags nothing"
+        );
+    }
+    assert!(
+        filter::delete(&pool, public_only.id, alice.id)
+            .await
+            .expect("the filter deletes"),
+        "the public-only filter was live"
+    );
+
+    let warn = filter::create(&pool, alice.id, &filter_for(&["home"], false))
+        .await
+        .expect("the warn filter creates");
+    let warned = get(&app, Some(&token), &path).await;
+    let body = warned.json_value();
+    assert_eq!(
+        ids(&body),
+        newest_first(&[&spoiler, &clean]),
+        "a warn filter keeps the matching post on the page"
+    );
+    let flagged = body
+        .as_array()
+        .expect("a page is an array")
+        .iter()
+        .find(|entry| entry["id"] == serde_json::json!(spoiler.id.to_string()))
+        .expect("the matching post is on the page");
+    assert!(
+        flagged["filtered"]
+            .as_array()
+            .is_some_and(|results| !results.is_empty()),
+        "the matching post carries a non-empty `filtered`"
+    );
+    assert!(
+        filter::delete(&pool, warn.id, alice.id)
+            .await
+            .expect("the filter deletes"),
+        "the warn filter was live"
+    );
+
+    let _hider = filter::create(&pool, alice.id, &filter_for(&["home"], true))
+        .await
+        .expect("the irreversible filter creates");
+    let hidden = get(&app, Some(&token), &path).await;
+    assert_eq!(
+        ids(&hidden.json_value()),
+        newest_first(&[&clean]),
+        "an irreversible home filter hides the matching post from the list"
     );
 }

@@ -49,12 +49,9 @@ use crate::{
     auth::AuthUser,
     error::{AppError, AppResult},
     extract::ApiParams,
-    models::{
-        domain_block::{self, DomainBlock},
-        follow,
-    },
+    models::{domain_block, follow},
     oauth::scopes::{FOLLOW, READ_BLOCKS, WRITE_BLOCKS},
-    pagination::{PageParams, link_header, set_link_header},
+    pagination::{NO_EXTRA_QUERY, PageParams, keyset_link, set_link_header},
     services::federation_out,
     state::AppState,
 };
@@ -64,11 +61,6 @@ use crate::{
 const MISSING_DOMAIN: &str = "Missing parameter: domain";
 /// 422 body when the `domain` normalises to nothing blockable.
 const INVALID_DOMAIN: &str = "Invalid domain";
-
-/// The `Link` header's query parameters carry nothing but the cursor:
-/// the listing has no filter to repeat on either link (the relationship
-/// listings' constant, same rule).
-const NO_EXTRA_QUERY: [(String, String); 0] = [];
 
 /// The `/api/v1/domain_blocks` router, merged into [`crate::api::v1`].
 pub fn router() -> Router<AppState> {
@@ -121,7 +113,15 @@ async fn list_domain_blocks(
         user = %auth.0.id,
         "domain blocks listed"
     );
-    let link = page_link(&state.config.base_url, uri.path(), &entries);
+    // The cursors key on the block row ([`DomainBlock::id`]), not on the
+    // domain.
+    let link = keyset_link(
+        &state.config.base_url,
+        uri.path(),
+        &NO_EXTRA_QUERY,
+        &entries,
+        |e| e.id,
+    );
     let mut headers = HeaderMap::new();
     set_link_header(&mut headers, link.as_deref())?;
     let domains = entries.into_iter().map(|entry| entry.domain).collect();
@@ -217,14 +217,4 @@ fn requested_domain(raw: Option<&str>) -> AppResult<String> {
 /// The `{}` both writes answer — Pleroma's `json(conn, %{})`.
 fn empty_answer() -> Json<Map<String, Value>> {
     Json(Map::new())
-}
-
-/// The `Link` header value for a fetched page: Pleroma's
-/// `add_link_headers` over the first (newest) and last (oldest) entry's
-/// [`DomainBlock::id`] — the cursors key on the block row, not on the
-/// domain — and `None` for an empty page.
-fn page_link(base_url: &str, path: &str, entries: &[DomainBlock]) -> Option<String> {
-    let newest = entries.first()?.id.to_string();
-    let oldest = entries.last()?.id.to_string();
-    link_header(base_url, path, &NO_EXTRA_QUERY, &newest, &oldest)
 }

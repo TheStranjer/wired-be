@@ -10,8 +10,9 @@
 //! `GET /restart` pair (WBE-207) — joins beside it, and with it the admin
 //! invites (WBE-199): `users/invite_token`, `users/invites`,
 //! `users/revoke_invite` and `users/email_invite`, their `invite_create`
-//! and `invite_revoke` log lines, and the `GET /registration/{token}`
-//! redirect the invitation letters carry; and the webhook maintenance API
+//! and `invite_revoke` log lines, and the frontend registration link the
+//! invitation letters carry (no backend `/registration/{token}` route);
+//! and the webhook maintenance API
 //! (WBE-209) too — `/webhooks` CRUD, the enable / disable / rotate_secret
 //! actions, their `{"errors": …}` validations, the internal protection and
 //! the `webhook_*` log lines.

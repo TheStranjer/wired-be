@@ -7,12 +7,9 @@ use std::{io, path::Path};
 
 use tracing::debug;
 
-use crate::error::{AppError, AppResult};
+use crate::error::{AppError, AppResult, io_error};
 
-use super::{
-    NEW_PACK_MANIFEST, PACK_EXISTS, PACK_FILE, Pack,
-    names::{io_error, pack_dir},
-};
+use super::{NEW_PACK_MANIFEST, PACK_EXISTS, PACK_FILE, Pack, names::pack_dir};
 
 /// Reads pack `name` from the packs root `dir`, parsing its `pack.json`.
 ///

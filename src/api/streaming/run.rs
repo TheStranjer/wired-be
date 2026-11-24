@@ -130,10 +130,14 @@ async fn from_hub(
     received: Result<Arc<StreamEvent>, broadcast::error::RecvError>,
 ) -> Flow {
     match received {
-        Ok(event) => match connection.frame_for(&event).await {
-            None => Flow::Keep,
-            Some(frame) => write(socket, Message::Text(frame.into())).await,
-        },
+        Ok(event) => {
+            for frame in connection.frames_for(&event).await {
+                if write(socket, Message::Text(frame.into())).await == Flow::Stop {
+                    return Flow::Stop;
+                }
+            }
+            Flow::Keep
+        }
         Err(broadcast::error::RecvError::Lagged(skipped)) => {
             warn!(skipped, "streaming connection fell behind the hub");
             Flow::Keep

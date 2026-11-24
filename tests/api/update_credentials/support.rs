@@ -27,9 +27,9 @@ pub(super) const BASE: &str = TEST_BASE_URL;
 /// Where the test instance serves stored files from.
 pub(super) const MEDIA: &str = "https://test.example/media";
 /// The entity's default avatar, `Config::for_tests`' instance asset.
-pub(super) const DEFAULT_AVATAR: &str = "https://test.example/images/avi.png";
+pub(super) const DEFAULT_AVATAR: &str = "https://test.example/media/default/avi.png";
 /// The entity's default banner, likewise.
-pub(super) const DEFAULT_HEADER: &str = "https://test.example/images/banner.png";
+pub(super) const DEFAULT_HEADER: &str = "https://test.example/media/default/banner.png";
 /// The 401 body `AuthUser` renders when no token was presented at all.
 pub(super) const NO_TOKEN: &str = r#"{"error":"Invalid credentials"}"#;
 /// The 401 body for a token that does not resolve.

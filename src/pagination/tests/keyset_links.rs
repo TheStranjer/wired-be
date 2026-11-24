@@ -45,6 +45,17 @@ fn min_id_orders_ascending() {
 }
 
 #[test]
+fn keyset_with_all_three_cursors_has_exact_sql() {
+    let query = format!("max_id={MAX_ID}&min_id={MIN_ID}&since_id={SINCE_ID}&limit=5");
+    assert_eq!(
+        keyset_sql(&query, "s.id"),
+        "SELECT id FROM statuses WHERE 1=1 AND s.id < $1 AND s.id > $2 AND s.id > $3 \
+             ORDER BY s.id ASC LIMIT $4",
+        "max, min and since conditions in order, ascending because min_id is present"
+    );
+}
+
+#[test]
 fn keyset_uses_the_given_id_column() {
     assert_eq!(
         keyset_sql(&format!("since_id={SINCE_ID}"), "s.id"),
@@ -239,4 +250,107 @@ fn set_link_header_rejects_bytes_that_are_not_header_safe() {
     let err = set_link_header(&mut headers, Some("evil\nvalue"))
         .expect_err("a newline cannot ride in a header");
     assert!(matches!(err, AppError::Internal(_)), "a server bug: {err}");
+}
+
+/// Three ids in ascending order: oldest, middle, newest.
+fn three_ids() -> (Uuid, Uuid, Uuid) {
+    (
+        Uuid::parse_str(MAX_ID).unwrap(),
+        Uuid::parse_str(MIN_ID).unwrap(),
+        Uuid::parse_str(SINCE_ID).unwrap(),
+    )
+}
+
+#[test]
+fn keyset_link_of_an_empty_page_is_none() {
+    let rows: [Uuid; 0] = [];
+    assert_eq!(
+        keyset_link("https://h", "/p", &NO_EXTRA_QUERY, &rows, |row| *row),
+        None,
+        "an empty page links nowhere"
+    );
+}
+
+#[test]
+fn keyset_link_of_one_row_points_both_ways_at_it() {
+    let (only, _, _) = three_ids();
+    let link = keyset_link("https://h", "/p", &NO_EXTRA_QUERY, &[only], |row| *row).unwrap();
+    assert_eq!(
+        link,
+        link_header("https://h", "/p", &[], &only.to_string(), &only.to_string()).unwrap(),
+        "the same value link_header builds"
+    );
+    assert!(
+        link.contains(&format!("max_id={only}>; rel=\"next\"")),
+        "{link}"
+    );
+    assert!(
+        link.contains(&format!("min_id={only}>; rel=\"prev\"")),
+        "{link}"
+    );
+}
+
+#[test]
+fn keyset_link_of_three_rows_uses_last_for_next_and_first_for_prev() {
+    let (oldest, middle, newest) = three_ids();
+    let rows = [(newest, 1), (middle, 2), (oldest, 3)];
+    let link = keyset_link("https://h", "/p", &NO_EXTRA_QUERY, &rows, |row| row.0).unwrap();
+    assert!(
+        link.contains(&format!("max_id={oldest}>; rel=\"next\"")),
+        "{link}"
+    );
+    assert!(
+        link.contains(&format!("min_id={newest}>; rel=\"prev\"")),
+        "{link}"
+    );
+    assert!(
+        !link.contains(&middle.to_string()),
+        "the middle row is not a cursor: {link}"
+    );
+}
+
+#[test]
+fn keyset_link_preserves_the_extra_query() {
+    let (oldest, _, newest) = three_ids();
+    let extra = [("limit".to_owned(), "5".to_owned())];
+    let link = keyset_link("https://h", "/p", &extra, &[newest, oldest], |row| *row).unwrap();
+    assert_eq!(
+        link,
+        link_header(
+            "https://h",
+            "/p",
+            &extra,
+            &newest.to_string(),
+            &oldest.to_string()
+        )
+        .unwrap(),
+        "the same value link_header builds with the extra pairs"
+    );
+    assert_eq!(link.matches("limit=5").count(), 2, "on both links: {link}");
+}
+
+#[test]
+fn link_for_page_handles_empty_one_and_two_entries() {
+    let none: [i64; 0] = [];
+    assert_eq!(
+        link_for_page("https://h", "/p", &none, |n| *n),
+        None,
+        "an empty page links nowhere"
+    );
+
+    let one = link_for_page("https://h", "/p", &[7_i64], |n| *n).unwrap();
+    assert_eq!(
+        one,
+        link_header("https://h", "/p", &[], "7", "7").unwrap(),
+        "one entry is both cursors"
+    );
+
+    let two = link_for_page("https://h", "/p", &[9_i64, 4], |n| *n).unwrap();
+    assert_eq!(
+        two,
+        link_header("https://h", "/p", &[], "9", "4").unwrap(),
+        "first entry is the prev cursor, last the next"
+    );
+    assert!(two.contains("max_id=4>; rel=\"next\""), "{two}");
+    assert!(two.contains("min_id=9>; rel=\"prev\""), "{two}");
 }

@@ -15,6 +15,10 @@
 //! The [`MaybeAuthUser`] extractor is attached to both routes, so a request
 //! presenting an invalid, expired or deactivated token is answered 401 "The
 //! access token is invalid" instead of being silently treated as anonymous.
+//! A valid user token must also grant `read:accounts`
+//! ([`MaybeAuthUser::require_user_scope`]): one that does not is a 403
+//! "Insufficient permissions: read:accounts."; anonymous requests and
+//! app-only tokens proceed.
 //!
 //! `lookup` resolves its `acct` parameter — or its `q` alias — through
 //! [`get_by_acct`](crate::models::user::get_by_acct): a stored nickname,
@@ -54,11 +58,11 @@ use crate::{
     entities::{account::Account, relationship::Relationship},
     error::{AppError, AppResult},
     models::user,
-    oauth::scopes::READ_FOLLOWS,
+    oauth::scopes::{READ_ACCOUNTS, READ_FOLLOWS},
     state::AppState,
 };
 
-use super::{follow::resolve_actor_or_fetch, render_account};
+use super::{follow::resolve_actor_or_fetch, follow_lists::require_profile_read, render_account};
 
 /// The 400 body message when the `acct` query parameter is absent or blank
 /// (Mastodon's `ParameterMissing` wording).
@@ -79,14 +83,22 @@ const MISSING_ACCT: &str = "Missing parameter: acct";
 ///
 /// [`AppError::NotFound`] for a malformed, unknown, deactivated or (to this
 /// viewer) invisible id;
+/// [`AppError::Forbidden`] ("This API requires an authenticated user") for
+/// an anonymous request while `RESTRICT_UNAUTHENTICATED` closes the
+/// account's profile half (see [`require_profile_read`]; Pleroma's `show`
+/// answers that case 404, this API keeps the 403 `statuses` gives), and
+/// when a presented user token does not grant `read:accounts`;
 /// [`AppError::Unauthorized`] from the extractor for an invalid token.
 /// Any database failure arrives through `?` as [`AppError::Database`].
 pub(super) async fn show_account(
     State(state): State<AppState>,
-    MaybeAuthUser(viewer, _): MaybeAuthUser,
+    auth: MaybeAuthUser,
     Path(id): Path<String>,
 ) -> AppResult<Json<Account>> {
+    auth.require_user_scope(READ_ACCOUNTS)?;
+    let viewer = auth.0;
     let found = visible_account_or_404(&state, &id, viewer.as_ref()).await?;
+    require_profile_read(&state.config, viewer.as_ref(), &found)?;
     Ok(Json(render_account(&state, viewer.as_ref(), &found).await?))
 }
 
@@ -146,6 +158,10 @@ impl LookupQuery {
 /// [`AppError::BadRequest`] when neither `acct` nor `q` carries a handle;
 /// [`AppError::NotFound`] when it names no live account, stored or
 /// resolvable (unknown, on a domain whose lookup fails, or deactivated);
+/// [`AppError::Forbidden`] for an anonymous request while
+/// `RESTRICT_UNAUTHENTICATED` closes the found account's profile half, as
+/// in [`show_account`], and when a presented user token does not grant
+/// `read:accounts` (checked before anything is resolved);
 /// [`AppError::Unauthorized`] from the extractor for an invalid token.
 /// Any database failure arrives through `?` as [`AppError::Database`].
 pub(super) async fn lookup_account(
@@ -153,6 +169,7 @@ pub(super) async fn lookup_account(
     auth: MaybeAuthUser,
     Query(query): Query<LookupQuery>,
 ) -> AppResult<Json<Account>> {
+    auth.require_user_scope(READ_ACCOUNTS)?;
     let Some(asked) = query.asked().map(str::to_owned) else {
         return Err(AppError::BadRequest(MISSING_ACCT.to_owned()));
     };
@@ -167,6 +184,7 @@ pub(super) async fn lookup_account(
         }
         None => return Err(AppError::NotFound),
     };
+    require_profile_read(&state.config, viewer, &found)?;
     Ok(Json(render_account(&state, viewer, &found).await?))
 }
 

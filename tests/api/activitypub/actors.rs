@@ -80,14 +80,34 @@ async fn the_litepub_schema_document_is_served() {
     assert_eq!(
         context.get("Hashtag"),
         Some(&json!("as:Hashtag")),
-        "…and the tag type"
+        "…and the tag type…"
     );
+    for (term, definition) in [
+        ("blurhash", json!("toot:blurhash")),
+        (
+            "focalPoint",
+            json!({"@container": "@list", "@id": "toot:focalPoint"}),
+        ),
+        ("formerType", json!("as:formerType")),
+        (
+            "_misskey_quote",
+            json!("https://misskey-hub.net/ns#_misskey_quote"),
+        ),
+        ("ChatMessage", json!("litepub:ChatMessage")),
+        ("discoverable", json!("toot:discoverable")),
+        ("PropertyValue", json!("schema:PropertyValue")),
+    ] {
+        assert_eq!(
+            context.get(term),
+            Some(&definition),
+            "…and the actor and media terms, the one map for every document: {term}"
+        );
+    }
 }
 
 /// The whole document a provisioned local account is served as: every key
-/// and value of Pleroma's `user.json`, end to end over HTTP. The `@context`
-/// is taken from the response because its exact terms are the renderer's
-/// own test's business.
+/// and value of Pleroma's `user.json`, end to end over HTTP, with the
+/// `@context` naming the one served schema instead of inlining terms.
 #[tokio::test]
 async fn a_local_user_is_served_as_its_actor_document() {
     let db = common::test_db().await;
@@ -106,11 +126,15 @@ async fn a_local_user_is_served_as_its_actor_document() {
     .await;
 
     let document = fetch_actor(&pool, &alice).await;
-    let context = document["@context"].clone();
     assert_eq!(
         document,
         json!({
-            "@context": context,
+            "@context": [
+                "https://www.w3.org/ns/activitystreams",
+                "https://w3id.org/security/v1",
+                format!("{BASE}/schemas/litepub-0.1.jsonld"),
+                {"@language": "und"},
+            ],
             "id": format!("{BASE}/users/alice"),
             "type": "Person",
             "preferredUsername": "alice",
@@ -502,5 +526,51 @@ async fn the_actor_address_still_serves_activity_json() {
         response.json_value()["id"],
         format!("{BASE}/users/alice"),
         "alice's own document"
+    );
+}
+
+/// A frontend on its own origin: a browser on `/users/alice` is sent to
+/// `FRONTEND_BASE_URL`, not `BASE_URL`, while an `ActivityPub` client still
+/// gets the JSON document, and both answers vary on `Accept`.
+#[tokio::test]
+async fn the_actor_redirect_follows_the_frontend_origin() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let _alice = common::create_local_user(&pool, "alice").await;
+    let mut config = common::test_config();
+    config.frontend_base_url = "https://fe.example".to_owned();
+    let app = common::test_app_with_config(pool, config);
+
+    let browser = common::TestRequest::get("/users/alice")
+        .header("accept", "text/html")
+        .send(&app)
+        .await;
+    assert_eq!(browser.status, StatusCode::FOUND, "a browser redirects");
+    assert_eq!(
+        browser.header("location"),
+        Some("https://fe.example/alice"),
+        "to the frontend origin, not the base URL"
+    );
+    assert_eq!(
+        browser.header("vary"),
+        Some("Accept"),
+        "the redirect varies on Accept"
+    );
+
+    let federating = fetch_activity_json(&app, "/users/alice").await;
+    assert_eq!(
+        federating.status,
+        StatusCode::OK,
+        "an ActivityPub client still gets the document"
+    );
+    assert_eq!(
+        federating.header("vary"),
+        Some("Accept"),
+        "the document varies on Accept"
+    );
+    assert_eq!(
+        federating.json_value()["id"],
+        format!("{BASE}/users/alice"),
+        "whose id stays on the base URL"
     );
 }

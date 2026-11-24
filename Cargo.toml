@@ -155,6 +155,7 @@ tokio = { version = "1.53.2", features = ["full"] }
 tower-http = { version = "0.7.1", features = ["trace", "cors", "timeout", "limit", "request-id", "compression-gzip"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+unicode-normalization = "0.1.26"
 # Extended grapheme clusters for the reaction emoji check (`src/util/emoji.rs`):
 # one emoji is one cluster, and only the cluster rule can say that
 # a ZWJ family or a flag pair is a single reaction while two emojis side by

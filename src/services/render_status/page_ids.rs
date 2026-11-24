@@ -1,5 +1,5 @@
 //! The id collections a page render asks its keyed loaders about: the
-//! order-preserving [`distinct`] helper and [`PageIds`], the five id sets
+//! order-preserving [`distinct`] helper and [`PageIds`], the id sets
 //! walked once from the page and its nested rows.
 
 use std::collections::{HashMap, HashSet};
@@ -19,7 +19,7 @@ where
 }
 
 /// The id sets [`Batch::load`] asks its keyed loaders about, walked once
-/// from the page and the two nested-row maps: the same five `distinct`
+/// from the page and the two nested-row maps: the same `distinct`
 /// collections for every render, named instead of spelled out inline.
 ///
 /// [`Batch::load`]: super::batch::Batch::load
@@ -40,10 +40,13 @@ pub(super) struct PageIds {
     /// The direct-message threads the page touches, for the viewer's
     /// participation read.
     pub(super) directs: Vec<Uuid>,
+    /// The statuses the page and its nested rows reply to, for the
+    /// viewer's parent-visibility read.
+    pub(super) parents: Vec<Uuid>,
 }
 
 impl PageIds {
-    /// Collects the five sets in first-seen order over `rows`, the
+    /// Collects the sets in first-seen order over `rows`, the
     /// `originals` they reblog and the `quoted` they quote.
     pub(super) fn of(
         rows: &[&StatusRow],
@@ -85,6 +88,13 @@ impl PageIds {
                     .copied()
                     .chain(originals.values())
                     .filter_map(|row| row.direct_conversation_id),
+            ),
+            parents: distinct(
+                rows.iter()
+                    .copied()
+                    .chain(originals.values())
+                    .chain(quoted.values())
+                    .filter_map(|row| row.in_reply_to_id),
             ),
         }
     }

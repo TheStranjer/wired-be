@@ -86,7 +86,7 @@ use std::collections::HashMap;
 use axum::{
     Json, Router,
     extract::{OriginalUri, Path, State},
-    http::{HeaderMap, Uri},
+    http::HeaderMap,
     routing::{get, post},
 };
 use sqlx::PgPool;
@@ -104,18 +104,18 @@ use crate::{
     },
     error::{AppError, AppResult},
     models::{
-        instance_rule, moderation_log,
+        instance_rule,
         report::{self, Report as ReportRow, ReportState},
         status, user,
         user::User,
     },
-    pagination::{PageParams, link_header, set_link_header},
+    pagination::{PageParams, keyset_link, set_link_header},
     services::{
         render_status::{ViewerMode, render_statuses},
-        webhooks,
+        report_moderation::{assign_report, set_report_state},
     },
     state::AppState,
-    util::{collections::group_pairs, id::parse_id},
+    util::{collections::group_pairs, id::parse_id, params::truthy},
 };
 
 /// The read endpoint class of [`StaffUser::require`].
@@ -181,7 +181,13 @@ async fn list_reports(
     let rows = report::mastodon_list(&state.db, &params, page).await?;
     debug!(listed = rows.len(), "admin mastodon reports listed");
     let entities = entities(&state, &staff.0, &rows).await?;
-    let link = page_link(&state, &uri, &rows);
+    let link = keyset_link(
+        &state.config.base_url,
+        uri.path(),
+        &link_query(uri.query()),
+        &rows,
+        |row: &ReportRow| row.id,
+    );
     let mut headers = HeaderMap::new();
     set_link_header(&mut headers, link.as_deref())?;
     Ok((headers, Json(entities)))
@@ -244,10 +250,10 @@ async fn reopen_report(
     entity(&state, &staff.0, &row).await.map(Json)
 }
 
-/// The shared write of the two state routes: [`report::set_state`] to
-/// `to`, the acting staff member named only on the resolution (Pleroma's
-/// `update_report_state` takes no actor; the ticket's `resolve` does),
-/// beside the `report_update` [`moderation_log`] entry and the
+/// The shared write of the two state routes: [`set_report_state`] to `to`,
+/// which names the acting staff member only on the resolution (Pleroma's
+/// `update_report_state` takes no actor; the ticket's `resolve` does) and
+/// leaves the `report_update` [`moderation_log`] entry and the
 /// `report.updated` [`webhooks`] event every state change of this table
 /// leaves — the same follow-ups the console's own bulk `PATCH /reports`
 /// runs.
@@ -257,6 +263,7 @@ async fn reopen_report(
 /// [`AppError::NotFound`] when the row went between the two reads;
 /// [`AppError::Database`] from the write, the target read and the log.
 ///
+/// [`moderation_log`]: crate::models::moderation_log
 /// [`webhooks`]: crate::services::webhooks
 async fn move_state(
     state: &AppState,
@@ -264,27 +271,9 @@ async fn move_state(
     filed: &ReportRow,
     to: ReportState,
 ) -> AppResult<ReportRow> {
-    let acted_by = (to == ReportState::Resolved).then_some(staff.id);
-    let moved = report::set_state(&state.db, filed.id, to, acted_by)
+    set_report_state(state, staff, filed.id, to)
         .await?
-        .ok_or(AppError::NotFound)?;
-    let target = user::get_by_id(&state.db, moved.target_id).await?;
-    let logged = moderation_log::report_update(
-        &state.db,
-        staff,
-        moved.id,
-        moved.state.as_str(),
-        target.as_ref(),
-    )
-    .await?;
-    debug!(
-        log = %logged.id,
-        report = %moved.id,
-        state = moved.state.as_str(),
-        "admin mastodon report state changed"
-    );
-    webhooks::report_updated(state, &moved).await;
-    Ok(moved)
+        .ok_or(AppError::NotFound)
 }
 
 /// `POST /api/v1/admin/reports/{id}/assign_to_self` — Pleroma's
@@ -301,7 +290,7 @@ async fn assign_to_self(
 ) -> AppResult<Json<MastodonAdminReport>> {
     staff.require(CLASS_WRITE, AREA_REPORTS)?;
     let filed = report_by_id(&state.db, &raw).await?;
-    let row = move_assignment(&state, &staff.0, &filed, Some(staff.0.id)).await?;
+    let row = move_assignment(&state, &staff.0, &filed, Some(&staff.0)).await?;
     entity(&state, &staff.0, &row).await.map(Json)
 }
 
@@ -323,8 +312,8 @@ async fn unassign_report(
     entity(&state, &staff.0, &row).await.map(Json)
 }
 
-/// The shared write of the two assignment routes: [`report::assign`], then
-/// the entry Pleroma's controller logs beside each — `report_assigned`
+/// The shared write of the two assignment routes: [`assign_report`], which
+/// writes the entry Pleroma's controller logs beside each — `report_assigned`
 /// naming the new owner by nickname, `report_unassigned` the release.
 /// Assignment is not a state change: the entity answers in whatever state
 /// the report already stood, and nothing else about the row moves.
@@ -337,31 +326,11 @@ async fn move_assignment(
     state: &AppState,
     staff: &User,
     filed: &ReportRow,
-    assignee: Option<Uuid>,
+    assignee: Option<&User>,
 ) -> AppResult<ReportRow> {
-    let moved = report::assign(&state.db, filed.id, assignee)
+    assign_report(&state.db, staff, filed.id, assignee)
         .await?
-        .ok_or(AppError::NotFound)?;
-    let target = user::get_by_id(&state.db, moved.target_id).await?;
-    let logged = if assignee.is_some() {
-        moderation_log::report_assigned(
-            &state.db,
-            staff,
-            moved.id,
-            &staff.nickname,
-            target.as_ref(),
-        )
-        .await?
-    } else {
-        moderation_log::report_unassigned(&state.db, staff, moved.id, target.as_ref()).await?
-    };
-    debug!(
-        log = %logged.id,
-        report = %moved.id,
-        assigned = moved.assigned_to.is_some(),
-        "admin mastodon report assignment changed"
-    );
-    Ok(moved)
+        .ok_or(AppError::NotFound)
 }
 
 /// The `{id}` segment of an admin report route as the stored row: text
@@ -397,18 +366,12 @@ fn list_params(pairs: &QueryPairs) -> AppResult<report::MastodonListParams> {
     })
 }
 
-/// The `resolved` filter: `true` asks for the acted-on pair and `false`
-/// for the open queue, each also spelled the way form-encoded clients
-/// send booleans (`1` / `0`); anything else — absence, emptiness, junk —
-/// is no statement, and the listing keeps its open default (Pleroma's
-/// `restrict_state` reads only the literal `true` as an action request
-/// and falls everything else through to `open`).
+/// The `resolved` filter: a true spelling asks for the acted-on pair and
+/// a false one for the open queue, in every spelling [`truthy`] reads
+/// (`true`, `1`, `yes`, `off`, …); anything else — absence, emptiness,
+/// junk — is no statement, and the listing keeps its open default.
 fn resolved_filter(text: Option<&str>) -> Option<bool> {
-    match text {
-        Some("true" | "1") => Some(true),
-        Some("false" | "0") => Some(false),
-        _ => None,
-    }
+    text.and_then(truthy)
 }
 
 /// One id filter: absent or empty names nothing to filter on, a value
@@ -550,22 +513,6 @@ async fn cited_statuses(
     Ok(rendered)
 }
 
-/// The `Link` header value for one fetched page: [`link_header`] over the
-/// first (newest) and last (oldest) row's id — the report ids the ticket
-/// keys this listing's cursors on — with the request's own filters
-/// repeated, and `None` for an empty page.
-fn page_link(state: &AppState, uri: &Uri, rows: &[ReportRow]) -> Option<String> {
-    let newest = rows.first()?.id.to_string();
-    let oldest = rows.last()?.id.to_string();
-    link_header(
-        &state.config.base_url,
-        uri.path(),
-        &link_query(uri.query()),
-        &newest,
-        &oldest,
-    )
-}
-
 /// The account an entity slot names; its absence is the impossible state
 /// the reports' foreign keys rule out, not a client failure.
 ///
@@ -590,21 +537,21 @@ mod tests {
     /// at all, which the listing also reads as open.
     #[test]
     fn the_resolved_filter_reads_booleans_and_ignores_junk() {
-        for stated in ["true", "1"] {
+        for stated in ["true", "1", "yes", "TRUE"] {
             assert_eq!(
                 resolved_filter(Some(stated)),
                 Some(true),
                 "`{stated}` is the acted-on pair"
             );
         }
-        for stated in ["false", "0"] {
+        for stated in ["false", "0", "no"] {
             assert_eq!(
                 resolved_filter(Some(stated)),
                 Some(false),
                 "`{stated}` states the open queue"
             );
         }
-        for unstated in [None, Some(""), Some("yes"), Some("TRUE"), Some("closed")] {
+        for unstated in [None, Some(""), Some("maybe"), Some("closed")] {
             assert_eq!(
                 resolved_filter(unstated),
                 None,

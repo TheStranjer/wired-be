@@ -10,15 +10,11 @@ use axum::{
     http::{HeaderMap, StatusCode},
     routing::post,
 };
-use hmac::{KeyInit as _, Mac as _};
 use sqlx::PgPool;
 use tokio::{net::TcpListener, task::JoinHandle};
 use uuid::Uuid;
 
-use super::{
-    KIND_DELIVER, MAX_ATTEMPTS,
-    signing::{HmacSha256, SIGNATURE_PREFIX},
-};
+use super::{KIND_DELIVER, MAX_ATTEMPTS, signing::SIGNATURE_PREFIX};
 use crate::{
     config::{Config, TEST_BASE_URL},
     jobs::{AttemptInfo, JobError},
@@ -29,7 +25,7 @@ use crate::{
         webhook::{self, Webhook},
     },
     state::AppState,
-    util::{id::new_id, token::to_hex},
+    util::{hmac::hmac_sha256, id::new_id, token::to_hex},
 };
 
 /// Test state over `pool` on the fixed test config, whose HTTP client
@@ -214,11 +210,9 @@ pub(super) fn served(seen: &Seen) -> bool {
 /// independent recomputation the delivery test checks the delivered
 /// signature against.
 pub(super) fn expect_signature(secret: &str, timestamp: &str, body: &[u8]) -> String {
-    let mut mac = HmacSha256::new_from_slice(secret.as_bytes()).expect("any key length is legal");
-    mac.update(timestamp.as_bytes());
-    mac.update(b".");
-    mac.update(body);
-    format!("{SIGNATURE_PREFIX}{}", to_hex(&mac.finalize().into_bytes()))
+    let message = [timestamp.as_bytes(), b".", body].concat();
+    let digest = hmac_sha256(secret.as_bytes(), &message).expect("any key length is legal");
+    format!("{SIGNATURE_PREFIX}{}", to_hex(&digest))
 }
 
 /// The message of a discarded job failure, or a panic naming what the

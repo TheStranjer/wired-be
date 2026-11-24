@@ -9,29 +9,19 @@ use crate::{
     config::TEST_BASE_URL,
     models::{
         block,
-        user::{Flag, NewUser, User, get_by_id, insert, local_ap_id},
+        user::{Flag, NewUser, User, get_by_id, insert},
     },
     pagination::{MAX_LIMIT, PageParams},
-    util::id::{new_id, parse_id},
+    util::id::{assert_local_activity_id, new_id},
 };
 
 use super::{Follow, FollowPageEntry, get};
 
+pub(super) use crate::test_fixtures::{local_new, local_user};
+
 /// The `ActivityPub` path segment a local follower's `ap_id` is built
 /// under, as [`follow`](super::follow) must write it (decision 6).
 pub(super) const ACTIVITY_PREFIX: &str = "/activities/";
-
-/// A local [`NewUser`] named `nickname` on the test instance.
-pub(super) fn local_new(nickname: &str) -> NewUser {
-    NewUser::local(nickname, &local_ap_id(TEST_BASE_URL, nickname))
-}
-
-/// Inserts a local, unlocked user named `nickname`.
-pub(super) async fn local_user(pool: &PgPool, nickname: &str) -> User {
-    insert(pool, &local_new(nickname))
-        .await
-        .expect("the local fixture inserts")
-}
 
 /// Inserts a local user named `nickname` whose account is locked, so
 /// follows of it wait for an answer.
@@ -150,23 +140,7 @@ pub(super) fn follow_ids(entries: &[FollowPageEntry]) -> Vec<Uuid> {
 /// minted for a local follower, checked for its shape and reduced to the id
 /// part.
 pub(super) fn activity_id(follow: &Follow) -> String {
-    let prefix = format!("{TEST_BASE_URL}{ACTIVITY_PREFIX}");
-    let ap_id = follow
-        .ap_id
-        .clone()
-        .expect("a local follower's row carries a minted activity id");
-    assert!(
-        ap_id.starts_with(&prefix),
-        "the activity id is this instance's, got {ap_id}"
-    );
-    let tail = ap_id
-        .strip_prefix(&prefix)
-        .expect("the prefix was just checked");
-    assert!(
-        parse_id(tail).is_some(),
-        "the tail of the activity id is an id: {tail}"
-    );
-    tail.to_owned()
+    assert_local_activity_id(follow.ap_id.as_deref())
 }
 
 /// The SQLSTATE a database failure carries, or an empty string when the

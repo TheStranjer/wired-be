@@ -83,7 +83,7 @@ use crate::{
     state::AppState,
 };
 
-use super::{notes_followers::one_relationship, render_account};
+use super::render_account;
 
 /// The 400 body message when the `uri` parameter of `POST /api/v1/follows`
 /// is absent, blank or `null` (Mastodon's `ParameterMissing` wording).
@@ -163,7 +163,9 @@ pub(super) async fn follow_account(
         "account followed"
     );
     after_follow_changed(&state, &auth.0, &target, Some(&stored), true).await;
-    one_relationship(&state, auth.0.id, target.id).await
+    Ok(Json(
+        Relationship::load_one(&state.db, auth.0.id, target.id).await?,
+    ))
 }
 
 /// Writes the toggles a follow named onto the row [`follow::follow`] returned
@@ -355,7 +357,9 @@ pub(super) async fn unfollow_account(
         false,
     )
     .await;
-    one_relationship(&state, auth.0.id, target.id).await
+    Ok(Json(
+        Relationship::load_one(&state.db, auth.0.id, target.id).await?,
+    ))
 }
 
 /// Post-write hook of [`follow_account`] and [`unfollow_account`]: the

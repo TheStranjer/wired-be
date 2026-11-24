@@ -6,14 +6,15 @@
 //! `totp.html.eex` asks for the authenticator code, `recovery.html.eex`
 //! for a printed backup code, and each links to the other. Built with
 //! the same plain `String` pushes and the same helpers as
-//! [`crate::oauth::authorize_page`]: no template engine, and every
+//! [`crate::oauth::page`]: no template engine, and every
 //! dynamic value HTML-escaped, so an attacker-supplied `state`, token
 //! or URI cannot break out of its attribute (decision 1).
 
 use url::form_urlencoded;
 
-use crate::oauth::authorize_page::{
-    push_error, push_escaped, push_field, push_head, push_hidden, push_tail,
+use crate::{
+    oauth::page::{push_error, push_field, push_head, push_hidden, push_tail},
+    util::sanitize::push_escaped,
 };
 
 /// Where the form posts.
@@ -75,7 +76,7 @@ pub struct MfaPage<'a> {
 #[must_use]
 pub fn render(page: &MfaPage<'_>) -> String {
     let mut out = String::new();
-    push_head(&mut out, None, title(page.recovery));
+    push_head(&mut out, title(page.recovery));
     out.push_str("<main>\n<h1>");
     out.push_str(title(page.recovery));
     out.push_str("</h1>\n");

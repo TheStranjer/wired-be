@@ -1,15 +1,15 @@
 //! The live consumers of the admin config store: the `:mrf*` chain the
 //! MRF loader reads back off the instance document the moment a write
 //! clears the cache, the `:instance` overrides riding the public v1, v2
-//! and `NodeInfo` documents, and the `need_reboot` flag following the
-//! registry's restart classes while the changed row stands.
+//! and `NodeInfo` documents, the `need_reboot` flag staying down for the
+//! live keys, and the two keys no runtime consumer reads
+//! (`:media_proxy`, `:restrict_unauthenticated`) refused outright.
 
 use axum::http::StatusCode;
 use serde_json::{Value, json};
+use wired_be::services::runtime_config::RuntimeConfig;
 
-use super::config_writes::{
-    CONFIG, PROCESS_FLAGS_LOCK, config_admin, post_configs, tuple_value, wire,
-};
+use super::config_writes::{CONFIG, PROCESS_FLAGS_LOCK, config_admin, post_configs, wire};
 use crate::common::{self, TestRequest};
 
 /// The MRF chain is a live consumer of the store: after a first read has
@@ -26,8 +26,8 @@ async fn setting_mrf_policies_through_the_api_activates_simple_policy() {
     let before = TestRequest::get("/api/v1/instance").send(&app).await;
     assert_eq!(
         before.json_value()["pleroma"]["metadata"]["federation"]["mrf_policies"],
-        json!([]),
-        "the fresh instance runs no policy, and this read fills the cache"
+        json!(["HashtagPolicy"]),
+        "the fresh instance runs only the always-on policy, and this read fills the cache"
     );
 
     let written = post_configs(
@@ -58,7 +58,7 @@ async fn setting_mrf_policies_through_the_api_activates_simple_policy() {
     let federation = after.json_value()["pleroma"]["metadata"]["federation"].clone();
     assert_eq!(
         federation["mrf_policies"],
-        json!(["SimplePolicy"]),
+        json!(["SimplePolicy", "HashtagPolicy"]),
         "the POST cleared the cache and the new chain answers"
     );
     assert_eq!(
@@ -80,8 +80,8 @@ async fn setting_mrf_policies_through_the_api_activates_simple_policy() {
     let reverted = TestRequest::get("/api/v1/instance").send(&app).await;
     assert_eq!(
         reverted.json_value()["pleroma"]["metadata"]["federation"]["mrf_policies"],
-        json!([]),
-        "and with the rows gone the env fallback runs the empty chain again"
+        json!(["HashtagPolicy"]),
+        "and with the rows gone the env fallback runs the always-on policy alone again"
     );
 }
 
@@ -164,31 +164,14 @@ async fn instance_overrides_show_in_the_public_documents() {
     );
 }
 
-/// The `:media_proxy` entry of a GET `/config` answer.
-fn media_proxy_entry(page: &Value) -> Value {
-    page["configs"]
-        .as_array()
-        .and_then(|configs| {
-            configs
-                .iter()
-                .find(|entry| {
-                    entry["key"]
-                        .as_str()
-                        .is_some_and(|key| key == ":media_proxy")
-                })
-                .cloned()
-        })
-        .expect("the media proxy entry answers")
-}
-
-/// The `need_reboot` flag follows the registry: a live key's write keeps
-/// it down and a restart-flagged key's write raises it — in the POST
-/// answer and in every later GET while the row stands. The flagged write
-/// also raises the process-wide flag the WBE-207 tests read, so this
-/// holds [`PROCESS_FLAGS_LOCK`] across it.
+/// The `need_reboot` flag follows the registry: no whitelisted key is
+/// restart-gated, so a live key's write keeps it down in the POST answer
+/// and in the later GET. The test reads the process-wide flag the
+/// WBE-207 tests also own, so it holds [`PROCESS_FLAGS_LOCK`].
 #[tokio::test]
 async fn config_need_reboot_follows_the_changed_keys() {
     let _flag_guard = PROCESS_FLAGS_LOCK.lock().await;
+    RuntimeConfig::reset_process_flags();
     let db = common::test_db().await;
     let pool = db.pool().clone();
     let app = common::test_app(pool.clone());
@@ -210,83 +193,92 @@ async fn config_need_reboot_follows_the_changed_keys() {
         ":instance takes effect without a restart"
     );
 
-    let proxy_write = post_configs(
-        &app,
-        &token,
-        json!([{
-            "group": ":pleroma",
-            "key": ":media_proxy",
-            "value": wire(&[("max_bytes", json!(1024))]),
-        }]),
-    )
-    .await;
-    assert_eq!(
-        proxy_write.json_value()["need_reboot"],
-        json!(true),
-        "the media proxy waits for the restart"
-    );
-
     let standing = TestRequest::get(CONFIG).bearer(&token).send(&app).await;
     assert_eq!(
         standing.json_value()["need_reboot"],
-        json!(true),
-        "and the flag holds while the stored row stands"
+        json!(false),
+        "and the page flag stays down while the stored row stands"
     );
-    let page = standing.json_value();
-    assert_eq!(
-        tuple_value(&media_proxy_entry(&page)["value"], "max_bytes"),
-        Some(&json!(1024)),
-        "the stored value is the effective one"
+    assert!(
+        !RuntimeConfig::need_reboot(),
+        "the process-wide flag is untouched"
     );
 }
 
-/// The restart flag clears with the row: deleting the stored
-/// `:media_proxy` is itself still a restart-flagged change, and once it
-/// stands no more the GET answers the env default and `need_reboot` is
-/// down. The page flag is the store's answer; the process-wide flag the
-/// same writes raise belongs to [`PROCESS_FLAGS_LOCK`]'s readers.
+/// `:media_proxy` and `:restrict_unauthenticated` are refused with the
+/// not-whitelisted 400 — upserts and deletes alike — because nothing
+/// reads a stored row for either key: no `config_entries` row appears,
+/// a valid sibling in the same batch is not written, `need_reboot` stays
+/// down in the page and in the process-wide flag, and neither key is
+/// listed by `GET /config`.
 #[tokio::test]
-async fn deleting_a_restart_flagged_row_lets_the_flag_fall() {
+async fn unread_keys_are_refused_and_write_nothing() {
     let _flag_guard = PROCESS_FLAGS_LOCK.lock().await;
+    RuntimeConfig::reset_process_flags();
     let db = common::test_db().await;
     let pool = db.pool().clone();
     let app = common::test_app(pool.clone());
-    let token = config_admin(&pool, "configreboot").await;
+    let token = config_admin(&pool, "configunread").await;
 
-    let opening = post_configs(
-        &app,
-        &token,
-        json!([{
-            "group": ":pleroma",
-            "key": ":media_proxy",
-            "value": wire(&[("max_bytes", json!(1024))]),
-        }]),
-    )
-    .await;
-    common::assert_answer(&opening, StatusCode::OK, "the seeded write");
+    for (key, value) in [
+        (
+            ":restrict_unauthenticated",
+            json!([{"tuple": ["timelines", [{"tuple": ["local", true]}]]}]),
+        ),
+        (
+            ":media_proxy",
+            Value::Array(wire(&[("enabled", json!(false))])),
+        ),
+    ] {
+        let upsert = post_configs(
+            &app,
+            &token,
+            json!([
+                { "group": ":pleroma", "key": ":instance", "value": wire(&[("name", json!("Sneaky"))]) },
+                { "group": ":pleroma", "key": key, "value": value },
+            ]),
+        )
+        .await;
+        common::assert_answer(&upsert, StatusCode::BAD_REQUEST, "the upsert");
+        common::assert_error(
+            &upsert,
+            &format!("Config not allowed: :pleroma/{key}"),
+            "the key is not whitelisted",
+        );
 
-    let deleted = post_configs(
-        &app,
-        &token,
-        json!([{ "group": ":pleroma", "key": ":media_proxy", "delete": true }]),
-    )
-    .await;
+        let delete = post_configs(
+            &app,
+            &token,
+            json!([{ "group": ":pleroma", "key": key, "delete": true }]),
+        )
+        .await;
+        common::assert_answer(&delete, StatusCode::BAD_REQUEST, "the delete");
+    }
+
+    let stored: i64 = sqlx::query_scalar("SELECT count(*) FROM config_entries")
+        .fetch_one(&pool)
+        .await
+        .expect("the row count reads");
     assert_eq!(
-        deleted.json_value()["need_reboot"],
-        json!(true),
-        "deleting a restart key is still a change waiting for the restart"
+        stored, 0,
+        "no refused batch wrote a row, valid sibling included"
     );
 
-    let after = TestRequest::get(CONFIG).bearer(&token).send(&app).await;
-    assert_eq!(
-        after.json_value()["need_reboot"],
-        json!(false),
-        "with the row gone nothing waits any more"
+    let page = TestRequest::get(CONFIG).bearer(&token).send(&app).await;
+    let body = page.json_value();
+    assert_eq!(body["need_reboot"], json!(false), "no restart is owed");
+    let listed: Vec<&str> = body["configs"]
+        .as_array()
+        .expect("the configs array")
+        .iter()
+        .filter_map(|entry| entry["key"].as_str())
+        .collect();
+    assert!(
+        !listed.contains(&":media_proxy") && !listed.contains(&":restrict_unauthenticated"),
+        "neither key is offered: {listed:?}"
     );
-    let page = after.json_value();
-    assert_eq!(
-        tuple_value(&media_proxy_entry(&page)["value"], "max_bytes"),
-        Some(&json!(50_000_000)),
-        "and the env default is back"
+    assert!(
+        !RuntimeConfig::need_reboot(),
+        "the process-wide flag was never raised"
     );
 }

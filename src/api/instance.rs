@@ -20,7 +20,9 @@
 //! `restrict_unauthenticated` lists come from
 //! [`crate::services::instance_meta`], the builder `NodeInfo` already
 //! shares, so the two endpoints never disagree about what this instance
-//! can do — and `peers` asks the same builder whether unauthenticated
+//! can do, and the same module owns the limit and markup blocks
+//! (`federation`, `fields_limits`, `poll_limits`, `markup`) and the constants
+//! behind them — and `peers` asks the same builder whether unauthenticated
 //! callers may see remote instances at all.
 //!
 //! None of these endpoints needs authentication — Pleroma's controller
@@ -43,82 +45,43 @@
 //!
 //! The module is split by concern: `handlers` holds the endpoint functions,
 //! `v1` the `/api/v1/instance` document, `v2` the `/api/v2/instance`
-//! document, `pleroma` the extension block both documents carry, and
-//! `domain_blocks` the domain-block and extended-description views. This
-//! file keeps the shared constants, the cached statistics type, the SQL and
-//! the two routers.
+//! document, `pleroma` the extension block both documents carry, `stats` the cached
+//! counters (shared with `NodeInfo`) and `domain_blocks` the domain-block and
+//! extended-description views. This file keeps the shared constants, the
+//! remaining SQL and the two routers.
 //!
 //! [`TimedCache`]: crate::util::cache::TimedCache
 //! [`LANGUAGES_TTL`]: crate::services::translate::LANGUAGES_TTL
 
 use axum::{Router, routing::get};
-use chrono::TimeDelta;
-use serde::Serialize;
 
-use crate::{state::AppState, util::cache::TimedCache};
+use crate::state::AppState;
 
 mod domain_blocks;
 mod handlers;
 mod pleroma;
+mod stats;
 #[cfg(test)]
 mod test_support;
 mod v1;
 mod v2;
 
-pub use domain_blocks::{sha256_hex, sha256_hex_bytes};
 use handlers::{
     show_activity, show_domain_blocks, show_extended_description, show_instance, show_instance_v2,
     show_peers, show_rules, show_translation_languages,
 };
-
-/// How long the `stats` block may be served from the in-memory cache.
-///
-/// Pleroma's `Pleroma.Stats` `GenServer` recalculates on the same
-/// 60-second interval (`lib/pleroma/stats.ex`).
-pub const STATS_TTL: TimeDelta = TimeDelta::seconds(60);
-
-/// The [`crate::state::AppState`] slot caching this endpoint's
-/// statistics; `Default` builds it with [`STATS_TTL`].
-pub type InstanceStatsCache = TimedCache<InstanceStats>;
-
-impl Default for TimedCache<InstanceStats> {
-    /// An empty stats cache with the endpoint's [`STATS_TTL`] window, so
-    /// every [`AppState`] constructor writes the same `Arc::default()`.
-    fn default() -> Self {
-        Self::new(STATS_TTL)
-    }
-}
+pub use stats::{InstanceStats, InstanceStatsCache, STATS_TTL, stats, stats_at};
 
 /// The Mastodon API level this endpoint claims compatibility with
 /// (Pleroma's `@mastodon_api_level`, `instance_view.ex`).
 const MASTODON_API_LEVEL: &str = "2.7.2";
-/// The Pleroma release whose HTTP interface this server replicates
-/// (decision 1), kept in the version's compatibility comment.
-const PLEROMA_COMPATIBILITY_VERSION: &str = "2.10.2";
-/// Path appended to [`Config::frontend_base_url`] for the instance
-/// thumbnail (Pleroma's `[:instance, :instance_thumbnail]`, whose default
-/// is an image under the static root; wired-be serves API only, so the
-/// frontend ships the file and the URL is advertised whether or not it
-/// sits behind it).
+/// Path appended to [`Config::media_base_url`] for the instance thumbnail
+/// (Pleroma's `[:instance, :instance_thumbnail]`, whose default is an image
+/// under the static root); the backend serves it from `/media/default`
+/// (see [`crate::default_assets`]).
 ///
-/// [`Config::frontend_base_url`]: crate::config::Config::frontend_base_url
-const THUMBNAIL_PATH: &str = "/images/thumbnail.jpg";
-/// Characters one poll option may hold (Pleroma's `[:instance,
-/// :poll_limits]` `max_option_chars`).
-const MAX_POLL_OPTION_CHARS: usize = 200;
-/// Seconds a poll may run for at least; 0 means "no minimum" (Pleroma's
-/// `min_expiration`).
-const MIN_POLL_EXPIRATION_SECS: usize = 0;
-/// Seconds a poll may run for at most: a year (Pleroma's `max_expiration`
-/// of `365 * 24 * 60 * 60`).
-const MAX_POLL_EXPIRATION_SECS: usize = 365 * 24 * 60 * 60;
-/// Bytes an uploaded avatar may hold (Pleroma's `avatar_upload_limit`).
-const AVATAR_UPLOAD_LIMIT: usize = 2_000_000;
-/// Bytes an uploaded banner may hold (Pleroma's `banner_upload_limit`).
-const BANNER_UPLOAD_LIMIT: usize = 4_000_000;
-/// Bytes a profile background may hold (Pleroma's
-/// `background_upload_limit`).
-const BACKGROUND_UPLOAD_LIMIT: usize = 4_000_000;
+/// [`Config::media_base_url`]: crate::config::Config::media_base_url
+const THUMBNAIL_PATH: &str = crate::default_assets::THUMBNAIL_PATH;
 /// Characters the instance description (and a profile note) may hold
 /// (Pleroma's `[:instance, :description_limit]`).
 const DESCRIPTION_LIMIT: usize = 5_000;
@@ -137,30 +100,12 @@ const VIDEO_MATRIX_LIMIT: usize = 2_304_000;
 const VIDEO_FRAME_RATE_LIMIT: usize = 60;
 /// Tags one account may feature (Mastodon 2.7.2's shipped value).
 const MAX_FEATURED_TAGS: usize = 10;
-/// Fields one local account may set (Pleroma's `max_account_fields`).
-const MAX_ACCOUNT_FIELDS: usize = 10;
-/// Fields a remote account may carry before they are dropped (Pleroma's
-/// `max_remote_account_fields`).
-const MAX_REMOTE_ACCOUNT_FIELDS: usize = 20;
-/// Characters a profile field name may hold (Pleroma's
-/// `account_field_name_length`).
-const ACCOUNT_FIELD_NAME_LENGTH: usize = 512;
-/// Characters a profile field value may hold (Pleroma's
-/// `account_field_value_length`).
-const ACCOUNT_FIELD_VALUE_LENGTH: usize = 2048;
-/// Source formats a status may be written in (the three
-/// [`crate::util::format`] renders; Pleroma's list names bbcode and
-/// Misskey markdown too, which this server has no renderer for).
-const POST_FORMATS: [&str; 3] = ["text/plain", "text/html", "text/markdown"];
 /// Attachment types the upload endpoint accepts: media types are sniffed
 /// from the bytes, so the configuration block names Pleroma's catch-all
 /// (`InstanceView.configuration`, `instance_view.ex`).
 const SUPPORTED_MIME_TYPES: [&str; 1] = ["application/octet-stream"];
 /// Monthly active users reported while no activity counter exists.
 const MONTHLY_ACTIVE_USERS: usize = 0;
-/// The public source repository of this server, reported as the v2
-/// document's `source_url` (Pleroma's `Pleroma.Application.repository()`).
-const SOURCE_URL: &str = "https://github.com/TheStranjer/wired-be";
 /// Statuses one account may pin (Mastodon's shipped limit; Pleroma's
 /// config default is `1`, but this block follows Mastodon's numbers the
 /// way [`MAX_FEATURED_TAGS`] already does).
@@ -168,49 +113,6 @@ const MAX_PINNED_STATUSES: usize = 5;
 /// Peer hosts `GET /api/v1/instance/peers` reports at most, the cap the
 /// listing answers with even on a far larger table.
 const PEER_LIMIT: i64 = 1_000;
-
-/// The three counters of a Pleroma-compatible instance, read in one
-/// round trip and cached for [`STATS_TTL`].
-///
-/// The field names drop the shared `count` postfix for Clippy's
-/// `struct_field_names`; `serde` and `sqlx` restore it on the wire and in
-/// the query, so both sides still speak Mastodon's
-/// `user_count`/`status_count`/`domain_count`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, sqlx::FromRow)]
-pub struct InstanceStats {
-    /// Accounts this instance owns that are still active.
-    #[serde(rename = "user_count")]
-    #[sqlx(rename = "user_count")]
-    pub users: i64,
-    /// Live, non-reblog posts this instance owns.
-    #[serde(rename = "status_count")]
-    #[sqlx(rename = "status_count")]
-    pub statuses: i64,
-    /// Instances whose users are mirrored here.
-    #[serde(rename = "domain_count")]
-    #[sqlx(rename = "domain_count")]
-    pub domains: i64,
-}
-
-/// [`read_stats`](handlers::read_stats): the three counters in one query.
-/// `user_count` counts active local accounts, `status_count` the live
-/// non-reblog posts this instance owns (a reblog shares its original's post,
-/// so counting both would double it), and `domain_count` the distinct hosts
-/// of the remote actors mirrored here. The `user_count` subquery is closed
-/// with the shared [`NOT_INSTANCE_ACTOR`] fragment: the instance actor is a
-/// local active account and belongs in no public statistic.
-///
-/// [`NOT_INSTANCE_ACTOR`]: crate::models::user::NOT_INSTANCE_ACTOR
-const STATS_SQL_LOCAL: &str = "SELECT
-       (SELECT count(*) FROM users
-         WHERE local AND is_active";
-/// The rest of [`STATS_SQL_LOCAL`], pushed after the instance-actor
-/// exclusion (see [`read_stats`](handlers::read_stats)).
-const STATS_SQL_REST: &str = ") AS user_count,
-       (SELECT count(*) FROM statuses
-         WHERE local AND deleted_at IS NULL AND reblog_of_id IS NULL) AS status_count,
-       (SELECT count(DISTINCT domain) FROM users
-         WHERE NOT local AND domain IS NOT NULL) AS domain_count";
 
 /// The [`Instance`](v1::Instance) `contact_account` row: the first local
 /// admin — lowest id, which sorts in creation order (decision 4), among the

@@ -5,15 +5,18 @@
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use crate::{error::AppResult, pagination::PageParams};
+use crate::{
+    error::AppResult,
+    pagination::{PageParams, keyset_page_by},
+};
 
-use super::{pages::page_rows, types::FollowPageEntry};
+use super::types::FollowPageEntry;
 
 /// The incoming side of [`pending_requests_for`]: the users still waiting for
 /// the bound account to answer their follow request, each entry led by the
 /// `follow_id` of the request row behind it — the id the page keys on, as in
 /// [`FOLLOWERS_PAGE_SQL`]. The text stops where its one placeholder belongs,
-/// because that is where [`page_rows`] pushes its bind and the builder is what
+/// because that is where [`keyset_page_by`] pushes its bind and the builder is what
 /// numbers it `$1`; the keyset it then appends runs on the relationship id
 /// `f.id`.
 const PENDING_REQUESTS_SQL: &str = "SELECT f.id AS follow_id, u.* FROM follows f
@@ -25,7 +28,7 @@ const PENDING_REQUESTS_SQL: &str = "SELECT f.id AS follow_id, u.* FROM follows f
 /// row names as its `followee`, the mirror of [`PENDING_REQUESTS_SQL`] — each
 /// entry led by the `follow_id` of the request row behind it, the id the page
 /// keys on. The text stops where its one placeholder belongs, because that is
-/// where [`page_rows`] pushes its bind and the builder is what numbers it
+/// where [`keyset_page_by`] pushes its bind and the builder is what numbers it
 /// `$1`; the keyset it then appends runs on the relationship id `f.id`.
 const PENDING_OUTGOING_SQL: &str = "SELECT f.id AS follow_id, u.* FROM follows f
     JOIN users u ON u.id = f.followee_id
@@ -57,7 +60,7 @@ pub async fn pending_requests_for(
     target_id: Uuid,
     page: PageParams,
 ) -> AppResult<Vec<FollowPageEntry>> {
-    page_rows(pool, PENDING_REQUESTS_SQL, target_id, &page).await
+    keyset_page_by(pool, PENDING_REQUESTS_SQL, target_id, "f.id", &page).await
 }
 
 /// The users `follower_id` has asked to follow and who have not answered: the
@@ -82,7 +85,7 @@ pub async fn outgoing_requests_from(
     follower_id: Uuid,
     page: PageParams,
 ) -> AppResult<Vec<FollowPageEntry>> {
-    page_rows(pool, PENDING_OUTGOING_SQL, follower_id, &page).await
+    keyset_page_by(pool, PENDING_OUTGOING_SQL, follower_id, "f.id", &page).await
 }
 
 /// How many follow requests are waiting for `user_id` to answer them: the

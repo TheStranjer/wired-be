@@ -4,7 +4,7 @@
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use super::{transient, whole};
+use super::whole;
 #[cfg(doc)]
 use crate::models::status_edit;
 use crate::{
@@ -62,17 +62,17 @@ pub(super) async fn replace_media(
         .db
         .begin()
         .await
-        .map_err(|err| transient("the attachment rewrite", &err))?;
+        .map_err(|err| FederationError::transient("the attachment rewrite failed", &err))?;
     sqlx::query("DELETE FROM media_attachments WHERE id = ANY($1)")
         .bind(old_ids)
         .execute(&mut *tx)
         .await
         .map(drop)
-        .map_err(|err| transient("the detached attachment delete", &err))?;
+        .map_err(|err| FederationError::transient("the detached attachment delete failed", &err))?;
     ingest::insert_media(&mut tx, status_id, attachments).await?;
     tx.commit()
         .await
-        .map_err(|err| transient("the attachment rewrite commit", &err))?;
+        .map_err(|err| FederationError::transient("the attachment rewrite commit failed", &err))?;
     Ok(())
 }
 
@@ -92,22 +92,22 @@ pub(super) async fn refresh_poll(
     };
     let stored = poll::get_for_status(&state.db, status_id)
         .await
-        .map_err(|err| transient("the stored poll read", &err))?;
+        .map_err(|err| FederationError::transient("the stored poll read failed", &err))?;
     if let Some(poll) = stored {
         let totals = remote_totals(poll_data);
         return poll::record_remote_totals(&state.db, poll.id, &totals)
             .await
-            .map_err(|err| transient("the remote poll totals", &err));
+            .map_err(|err| FederationError::transient("the remote poll totals failed", &err));
     }
     let mut tx = state
         .db
         .begin()
         .await
-        .map_err(|err| transient("the poll insert", &err))?;
+        .map_err(|err| FederationError::transient("the poll insert failed", &err))?;
     ingest::insert_poll(&mut tx, status_id, Some(poll_data)).await?;
     tx.commit()
         .await
-        .map_err(|err| transient("the poll insert commit", &err))?;
+        .map_err(|err| FederationError::transient("the poll insert commit failed", &err))?;
     Ok(())
 }
 

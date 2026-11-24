@@ -4,8 +4,6 @@
 
 use std::net::SocketAddr;
 
-use url::Url;
-
 #[cfg(doc)]
 use super::Config;
 
@@ -22,6 +20,7 @@ use super::{
         INSTANCE_LANGUAGES_VAR, INSTANCE_NAME_VAR,
     },
 };
+use crate::util::url::{host_with_port, parse_http_url};
 
 /// The shape [`endpoints`] answers: the database URL, the listen socket,
 /// the public origin and the media URL prefix, in [`Config`] field order;
@@ -63,21 +62,13 @@ where
 /// Returns [`ConfigError::InvalidBaseUrl`] unless the value is an absolute
 /// `http`/`https` URL with a host and no path, query or trailing junk.
 fn normalize_base_url(raw: &str) -> Result<String, ConfigError> {
-    let Ok(url) = Url::parse(raw) else {
-        return Err(ConfigError::InvalidBaseUrl);
-    };
-    if !matches!(url.scheme(), "http" | "https") {
-        return Err(ConfigError::InvalidBaseUrl);
-    }
-    let Some(host) = url.host_str() else {
+    let Some(url) = parse_http_url(raw) else {
         return Err(ConfigError::InvalidBaseUrl);
     };
     if !matches!(url.path(), "" | "/") || url.query().is_some() {
         return Err(ConfigError::InvalidBaseUrl);
     }
-    let domain = url
-        .port()
-        .map_or_else(|| host.to_owned(), |port| format!("{host}:{port}"));
+    let domain = host_with_port(&url);
     Ok(format!("{}://{domain}", url.scheme()))
 }
 

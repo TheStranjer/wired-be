@@ -11,7 +11,7 @@ use axum::{Router, http::StatusCode};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde_json::{Value, json};
 use sqlx::PgPool;
-use wired_be::models::oauth_app::OauthApp;
+use wired_be::{models::oauth_app::OauthApp, util::token::sha256_hex};
 
 use super::support::{assert_no_store, error_text, fixtures};
 use crate::common;
@@ -34,10 +34,11 @@ async fn post_revoke_json(app: &Router, body: &Value) -> common::TestResponse {
         .await
 }
 
-/// Rows in `oauth_tokens` whose access token is `token`.
+/// Rows in `oauth_tokens` whose access token is the raw `token` (the table
+/// stores its SHA-256 digest, so that is what is matched).
 pub(super) async fn token_rows(pool: &PgPool, token: &str) -> i64 {
     let (rows,): (i64,) = sqlx::query_as("SELECT count(*) FROM oauth_tokens WHERE token = $1")
-        .bind(token)
+        .bind(sha256_hex(token))
         .fetch_one(pool)
         .await
         .expect("the count reaches the database");

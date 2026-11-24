@@ -4,6 +4,8 @@
 
 use sqlx::{Postgres, QueryBuilder};
 
+use crate::util::params::truthy;
+
 /// The three ways one of
 /// [`mastodon_list`](super::mastodon::mastodon_list)'s boolean criteria can be stated.
 ///
@@ -28,24 +30,18 @@ impl Criterion {
     /// The criterion one query parameter's text spells, in the three readings
     /// the ticket's filters have.
     ///
-    /// `true` and `1` are [`Only`](Self::Only), `false` and `0` are
-    /// [`Except`](Self::Except), both trimmed and case-insensitive — the same
-    /// two spellings [`crate::api::helpers::is_true`] gives, widened to their
-    /// negation — and everything else (absent, empty, `yes`, junk) is
+    /// A true spelling of [`truthy`] (`true`, `1`, `yes`, …) is
+    /// [`Only`](Self::Only), a false one (`false`, `0`, `no`, …) is
+    /// [`Except`](Self::Except), and everything else (absent, empty, junk) is
     /// [`Any`](Self::Any). Pleroma's `CastAndValidate` refuses a value its
     /// boolean cast does not know; this listing ignores it instead, the way it
     /// ignores every criterion the ticket says it cannot weigh.
     #[must_use]
     pub fn parse(text: Option<&str>) -> Self {
-        let Some(text) = text.map(str::trim) else {
-            return Self::Any;
-        };
-        if text.eq_ignore_ascii_case("true") || text == "1" {
-            Self::Only
-        } else if text.eq_ignore_ascii_case("false") || text == "0" {
-            Self::Except
-        } else {
-            Self::Any
+        match text.and_then(truthy) {
+            Some(true) => Self::Only,
+            Some(false) => Self::Except,
+            None => Self::Any,
         }
     }
 }
@@ -80,17 +76,17 @@ mod tests {
         assert_eq!(Criterion::default(), Criterion::Any, "the default");
         assert_eq!(Criterion::parse(None), Criterion::Any, "an absent key");
         assert_eq!(Criterion::parse(Some("")), Criterion::Any, "an empty one");
-        for text in ["maybe", "yes", "t", "  ", "2"] {
+        for text in ["maybe", "  ", "2"] {
             assert_eq!(
                 Criterion::parse(Some(text)),
                 Criterion::Any,
                 "`{text}` is no boolean this listing weighs"
             );
         }
-        for text in ["true", "TRUE", " true ", "1"] {
+        for text in ["true", "TRUE", " true ", "1", "yes", "t"] {
             assert_eq!(Criterion::parse(Some(text)), Criterion::Only, "`{text}`");
         }
-        for text in ["false", "False", " 0 "] {
+        for text in ["false", "False", " 0 ", "no", "f"] {
             assert_eq!(
                 Criterion::parse(Some(text)),
                 Criterion::Except,

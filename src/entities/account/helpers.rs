@@ -12,7 +12,10 @@ use serde_json::Value;
 use super::AccountSource;
 
 use super::{AccountViewer, Field};
-use crate::{config::Config, models::user::User, services::media_proxy};
+use crate::{
+    config::Config, default_assets, models::user::User, services::media_proxy,
+    util::sanitize::sanitize_display_name,
+};
 
 /// Whether `viewer` is looking at their own account — Pleroma's
 /// `self = opts[:for] == user`, compared by primary key.
@@ -41,21 +44,12 @@ pub(super) const fn visible_following_count(user: &User, is_self: bool) -> i32 {
     }
 }
 
-/// The web profile URL of the local account `nickname` on this instance:
-/// `{base_url}/users/{nickname}`, the same shape as
-/// [`local_ap_id`](crate::models::user::local_ap_id) but built from the
-/// config instead of a raw base url.
-#[must_use]
-pub fn local_url(config: &Config, nickname: &str) -> String {
-    format!("{}/users/{nickname}", config.base_url)
-}
-
 /// The avatar/banner URL a remote user's profile renders with: the stored
-/// `stored_url`, or `{frontend_base_url}{default_path}` when unset, then
+/// `stored_url`, or `{media_base_url}{default_path}` when unset, then
 /// through the media proxy helper — remote users only (ticket), so a local
-/// user's images pass through untouched. The default assets are shipped by
-/// the frontend, so the fallback hangs off [`Config::frontend_base_url`],
-/// not the API's own origin.
+/// user's images pass through untouched. The default assets are served by
+/// the backend under `/media/default` (see [`crate::default_assets`]), so
+/// the fallback hangs off [`Config::media_base_url`].
 ///
 /// Crate-visible because the admin API's account entity renders the same
 /// `avatar` Pleroma's `AdminAPI.AccountView` puts through
@@ -67,13 +61,28 @@ pub(crate) fn profile_image(
     stored_url: Option<&str>,
     default_path: &str,
 ) -> String {
-    let fallback = format!("{}{default_path}", config.frontend_base_url);
+    let fallback = default_assets::url(config, default_path);
     let url = stored_url.unwrap_or(&fallback);
     if user.local.get() {
         url.to_owned()
     } else {
         media_proxy::proxy_url(config, url)
     }
+}
+
+/// Pleroma's `strip_tags(user.name || user.nickname)`: the display name
+/// when the account has one, the handle when it does not, and either way
+/// reduced to one line of plain text (the column holds sanitized markup, so
+/// a name fetched from a remote actor can still carry tags). Crate-visible
+/// because the admin API's account entity and the push job's notification
+/// title both render this one rule.
+pub(crate) fn plain_display_name(user: &User) -> String {
+    let stored = if user.name.is_empty() {
+        user.nickname.as_str()
+    } else {
+        user.name.as_str()
+    };
+    sanitize_display_name(stored)
 }
 
 /// The part of `nickname` before the first `@` — Pleroma's
@@ -138,12 +147,12 @@ mod tests {
         let value = render(&alice, &config);
         assert_eq!(
             value["avatar"],
-            serde_json::json!(format!("{BASE}/images/avi.png")),
+            serde_json::json!(format!("{BASE}/media/default/avi.png")),
             "a missing avatar gets the instance default"
         );
         assert_eq!(
             value["header"],
-            serde_json::json!(format!("{BASE}/images/banner.png")),
+            serde_json::json!(format!("{BASE}/media/default/banner.png")),
             "a missing banner gets the instance default"
         );
         assert_eq!(
@@ -159,12 +168,11 @@ mod tests {
     }
 
     /// The unset avatar/banner fall back to the paths under
-    /// `FRONTEND_BASE_URL` when that origin differs from `BASE_URL`, and
-    /// stay where they were on the default config, where the variable is
-    /// unset and the two origins are equal.
+    /// `MEDIA_BASE_URL`, wherever it points, and ignore `FRONTEND_BASE_URL`.
     #[test]
-    fn default_images_follow_the_frontend_origin() {
+    fn default_images_follow_the_media_base_url() {
         let mut config = Config::for_tests();
+        config.media_base_url = "https://cdn.example/files".to_owned();
         config.frontend_base_url = "https://fe.example".to_owned();
         let mut alice = base_user("alice", &format!("{BASE}/users/alice"));
         alice.local = Flag::new(true);
@@ -177,21 +185,21 @@ mod tests {
         ] {
             let url = value[key].as_str().unwrap();
             assert!(
-                url.starts_with("https://fe.example") && url.ends_with(path),
-                "{key} falls back to {path} under the frontend origin: {url}"
+                url == format!("https://cdn.example/files{path}"),
+                "{key} falls back to {path} under the media base URL: {url}"
             );
         }
 
         let defaults = render(&alice, &Config::for_tests());
         assert_eq!(
             defaults["avatar"],
-            serde_json::json!(format!("{BASE}{DEFAULT_AVATAR_PATH}")),
-            "with FRONTEND_BASE_URL unset the avatar URL is unchanged"
+            serde_json::json!(format!("{BASE}/media{DEFAULT_AVATAR_PATH}")),
+            "the default media base URL puts the avatar under /media"
         );
         assert_eq!(
             defaults["header"],
-            serde_json::json!(format!("{BASE}{DEFAULT_BANNER_PATH}")),
-            "with FRONTEND_BASE_URL unset the header URL is unchanged"
+            serde_json::json!(format!("{BASE}/media{DEFAULT_BANNER_PATH}")),
+            "and the banner"
         );
     }
 
@@ -222,16 +230,6 @@ mod tests {
             malformed["fields"],
             serde_json::json!([]),
             "jsonb of another shape renders as the empty list"
-        );
-    }
-
-    #[test]
-    fn local_url_builds_the_profile_url_from_the_config() {
-        let config = Config::for_tests();
-        assert_eq!(
-            local_url(&config, "alice"),
-            "https://test.example/users/alice",
-            "the profile url is the base url plus the users path and nickname"
         );
     }
 
@@ -339,7 +337,7 @@ mod tests {
         );
         assert_eq!(
             local["header"],
-            serde_json::json!(format!("{BASE}/images/banner.png")),
+            serde_json::json!(format!("{BASE}/media/default/banner.png")),
             "the unset banner is the instance default on the instance's own host"
         );
 
@@ -354,7 +352,7 @@ mod tests {
         let defaults = render(&carol, &config);
         assert_eq!(
             defaults["avatar"],
-            serde_json::json!(format!("{BASE}/images/avi.png")),
+            serde_json::json!(format!("{BASE}/media/default/avi.png")),
             "a remote user without a stored avatar keeps the instance default, proxied or not"
         );
     }
