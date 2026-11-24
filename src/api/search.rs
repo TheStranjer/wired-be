@@ -31,6 +31,11 @@
 //! stored text too, with the visibility clause still holding it to
 //! `public` and `unlisted` rows.
 //!
+//! `offset` paging is for a viewer only: an anonymous request that carries a
+//! non-blank `offset` is the 401 `OFFSET_UNAUTHENTICATED`, as Mastodon
+//! refuses it, since a deep offset makes the database rank every match
+//! before skipping it.
+//!
 //! The accounts list pages by `offset` ([`PageParams`] with the account
 //! listings' default 40 and cap 80): a ranking over a changing corpus has
 //! no stable id cursor, which is why Pleroma pages search with
@@ -103,7 +108,7 @@ use serde::Serialize;
 use crate::{
     auth::MaybeAuthUser,
     entities::{account::Account, status::Status as StatusEntity},
-    error::AppResult,
+    error::{AppError, AppResult},
     models::user::User,
     oauth::scopes::READ_ACCOUNTS,
     state::AppState,
@@ -151,6 +156,10 @@ const NO_OFFSET: i64 = 0;
 /// 400 body for an `account_id` that is not a valid id — the shared
 /// pagination wording.
 const INVALID_ID: &str = "Invalid id";
+
+/// 401 body for an anonymous request that pages by `offset`.
+const OFFSET_UNAUTHENTICATED: &str =
+    "Search queries pagination is not supported without authentication";
 
 /// `type` spelling that searches accounts.
 const ACCOUNTS_TYPE: &str = "accounts";
@@ -233,6 +242,22 @@ struct SearchResults {
     hashtags: HashtagList,
 }
 
+/// Refuses offset paging for a request without a viewer: a deep `OFFSET`
+/// forces a full ranked scan of every match before skipping it, a cost an
+/// anonymous caller must not be able to demand (Mastodon's
+/// `Search queries pagination is not supported without authentication`).
+///
+/// # Errors
+///
+/// [`AppError::Unauthorized`] when `auth` carries no user and `params` has
+/// an `offset`.
+fn refuse_anonymous_offset(auth: &MaybeAuthUser, params: &SearchParams) -> AppResult<()> {
+    if auth.0.is_none() && params.has_offset() {
+        return Err(AppError::Unauthorized(OFFSET_UNAUTHENTICATED.to_owned()));
+    }
+    Ok(())
+}
+
 /// `GET /api/v1/accounts/search` — the account search on its own, answered
 /// as a flat array of [`Account`] entities (Mastodon's account-search
 /// spelling, which Pleroma renders through its `AccountView`). A resolving
@@ -259,6 +284,7 @@ async fn account_search(
 ) -> AppResult<Json<Vec<Account>>> {
     auth.require_user_scope(READ_ACCOUNTS)?;
     let params = SearchParams::parse(uri.query())?;
+    refuse_anonymous_offset(&auth, &params)?;
     let viewer: Option<&User> = auth.0.as_ref();
     let rows = account_rows(&state, viewer, &params).await?;
     let request = Resolver::new(&params, Arms::AccountsOnly, viewer, &rows);
@@ -319,6 +345,7 @@ async fn search_document(
 ) -> AppResult<Json<SearchResults>> {
     auth.require_user_scope(READ_ACCOUNTS)?;
     let params = SearchParams::parse(uri.query())?;
+    refuse_anonymous_offset(&auth, &params)?;
     let viewer: Option<&User> = auth.0.as_ref();
     let rows = if params.searches(Resource::Accounts) {
         account_rows(&state, viewer, &params).await?

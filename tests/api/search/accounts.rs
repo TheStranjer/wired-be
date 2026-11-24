@@ -8,8 +8,8 @@ use axum::http::StatusCode;
 use wired_be::models::block;
 
 use super::support::{
-    ACCOUNTS_SEARCH, BASE, INVALID_TOKEN, NO_READ_ACCOUNTS, V1_SEARCH, V2_SEARCH, fixture,
-    follow_pair, get, listed_ids,
+    ACCOUNTS_SEARCH, BASE, INVALID_TOKEN, NO_READ_ACCOUNTS, OFFSET_UNAUTHENTICATED, V1_SEARCH,
+    V2_SEARCH, fixture, follow_pair, get, listed_ids,
 };
 use crate::common;
 
@@ -276,6 +276,43 @@ async fn search_auth_gates() {
             &format!("{path} invalid token"),
         );
         common::assert_error(&unknown, INVALID_TOKEN, &format!("{path} invalid token"));
+    }
+}
+
+/// An anonymous request that pages by `offset` is the 401 on every search
+/// route (a deep offset is a cost amplifier), a blank `offset` and an absent
+/// one are answered, and a viewer may page.
+#[tokio::test]
+async fn anonymous_offset_paging_is_refused() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let app = common::test_app(pool.clone());
+    let _alice = common::create_local_user(&pool, "alice").await;
+    let (_, read_token) = fixture(&pool, "reader", "read").await;
+    let app_only = common::create_app_only_token(&pool, "read").await;
+
+    for path in [ACCOUNTS_SEARCH, V1_SEARCH, V2_SEARCH] {
+        for query in ["q=a&offset=20", "q=a&offset=0", "q=a&offset=junk"] {
+            let target = format!("{path}?{query}");
+            let who = format!("{path} anonymous `{query}`");
+            let refused = get(&app, None, &target).await;
+            common::assert_answer(&refused, StatusCode::UNAUTHORIZED, &who);
+            common::assert_error(&refused, OFFSET_UNAUTHENTICATED, &who);
+        }
+        let shared = get(&app, Some(&app_only), &format!("{path}?q=a&offset=20")).await;
+        common::assert_answer(&shared, StatusCode::UNAUTHORIZED, "an app-only token");
+        common::assert_error(&shared, OFFSET_UNAUTHENTICATED, "an app-only token");
+
+        for query in ["q=a", "q=a&offset=", "q=a&offset=%20"] {
+            let allowed = get(&app, None, &format!("{path}?{query}")).await;
+            common::assert_answer(
+                &allowed,
+                StatusCode::OK,
+                &format!("{path} anonymous `{query}`"),
+            );
+        }
+        let paged = get(&app, Some(&read_token), &format!("{path}?q=a&offset=20")).await;
+        common::assert_answer(&paged, StatusCode::OK, &format!("{path} with a viewer"));
     }
 }
 
