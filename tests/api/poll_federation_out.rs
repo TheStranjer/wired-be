@@ -7,8 +7,8 @@
 //! the marks, the option counts and the poll's totals all move — and beside
 //! that counting this instance sends one `Create` per chosen option: its
 //! object a bodyless `Note` naming the option title and answering the
-//! question's uri under the `{BASE_URL}/objects/vote-{vote id}-{option
-//! position}` id, the activity under the matching `{BASE_URL}/activities/…`
+//! question's uri under the `{BASE_URL}/objects/vote-{poll id}-{voter
+//! id}-{option position}` id, the activity under the matching `{BASE_URL}/activities/…`
 //! id, both addressed to the poll's author alone, and the fan-out delivers
 //! to their personal inbox only. A vote on a LOCAL poll sends no answer —
 //! its author reads the counters, not the wire — and queues one debounced
@@ -230,7 +230,7 @@ async fn delivered(pool: &PgPool) -> Vec<String> {
 
 /// The whole answer activity the ticket pins for `option`: the bodyless
 /// `Note` naming its title and answering `question_uri`, under the
-/// poll-keyed `vote-{poll id}-{option position}` ids, voter as actor and
+/// `vote-{poll id}-{voter id}-{option position}` ids, voter as actor and
 /// `attributedTo`, author as the only addressee.
 fn expected_answer(
     stand: &Poll,
@@ -239,7 +239,7 @@ fn expected_answer(
     author: &User,
     question_uri: &str,
 ) -> Value {
-    let name = format!("vote-{}-{}", stand.id, option.position);
+    let name = format!("vote-{}-{}-{}", stand.id, voter.id, option.position);
     json!({
         "@context": context(),
         "id": format!("{BASE}/activities/{name}"),

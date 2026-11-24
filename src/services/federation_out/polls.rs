@@ -79,8 +79,11 @@ pub async fn after_local_poll_changed(state: &AppState, status: &Status) {
 /// is for the interaction documents.
 #[derive(Debug)]
 struct Ballot<'a> {
-    /// The poll's own row id: the `{vote id}` of the pinned answer ids.
+    /// The poll's own row id: the `{poll id}` of the answer ids.
     poll_id: Uuid,
+    /// The voting user's row id: the `{voter id}` of the answer ids, so two
+    /// local voters on one option never share an id.
+    voter_id: Uuid,
     /// The question's object uri — the answers' `inReplyTo`.
     question_uri: &'a str,
     /// The voting account's actor id: `actor` and `attributedTo`.
@@ -91,10 +94,12 @@ struct Ballot<'a> {
 
 /// The `Create` of one answer: the bodyless `Note` naming `option`'s title
 /// and answering the question behind `ballot`, under the deterministic
-/// `{BASE_URL}/objects/vote-{vote id}-{option position}` object id and the
-/// matching `{BASE_URL}/activities/vote-{vote id}-{option position}`
-/// activity id the ticket pins (`{vote id}` is the poll's own row id, which
-/// is exactly what `POST /api/v1/polls/{id}/votes` is keyed on).
+/// `{BASE_URL}/objects/vote-{poll id}-{voter id}-{option position}` object
+/// id and the matching
+/// `{BASE_URL}/activities/vote-{poll id}-{voter id}-{option position}`
+/// activity id (`{poll id}` is the poll's own row id, which is exactly what
+/// `POST /api/v1/polls/{id}/votes` is keyed on, and `{voter id}` the local
+/// voter's row id, so each voter's answer has an id of its own).
 ///
 /// The shape is the one this instance's own inbound fold
 /// ([`crate::federation::handlers::vote`]) reads back: a `name`, no
@@ -104,7 +109,10 @@ struct Ballot<'a> {
 /// voter's timeline — and the envelope repeats that one-address line so the
 /// fan-out resolves exactly the author's personal inbox.
 fn answer_document(state: &AppState, ballot: &Ballot<'_>, option: &PollOption) -> Value {
-    let name = format!("vote-{}-{}", ballot.poll_id, option.position);
+    let name = format!(
+        "vote-{}-{}-{}",
+        ballot.poll_id, ballot.voter_id, option.position
+    );
     let object = json!({
         "id": format!("{}{OBJECTS_PATH}{name}", state.config.base_url),
         "type": "Note",
@@ -170,6 +178,7 @@ pub async fn after_poll_vote(state: &AppState, poll: &PollRow, voter: &User, opt
     };
     let ballot = Ballot {
         poll_id: poll.id,
+        voter_id: voter.id,
         question_uri: &posted.uri,
         voter_ap_id: &voter.ap_id,
         author_ap_id: &author.ap_id,
@@ -344,6 +353,100 @@ mod tests {
         assert_eq!(jobs[0].0["activity"]["type"], "Create", "a Create");
         assert_eq!(jobs[0].1, None, "not debounced");
         assert!(!all_publishes_delayed(&pool).await, "and not delayed");
+    }
+
+    /// A two-option poll on the REMOTE public status `question` of `bob`.
+    async fn remote_poll(pool: &PgPool, question: &str) -> (PollRow, Vec<PollOption>) {
+        let bob = remote(pool, "bob").await;
+        let asked = remote_status(pool, &bob, question, Visibility::Public).await;
+        let stand = {
+            let mut conn = pool.acquire().await.expect("a slot connection");
+            poll::create(
+                &mut conn,
+                asked.id,
+                &PollParams {
+                    options: vec!["tea".to_owned(), "coffee".to_owned(), "cocoa".to_owned()],
+                    multiple: true,
+                    ..PollParams::default()
+                },
+            )
+            .await
+            .expect("the remote poll creates")
+        };
+        let options = poll::options(pool, stand.id)
+            .await
+            .expect("the options read");
+        (stand, options)
+    }
+
+    /// The ids of the `Create` and of its object in a queued answer.
+    fn answer_ids(args: &Value) -> (String, String) {
+        let activity = &args["activity"];
+        (
+            activity["id"].as_str().expect("an activity id").to_owned(),
+            activity["object"]["id"]
+                .as_str()
+                .expect("an object id")
+                .to_owned(),
+        )
+    }
+
+    /// Two local voters choosing the same option of one remote poll queue
+    /// two answers under distinct activity and object ids.
+    #[tokio::test]
+    async fn two_local_voters_on_one_option_get_distinct_answer_ids() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let wanda = local(&pool, "wanda").await;
+        let walt = local(&pool, "walt").await;
+        let state = app_state(&pool);
+        let (stand, options) = remote_poll(&pool, "question-two-voters").await;
+
+        cast(&state, &stand, &wanda, options[0].id).await;
+        cast(&state, &stand, &walt, options[0].id).await;
+
+        let jobs = publish_jobs(&pool).await;
+        assert_eq!(jobs.len(), 2, "one answer per voter");
+        let (first_activity, first_object) = answer_ids(&jobs[0].0);
+        let (second_activity, second_object) = answer_ids(&jobs[1].0);
+        assert_ne!(first_activity, second_activity, "distinct activity ids");
+        assert_ne!(first_object, second_object, "distinct object ids");
+        assert!(
+            first_activity.contains(&wanda.id.to_string())
+                || second_activity.contains(&wanda.id.to_string()),
+            "the voter's id is part of the activity id"
+        );
+    }
+
+    /// One voter's multiple-choice ballot on options 0 and 2 queues two
+    /// answers under distinct ids.
+    #[tokio::test]
+    async fn a_multiple_choice_ballot_gets_one_id_per_option() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let wanda = local(&pool, "wanda").await;
+        let state = app_state(&pool);
+        let (stand, options) = remote_poll(&pool, "question-multiple").await;
+        let chosen = [options[0].id, options[2].id];
+
+        assert!(
+            poll::cast_vote(&state.db, stand.id, wanda.id, &chosen)
+                .await
+                .expect("the ballot writes"),
+            "the fixture ballot counts"
+        );
+        after_poll_vote(&state, &stand, &wanda, &chosen).await;
+
+        let jobs = publish_jobs(&pool).await;
+        assert_eq!(jobs.len(), 2, "one answer per chosen option");
+        let (first_activity, first_object) = answer_ids(&jobs[0].0);
+        let (second_activity, second_object) = answer_ids(&jobs[1].0);
+        assert_ne!(first_activity, second_activity, "distinct activity ids");
+        assert_ne!(first_object, second_object, "distinct object ids");
+        assert!(
+            first_activity.ends_with("-0") && second_activity.ends_with("-2"),
+            "each id ends in its option position"
+        );
     }
 
     /// The refusals of the answer hook: a ballot signed by nobody of ours,
