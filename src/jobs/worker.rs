@@ -270,13 +270,14 @@ async fn record_outcome(db: &PgPool, id: Uuid, attempts: i32, outcome: Result<()
     }
 }
 
-/// Returns expired locks to the queue ([`rescue_stuck`] past
-/// [`STUCK_LOCK_AGE`]), logging how many rows the sweep rescued.
+/// Settles expired locks ([`rescue_stuck`] past [`STUCK_LOCK_AGE`]): jobs
+/// with attempts left return to the queue, jobs at their budget are
+/// discarded. Logs how many rows the sweep touched.
 async fn sweep_stuck(state: &AppState) {
     match rescue_stuck(&state.db, STUCK_LOCK_AGE).await {
         Ok(count) => {
             if count > 0 {
-                info!(count, "rescued stuck jobs");
+                info!(count, "settled stuck jobs (retried or discarded)");
             }
         }
         Err(err) => error!(%err, "stuck job rescue failed"),
