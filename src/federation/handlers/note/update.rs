@@ -91,8 +91,8 @@ async fn ingest_the_rest(
 }
 
 /// The edit fold of [`apply_update`], in the order the ticket fixes: the
-/// stale gate, the parse, the versioned write, the attachments, the poll,
-/// and the edit route's own hook — each step the same code the local edit
+/// stale gate, the parse, the versioned write, the announced custom emoji,
+/// the attachments, the poll, and the edit route's own hook — each step the same code the local edit
 /// runs, on state the document restates.
 async fn fold_edit(
     state: &AppState,
@@ -141,6 +141,7 @@ async fn fold_edit(
     else {
         return Ok(Outcome::Ignored("the status was deleted under its edit"));
     };
+    ingest::upsert_emojis(state, &parsed.emojis).await?;
     if media_plan.replaces() {
         let old_ids: Vec<Uuid> = media.into_iter().map(|row| row.id).collect();
         replace_media(state, stored.id, &old_ids, &parsed.attachments).await?;
@@ -257,6 +258,9 @@ fn restates(parsed: &ParsedNote, stored: &Status) -> bool {
 fn update_time(object: &Value, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
     clamped_time(object.get("updated"), now)
 }
+
+#[cfg(test)]
+mod emoji_tests;
 
 #[cfg(test)]
 mod tests {
