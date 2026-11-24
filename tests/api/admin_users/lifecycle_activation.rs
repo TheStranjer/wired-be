@@ -241,6 +241,38 @@ async fn toggle_flips_one_account_and_logs_the_move() {
     assert!(still_active, "and the refused toggle wrote nothing");
 }
 
+/// The toggle refuses to deactivate the caller: their own nickname, or id,
+/// is the 403 and the row stays active with nothing logged, while toggling
+/// another account is still the 200 of the unchanged route.
+#[tokio::test]
+async fn toggle_refuses_to_deactivate_the_caller() {
+    let db = common::test_db().await;
+    let seeded = seed(&db).await;
+    let token = write_token(&seeded).await;
+
+    for segment in ["root".to_owned(), seeded.root.id.to_string()] {
+        let own = TestRequest::patch(&toggle_path(&segment))
+            .bearer(&token)
+            .send(&seeded.app)
+            .await;
+        common::assert_answer(&own, StatusCode::FORBIDDEN, "the caller's own toggle");
+        common::assert_error(&own, "This action is not allowed", "in the pinned words");
+    }
+    let (still_active, _, _) = lifecycle_flags(&seeded.pool, "root").await;
+    assert!(still_active, "the refused toggle left the admin active");
+    assert!(
+        logged(&seeded.pool, "deactivate").await.is_empty(),
+        "and logged nothing"
+    );
+
+    let other = TestRequest::patch(&toggle_path("plain"))
+        .bearer(&token)
+        .send(&seeded.app)
+        .await;
+    common::assert_answer(&other, StatusCode::OK, "another account's toggle");
+    assert_eq!(other.json_value()["is_active"], false, "moves as before");
+}
+
 /// Approval clears the staff gate for the pending accounts, mails each
 /// one that holds an address the approval letter, mints nothing, answers
 /// every named account that exists — and leaves the already-approved one

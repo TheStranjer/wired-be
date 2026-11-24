@@ -12,9 +12,9 @@ use wired_be::models::{follow, status::Visibility, user::User};
 
 use super::support::{BASE, NOT_FOUND};
 use super::write_support::{
-    DISABLED, INVALID_TYPE, MISSING_TYPE, WRONG_TARGET, Writes, account_action_path, act,
-    file_against, job_count, letters, logged, login, one_entry, post_json, report_state, row_state,
-    seed_writes, sweeps_for, token_count, verify,
+    DISABLED, INVALID_TYPE, MISSING_TYPE, NOT_ALLOWED, ONLY_LOCAL, WRONG_TARGET, Writes,
+    account_action_path, act, file_against, job_count, letters, logged, login, one_entry,
+    post_json, report_state, row_state, seed_writes, sweeps_for, token_count, verify,
 };
 use crate::common::{self, TestRequest};
 
@@ -434,6 +434,79 @@ async fn the_action_refuses_a_report_it_does_not_belong_to() {
         logged(&seeded.pool, "deactivate").await.is_empty()
             && logged(&seeded.pool, "disable").await.is_empty(),
         "nor the action's own entries"
+    );
+}
+
+/// A deactivating action on the admin's own account is the 403, for both
+/// `disable` and `suspend`: the admin stays active and nothing is logged.
+#[tokio::test]
+async fn the_action_refuses_to_deactivate_the_admin_themselves() {
+    let db = common::test_db().await;
+    let seeded = seed_writes(&db).await;
+    let path = account_action_path(seeded.root.id, "action");
+
+    for kind in ["disable", "suspend"] {
+        let response = post_json(&seeded.app, &seeded.token, &path, &json!({"type": kind})).await;
+        common::assert_answer(&response, StatusCode::FORBIDDEN, "the caller's own account");
+        common::assert_error(&response, NOT_ALLOWED, "in the pinned words");
+    }
+
+    let (active, _, _) = row_state(&seeded.pool, seeded.root.id)
+        .await
+        .expect("the row is there");
+    assert!(active, "the admin is still active");
+    for action in ["disable", "suspend", "deactivate"] {
+        assert!(
+            logged(&seeded.pool, action).await.is_empty(),
+            "and no {action} entry was left"
+        );
+    }
+
+    act(
+        &seeded.app,
+        &seeded.token,
+        seeded.root.id,
+        &json!({"type": "none"}),
+    )
+    .await;
+    assert_eq!(
+        logged(&seeded.pool, "none").await.len(),
+        1,
+        "a type that deactivates nothing is still allowed on the caller"
+    );
+}
+
+/// `disable` on a remote mirror is the 400, and a `report_id` supplied with
+/// it stays `open`: the refusal comes before the report is resolved.
+#[tokio::test]
+async fn the_action_refuses_to_disable_a_remote_mirror() {
+    let db = common::test_db().await;
+    let seeded = seed_writes(&db).await;
+    let report = file_against(&seeded.pool, &seeded.beeper, &seeded.mirror).await;
+
+    let response = post_json(
+        &seeded.app,
+        &seeded.token,
+        &account_action_path(seeded.mirror.id, "action"),
+        &json!({"type": "disable", "report_id": report.to_string()}),
+    )
+    .await;
+    common::assert_answer(&response, StatusCode::BAD_REQUEST, "a remote account");
+    common::assert_error(&response, ONLY_LOCAL, "in Pleroma's words");
+
+    assert_eq!(
+        report_state(&seeded.pool, report).await,
+        ("open".to_owned(), false),
+        "the report was left open"
+    );
+    let (active, _, _) = row_state(&seeded.pool, seeded.mirror.id)
+        .await
+        .expect("the row is there");
+    assert!(active, "and the mirror's flag did not move");
+    assert!(
+        logged(&seeded.pool, "report_update").await.is_empty()
+            && logged(&seeded.pool, "disable").await.is_empty(),
+        "nor was anything logged"
     );
 }
 
