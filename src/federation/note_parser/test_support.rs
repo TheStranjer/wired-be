@@ -97,7 +97,6 @@ pub(super) fn author() -> User {
         last_fetched_at: None,
         inserted_at: parse_time("2024-01-31T12:34:56.789Z").unwrap(),
         updated_at: parse_time("2024-01-31T12:34:56.789Z").unwrap(),
-        preferred_frontend: None,
         is_suggested: Flag::new(false),
         password_reset_pending: Flag::new(false),
         email_notifications: Flag::new(true),

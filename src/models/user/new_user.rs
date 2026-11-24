@@ -152,8 +152,6 @@ pub struct NewUser {
     /// blob by default, matching the column default. Holds the TOTP
     /// secret; never in `Debug` output.
     pub mfa_settings: Value,
-    /// The frontend the account picked; `None` (no choice) by default.
-    pub preferred_frontend: Option<String>,
     /// Whether the account sits in the suggestion pool; `false` by default,
     /// because only an admin puts it there (the admin API is a later
     /// ticket).
@@ -237,7 +235,6 @@ impl fmt::Debug for NewUser {
             .field("last_status_at", &self.last_status_at)
             .field("last_fetched_at", &self.last_fetched_at)
             .field("mfa_settings", &"<redacted>")
-            .field("preferred_frontend", &self.preferred_frontend)
             .field("is_suggested", &self.is_suggested)
             .field("password_reset_pending", &self.password_reset_pending)
             .field("email_notifications", &self.email_notifications)
@@ -313,7 +310,6 @@ impl Default for NewUser {
             last_status_at: None,
             last_fetched_at: None,
             mfa_settings: mfa::MfaSettings::default_value(),
-            preferred_frontend: None,
             is_suggested: Flag::new(false),
             password_reset_pending: Flag::new(false),
             email_notifications: Flag::new(true),

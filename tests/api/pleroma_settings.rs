@@ -1,6 +1,6 @@
-//! Frontend settings store, mascot and preferred frontend
-//! (`/api/v1/pleroma/settings/{app}`, `/api/v1/pleroma/mascot`,
-//! `/api/v1/pleroma/preferred_frontend`, WBE-122) over the real router.
+//! Frontend settings store and mascot (`/api/v1/pleroma/settings/{app}`,
+//! `/api/v1/pleroma/mascot`, WBE-122) over the real router, plus the
+//! retired frontend-picker routes (WBE-691).
 //!
 //! The settings tests walk the deep-merge lifecycle (add, merge nested,
 //! delete with `null`, sibling apps kept), pin the `{app}` name rule and
@@ -8,9 +8,8 @@
 //! mascot tests pin the default fox, the upload path (stored bytes
 //! readable at the announced URL, the attachment round-tripped through
 //! `settings_store["mascot"]`), the 415 for non-image bytes and the 422
-//! for a missing `file`. The frontend tests pin the config-backed
-//! available list, the pick's column-and-cookie pair, and the 422 for a
-//! name nobody made pickable. Every route runs the `AuthUser` pipeline;
+//! for a missing `file`. The picker test pins the JSON 404 fallback both
+//! retired routes now answer. Every route runs the `AuthUser` pipeline;
 //! `GET`/`PATCH` settings and the mascot routes also run their scope gate.
 
 #![cfg(test)]
@@ -24,12 +23,10 @@ use wired_be::models::user::{self, User};
 
 use crate::common::{self, MultipartPart};
 
-/// The pickable frontend the fixtures configure.
+/// An app name the settings fixtures store under.
 const FRONTEND: &str = "pleroma-fe";
-/// A frontend the fixtures never configure on the default list.
+/// A second app name, for sibling-settings assertions.
 const OTHER_APP: &str = "mochi-pub";
-/// A second frontend name: pickable when configured, refused when not.
-const SECOND_FRONTEND: &str = "ghost-fe";
 /// Boundary the multipart bodies are framed with.
 const BOUNDARY: &str = "wired-settings-test-boundary";
 /// Where the test instance serves stored files from.
@@ -51,10 +48,10 @@ fn settings_path(app_name: &str) -> String {
 
 /// The mascot route.
 const MASCOT: &str = "/api/v1/pleroma/mascot";
-/// The available-frontends route.
-const AVAILABLE: &str = "/api/v1/pleroma/preferred_frontend/available";
-/// The preferred-frontend pick route.
-const PREFERRED: &str = "/api/v1/pleroma/preferred_frontend";
+/// The retired available-frontends route.
+const RETIRED_AVAILABLE: &str = "/api/v1/pleroma/preferred_frontend/available";
+/// The retired preferred-frontend pick route.
+const RETIRED_PICK: &str = "/api/v1/pleroma/preferred_frontend";
 
 /// Inserts a local user named `nickname` plus a bearer token granting
 /// `scopes`: both, since one assertion needs the id and every request
@@ -504,152 +501,45 @@ async fn a_mascot_can_only_be_an_image() {
     );
 }
 
-/// The available list is `AVAILABLE_FRONTENDS`: empty by default, and the
-/// configured names in configuration order.
+/// Pleroma's frontend-picker routes are not served: a user token gets the
+/// app's JSON 404 fallback, marked `x-wired-fallback: 1`, on both.
 #[tokio::test]
-async fn available_frontends_come_from_the_config() {
+async fn the_frontend_picker_routes_are_not_served() {
     let db = common::test_db().await;
     let pool = db.pool().clone();
-    let (_alice, token) = fixture(&pool, "alice", "read:accounts").await;
-    let default_app = common::test_app(pool.clone());
-    assert_eq!(
-        common::TestRequest::get(AVAILABLE)
-            .bearer(&token)
-            .send(&default_app)
-            .await
-            .json_value(),
-        json!([]),
-        "an unconfigured instance offers nothing"
-    );
+    let (_alice, token) = fixture(&pool, "alice", "read:accounts write:accounts").await;
+    let app = common::test_app(pool);
 
-    let mut config = common::test_config();
-    config.available_frontends = vec![FRONTEND.to_owned(), SECOND_FRONTEND.to_owned()];
-    let picky = common::test_app_with_config(pool.clone(), config);
-    assert_eq!(
-        common::TestRequest::get(AVAILABLE)
-            .bearer(&token)
-            .send(&picky)
-            .await
-            .json_value(),
-        json!([FRONTEND, SECOND_FRONTEND]),
-        "the configured list, in order"
-    );
-}
-
-/// A pick of a name the operator made available is stored in the account's
-/// column, echoed back in the year-lived cookie and answered as
-/// `{"frontend_name": …}`; a later pick — sent as a form body, the other
-/// spelling decision 10 accepts — replaces it.
-#[tokio::test]
-async fn a_preferred_frontend_pick_is_stored_and_cookied() {
-    let db = common::test_db().await;
-    let pool = db.pool().clone();
-    let (alice, token) = fixture(&pool, "alice", "read:accounts").await;
-    let mut config = common::test_config();
-    config.available_frontends = vec![FRONTEND.to_owned(), SECOND_FRONTEND.to_owned()];
-    let app = common::test_app_with_config(pool.clone(), config);
-
-    let response = common::TestRequest::put(PREFERRED)
+    let available = common::TestRequest::get(RETIRED_AVAILABLE)
         .bearer(&token)
-        .json(&json!({"frontend_name": FRONTEND}))
         .send(&app)
         .await;
-    assert_eq!(response.status, StatusCode::OK, "the pick is accepted");
+    common::assert_answer(&available, StatusCode::NOT_FOUND, "the available list");
+    common::assert_error(&available, "Not implemented", "the available list");
     assert_eq!(
-        response.json_value(),
-        json!({"frontend_name": FRONTEND}),
-        "the ticket's body"
-    );
-    assert_eq!(
-        response.header("set-cookie"),
-        Some("preferred_frontend=pleroma-fe; Path=/; Max-Age=31536000"),
-        "the cookie the frontends read, one year, whole origin"
-    );
-    assert_eq!(
-        stored(&pool, alice.id).await.preferred_frontend.as_deref(),
-        Some(FRONTEND),
-        "the choice survives in the column"
+        available.header("x-wired-fallback"),
+        Some("1"),
+        "the fallback answers the available list"
     );
 
-    let replaced = common::TestRequest::put(PREFERRED)
+    let pick = common::TestRequest::put(RETIRED_PICK)
         .bearer(&token)
-        .form(&[("frontend_name", SECOND_FRONTEND)])
+        .json(&json!({"frontend_name": "pleroma-fe"}))
         .send(&app)
         .await;
+    common::assert_answer(&pick, StatusCode::NOT_FOUND, "the pick");
+    common::assert_error(&pick, "Not implemented", "the pick");
     assert_eq!(
-        replaced.json_value(),
-        json!({"frontend_name": SECOND_FRONTEND}),
-        "a form body picks too, and a new name replaces the old"
-    );
-    assert_eq!(
-        replaced.header("set-cookie"),
-        Some("preferred_frontend=ghost-fe; Path=/; Max-Age=31536000"),
-        "the cookie names the latest pick"
-    );
-    assert_eq!(
-        stored(&pool, alice.id).await.preferred_frontend.as_deref(),
-        Some(SECOND_FRONTEND),
-        "the column follows the latest pick"
-    );
-}
-
-/// A name the operator did not make pickable — and any name at all on the
-/// default empty list — is 422 `{"error":"Invalid frontend"}` without a
-/// write; a body without `frontend_name` is the extractor's 422.
-#[tokio::test]
-async fn an_unpickable_frontend_is_refused() {
-    let db = common::test_db().await;
-    let pool = db.pool().clone();
-    let (alice, token) = fixture(&pool, "alice", "read:accounts").await;
-    let mut config = common::test_config();
-    config.available_frontends = vec![FRONTEND.to_owned()];
-    let app = common::test_app_with_config(pool.clone(), config);
-
-    let refused = common::TestRequest::put(PREFERRED)
-        .bearer(&token)
-        .json(&json!({"frontend_name": SECOND_FRONTEND}))
-        .send(&app)
-        .await;
-    assert_eq!(refused.status, StatusCode::UNPROCESSABLE_ENTITY, "422");
-    assert_eq!(
-        refused.json_value(),
-        json!({"error": "Invalid frontend"}),
-        "the ticket's refusal body"
-    );
-
-    let empty_body = common::TestRequest::put(PREFERRED)
-        .bearer(&token)
-        .json(&json!({}))
-        .send(&app)
-        .await;
-    assert_eq!(
-        empty_body.status,
-        StatusCode::UNPROCESSABLE_ENTITY,
-        "a body without the parameter is unprocessable"
-    );
-    assert!(
-        stored(&pool, alice.id).await.preferred_frontend.is_none(),
-        "no refusal wrote the column"
-    );
-
-    let default_app = common::test_app(pool);
-    assert_eq!(
-        common::TestRequest::put(PREFERRED)
-            .bearer(&token)
-            .json(&json!({"frontend_name": FRONTEND}))
-            .send(&default_app)
-            .await
-            .json_value(),
-        json!({"error": "Invalid frontend"}),
-        "with the default empty list nothing is pickable at all"
+        pick.header("x-wired-fallback"),
+        Some("1"),
+        "the fallback answers the pick"
     );
 }
 
 /// Every route demands a user token; `GET` settings and the mascot ask the
 /// `read:accounts` scope, `PATCH` settings and the mascot upload the
-/// `write:accounts` one; the preferred-frontend pair gates on the token
-/// alone. A narrower grant, an app-only credential or no credential never
-/// reaches the handlers.
+/// `write:accounts` one. A narrower grant, an app-only credential or no
+/// credential never reaches the handlers.
 #[tokio::test]
 async fn every_route_enforces_auth_and_scope() {
     let db = common::test_db().await;
@@ -658,9 +548,7 @@ async fn every_route_enforces_auth_and_scope() {
     let write_only = common::create_app_and_token(&pool, &alice, "write:accounts").await;
     let wrong_scope = common::create_app_and_token(&pool, &alice, "read:chats").await;
     let app_only = common::create_app_only_token(&pool, "read write").await;
-    let mut config = common::test_config();
-    config.available_frontends = vec![FRONTEND.to_owned()];
-    let app = common::test_app_with_config(pool.clone(), config);
+    let app = common::test_app(pool);
 
     let anonymous = common::TestRequest::get(&settings_path(FRONTEND))
         .send(&app)
@@ -673,10 +561,6 @@ async fn every_route_enforces_auth_and_scope() {
     );
     let anonymous_mascot = common::TestRequest::get(MASCOT).send(&app).await;
     assert_eq!(anonymous_mascot.status, StatusCode::UNAUTHORIZED, "401");
-    let anonymous_available = common::TestRequest::get(AVAILABLE).send(&app).await;
-    assert_eq!(anonymous_available.status, StatusCode::UNAUTHORIZED, "401");
-    let anonymous_pick = common::TestRequest::put(PREFERRED).send(&app).await;
-    assert_eq!(anonymous_pick.status, StatusCode::UNAUTHORIZED, "401");
 
     let app_token = common::TestRequest::get(&settings_path(FRONTEND))
         .bearer(&app_only)
@@ -719,21 +603,5 @@ async fn every_route_enforces_auth_and_scope() {
         narrow.json_value(),
         json!({"error": "Insufficient permissions: read:accounts."}),
         "read:chats reaches neither of the account scopes"
-    );
-
-    let frontend_needs_no_scope = common::TestRequest::put(PREFERRED)
-        .bearer(&wrong_scope)
-        .json(&json!({"frontend_name": FRONTEND}))
-        .send(&app)
-        .await;
-    assert_eq!(
-        frontend_needs_no_scope.status,
-        StatusCode::OK,
-        "the preferred-frontend pair gates on the token alone"
-    );
-    assert_eq!(
-        stored(&pool, alice.id).await.preferred_frontend.as_deref(),
-        Some(FRONTEND),
-        "and still stores the pick"
     );
 }

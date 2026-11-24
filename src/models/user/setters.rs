@@ -160,29 +160,6 @@ pub async fn set_settings_store(pool: &PgPool, id: Uuid, store: &Value) -> AppRe
     Ok(())
 }
 
-/// The `UPDATE` behind [`set_preferred_frontend`]: writes the chosen
-/// frontend and refreshes `updated_at`.
-const SET_PREFERRED_FRONTEND_SQL: &str =
-    "UPDATE users SET preferred_frontend = $2, updated_at = now() WHERE id = $1";
-
-/// Stores `frontend` as user `id`'s `preferred_frontend` column: the
-/// frontend the account picked at `PUT /api/v1/pleroma/preferred_frontend`
-/// (a name the endpoint has validated against the configured list).
-///
-/// # Errors
-///
-/// Any database failure (connection, encoding) arrives as
-/// [`AppError::Database`](crate::error::AppError).
-pub async fn set_preferred_frontend(pool: &PgPool, id: Uuid, frontend: &str) -> AppResult<()> {
-    sqlx::query(SET_PREFERRED_FRONTEND_SQL)
-        .bind(id)
-        .bind(frontend)
-        .execute(pool)
-        .await
-        .map(drop)?;
-    Ok(())
-}
-
 /// The `UPDATE` behind [`set_email_notifications`]: writes the flag and
 /// refreshes `updated_at`.
 const SET_EMAIL_NOTIFICATIONS_SQL: &str =
@@ -415,31 +392,6 @@ mod tests {
         set_settings_store(&pool, new_id(), &json!({"x": 1}))
             .await
             .unwrap();
-    }
-
-    #[tokio::test]
-    async fn set_preferred_frontend_stores_the_choice() {
-        let db = crate::test_db::test_db().await.expect("test database slot");
-        let pool = db.pool().clone();
-        let alice = insert(&pool, &local_new("alice")).await.unwrap();
-        assert!(alice.preferred_frontend.is_none(), "no choice yet");
-        set_preferred_frontend(&pool, alice.id, "pleroma-fe")
-            .await
-            .unwrap();
-        assert_eq!(
-            fetch(&pool, alice.id).await.preferred_frontend.as_deref(),
-            Some("pleroma-fe"),
-            "the chosen frontend is what reads back"
-        );
-
-        set_preferred_frontend(&pool, alice.id, "mochi-pub")
-            .await
-            .unwrap();
-        assert_eq!(
-            fetch(&pool, alice.id).await.preferred_frontend.as_deref(),
-            Some("mochi-pub"),
-            "a new choice replaces the old one"
-        );
     }
 
     #[tokio::test]

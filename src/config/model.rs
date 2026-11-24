@@ -235,11 +235,6 @@ pub struct Config {
     /// when none is configured. Each one answers the `/oauth` provider
     /// endpoints under its own name (see [`crate::api::oauth_external`]).
     pub oauth_providers: Vec<OauthProvider>,
-    /// The frontends clients may pick, from `AVAILABLE_FRONTENDS` (a
-    /// comma-separated list, empty by default): the answer of
-    /// `GET /api/v1/pleroma/preferred_frontend/available` and the whitelist
-    /// `PUT /api/v1/pleroma/preferred_frontend` validates against.
-    pub available_frontends: Vec<String>,
     /// Job handlers a single worker runs at the same time.
     pub job_concurrency: usize,
     /// Job queue names the worker drains, in claim priority order.

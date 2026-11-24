@@ -22,7 +22,7 @@ impl fmt::Debug for Config {
 /// instance's identity, its content limits, storage locations, auth
 /// requirements and everything it exposes to clients — every field from
 /// `database_url` (redacted, it carries the password) to
-/// `available_frontends`. The builder arrives borrowed and leaves borrowed,
+/// `oauth_providers`. The builder arrives borrowed and leaves borrowed,
 /// so `fmt` can keep the chain going.
 fn debug_identity_and_exposure<'a, 'b, 'd>(
     debug: &'d mut fmt::DebugStruct<'a, 'b>,
@@ -93,7 +93,6 @@ fn debug_identity_and_exposure<'a, 'b, 'd>(
         )
         .field("restrict_unauthenticated", &config.restrict_unauthenticated)
         .field("oauth_providers", &config.oauth_providers)
-        .field("available_frontends", &config.available_frontends)
 }
 
 /// Writes the second segment of the [`Config`] `Debug` document: the job

@@ -3,18 +3,15 @@
 
 use super::*;
 
-/// The preferred-frontend migration (WBE-122) adds the one column
-/// `PUT /api/v1/pleroma/preferred_frontend` stores: a nullable
-/// `text` `preferred_frontend` on `users` with no default — the
-/// account that never picked a frontend keeps NULL, and the pick
-/// itself is validated against `AVAILABLE_FRONTENDS`, not against
-/// the schema.
+/// The drop-preferred-frontend migration (WBE-691) removes the
+/// `preferred_frontend` column the frontend picker used to store:
+/// this backend serves no frontend, so `users` no longer has it.
 #[tokio::test]
-async fn users_preferred_frontend_migration_adds_the_column() {
+async fn users_preferred_frontend_migration_drops_the_column() {
     let db = crate::test_db::test_db().await.expect("test database slot");
     let pool = db.pool().clone();
-    let (data_type, is_nullable, default): (String, String, Option<String>) = sqlx::query_as(
-        "SELECT data_type, is_nullable, column_default
+    let (count,): (i64,) = sqlx::query_as(
+        "SELECT count(*)
            FROM information_schema.columns
           WHERE table_schema = 'public'
             AND table_name = 'users'
@@ -23,9 +20,7 @@ async fn users_preferred_frontend_migration_adds_the_column() {
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!(data_type, "text", "the frontend name is stored as text");
-    assert_eq!(is_nullable, "YES", "no choice is stored as NULL");
-    assert!(default.is_none(), "and nothing defaults to a frontend");
+    assert_eq!(count, 0, "the picker's column is gone from users");
 }
 
 /// The notification-settings migration (WBE-111) adds the one

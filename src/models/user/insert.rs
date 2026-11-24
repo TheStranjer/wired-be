@@ -37,7 +37,7 @@ const INSERT_SQL: &str = "INSERT INTO users (
      also_known_as, moved_to_ap_id, last_move_at, email_confirmed,
      approval_pending, last_active_at, followers_count, following_count,
      statuses_count, last_status_at, last_fetched_at, mfa_settings,
-     preferred_frontend, raw_fields, is_suggested, registration_reason,
+     raw_fields, is_suggested, registration_reason,
      password_reset_pending, notification_settings, email_notifications,
      confirmation_token, confirmation_sent_at
 ) VALUES (
@@ -45,7 +45,7 @@ const INSERT_SQL: &str = "INSERT INTO users (
      $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28,
      $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41,
      $42, $43, $44, $45, $46, $47, $48, $49, $50, $51, $52, $53, $54,
-     $55, $56, $57, $58, $59, $60, $61, $62, $63, $64, $65, $66, $67, $68
+     $55, $56, $57, $58, $59, $60, $61, $62, $63, $64, $65, $66, $67
 ) RETURNING *";
 
 /// Inserts `new_user` on `executor` — the pool or an open transaction —
@@ -126,7 +126,6 @@ where
         .bind(new_user.last_status_at)
         .bind(new_user.last_fetched_at)
         .bind(new_user.mfa_settings.clone())
-        .bind(new_user.preferred_frontend.as_deref())
         .bind(new_user.raw_fields.clone())
         .bind(new_user.is_suggested)
         .bind(new_user.registration_reason.as_deref())
@@ -272,10 +271,6 @@ mod tests {
             notification_settings::NotificationSettings::default_value(),
             "notification_settings defaults to the migration's all-off blob"
         );
-        assert!(
-            user.preferred_frontend.is_none(),
-            "an account that never picked a frontend has no preference"
-        );
     }
 
     /// Every Pleroma extension column at the default the migration states,
@@ -400,11 +395,6 @@ mod tests {
             }),
             "the mfa_settings blob round trips through jsonb"
         );
-        assert_eq!(
-            user.preferred_frontend.as_deref(),
-            Some("pleroma-fe"),
-            "the chosen frontend round trips through the text column"
-        );
     }
 
     /// The Pleroma extension columns round trip through [`insert`]: arrays
@@ -448,7 +438,6 @@ mod tests {
                 "totp": {"secret": "BASE32SECRET", "confirmed": true},
                 "backup_codes": ["0123456789abcdef"],
             }),
-            preferred_frontend: Some("pleroma-fe".to_owned()),
             email_notifications: Flag::new(false),
             ..local_new("dora")
         };

@@ -167,9 +167,6 @@ pub const RESTRICT_UNAUTHENTICATED_AREAS: [&str; 6] = [
 /// Environment variable holding the external OAuth login providers, as the
 /// JSON text of an [`OauthProvider`] array.
 pub const OAUTH_PROVIDERS_VAR: &str = "OAUTH_PROVIDERS";
-/// Environment variable holding the comma-separated list of frontends
-/// clients may pick at `PUT /api/v1/pleroma/preferred_frontend`.
-pub const AVAILABLE_FRONTENDS_VAR: &str = "AVAILABLE_FRONTENDS";
 /// Environment variable holding the job worker's concurrent handler count.
 pub const JOB_CONCURRENCY_VAR: &str = "JOB_CONCURRENCY";
 /// Environment variable holding the comma-separated job queue names.

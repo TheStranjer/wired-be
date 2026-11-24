@@ -273,11 +273,6 @@ pub const DEFAULT_REGISTRATIONS_APPROVAL_REQUIRED: bool = false;
 /// login provider is configured, so `GET /oauth/prepare_request` and the
 /// provider endpoints answer their errors for every name.
 pub const DEFAULT_OAUTH_PROVIDERS: &str = "[]";
-/// Frontend list used when `AVAILABLE_FRONTENDS` is unset: nothing is pickable.
-///
-/// So `GET /api/v1/pleroma/preferred_frontend/available` answers `[]` and
-/// `PUT /api/v1/pleroma/preferred_frontend` refuses every name.
-pub const DEFAULT_AVAILABLE_FRONTENDS: &str = "";
 /// Worker concurrency used when `JOB_CONCURRENCY` is unset.
 pub const DEFAULT_JOB_CONCURRENCY: usize = 10;
 /// Deleted-status purge age used when `PURGE_DELETED_STATUSES_DAYS` is

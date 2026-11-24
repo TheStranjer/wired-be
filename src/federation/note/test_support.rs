@@ -111,7 +111,6 @@ fn fixture_user(nickname: &str, ap_id: &str, local: bool) -> User {
         last_fetched_at: None,
         inserted_at: parse_time(PUBLISHED).unwrap(),
         updated_at: parse_time(PUBLISHED).unwrap(),
-        preferred_frontend: None,
         is_suggested: Flag::new(false),
         password_reset_pending: Flag::new(false),
         email_notifications: Flag::new(true),
