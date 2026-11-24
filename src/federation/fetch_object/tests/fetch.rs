@@ -360,3 +360,72 @@ async fn the_fetch_budget_stops_a_fanning_run() {
     );
     server.abort();
 }
+
+/// Every MRF list shape that refuses the loopback mock refuses the fetch
+/// before a request leaves: a `reject` naming it, and an `accept`
+/// allowlist that names only another host.
+#[tokio::test]
+async fn an_object_of_a_rejected_host_is_not_fetched() {
+    for lists in [
+        json!({"reject": ["127.0.0.1"]}),
+        json!({"accept": ["friend.example"]}),
+    ] {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        set_simple_lists(&pool, &lists).await;
+        let state = test_state(pool);
+        let listener = bind().await;
+        let base = origin(&listener);
+        let peer = peer_at(&base);
+        let server = spawn(listener, peer_app(peer.clone()));
+
+        let err = fetch_object_json(&state, &object_url(&base, "one"))
+            .await
+            .expect_err("the policy refuses the host");
+
+        assert!(
+            matches!(&err, FetchError::Invalid(detail) if detail.contains("127.0.0.1")),
+            "a refused host is an Invalid fetch naming it ({lists}): {err}"
+        );
+        assert_eq!(
+            peer.hits.load(Ordering::SeqCst),
+            0,
+            "nothing was sent to the refused host ({lists})"
+        );
+        server.abort();
+    }
+}
+
+/// An allowlist that names the host, and no MRF configuration at all,
+/// leave the fetch alone.
+#[tokio::test]
+async fn an_object_of_an_allowed_host_is_fetched() {
+    for lists in [Some(json!({"accept": ["127.0.0.1"]})), None] {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        if let Some(lists) = &lists {
+            set_simple_lists(&pool, lists).await;
+        }
+        let state = test_state(pool);
+        let listener = bind().await;
+        let base = origin(&listener);
+        let peer = peer_at(&base);
+        let server = spawn(listener, peer_app(peer.clone()));
+
+        let document = fetch_object_json(&state, &object_url(&base, "one"))
+            .await
+            .expect("the host is not refused");
+
+        assert_eq!(
+            document["id"],
+            json!(object_url(&base, "one")),
+            "the object was fetched ({lists:?})"
+        );
+        assert_eq!(
+            peer.hits.load(Ordering::SeqCst),
+            1,
+            "one GET reached the host ({lists:?})"
+        );
+        server.abort();
+    }
+}
