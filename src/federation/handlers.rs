@@ -35,6 +35,8 @@ pub mod follow;
 pub mod interactions;
 pub mod misc;
 pub mod note;
+#[cfg(test)]
+mod test_support;
 pub mod vote;
 
 use crate::federation::dispatch::Handlers;
