@@ -2,7 +2,8 @@
 //! WBE-128): `GET /api/v1/accounts/search` (the flat account array), and
 //! `GET /api/v1/search` / `GET /api/v2/search` (the combined document
 //! with all three arms live). The routes answer anonymously (Pleroma's
-//! `fallback: :proceed_unauthenticated`), demand `read:accounts` from a
+//! `fallback: :proceed_unauthenticated`), demand `read:accounts` (the
+//! account array) or `read:search` (the combined documents) from a
 //! presented user token, normalise the query (leading `@`, case), page by
 //! `limit` (the accounts' default 40 and cap 80, the statuses' and
 //! hashtags' default 20 and cap 40) and `offset`, restrict the account

@@ -53,6 +53,13 @@ pub const WRITE_NOTIFICATIONS: &str = "write:notifications";
 /// client shows its user (Pleroma's own pipeline asks only for a user token
 /// here, the ticket for its `read:accounts` sub-scope).
 pub const READ_ACCOUNTS: &str = "read:accounts";
+/// The read side of search: the combined v1 and v2 search documents.
+///
+/// `GET /api/v1/search` and `GET /api/v2/search` (Mastodon's
+/// `authorize_if_got_token! :read, :'read:search'` on the v2 search
+/// controller, Pleroma's `read:search` on its `SearchController`). The
+/// account-only `GET /api/v1/accounts/search` stays on [`READ_ACCOUNTS`].
+pub const READ_SEARCH: &str = "read:search";
 /// The write side of account data: `POST /api/v1/announcements/{id}/dismiss`,
 /// a dismissal a user stores about themselves (Pleroma's `write:accounts`).
 pub const WRITE_ACCOUNTS: &str = "write:accounts";
@@ -426,12 +433,39 @@ mod tests {
     #[test]
     fn read_grants_the_read_tree() {
         let scopes = Scopes::parse(READ);
-        for required in [READ, "read:accounts", "read:statuses", READ_FOLLOWS] {
+        for required in [
+            READ,
+            "read:accounts",
+            "read:statuses",
+            READ_FOLLOWS,
+            READ_SEARCH,
+        ] {
             assert!(scopes.contains(required), "`read` grants {required}");
         }
         for absent in [WRITE, FOLLOW, PUSH, ADMIN_READ, ADMIN_WRITE] {
             assert!(!scopes.contains(absent), "`read` does not grant {absent}");
         }
+    }
+
+    #[test]
+    fn read_search_is_a_valid_scope_in_the_read_tree() {
+        assert_eq!(READ_SEARCH, "read:search", "the scope's wire name");
+        assert!(
+            Scopes::parse(READ_SEARCH).validate().is_ok(),
+            "`read:search` validates"
+        );
+        let narrow = Scopes::parse(READ_SEARCH);
+        assert!(narrow.contains(READ_SEARCH), "it grants itself");
+        for absent in [READ, "read:accounts", "read:statuses"] {
+            assert!(
+                !narrow.contains(absent),
+                "`read:search` does not grant {absent}"
+            );
+        }
+        assert!(
+            !Scopes::parse("read:accounts").contains(READ_SEARCH),
+            "`read:accounts` does not grant `read:search`"
+        );
     }
 
     #[test]

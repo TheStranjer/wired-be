@@ -8,8 +8,8 @@ use axum::http::StatusCode;
 use wired_be::models::block;
 
 use super::support::{
-    ACCOUNTS_SEARCH, BASE, INVALID_TOKEN, NO_READ_ACCOUNTS, OFFSET_UNAUTHENTICATED, V1_SEARCH,
-    V2_SEARCH, fixture, follow_pair, get, listed_ids,
+    ACCOUNTS_SEARCH, BASE, INVALID_TOKEN, NO_READ_ACCOUNTS, NO_READ_SEARCH, OFFSET_UNAUTHENTICATED,
+    V1_SEARCH, V2_SEARCH, fixture, follow_pair, get, listed_ids,
 };
 use crate::common;
 
@@ -268,7 +268,12 @@ async fn search_auth_gates() {
             StatusCode::FORBIDDEN,
             &format!("{path} wrong scope"),
         );
-        common::assert_error(&refused, NO_READ_ACCOUNTS, &format!("{path} wrong scope"));
+        let expected = if path == ACCOUNTS_SEARCH {
+            NO_READ_ACCOUNTS
+        } else {
+            NO_READ_SEARCH
+        };
+        common::assert_error(&refused, expected, &format!("{path} wrong scope"));
         let unknown = get(&app, Some("no-such-token"), &target).await;
         common::assert_answer(
             &unknown,
@@ -314,6 +319,58 @@ async fn anonymous_offset_paging_is_refused() {
         let paged = get(&app, Some(&read_token), &format!("{path}?q=a&offset=20")).await;
         common::assert_answer(&paged, StatusCode::OK, &format!("{path} with a viewer"));
     }
+}
+
+/// The combined documents demand `read:search`, the account array
+/// `read:accounts`: each token reaches only its own route, `read` reaches
+/// both and an anonymous request reaches both.
+#[tokio::test]
+async fn search_scopes_split_between_the_document_and_the_account_array() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let app = common::test_app(pool.clone());
+    let _bob = common::create_local_user(&pool, "bob").await;
+    let (_, search_token) = fixture(&pool, "searcher", "read:search").await;
+    let (_, accounts_token) = fixture(&pool, "accounter", "read:accounts").await;
+    let (_, read_token) = fixture(&pool, "reader", "read").await;
+
+    let documents = format!("{V2_SEARCH}?q=bo");
+    let flat = format!("{ACCOUNTS_SEARCH}?q=bo");
+    let v1 = format!("{V1_SEARCH}?q=bo");
+
+    for path in [&documents, &v1] {
+        let granted = get(&app, Some(&search_token), path).await;
+        common::assert_answer(&granted, StatusCode::OK, &format!("{path} read:search"));
+        let refused = get(&app, Some(&accounts_token), path).await;
+        common::assert_answer(
+            &refused,
+            StatusCode::FORBIDDEN,
+            &format!("{path} read:accounts only"),
+        );
+        common::assert_error(&refused, NO_READ_SEARCH, &format!("{path} read:accounts"));
+        let broad = get(&app, Some(&read_token), path).await;
+        common::assert_answer(&broad, StatusCode::OK, &format!("{path} read"));
+        let anonymous = get(&app, None, path).await;
+        common::assert_answer(&anonymous, StatusCode::OK, &format!("{path} anonymous"));
+    }
+
+    let by_accounts = get(&app, Some(&accounts_token), &flat).await;
+    common::assert_answer(
+        &by_accounts,
+        StatusCode::OK,
+        "accounts/search read:accounts",
+    );
+    let by_search = get(&app, Some(&search_token), &flat).await;
+    common::assert_answer(
+        &by_search,
+        StatusCode::FORBIDDEN,
+        "accounts/search read:search only",
+    );
+    common::assert_error(&by_search, NO_READ_ACCOUNTS, "accounts/search read:search");
+    let by_read = get(&app, Some(&read_token), &flat).await;
+    common::assert_answer(&by_read, StatusCode::OK, "accounts/search read");
+    let anonymous = get(&app, None, &flat).await;
+    common::assert_answer(&anonymous, StatusCode::OK, "accounts/search anonymous");
 }
 
 /// An absent, empty or sigil-only `q` answers no accounts on any route,
