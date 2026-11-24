@@ -30,38 +30,17 @@ use sqlx::PgPool;
 use uuid::Uuid;
 use wired_be::{
     config::TEST_BASE_URL,
-    federation::{delivery::KIND_DELIVER, dispatch::handle_incoming},
     models::{
         block, follow,
         user::{Flag, NewUser, User},
     },
-    state::AppState,
 };
 
-use crate::common;
+use crate::common::{self, deliver, delivering_state, delivery_jobs, reload_user};
 
 /// The remote actors the fixtures deliver as.
 const BOB: &str = "https://remote.example/users/bob";
 const MALLORY: &str = "https://remote.example/users/mallory";
-
-/// The job args the inbox routes write for a delivery signed by `who`.
-fn incoming_args(activity: &Value, who: &User) -> Value {
-    json!({"activity": activity, "signer_id": who.id.to_string(), "inbox_owner": null})
-}
-
-/// Runs one activity through the real dispatcher and fails the test if the
-/// job wants a retry or refuses the document. (An ignored activity completes
-/// the same: the fold's refusals are outcomes, not errors.)
-async fn deliver(state: &AppState, activity: &Value, who: &User) {
-    handle_incoming(state.clone(), incoming_args(activity, who))
-        .await
-        .expect("the follow fixture delivery completes the job");
-}
-
-/// The dispatcher state over the stock test config.
-fn delivering_state(pool: &PgPool) -> AppState {
-    common::test_app_state(pool.clone(), common::test_config())
-}
 
 /// A `Follow` by `actor` of `object`, named `n` on the actor's host.
 fn follow_activity(n: &str, actor: &str, object: &str) -> Value {
@@ -107,14 +86,6 @@ async fn relation(pool: &PgPool, follower: &User, target: &User) -> follow::Foll
         .expect("the relationship exists")
 }
 
-/// User `id` as it stands now (counters and all).
-async fn fresh_user(pool: &PgPool, id: Uuid) -> User {
-    wired_be::models::user::get_by_id(pool, id)
-        .await
-        .expect("the user reads")
-        .expect("the user exists")
-}
-
 /// `(type, from_account_id, status_id)` for every notification of `user_id`,
 /// oldest first.
 async fn told(pool: &PgPool, user_id: Uuid) -> Vec<(String, Uuid, Option<Uuid>)> {
@@ -134,18 +105,6 @@ async fn follow_count(pool: &PgPool) -> i64 {
         .fetch_one(pool)
         .await
         .expect("the table reads")
-}
-
-/// The args of every queued `federator.deliver` job, in insertion order.
-async fn delivery_jobs(pool: &PgPool) -> Vec<Value> {
-    sqlx::query_as::<_, (Value,)>("SELECT args FROM jobs WHERE kind = $1 ORDER BY inserted_at, id")
-        .bind(KIND_DELIVER)
-        .fetch_all(pool)
-        .await
-        .expect("the jobs read")
-        .into_iter()
-        .map(|(args,)| args)
-        .collect()
 }
 
 /// How many jobs of any kind the queue holds.
@@ -200,8 +159,8 @@ async fn a_follow_of_an_open_local_account_grants_and_answers_with_an_accept() {
     );
     assert_eq!(
         (
-            fresh_user(&pool, alice.id).await.followers_count,
-            fresh_user(&pool, bob.id).await.following_count
+            reload_user(&pool, alice.id).await.followers_count,
+            reload_user(&pool, bob.id).await.following_count
         ),
         (1, 1),
         "the counters step up with the grant"
@@ -273,7 +232,7 @@ async fn a_follow_of_a_locked_local_account_waits_with_a_request_and_sends_nothi
         "and the request still carries the delivered id"
     );
     assert_eq!(
-        fresh_user(&pool, carol.id).await.followers_count,
+        reload_user(&pool, carol.id).await.followers_count,
         0,
         "a waiting request counts nothing"
     );
@@ -410,8 +369,8 @@ async fn an_accept_by_the_followee_grants_our_pending_follow() {
     );
     assert_eq!(
         (
-            fresh_user(&pool, alice.id).await.following_count,
-            fresh_user(&pool, bob.id).await.followers_count
+            reload_user(&pool, alice.id).await.following_count,
+            reload_user(&pool, bob.id).await.followers_count
         ),
         (1, 1),
         "the counters step up with the transition"
@@ -492,7 +451,7 @@ async fn an_accept_from_another_actor_grants_nothing() {
         "the foreign answer moved nothing"
     );
     assert_eq!(
-        fresh_user(&pool, alice.id).await.following_count,
+        reload_user(&pool, alice.id).await.following_count,
         0,
         "and counted nothing"
     );
@@ -552,7 +511,7 @@ async fn a_reject_by_the_followee_removes_our_pending_follow() {
         "the refused request is gone"
     );
     assert_eq!(
-        fresh_user(&pool, alice.id).await.following_count,
+        reload_user(&pool, alice.id).await.following_count,
         0,
         "a request that never counted leaves nothing to uncount"
     );
@@ -571,8 +530,8 @@ async fn a_reject_of_an_accepted_follow_steps_the_counters_back() {
         .expect("the fixture grants");
     assert_eq!(
         (
-            fresh_user(&pool, alice.id).await.following_count,
-            fresh_user(&pool, bob.id).await.followers_count
+            reload_user(&pool, alice.id).await.following_count,
+            reload_user(&pool, bob.id).await.followers_count
         ),
         (1, 1),
         "the grant counted"
@@ -599,8 +558,8 @@ async fn a_reject_of_an_accepted_follow_steps_the_counters_back() {
     );
     assert_eq!(
         (
-            fresh_user(&pool, alice.id).await.following_count,
-            fresh_user(&pool, bob.id).await.followers_count
+            reload_user(&pool, alice.id).await.following_count,
+            reload_user(&pool, bob.id).await.followers_count
         ),
         (0, 0),
         "and its counters step down with it"
@@ -643,8 +602,8 @@ async fn an_undo_takes_back_the_row_the_counters_and_the_telling() {
     assert_eq!(follow_count(&pool).await, 0, "the follow row went");
     assert_eq!(
         (
-            fresh_user(&pool, alice.id).await.followers_count,
-            fresh_user(&pool, bob.id).await.following_count
+            reload_user(&pool, alice.id).await.followers_count,
+            reload_user(&pool, bob.id).await.following_count
         ),
         (0, 0),
         "its counters stepped down"
@@ -757,7 +716,7 @@ async fn an_undo_of_another_actors_follow_withdraws_nothing() {
         "bob's follow stands through both"
     );
     assert_eq!(
-        fresh_user(&pool, alice.id).await.followers_count,
+        reload_user(&pool, alice.id).await.followers_count,
         1,
         "and so does its count"
     );
@@ -784,7 +743,7 @@ async fn a_duplicate_follow_updates_the_id_and_resends_the_answer() {
         "the stored id moves to the newest Follow"
     );
     assert_eq!(
-        fresh_user(&pool, alice.id).await.followers_count,
+        reload_user(&pool, alice.id).await.followers_count,
         1,
         "the restated grant counts once"
     );

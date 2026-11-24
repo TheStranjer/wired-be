@@ -28,13 +28,9 @@
 use axum::{Router, http::StatusCode};
 use serde_json::{Value, json};
 use sqlx::PgPool;
-use wired_be::{
-    federation::dispatch::handle_incoming,
-    models::{status, user::User},
-    state::AppState,
-};
+use wired_be::models::{status, user::User};
 
-use crate::common;
+use crate::common::{self, deliver, delivering_state};
 
 /// The author every fixture here posts as, and delivers as.
 const BOB: &str = "https://remote.example/users/bob";
@@ -473,28 +469,9 @@ fn delete_of(uri: &str) -> Value {
     })
 }
 
-/// The dispatcher state over the stock test config.
-fn delivering_state(pool: &PgPool) -> AppState {
-    common::test_app_state(pool.clone(), common::test_config())
-}
-
 /// The remote author: `bob@remote.example`, host of every fixture id.
 async fn bob(pool: &PgPool) -> User {
     common::create_remote_user(pool, "bob", "remote.example").await
-}
-
-/// The job args the inbox routes write for a delivery signed by `who`.
-fn incoming_args(activity: &Value, who: &User) -> Value {
-    json!({"activity": activity, "signer_id": who.id.to_string(), "inbox_owner": null})
-}
-
-/// Runs one activity through the real `federator.incoming` handler — the
-/// whole dispatcher — and fails the test if the job wants a retry or
-/// refuses the document.
-async fn deliver(state: &AppState, activity: &Value, who: &User) {
-    handle_incoming(state.clone(), incoming_args(activity, who))
-        .await
-        .expect("the fixture delivery completes the job");
 }
 
 /// `GET /api/v1/statuses/{id}`, anonymous: the stored post's entity.

@@ -17,10 +17,10 @@ use wired_be::{
 };
 
 use super::support::{
-    BASE, MockRelay, answer_accept, assert_queued_follow, delivery_jobs, followed_and_accepted,
-    instance_follow, relay_mirror, relay_state, standing_relay,
+    BASE, MockRelay, answer_accept, assert_queued_follow, followed_and_accepted, instance_follow,
+    relay_mirror, relay_state, standing_relay,
 };
-use crate::common;
+use crate::common::{self, delivery_jobs};
 
 // --- the handshake -------------------------------------------------------------------
 

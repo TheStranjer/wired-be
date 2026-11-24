@@ -3,11 +3,10 @@
 //! target, the request a locked local target receives, the notification of
 //! an unlocked one, and the blocked follower that stays behind.
 
-use serde_json::{Value, json};
+use serde_json::json;
 use sqlx::PgPool;
 use wired_be::{
     config::TEST_BASE_URL,
-    federation::delivery::KIND_DELIVER,
     models::{
         block,
         follow::FollowState,
@@ -17,19 +16,7 @@ use wired_be::{
 
 use super::support::{PASSWORD, aliased_target, assert_stays, fixture, follow_user, move_account};
 use super::support::{relation, stored};
-use crate::common;
-
-/// The args of every queued `federator.deliver` job, in insertion order.
-async fn delivery_jobs(pool: &PgPool) -> Vec<Value> {
-    sqlx::query_as::<_, (Value,)>("SELECT args FROM jobs WHERE kind = $1 ORDER BY inserted_at, id")
-        .bind(KIND_DELIVER)
-        .fetch_all(pool)
-        .await
-        .expect("the delivery jobs read")
-        .into_iter()
-        .map(|(args,)| args)
-        .collect()
-}
+use crate::common::{self, delivery_jobs};
 
 /// `(type, from_account_id)` of every notification of `user`, oldest first.
 async fn told(pool: &PgPool, user: &User) -> Vec<(String, uuid::Uuid)> {

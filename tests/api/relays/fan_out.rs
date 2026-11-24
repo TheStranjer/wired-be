@@ -14,10 +14,8 @@ use wired_be::{
     },
 };
 
-use super::support::{
-    BASE, MockRelay, PUBLIC, deliver, followed_and_accepted, queued_inboxes, relay_state,
-};
-use crate::common;
+use super::support::{BASE, MockRelay, PUBLIC, followed_and_accepted, queued_inboxes, relay_state};
+use crate::common::{self, deliver};
 
 // --- the publisher's fan-out ----------------------------------------------------------
 

@@ -33,14 +33,13 @@ use sqlx::PgPool;
 use uuid::Uuid;
 use wired_be::{
     config::TEST_BASE_URL,
-    federation::delivery::KIND_DELIVER,
     models::{
         follow::{self, Follow, FollowState},
         user::{Flag, User},
     },
 };
 
-use crate::common;
+use crate::common::{self, delivery_jobs};
 
 /// The scope all four writes ask.
 const WRITE: &str = "write:follows";
@@ -93,19 +92,6 @@ async fn locked_writer(pool: &PgPool, nickname: &str) -> (User, String) {
     .await;
     let token = common::create_app_and_token(pool, &created, WRITE).await;
     (created, token)
-}
-
-/// The args of every queued `federator.deliver` job, in insertion order —
-/// the deliveries the hooks' one-recipient publishes left behind.
-async fn delivery_jobs(pool: &PgPool) -> Vec<Value> {
-    sqlx::query_as::<_, (Value,)>("SELECT args FROM jobs WHERE kind = $1 ORDER BY inserted_at, id")
-        .bind(KIND_DELIVER)
-        .fetch_all(pool)
-        .await
-        .expect("the delivery jobs read")
-        .into_iter()
-        .map(|(args,)| args)
-        .collect()
 }
 
 /// How many jobs of any kind the queue holds.

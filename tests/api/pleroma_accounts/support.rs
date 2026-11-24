@@ -12,7 +12,7 @@ use wired_be::{
         favourite,
         follow::{self, Follow, FollowState},
         status::{Status, Visibility},
-        user::{Flag, User, get_by_id},
+        user::{Flag, User},
     },
 };
 
@@ -198,11 +198,6 @@ pub(super) async fn stored(pool: &PgPool, follower: &User, target: &User) -> Fol
         .await
         .unwrap()
         .expect("the fixture relationship exists")
-}
-
-/// The row of user `id` as it stands now, for reading counters back.
-pub(super) async fn fresh_user(pool: &PgPool, id: Uuid) -> User {
-    get_by_id(pool, id).await.unwrap().expect("the user exists")
 }
 
 /// The pair of `user` behind the request row `row`.
