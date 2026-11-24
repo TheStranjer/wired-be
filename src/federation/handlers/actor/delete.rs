@@ -102,7 +102,7 @@ mod tests {
         let alice = mirror(&pool).await;
         let alice_id = alice.id;
         let bob = local_user(&pool, "bob").await;
-        let _following = accepted_follow(&pool, &bob, &alice).await;
+        accepted_follow(&pool, &bob, &alice).await;
         let posted = mirror_post(&pool, &alice, "farewell").await;
 
         let gone = delete_actor(
