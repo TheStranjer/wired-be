@@ -18,6 +18,8 @@
 
 #![cfg(test)]
 
+/// The cap on the `destroy_multiple` id array.
+mod batch_cap;
 /// The clear, single-dismiss, legacy-dismiss and `destroy_multiple` routes.
 mod dismiss;
 /// The credential and scope gates of every route.

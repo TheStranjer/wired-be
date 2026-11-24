@@ -60,6 +60,13 @@ const ID_KEYS: [&str; 2] = ["id", "id[]"];
 /// [`requested_status_ids`].
 const IDS_KEYS: [&str; 2] = ["ids", "ids[]"];
 
+/// The most distinct ids a client-supplied id array may name on the routes
+/// that do per-id work (list membership, conversation recipients, bulk
+/// notification dismissal); more is refused with [`TOO_MANY_IDS`].
+pub const MAX_BATCH_IDS: usize = 200;
+/// The 422 message of an id array past [`MAX_BATCH_IDS`].
+pub const TOO_MANY_IDS: &str = "Too many ids";
+
 /// Resolves the `{id}` segment of an account route to its [`User`] row.
 ///
 /// `id_str` must be `UUID` text as clients know it (decision 4: the
@@ -609,6 +616,28 @@ where
     (ids, all_ids)
 }
 
+/// [`distinct_ids`], refused with [`TOO_MANY_IDS`] when the distinct ids
+/// number more than [`MAX_BATCH_IDS`].
+///
+/// The count is of ids, not of texts: repeats fold into one and junk text
+/// names nothing, so a request is refused only for naming more accounts
+/// than the batch routes will do per-id work for. Callers run it before
+/// any database read.
+///
+/// # Errors
+///
+/// [`AppError::Unprocessable`] with [`TOO_MANY_IDS`] past the cap.
+pub fn capped_distinct_ids<'a, I>(texts: I) -> AppResult<(Vec<Uuid>, bool)>
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    let (ids, all_ids) = distinct_ids(texts);
+    if ids.len() > MAX_BATCH_IDS {
+        return Err(AppError::Unprocessable(TOO_MANY_IDS.to_owned()));
+    }
+    Ok((ids, all_ids))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -856,6 +885,39 @@ mod tests {
         let (found, every_text_parsed) = distinct_ids([ID_A, "junk", ID_A, ""]);
         assert!(!every_text_parsed, "junk clears the flag");
         assert_eq!(found.len(), 1, "the ids around the junk are still kept");
+    }
+
+    /// `count` distinct id texts (the simple spelling of 1, 2, ...).
+    fn id_texts(count: usize) -> Vec<String> {
+        (1..=count).map(|n| format!("{n:032x}")).collect()
+    }
+
+    #[test]
+    fn capped_distinct_ids_allows_exactly_the_cap() {
+        let texts = id_texts(MAX_BATCH_IDS);
+        let (ids, all_ids) = capped_distinct_ids(texts.iter().map(String::as_str))
+            .expect("the cap itself is allowed");
+        assert_eq!(ids.len(), MAX_BATCH_IDS);
+        assert!(all_ids);
+    }
+
+    #[test]
+    fn capped_distinct_ids_refuses_one_past_the_cap() {
+        let texts = id_texts(MAX_BATCH_IDS + 1);
+        let err = capped_distinct_ids(texts.iter().map(String::as_str))
+            .expect_err("one past the cap is refused");
+        assert!(matches!(&err, AppError::Unprocessable(m) if m.as_str() == TOO_MANY_IDS));
+    }
+
+    #[test]
+    fn capped_distinct_ids_counts_distinct_ids_only() {
+        let mut texts = id_texts(MAX_BATCH_IDS);
+        texts.extend(id_texts(MAX_BATCH_IDS));
+        texts.push("junk".to_owned());
+        let (ids, all_ids) = capped_distinct_ids(texts.iter().map(String::as_str))
+            .expect("repeats and junk do not count");
+        assert_eq!(ids.len(), MAX_BATCH_IDS);
+        assert!(!all_ids, "the junk is still flagged");
     }
 
     #[test]

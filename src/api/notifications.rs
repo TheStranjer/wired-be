@@ -84,7 +84,7 @@ use uuid::Uuid;
 use crate::{
     api::{
         chats::message_of,
-        helpers::{distinct, distinct_ids},
+        helpers::distinct,
         notifications_v2::{StringList, account_filter, names_of},
     },
     auth::AuthUser,
@@ -114,6 +114,11 @@ use crate::{
     state::AppState,
     util::id::parse_id,
 };
+
+use self::destroy_params::DestroyParams;
+
+/// The `destroy_multiple` parameters and their id cap.
+mod destroy_params;
 
 /// The 400 body of the legacy dismissal given no `id`.
 const MISSING_ID: &str = "Missing parameter: id";
@@ -416,11 +421,14 @@ impl DismissParams {
 /// notifications that belong to the caller and answer `{}`. Ids the
 /// caller does not own, that name nothing, or that are no id text at all
 /// simply match nothing; asking with no `ids` at all dismisses nothing and
-/// is likewise not an error.
+/// is likewise not an error. More than
+/// [`MAX_BATCH_IDS`](crate::api::helpers::MAX_BATCH_IDS) distinct ids is
+/// refused before anything is read or dismissed.
 ///
 /// # Errors
 ///
-/// The auth errors of [`clear`]. Any database failure arrives through `?`
+/// The auth errors of [`clear`]; [`Unprocessable`](crate::error::AppError::Unprocessable)
+/// (`Too many ids`) past the cap. Any database failure arrives through `?`
 /// as [`Database`](crate::error::AppError::Database).
 async fn destroy_multiple(
     State(state): State<AppState>,
@@ -428,7 +436,7 @@ async fn destroy_multiple(
     ApiParams(params): ApiParams<DestroyParams>,
 ) -> AppResult<Json<Value>> {
     auth.require(WRITE_NOTIFICATIONS)?;
-    let ids = params.parsed_ids();
+    let ids = params.parsed_ids()?;
     let dismissed = notification::dismiss_ids(&state.db, auth.0.id, &ids).await?;
     debug!(
         dismissed,
@@ -437,46 +445,6 @@ async fn destroy_multiple(
         "notifications dismissed in bulk"
     );
     Ok(empty_body())
-}
-
-/// The bulk dismissal's parameters: `ids` under either spelling clients
-/// send — a list (`ids[]=a&ids[]=b`, or a JSON array) or a lone value —
-/// from the query string, the body, or both merged.
-#[derive(Debug, Deserialize)]
-struct DestroyParams {
-    /// The notifications to dismiss; absent asks for none.
-    #[serde(default)]
-    ids: Option<IdList>,
-}
-
-/// One value or a list (a JSON array, or `ids[]=…` keys) — the two
-/// spellings Mastodon clients and forms both send.
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
-enum IdList {
-    /// A lone id.
-    Single(String),
-    /// A list of ids.
-    Multiple(Vec<String>),
-}
-
-impl IdList {
-    /// The values, borrowed, in the order sent.
-    fn values(&self) -> Vec<&str> {
-        match self {
-            Self::Single(value) => vec![value.as_str()],
-            Self::Multiple(values) => values.iter().map(String::as_str).collect(),
-        }
-    }
-}
-
-impl DestroyParams {
-    /// The parsed ids, in the order sent, each named once; values that
-    /// are not id text are skipped — they can name no row anyway.
-    fn parsed_ids(&self) -> Vec<Uuid> {
-        let values = self.ids.as_ref().map_or_else(Vec::new, IdList::values);
-        distinct_ids(values).0
-    }
 }
 
 /// `POST /api/pleroma/notifications/read` — mark seen and answer per the
@@ -859,31 +827,6 @@ mod tests {
                 "which is a 400, not {err}"
             );
         }
-    }
-
-    #[test]
-    fn the_bulk_ids_parse_from_lists_and_lone_values() {
-        let id = "01934567-89ab-7cde-f012-3456789abcde";
-        let other = "01934567-89ab-7cde-f012-3456789abcdf";
-        let list: DestroyParams = params(json!({"ids": [id, other, id]}));
-        assert_eq!(
-            list.parsed_ids(),
-            vec![
-                id.parse::<Uuid>().expect("fixture id"),
-                other.parse().expect("fixture id")
-            ],
-            "the json array, each id once"
-        );
-        let lone: DestroyParams = params(json!({"ids": id}));
-        assert_eq!(lone.parsed_ids().len(), 1, "and the lone `ids=` value");
-        let mixed: DestroyParams = params(json!({"ids": [id, "not-an-id", "7"]}));
-        assert_eq!(
-            mixed.parsed_ids().len(),
-            1,
-            "values that name no row are skipped, not an error"
-        );
-        let empty: DestroyParams = params(json!({}));
-        assert!(empty.parsed_ids().is_empty(), "absent asks for none");
     }
 
     #[test]

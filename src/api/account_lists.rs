@@ -87,7 +87,7 @@ use crate::{
     error::{AppError, AppResult},
     models::{follow, suggestion, user, user::User},
     oauth::scopes::{READ, READ_ACCOUNTS, READ_FOLLOWS, WRITE_ACCOUNTS},
-    pagination::PageParams,
+    pagination::{MAX_LIMIT, PageParams},
     state::AppState,
 };
 
@@ -316,7 +316,8 @@ async fn dismiss(
 /// text and ones that name no stored account are skipped, so the response
 /// holds one entry per known id in the order requested (a repeated id is
 /// answered twice, because that is what was asked). No usable `id` at all is
-/// the empty array, never an error.
+/// the empty array, never an error. Only the first [`MAX_LIMIT`] usable ids
+/// are answered, as one page; the rest are ignored.
 ///
 /// # Errors
 ///
@@ -329,7 +330,8 @@ async fn familiar_followers(
     uri: Uri,
 ) -> AppResult<Json<Vec<FamiliarFollowers>>> {
     auth.require(READ_FOLLOWS)?;
-    let requested = requested_ids(uri.query());
+    let mut requested = requested_ids(uri.query());
+    requested.truncate(familiar_batch_size());
     let known = user::get_many(&state.db, &requested).await?;
     let targets: HashMap<Uuid, &User> = known.iter().map(|found| (found.id, found)).collect();
     let mut entries = Vec::new();
@@ -344,6 +346,13 @@ async fn familiar_followers(
         "familiar followers listed"
     );
     Ok(Json(entries))
+}
+
+/// How many of the requested ids the familiar-followers batch answers:
+/// [`MAX_LIMIT`], as a page. Each id costs queries, so the ids past the
+/// first page are never read.
+fn familiar_batch_size() -> usize {
+    usize::try_from(MAX_LIMIT).unwrap_or(usize::MAX)
 }
 
 /// The one entry of the familiar-followers batch for `target`: the privacy

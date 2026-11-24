@@ -38,6 +38,9 @@ use wired_be::{
 
 use crate::common;
 
+/// The cap on the recipient array of the rewrite.
+mod batch_cap;
+
 /// The scope the three reads demand.
 const READ: &str = "read:statuses";
 /// The scope the four writes demand.
