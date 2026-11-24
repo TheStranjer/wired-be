@@ -83,13 +83,13 @@ use uuid::Uuid;
 
 use crate::{
     api::{
+        chats::message_of,
         helpers::{distinct, distinct_ids},
         notifications_v2::{NO_EXTRA_QUERY, StringList, account_filter, names_of},
     },
     auth::AuthUser,
     entities::{
         account::{Account, AccountViewer},
-        chat::ChatMessage as ChatMessageEntity,
         notification::Notification as NotificationEntity,
         relationship::{Relationship, RelationshipMap},
     },
@@ -98,7 +98,6 @@ use crate::{
     models::{
         chat,
         filter::{Filter, list_active},
-        media_attachment,
         notification::{
             self, FlatPageParams, Notification as NotificationRow, NotificationFilters,
         },
@@ -746,11 +745,7 @@ async fn chat_message_entity(
     else {
         return Ok(None);
     };
-    let attachment = match reference.attachment_media_id {
-        Some(media_id) => media_attachment::get_by_id(&state.db, media_id).await?,
-        None => None,
-    };
-    let entity = ChatMessageEntity::from_reference(&reference, attachment.as_ref(), &state.config);
+    let entity = message_of(state, &reference).await?;
     let value = serde_json::to_value(entity).map_err(|err| {
         AppError::Internal(format!("chat message entity failed to serialize: {err}"))
     })?;
