@@ -15,7 +15,7 @@ use crate::{
     config::Config,
     error::{AppError, AppResult},
     federation::{
-        actor::actor_json,
+        actor::{actor_json, instance_actor_json},
         vocab::{ACTIVITY_JSON, AP_MEDIA_TYPES},
     },
     models::user::User,
@@ -72,6 +72,11 @@ pub(super) fn frontend_redirect(config: &Config, path: &str) -> AppResult<Respon
 /// The actor document for `user` as an `ActivityPub` response.
 pub(super) fn actor_response(user: &User, config: &Config) -> Response {
     document_response(&actor_json(user, config))
+}
+
+/// The instance actor document for `user` as an `ActivityPub` response.
+pub(super) fn instance_actor_response(user: &User, config: &Config) -> Response {
+    document_response(&instance_actor_json(user, config))
 }
 
 /// A built document's answer, the collection routes' shared ending.

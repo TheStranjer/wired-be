@@ -141,6 +141,21 @@ pub(super) const ROWS: &[RouteSpec] = &[
         auth: AuthClass::Public,
     },
     RouteSpec {
+        method: "GET",
+        path: "/internal/fetch/outbox",
+        auth: AuthClass::Public,
+    },
+    RouteSpec {
+        method: "GET",
+        path: "/internal/fetch/followers",
+        auth: AuthClass::Public,
+    },
+    RouteSpec {
+        method: "GET",
+        path: "/internal/fetch/following",
+        auth: AuthClass::Public,
+    },
+    RouteSpec {
         method: "POST",
         path: "/internal/fetch/inbox",
         auth: AuthClass::Public,

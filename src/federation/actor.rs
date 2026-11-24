@@ -65,6 +65,21 @@ pub fn actor_json(user: &User, config: &Config) -> Value {
     )
 }
 
+/// The `ActivityPub` document of the instance actor.
+///
+/// It is [`actor_json`] without `featured`: the instance actor pins
+/// nothing and serves no such collection, so advertising one only makes
+/// peers fetch a 404. Its `outbox`, `followers` and `following` stay, as
+/// the empty collections `/internal/fetch` serves.
+#[must_use]
+pub fn instance_actor_json(user: &User, config: &Config) -> Value {
+    let mut document = actor_json(user, config);
+    if let Some(fields) = document.as_object_mut() {
+        drop(fields.remove("featured"));
+    }
+    document
+}
+
 /// Every field of [`actor_json`]'s object as a `(name, value)` pair, in the
 /// order Pleroma's renderer assembles them; the media fields come in only
 /// when the row has the media, and `movedTo` only when the row records a
@@ -316,6 +331,39 @@ mod tests {
     /// The document `user` renders on the test instance.
     fn render(user: &User) -> Value {
         actor_json(user, &Config::for_tests())
+    }
+
+    #[test]
+    fn the_instance_actor_document_omits_only_featured() {
+        let mut user = base_user("internal.fetch", "https://test.example/internal/fetch");
+        "Application".clone_into(&mut user.actor_type);
+        let config = Config::for_tests();
+        let document = instance_actor_json(&user, &config);
+        let expected: Vec<&str> = BASE_KEYS
+            .iter()
+            .copied()
+            .filter(|key| *key != "featured")
+            .collect();
+        assert_eq!(json_keys(&document), expected, "every key but featured");
+        let mut with_featured = actor_json(&user, &config);
+        assert!(
+            with_featured
+                .as_object_mut()
+                .and_then(|fields| fields.remove("featured"))
+                .is_some(),
+            "the shared renderer still emits featured"
+        );
+        assert_eq!(document, with_featured, "nothing else differs");
+    }
+
+    #[test]
+    fn a_user_document_keeps_featured() {
+        let document = render(&local_alice());
+        assert_eq!(
+            document["featured"],
+            format!("{AP_ID}/collections/featured"),
+            "a user actor still advertises featured"
+        );
     }
 
     #[test]

@@ -29,7 +29,9 @@ use crate::{
 
 use super::{
     ORDERED_COLLECTION, RELAY_PATH, Reader, gate_actor_read,
-    negotiation::{actor_response, document, wants_activity_json, with_vary},
+    negotiation::{
+        actor_response, document, instance_actor_response, wants_activity_json, with_vary,
+    },
 };
 
 /// `GET /users/{nickname}` — the local actor named `nickname`, as an
@@ -150,9 +152,45 @@ pub(super) async fn get_featured(
 /// needs in order to be able to sign).
 pub(super) async fn get_instance_actor(State(state): State<AppState>) -> Response {
     match instance_actor::ensure_instance_actor(&state.db, &state.config).await {
-        Ok(actor) => actor_response(&actor, &state.config),
+        Ok(actor) => instance_actor_response(&actor, &state.config),
         Err(err) => err.into_response(),
     }
+}
+
+/// `GET /internal/fetch/outbox` — the instance actor's outbox: an empty
+/// `OrderedCollection`, so the address the actor document advertises
+/// resolves. The instance actor publishes no posts.
+pub(super) async fn get_instance_outbox(State(state): State<AppState>) -> Response {
+    instance_collection(&state, "outbox")
+}
+
+/// `GET /internal/fetch/followers` — the instance actor's followers: an
+/// empty `OrderedCollection`.
+pub(super) async fn get_instance_followers(State(state): State<AppState>) -> Response {
+    instance_collection(&state, "followers")
+}
+
+/// `GET /internal/fetch/following` — whom the instance actor follows: an
+/// empty `OrderedCollection`.
+pub(super) async fn get_instance_following(State(state): State<AppState>) -> Response {
+    instance_collection(&state, "following")
+}
+
+/// The three instance collections' shared answer: one empty
+/// `OrderedCollection` at `{BASE_URL}/internal/fetch/{name}`, with
+/// `totalItems: 0` and no `first` page (there is none to fetch). Not
+/// negotiated and not gated by `AUTHORIZED_FETCH`, like the actor itself.
+fn instance_collection(state: &AppState, name: &str) -> Response {
+    let id = format!(
+        "{}{}/{name}",
+        state.config.base_url,
+        instance_actor::INSTANCE_ACTOR_PATH
+    );
+    let mut root = collections::collection_root(&id, ORDERED_COLLECTION, Some(0), &state.config);
+    if let Some(fields) = root.as_object_mut() {
+        drop(fields.remove("first"));
+    }
+    with_vary(document(Ok(root)))
 }
 
 /// `GET /relay` — this instance's relay-facing actor document. Serving
@@ -178,7 +216,7 @@ async fn relay_actor_document(state: &AppState, headers: &HeaderMap) -> AppResul
         return Err(AppError::RouteNotFound);
     }
     let actor = instance_actor::ensure_instance_actor(&state.db, &state.config).await?;
-    Ok(actor_response(&actor, &state.config))
+    Ok(instance_actor_response(&actor, &state.config))
 }
 
 /// `GET /relay/following` — whom this instance follows in the relay role:
