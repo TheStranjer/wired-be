@@ -183,11 +183,6 @@ pub(super) fn direct_stream(id: Uuid) -> String {
     format!("direct:{id}")
 }
 
-/// The `user:pleroma_chat:{id}` hub stream name.
-pub(super) fn chat_stream(id: Uuid) -> String {
-    format!("user:pleroma_chat:{id}")
-}
-
 /// The `list:{id}` hub stream name.
 pub(super) fn list_stream(id: Uuid) -> String {
     format!("list:{id}")

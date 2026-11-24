@@ -75,7 +75,9 @@ mod tests {
     use crate::{
         api::streaming::{
             names::USER_NOTIFICATION,
-            test_support::{account, for_reader, frame_payload, phrase_filter, state},
+            test_support::{
+                FrameFor as _, account, for_reader, frame_payload, phrase_filter, state,
+            },
         },
         config::TEST_BASE_URL,
         models::{

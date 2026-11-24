@@ -40,7 +40,9 @@ use uuid::Uuid;
 
 use self::bridge::{Envelope, bridge_publish};
 pub use self::{
-    events::{Audience, RenderSpec, StreamEvent, stream_matches},
+    events::{
+        Audience, RenderSpec, StreamEvent, matched_streams, public_stream_name, stream_matches,
+    },
     listener::{handle_cleanup, run_pg_listener},
 };
 

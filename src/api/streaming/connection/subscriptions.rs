@@ -114,7 +114,9 @@ mod tests {
     use crate::{
         api::streaming::{
             names::USER,
-            test_support::{account, block_author, event, state, status_payload, token_for},
+            test_support::{
+                FrameFor as _, account, block_author, event, state, status_payload, token_for,
+            },
         },
         oauth::scopes::READ,
         streaming::hub::{Audience, StreamEvent},
