@@ -197,7 +197,7 @@ mod tests {
         let off = DirectParams::parse(Some("with_muted=yes&with_muted=false"));
         assert!(
             !off.with_muted.get(),
-            "the last occurrence wins, `no` is off"
+            "the last occurrence wins, `false` is off"
         );
         assert_eq!(
             DirectParams::parse(Some("limit=5&since_id=7")),
@@ -216,11 +216,13 @@ mod tests {
         let on = ListParams::parse(Some("only_media=true&with_muted=1&limit=5&max_id=abc"));
         assert!(on.only_media.get(), "`only_media=true` is on");
         assert!(on.with_muted.get(), "`with_muted=1` is on too");
-        let off = ListParams::parse(Some("only_media=yes&with_muted=false"));
+        let off = ListParams::parse(Some("only_media=maybe&with_muted=true&with_muted=false"));
         assert!(
             !off.only_media.get() && !off.with_muted.get(),
-            "`yes` is not true and the last occurrence wins"
+            "junk is not true and the last occurrence wins"
         );
+        let yes = ListParams::parse(Some("only_media=yes"));
+        assert!(yes.only_media.get(), "`yes` is a true spelling");
         assert_eq!(
             ListParams::parse(Some("local=true&min_id=7")),
             ListParams::default(),

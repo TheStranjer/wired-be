@@ -75,6 +75,7 @@ use crate::{
         runtime_config::{self, ConfigEntry, DeleteOutcome, RuntimeConfig},
     },
     state::AppState,
+    util::params::truthy,
 };
 
 /// The read endpoint class of [`AdminUser::require`].
@@ -333,12 +334,13 @@ fn rows_need_reboot(rows: &[ConfigEntry]) -> bool {
 }
 
 /// Whether the request asked for the rows-as-stored answer. Pleroma's
-/// spex casts a real boolean; the query string is text, so `true` and
-/// `1` (any case) read as yes and anything else as no.
+/// spex casts a real boolean; the query string is text, so the spellings
+/// [`truthy`] reads as true (`true`, `1`, `yes`, … in any case) read as
+/// yes and anything else as no.
 fn is_only_db(params: &HashMap<String, String>) -> bool {
     params
         .get(ONLY_DB)
-        .is_some_and(|text| text.eq_ignore_ascii_case("true") || text == "1")
+        .is_some_and(|text| truthy(text) == Some(true))
 }
 
 /// One stored row in the API's render: the value as stored, in wire
@@ -537,9 +539,11 @@ mod tests {
             ("true", true),
             ("TRUE", true),
             ("1", true),
+            ("yes", true),
             ("0", false),
             ("", false),
-            ("yes", false),
+            ("no", false),
+            ("junk", false),
         ] {
             let overwrote = params.insert(ONLY_DB.to_owned(), value.to_owned());
             drop(overwrote);
