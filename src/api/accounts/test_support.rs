@@ -100,7 +100,6 @@ pub(super) fn stored_user() -> User {
         inserted_at: Utc::now(),
         updated_at: Utc::now(),
         mfa_settings: json!({}),
-        preferred_frontend: None,
         is_suggested: Flag::new(false),
         password_reset_pending: Flag::new(false),
         email_notifications: Flag::new(true),

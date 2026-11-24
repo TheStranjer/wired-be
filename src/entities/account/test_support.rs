@@ -205,7 +205,6 @@ pub(super) fn base_user(nickname: &str, ap_id: &str) -> User {
         last_fetched_at: None,
         inserted_at: stamped(),
         updated_at: stamped(),
-        preferred_frontend: None,
         is_suggested: Flag::new(false),
         password_reset_pending: Flag::new(false),
         email_notifications: Flag::new(true),

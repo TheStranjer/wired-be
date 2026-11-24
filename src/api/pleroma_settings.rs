@@ -1,18 +1,15 @@
-//! Frontend settings store, mascot and preferred frontend: the
-//! `/api/v1/pleroma` client-settings surface (WBE-122).
+//! Frontend settings store and mascot: the `/api/v1/pleroma`
+//! client-settings surface (WBE-122).
 //!
 //! The reference is Pleroma's `SettingsController`
-//! (`lib/pleroma/web/pleroma_api/controllers/settings_controller.ex`),
+//! (`lib/pleroma/web/pleroma_api/controllers/settings_controller.ex`) and
 //! `MascotController`
-//! (`lib/pleroma/web/pleroma_api/controllers/mascot_controller.ex`) and
-//! `FrontendSettingsController`
-//! (`lib/pleroma/web/pleroma_api/controllers/frontend_settings_controller.ex`).
+//! (`lib/pleroma/web/pleroma_api/controllers/mascot_controller.ex`).
 //! The ticket shapes are authoritative where Pleroma's differ: the
-//! settings-store size cap, the `app` name rule, the stored mascot (a
+//! settings-store size cap, the `app` name rule and the stored mascot (a
 //! Pleroma `users.mascot` column; here a `mascot` key inside the settings
-//! store) and the database-backed preferred frontend (Pleroma keeps the
-//! choice in the cookie alone; here the cookie is set *and* the choice is
-//! stored in `users.preferred_frontend`).
+//! store). Pleroma's frontend-picker routes are not served: Wired is
+//! API-only, so they fall through to the JSON 404.
 //!
 //! Every route requires a user token ([`AuthUser`]).
 //!
@@ -41,24 +38,12 @@
 //!   file goes through [`crate::uploads`] and the attachment is stored
 //!   under the `mascot` key of the settings store; the same attachment
 //!   JSON is the answer.
-//! - `GET /api/v1/pleroma/preferred_frontend/available` — the frontends
-//!   the operator made pickable, `AVAILABLE_FRONTENDS` as a list
-//!   (empty by default; Pleroma's `[:frontends, :pickable]`).
-//! - `PUT /api/v1/pleroma/preferred_frontend` — body `frontend_name`,
-//!   which must be one of the available frontends or the answer is 422
-//!   `{"error":"Invalid frontend"}`. The choice is stored in the account's
-//!   `preferred_frontend` column and echoed back in a year-lived cookie,
-//!   `preferred_frontend=<name>; Path=/; Max-Age=31536000`; the answer is
-//!   `{"frontend_name": name}`.
 
 use axum::{
     Json, Router,
     extract::{Path, State},
-    http::{HeaderValue, header},
-    response::{IntoResponse as _, Response},
-    routing::{get, put},
+    routing::get,
 };
-use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use uuid::Uuid;
 
@@ -108,15 +93,6 @@ const DEFAULT_MASCOT_ID: &str = "default-mascot";
 const DEFAULT_MASCOT_PATH: &str = crate::default_assets::MASCOT_PATH;
 /// `pleroma.mime_type` of the default mascot.
 const DEFAULT_MASCOT_MIME: &str = "image/png";
-/// 422 body for a `frontend_name` the operator did not make pickable, the
-/// message the ticket fixes.
-const INVALID_FRONTEND: &str = "Invalid frontend";
-/// Name of the cookie that mirrors the stored frontend choice.
-const FRONTEND_COOKIE: &str = "preferred_frontend";
-/// `Max-Age` of the frontend cookie, in seconds: one year, as the ticket
-/// fixes it.
-const FRONTEND_COOKIE_MAX_AGE: &str = "31536000";
-
 /// The `/api/v1/pleroma` frontend-settings router, merged into
 /// [`crate::api::v1`].
 ///
@@ -131,14 +107,6 @@ pub fn router(config: &Config) -> Router<AppState> {
             get(get_settings).patch(update_settings),
         )
         .route("/pleroma/mascot", get(get_mascot).put(update_mascot))
-        .route(
-            "/pleroma/preferred_frontend/available",
-            get(available_frontends),
-        )
-        .route(
-            "/pleroma/preferred_frontend",
-            put(update_preferred_frontend),
-        )
         .layer(upload_body_limit(config))
 }
 
@@ -146,14 +114,6 @@ pub fn router(config: &Config) -> Router<AppState> {
 /// only the `file` part, so the text fields (whatever they are) are parsed
 /// into a plain [`Value`] and ignored, like the media upload's `thumbnail`.
 type MascotFields = Value;
-
-/// The body of `PUT /api/v1/pleroma/preferred_frontend`.
-#[derive(Debug, Deserialize)]
-struct PreferredFrontendParams {
-    /// The frontend the client picked; must be one of
-    /// [`Config::available_frontends`].
-    frontend_name: String,
-}
 
 /// `GET /api/v1/pleroma/settings/{app}` — the account's stored settings
 /// for `{app}`, `{}` when it has none.
@@ -255,56 +215,6 @@ async fn update_mascot(
     )
     .await?;
     Ok(Json(attachment))
-}
-
-/// `GET /api/v1/pleroma/preferred_frontend/available` — the frontends the
-/// operator made pickable, in configuration order.
-///
-/// # Errors
-///
-/// [`AppError::Unauthorized`] / [`AppError::Forbidden`] from [`AuthUser`]
-/// (no scope: Pleroma's `available_frontends` asks for a token only).
-async fn available_frontends(
-    State(state): State<AppState>,
-    _auth: AuthUser,
-) -> AppResult<Json<Vec<String>>> {
-    Ok(Json(state.config.available_frontends.clone()))
-}
-
-/// `PUT /api/v1/pleroma/preferred_frontend` — store the picked frontend,
-/// set the cookie it mirrors and answer `{"frontend_name": name}`.
-///
-/// # Errors
-///
-/// [`AppError::Unauthorized`] / [`AppError::Forbidden`] from [`AuthUser`];
-/// [`AppError::Unprocessable`] with [`INVALID_FRONTEND`] for a name the
-/// operator did not make pickable (and with the extractor's wording for a
-/// body without `frontend_name`); [`AppError::Internal`] if a configured
-/// name cannot be written into a header. Any database failure arrives
-/// through `?` as [`AppError::Database`].
-async fn update_preferred_frontend(
-    State(state): State<AppState>,
-    auth: AuthUser,
-    ApiBody(params): ApiBody<PreferredFrontendParams>,
-) -> AppResult<Response> {
-    if !state
-        .config
-        .available_frontends
-        .contains(&params.frontend_name)
-    {
-        return Err(AppError::Unprocessable(INVALID_FRONTEND.to_owned()));
-    }
-    user::set_preferred_frontend(&state.db, auth.0.id, &params.frontend_name).await?;
-    let cookie = HeaderValue::from_str(&frontend_cookie(&params.frontend_name)).map_err(|err| {
-        AppError::Internal(format!(
-            "the configured frontend name is not cookie-safe: {err}"
-        ))
-    })?;
-    Ok((
-        [(header::SET_COOKIE, cookie)],
-        Json(json!({ "frontend_name": params.frontend_name })),
-    )
-        .into_response())
 }
 
 /// Whether `app` is a usable settings-app name: 1 to [`MAX_APP_NAME_CHARS`]
@@ -487,12 +397,6 @@ fn default_mascot(origin: &str) -> Value {
         &format!("{origin}{DEFAULT_MASCOT_PATH}"),
         DEFAULT_MASCOT_MIME,
     )
-}
-
-/// The `Set-Cookie` value mirroring the stored frontend choice: the name
-/// as its value, one year of life, valid for the whole origin.
-fn frontend_cookie(name: &str) -> String {
-    format!("{FRONTEND_COOKIE}={name}; Path=/; Max-Age={FRONTEND_COOKIE_MAX_AGE}")
 }
 
 #[cfg(test)]
@@ -728,15 +632,6 @@ mod tests {
                 "pleroma": { "mime_type": "image/png" },
             }),
             "Wired's default mascot, hung off the given media base URL"
-        );
-    }
-
-    #[test]
-    fn the_frontend_cookie_is_the_documented_one_year_choice() {
-        assert_eq!(
-            frontend_cookie("pleroma-fe"),
-            "preferred_frontend=pleroma-fe; Path=/; Max-Age=31536000",
-            "name, path and one-year lifetime, exactly"
         );
     }
 

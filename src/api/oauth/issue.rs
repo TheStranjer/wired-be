@@ -282,7 +282,6 @@ mod tests {
             last_fetched_at: None,
             inserted_at: now,
             updated_at: now,
-            preferred_frontend: None,
             is_suggested: Flag::new(false),
             password_reset_pending: Flag::new(false),
             email_notifications: Flag::new(true),

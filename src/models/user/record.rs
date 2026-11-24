@@ -179,10 +179,6 @@ pub struct User {
     /// backup-code hashes). Holds the TOTP secret; never in `Debug`
     /// output.
     pub mfa_settings: Value,
-    /// The frontend the account picked at `PUT /api/v1/pleroma/preferred_frontend`;
-    /// `None` when it never chose one. The `preferred_frontend` cookie
-    /// mirrors it (Pleroma keeps the choice in the cookie alone).
-    pub preferred_frontend: Option<String>,
     /// Whether an admin put the account in the suggestion pool the
     /// `GET /api/v{1,2}/suggestions` endpoints answer from
     /// (Pleroma's `is_suggested`). Nothing here sets it: the admin API
@@ -278,7 +274,6 @@ impl fmt::Debug for User {
             .field("inserted_at", &self.inserted_at)
             .field("updated_at", &self.updated_at)
             .field("mfa_settings", &"<redacted>")
-            .field("preferred_frontend", &self.preferred_frontend)
             .field("is_suggested", &self.is_suggested)
             .field("password_reset_pending", &self.password_reset_pending)
             .field("email_notifications", &self.email_notifications)

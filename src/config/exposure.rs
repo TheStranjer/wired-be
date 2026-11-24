@@ -12,7 +12,7 @@ use super::Config;
 use super::{
     auth::AuthSettings,
     defaults::{
-        DEFAULT_AVAILABLE_FRONTENDS, DEFAULT_INVITES_ENABLED, DEFAULT_REGISTRATIONS_OPEN,
+        DEFAULT_INVITES_ENABLED, DEFAULT_REGISTRATIONS_OPEN,
         DEFAULT_SEARCH_STATUSES_UNAUTHENTICATED,
     },
     error::ConfigError,
@@ -22,22 +22,22 @@ use super::{
     jobs::{RestSettings, rest_settings},
     limits::ContentLimits,
     mail::{MailerSettings, domain_of},
-    parse::{boolean, comma_list, trimmed, trimmed_url},
+    parse::{boolean, trimmed, trimmed_url},
     registration::{registration_modes, restrict_areas, signup_and_mail},
     vars::{
-        AVAILABLE_FRONTENDS_VAR, INVITES_ENABLED_VAR, REGISTRATIONS_OPEN_VAR,
-        SEARCH_STATUSES_UNAUTHENTICATED_VAR, TRANSLATION_API_KEY_VAR, TRANSLATION_API_URL_VAR,
-        TRANSLATION_PROVIDER_VAR, VAPID_PRIVATE_KEY_VAR, VAPID_PUBLIC_KEY_VAR,
+        INVITES_ENABLED_VAR, REGISTRATIONS_OPEN_VAR, SEARCH_STATUSES_UNAUTHENTICATED_VAR,
+        TRANSLATION_API_KEY_VAR, TRANSLATION_API_URL_VAR, TRANSLATION_PROVIDER_VAR,
+        VAPID_PRIVATE_KEY_VAR, VAPID_PUBLIC_KEY_VAR,
     },
     wording::{TextLengthLimits, profile_and_limits},
 };
 
 /// What [`client_exposure`] reads: the toggles that gate what the instance
-/// exposes to clients, the areas it keeps from anonymous readers and the
-/// pickable-frontend list, named by what they are and hung on the [`Config`]
+/// exposes to clients and the areas it keeps from anonymous readers, named
+/// by what they are and hung on the [`Config`]
 /// fields in [`Config::from_lookup`] (`REGISTRATIONS_OPEN`,
 /// `INVITES_ENABLED`, `SEARCH_STATUSES_UNAUTHENTICATED`,
-/// `RESTRICT_UNAUTHENTICATED`, `AVAILABLE_FRONTENDS`).
+/// `RESTRICT_UNAUTHENTICATED`).
 #[derive(Debug)]
 pub(crate) struct ExposureSettings {
     /// Whether new registrations are open (`REGISTRATIONS_OPEN`).
@@ -57,9 +57,6 @@ pub(crate) struct ExposureSettings {
     /// The areas an anonymous request may not read
     /// (`RESTRICT_UNAUTHENTICATED`).
     pub(crate) restrict_unauthenticated: BTreeSet<String>,
-    /// The frontends the settings endpoints let a user pick
-    /// (`AVAILABLE_FRONTENDS`).
-    pub(crate) available_frontends: Vec<String>,
 }
 
 /// Reads the settings that gate what the instance exposes to clients:
@@ -69,7 +66,7 @@ pub(crate) struct ExposureSettings {
 /// registration means — waiting for staff approval and confirming the
 /// email ([`registration_modes`]) — whether anonymous requests may search
 /// statuses at the combined search, which areas anonymous reads are
-/// refused, and the frontends the settings endpoints let a user pick.
+/// refused.
 /// Grouped because each is a plain default-or-parse and
 /// [`Config::from_lookup`] has a size budget (AGENTS.md).
 ///
@@ -96,9 +93,6 @@ where
     )?
     .into();
     let restrict_unauthenticated = restrict_areas(lookup)?;
-    let available_frontends = comma_list(
-        &lookup(AVAILABLE_FRONTENDS_VAR).unwrap_or_else(|| DEFAULT_AVAILABLE_FRONTENDS.to_owned()),
-    );
     Ok(ExposureSettings {
         registrations_open,
         invites_enabled,
@@ -106,7 +100,6 @@ where
         account_activation_required,
         search_statuses_unauthenticated,
         restrict_unauthenticated,
-        available_frontends,
     })
 }
 
@@ -419,30 +412,12 @@ mod tests {
     }
 
     #[test]
-    fn available_frontends_default_to_empty() {
-        let config = config_with(&[]);
-        assert!(
-            config.available_frontends.is_empty(),
-            "no frontend is pickable until the operator names some"
-        );
-    }
-
-    #[test]
-    fn available_frontends_parses_a_comma_list() {
-        let config = config_with(&[(AVAILABLE_FRONTENDS_VAR, " pleroma-fe, mochi-pub ,,x")]);
-        assert_eq!(
-            config.available_frontends,
-            vec![
-                "pleroma-fe".to_owned(),
-                "mochi-pub".to_owned(),
-                "x".to_owned()
-            ],
-            "the list is trimmed and blanks drop, order kept"
-        );
+    fn the_retired_available_frontends_variable_is_not_read() {
+        let config = config_with(&[("AVAILABLE_FRONTENDS", "x")]);
         let debug = format!("{config:?}");
         assert!(
-            debug.contains(r#"available_frontends: ["pleroma-fe", "mochi-pub", "x"]"#),
-            "the frontend list is visible in Debug output: {debug}"
+            !debug.contains("available_frontends"),
+            "the retired frontend list is not in Debug output: {debug}"
         );
     }
 }

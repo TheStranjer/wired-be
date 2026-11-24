@@ -131,7 +131,6 @@ mod tests {
             last_fetched_at: None,
             inserted_at: Utc.with_ymd_and_hms(2024, 1, 31, 12, 34, 56).unwrap(),
             updated_at: Utc.with_ymd_and_hms(2024, 1, 31, 12, 34, 56).unwrap(),
-            preferred_frontend: None,
             is_suggested: Flag::new(false),
             password_reset_pending: Flag::new(false),
             email_notifications: Flag::new(true),

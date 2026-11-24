@@ -151,16 +151,6 @@ pub(super) const ROWS: &[RouteSpec] = &[
     },
     RouteSpec {
         method: "GET",
-        path: "/api/v1/pleroma/preferred_frontend/available",
-        auth: AuthClass::User,
-    },
-    RouteSpec {
-        method: "PUT",
-        path: "/api/v1/pleroma/preferred_frontend",
-        auth: AuthClass::User,
-    },
-    RouteSpec {
-        method: "GET",
         path: "/api/v0/pleroma/reports",
         auth: AuthClass::User,
     },
