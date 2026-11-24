@@ -28,8 +28,7 @@ use super::{
 /// `email_notifications` flag through
 /// [`set_email_notifications`](crate::models::user::set_email_notifications)
 /// and answers 200 [`UNSUBSCRIBED_MESSAGE`] as a [`protected_page`] —
-/// `X-Frame-Options: DENY`, unlike the embed pages, because a mailer
-/// link is no frame's content. Every refusal is the one 400
+/// `X-Frame-Options: DENY`, because a mailer link is no frame's content. Every refusal is the one 400
 /// [`INVALID_TOKEN_MESSAGE`] page: a token that does not verify, and,
 /// since no token can verify without a signing secret, a state built off
 /// the boot path with
@@ -260,7 +259,7 @@ mod tests {
         assert_eq!(
             headers[FRAME_OPTIONS_HEADER.clone()],
             "DENY",
-            "and not framable, like every non-embed page"
+            "and not framable, like every page"
         );
     }
 }

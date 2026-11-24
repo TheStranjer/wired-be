@@ -36,8 +36,7 @@
 //! endpoints and `manifest.json` live at `/…`, the addresses `MongooseIM`'s
 //! `extauth` http contract and the manifest `<link>` convention fix.
 //! [`html_pages::router`] joins it at the root too: the shared HTML helper
-//! pages live at the top-level paths Pleroma routes them on,
-//! `/embed/{id}`, `/notice/{id}/embed_player` and
+//! pages live at the top-level path Pleroma routes them on,
 //! `/mailer/unsubscribe/{token}`.
 //! [`remote_interaction::router`] joins it at the root as well: the
 //! ostatus subscribe pages, `GET /authorize_interaction` and the
