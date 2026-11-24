@@ -10,7 +10,10 @@ use super::{
     MAX_SUMMARY_REACTORS, ReactionSummary,
     groups::{ReactionRow, ReactorGroup, group},
 };
-use crate::{error::AppResult, util::collections::group_pairs};
+use crate::{
+    error::AppResult,
+    util::{collections::group_pairs, emoji::display_name},
+};
 
 /// [`for_statuses`]: one aggregated row per `(status, emoji)` of a batch of
 /// statuses (`$1`), computed in the database so a status with thousands of
@@ -20,7 +23,7 @@ use crate::{error::AppResult, util::collections::group_pairs};
 /// earliest reactors (reaction time, then row id, for a stable order) and
 /// `first_at` the emoji's first reaction time, which together with the emoji
 /// text orders a status's groups the way the roll-up promises.
-pub(super) const FOR_STATUSES_SQL: &str = "SELECT status_id, emoji,
+pub(super) const FOR_STATUSES_SQL: &str = "SELECT status_id, emoji, emoji_domain,
         (array_agg(url ORDER BY inserted_at) FILTER (WHERE url IS NOT NULL))[1] AS url,
         count(*) AS count,
         COALESCE(bool_or(user_id = $2::uuid), false) AS me,
@@ -28,8 +31,8 @@ pub(super) const FOR_STATUSES_SQL: &str = "SELECT status_id, emoji,
         min(inserted_at) AS first_at
     FROM emoji_reactions
    WHERE status_id = ANY($1)
-GROUP BY status_id, emoji
-ORDER BY status_id, first_at, emoji";
+GROUP BY status_id, emoji, emoji_domain
+ORDER BY status_id, first_at, emoji, emoji_domain NULLS FIRST";
 
 /// One fetched row of [`FOR_STATUSES_SQL`]: the roll-up of one emoji on one
 /// status. `first_at` is only ordered by and is not read.
@@ -39,6 +42,8 @@ struct SummaryRow {
     status_id: Uuid,
     /// The emoji as stored.
     emoji: String,
+    /// The instance the emoji belongs to; `None` for a unicode or local one.
+    emoji_domain: Option<String>,
     /// The custom emoji's image URL, if any.
     url: Option<String>,
     /// How many accounts reacted with this emoji.
@@ -53,7 +58,7 @@ impl From<SummaryRow> for ReactionSummary {
     /// The summary of `row`, its status key dropped.
     fn from(row: SummaryRow) -> Self {
         Self {
-            name: row.emoji,
+            name: display_name(&row.emoji, row.emoji_domain.as_deref()),
             count: row.count,
             me: row.me,
             url: row.url,
@@ -63,13 +68,17 @@ impl From<SummaryRow> for ReactionSummary {
 }
 
 /// [`reactors`]: one status's reactions, optionally narrowed to the single
-/// emoji `emoji` names (`$2` is that emoji or `NULL` for all of them), in the
-/// same order [`for_statuses`] uses, and for the same reason.
-pub(super) const REACTORS_SQL: &str = "SELECT r.status_id, r.emoji, r.url, r.user_id,
-        min(r.inserted_at) OVER (PARTITION BY r.status_id, r.emoji) AS first_at
+/// emoji `emoji` names (`$2` is that emoji or `NULL` for all of them, `$3` its
+/// origin domain, `NULL` for a unicode or local emoji), in the same order
+/// [`for_statuses`] uses, and for the same reason.
+pub(super) const REACTORS_SQL: &str =
+    "SELECT r.status_id, r.emoji, r.emoji_domain, r.url, r.user_id,
+        min(r.inserted_at) OVER (PARTITION BY r.status_id, r.emoji, r.emoji_domain) AS first_at
     FROM emoji_reactions r
-   WHERE r.status_id = $1 AND ($2::text IS NULL OR r.emoji = $2::text)
-ORDER BY first_at, r.emoji, r.inserted_at, r.id";
+   WHERE r.status_id = $1
+     AND ($2::text IS NULL
+          OR (r.emoji = $2::text AND r.emoji_domain IS NOT DISTINCT FROM $3::text))
+ORDER BY first_at, r.emoji, r.emoji_domain NULLS FIRST, r.inserted_at, r.id";
 
 /// The reaction roll-ups of every status in `status_ids`, keyed by status.
 ///
@@ -108,9 +117,11 @@ pub async fn for_statuses(
     ))
 }
 
-/// Every reaction of `status_id` as one [`ReactorGroup`] per emoji, in the same
-/// order [`for_statuses`] uses, optionally narrowed to the single emoji `emoji`
-/// names (`None`: all of them).
+/// Every reaction of `status_id` as one [`ReactorGroup`] per emoji.
+///
+/// The groups come in the same order [`for_statuses`] uses, optionally narrowed
+/// to the single emoji `emoji` names (`None`: all of them) of origin `domain`
+/// (`None`: a unicode or local emoji; ignored when `emoji` is `None`).
 ///
 /// Unlike the batched roll-up this keeps the whole reactor list, because the
 /// endpoint it serves renders those accounts, and it knows nothing about the
@@ -126,10 +137,12 @@ pub async fn reactors(
     pool: &PgPool,
     status_id: Uuid,
     emoji: Option<&str>,
+    domain: Option<&str>,
 ) -> AppResult<Vec<ReactorGroup>> {
     let rows = sqlx::query_as::<_, ReactionRow>(REACTORS_SQL)
         .bind(status_id)
         .bind(emoji)
+        .bind(domain)
         .fetch_all(pool)
         .await?;
     Ok(group(rows)

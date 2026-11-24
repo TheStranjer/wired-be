@@ -36,6 +36,17 @@
 //! activity's `tag` list and runs it through its media proxy; this instance
 //! serves the URL as stored).
 //!
+//! A custom emoji of another instance — the `:misskeycat:` a Misskey user left
+//! on a post — is named Pleroma's way, `shortcode@domain`, with or without the
+//! surrounding colons (`…/reactions/misskeycat@misskey.test` and
+//! `…/reactions/:misskeycat@misskey.test:` are one emoji). It must name an
+//! enabled `custom_emojis` row of that domain, learned from a remote post or
+//! reaction that used it. It is stored as `:shortcode:` with the remote image
+//! URL and the domain beside it, federates as the `EmojiReact` Misskey and
+//! Pleroma send for a re-used remote emoji (`content` `:shortcode:` plus an
+//! `Emoji` tag whose icon is the remote image), and is named `shortcode@domain`
+//! in every read. Plain `:shortcode:` keeps meaning the local emoji.
+//!
 //! # Reading reactions
 //!
 //! Both `GET` routes are Pleroma's `index`: authentication is optional
@@ -123,7 +134,10 @@ use crate::{
         render_status::{ViewerMode, render_status},
     },
     state::AppState,
-    util::emoji::Emoji,
+    util::{
+        emoji::{Emoji, remote_shortcode},
+        id::new_activity_ap_id,
+    },
 };
 
 /// 400 body for an `{emoji}` segment that is neither one unicode emoji
@@ -172,6 +186,9 @@ struct Accepted {
     text: String,
     /// The custom emoji's image URL, `None` for a unicode emoji.
     url: Option<String>,
+    /// The instance a remote custom emoji belongs to, `None` for a unicode or
+    /// local emoji.
+    domain: Option<String>,
 }
 
 impl Accepted {
@@ -214,10 +231,11 @@ async fn react(
     auth.require(WRITE_STATUSES)?;
     let row = status_for_viewer_or_404(&state, Some(&auth.0), &id).await?;
     let accepted = accepted_emoji(&state, &emoji).await?;
-    let stored = emoji_reaction::react(
+    let stored = emoji_reaction::react_in_domain(
         &state.db,
-        &state.config.base_url,
         &accepted.reaction(auth.0.id, row.id),
+        &new_activity_ap_id(&state.config.base_url),
+        accepted.domain.as_deref(),
     )
     .await?;
     debug!(
@@ -251,8 +269,14 @@ async fn unreact(
     auth.require(WRITE_STATUSES)?;
     let row = status_for_viewer_or_404(&state, Some(&auth.0), &id).await?;
     let accepted = accepted_emoji(&state, &emoji).await?;
-    if let Some(removed) =
-        emoji_reaction::unreact(&state.db, auth.0.id, row.id, &accepted.text).await?
+    if let Some(removed) = emoji_reaction::unreact_in_domain(
+        &state.db,
+        auth.0.id,
+        row.id,
+        &accepted.text,
+        accepted.domain.as_deref(),
+    )
+    .await?
     {
         debug!(
             status = %row.id,
@@ -283,7 +307,18 @@ async fn list_reactions(
     ApiParams(params): ApiParams<ReactionParams>,
 ) -> AppResult<Json<Vec<EmojiReaction>>> {
     auth.require_user_scope(READ_STATUSES)?;
-    read_reactions(&state, auth.0.as_ref(), &id, None, params.muted_visible()).await
+    let everything = Wanted {
+        emoji: None,
+        domain: None,
+    };
+    read_reactions(
+        &state,
+        auth.0.as_ref(),
+        &id,
+        everything,
+        params.muted_visible(),
+    )
+    .await
 }
 
 /// `GET /api/v1/pleroma/statuses/{id}/reactions/{emoji}` — the same array
@@ -305,19 +340,39 @@ async fn list_one_reaction(
     ApiParams(params): ApiParams<ReactionParams>,
 ) -> AppResult<Json<Vec<EmojiReaction>>> {
     auth.require_user_scope(READ_STATUSES)?;
-    read_reactions(
-        &state,
-        auth.0.as_ref(),
-        &id,
-        Some(&emoji),
-        params.muted_visible(),
-    )
-    .await
+    let (text, domain) = named_emoji(&emoji);
+    let wanted = Wanted {
+        emoji: Some(&text),
+        domain: domain.as_deref(),
+    };
+    read_reactions(&state, auth.0.as_ref(), &id, wanted, params.muted_visible()).await
+}
+
+/// The emoji a read narrows to: its stored text and, for a remote custom emoji,
+/// its origin domain.
+#[derive(Clone, Copy, Debug)]
+struct Wanted<'a> {
+    /// The stored emoji text; `None` asks for every emoji.
+    emoji: Option<&'a str>,
+    /// The origin domain of a remote custom emoji.
+    domain: Option<&'a str>,
+}
+
+/// The stored spelling and origin of the emoji an `{emoji}` segment names,
+/// without asking whether this instance has it.
+///
+/// `shortcode@domain` (colons or not) names `:shortcode:` of `domain`; any
+/// other text is its own stored spelling.
+fn named_emoji(text: &str) -> (String, Option<String>) {
+    match remote_shortcode(text) {
+        Some((code, domain)) => (format!(":{code}:"), Some(domain)),
+        None => (text.to_owned(), None),
+    }
 }
 
 /// The body of both reads: the reactions of the status `id` as `viewer` may see
-/// them, narrowed to `emoji` (`None`: every emoji), with `muted_visible`
-/// deciding whether the viewer's muted accounts stay in.
+/// them, narrowed to the `wanted` emoji (none: every emoji), with
+/// `muted_visible` deciding whether the viewer's muted accounts stay in.
 ///
 /// # Errors
 ///
@@ -327,11 +382,11 @@ async fn read_reactions(
     state: &AppState,
     viewer: Option<&User>,
     id: &str,
-    emoji: Option<&str>,
+    wanted: Wanted<'_>,
     muted_visible: bool,
 ) -> AppResult<Json<Vec<EmojiReaction>>> {
     let row = status_for_viewer_or_404(state, viewer, id).await?;
-    let groups = emoji_reaction::reactors(&state.db, row.id, emoji).await?;
+    let groups = emoji_reaction::reactors(&state.db, row.id, wanted.emoji, wanted.domain).await?;
     let hidden = hidden_reactors(&state.db, viewer, muted_visible).await?;
     let shown: Vec<ReactorGroup> = groups
         .into_iter()
@@ -470,6 +525,9 @@ async fn rendered_status(
 /// unicode emoji grapheme nor a shortcode naming a local, enabled emoji; any
 /// database failure arrives through `?` as [`AppError::Database`].
 async fn accepted_emoji(state: &AppState, text: &str) -> AppResult<Accepted> {
+    if let Some((code, domain)) = remote_shortcode(text) {
+        return remote_emoji(&state.db, code, domain).await;
+    }
     let Some(classified) = Emoji::classify(text) else {
         return Err(invalid_emoji());
     };
@@ -477,15 +535,43 @@ async fn accepted_emoji(state: &AppState, text: &str) -> AppResult<Accepted> {
         Emoji::Unicode(_) => Ok(Accepted {
             text: text.to_owned(),
             url: None,
+            domain: None,
         }),
         Emoji::Custom(shortcode) => local_emoji(&state.db, shortcode)
             .await?
             .map(|emoji| Accepted {
                 text: text.to_owned(),
                 url: Some(emoji.image_url),
+                domain: None,
             })
             .ok_or_else(invalid_emoji),
     }
+}
+
+/// The remote, enabled custom emoji `shortcode@domain` names, stored as the
+/// `:shortcode:` text with the emoji's image and its origin `domain`.
+///
+/// The row is one [`custom_emoji`] knows from a remote post or reaction that
+/// used it, so an emoji this instance never saw is refused like any other
+/// unknown name.
+///
+/// # Errors
+///
+/// [`AppError::BadRequest`] with `"Invalid emoji"` when no enabled row of that
+/// shortcode and domain exists; any database failure arrives through `?` as
+/// [`AppError::Database`].
+async fn remote_emoji(pool: &PgPool, shortcode: &str, domain: String) -> AppResult<Accepted> {
+    let wanted = [shortcode.to_owned()];
+    let found = custom_emoji::get_by_shortcodes(pool, &wanted, Some(domain.as_str())).await?;
+    let emoji = found
+        .into_iter()
+        .find(|emoji| !emoji.disabled)
+        .ok_or_else(invalid_emoji)?;
+    Ok(Accepted {
+        text: format!(":{shortcode}:"),
+        url: Some(emoji.image_url),
+        domain: Some(domain),
+    })
 }
 
 /// The 400 both writes send for an `{emoji}` segment they cannot name.
@@ -587,6 +673,7 @@ mod tests {
         let accepted = Accepted {
             text: ":cat:".to_owned(),
             url: Some("https://test.example/emoji/cats/cat.png".to_owned()),
+            domain: None,
         };
         let (author_id, status_id) = (Uuid::now_v7(), Uuid::now_v7());
         let reaction = accepted.reaction(author_id, status_id);
@@ -603,6 +690,7 @@ mod tests {
         let thumb = Accepted {
             text: "👍".to_owned(),
             url: None,
+            domain: None,
         };
         let unicode = thumb.reaction(author_id, status_id);
         assert_eq!(unicode.url, None, "a unicode reaction names no image");
@@ -666,6 +754,30 @@ mod tests {
         assert_eq!(
             INVALID_EMOJI, "Invalid emoji",
             "the message the ticket pins"
+        );
+    }
+
+    #[test]
+    fn a_read_names_a_remote_emoji_by_its_stored_text_and_domain() {
+        assert_eq!(
+            named_emoji("misskeycat@misskey.test"),
+            (":misskeycat:".to_owned(), Some("misskey.test".to_owned())),
+            "the bare remote spelling"
+        );
+        assert_eq!(
+            named_emoji(":misskeycat@misskey.test:"),
+            (":misskeycat:".to_owned(), Some("misskey.test".to_owned())),
+            "and the coloned one are the same emoji"
+        );
+        assert_eq!(
+            named_emoji(":cat:"),
+            (":cat:".to_owned(), None),
+            "a plain shortcode is the local emoji"
+        );
+        assert_eq!(
+            named_emoji("👍"),
+            ("👍".to_owned(), None),
+            "and unicode is its own text"
         );
     }
 

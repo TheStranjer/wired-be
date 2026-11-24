@@ -12,12 +12,16 @@ use crate::{
         json,
     },
     models::{
+        custom_emoji,
         emoji_reaction::{self, NewReaction},
         favourite,
         user::User,
     },
     state::AppState,
-    util::{emoji::Emoji, sanitize::strip_html},
+    util::{
+        emoji::{Emoji, shortcode as shortcode_of},
+        sanitize::strip_html,
+    },
 };
 
 /// One delivered reaction, in the parts the fold stores.
@@ -159,14 +163,20 @@ pub(super) async fn apply_undo_emoji_react(
             "an Undo of an EmojiReact its actor never made",
         ));
     };
-    let removed = emoji_reaction::unreact(&state.db, signer.id, row.status_id, &row.emoji)
-        .await
-        .map_err(|err| {
-            FederationError::transient(
-                "could not fold the remote interaction's reaction withdrawal",
-                &err,
-            )
-        })?;
+    let removed = emoji_reaction::unreact_in_domain(
+        &state.db,
+        signer.id,
+        row.status_id,
+        &row.emoji,
+        row.emoji_domain.as_deref(),
+    )
+    .await
+    .map_err(|err| {
+        FederationError::transient(
+            "could not fold the remote interaction's reaction withdrawal",
+            &err,
+        )
+    })?;
     let Some(removed) = removed else {
         return Ok(Outcome::Ignored("that reaction is already withdrawn"));
     };
@@ -231,7 +241,8 @@ async fn fold_reaction(
         emoji: &reaction.emoji,
         url: reaction.url.as_deref(),
     };
-    let row = emoji_reaction::react_with_ap_id(&state.db, &new, &view.id)
+    let domain = remember_emoji(state, signer, reaction).await?;
+    let row = emoji_reaction::react_in_domain(&state.db, &new, &view.id, domain)
         .await
         .map_err(|err| {
             FederationError::transient("could not fold the remote interaction's reaction", &err)
@@ -244,6 +255,32 @@ async fn fold_reaction(
         "an inbound reaction landed on a status"
     );
     Ok(Outcome::Handled)
+}
+
+/// Records the custom emoji a delivered reaction brought and answers its origin
+/// domain, `None` for a unicode reaction.
+///
+/// The emoji is filed under the reactor's own domain, as the posts' `Emoji`
+/// tags are, so a local user can later join the reaction by naming
+/// `shortcode@domain`.
+async fn remember_emoji<'a>(
+    state: &AppState,
+    signer: &'a User,
+    reaction: &Reaction,
+) -> Result<Option<&'a str>, FederationError> {
+    let (Some(url), Some(code), Some(domain)) = (
+        reaction.url.as_deref(),
+        shortcode_of(&reaction.emoji),
+        signer.domain.as_deref(),
+    ) else {
+        return Ok(None);
+    };
+    custom_emoji::upsert_remote(&state.db, code, Some(domain), url)
+        .await
+        .map_err(|err| {
+            FederationError::transient("could not record the remote reaction's emoji", &err)
+        })?;
+    Ok(Some(domain))
 }
 
 /// What a `Like`'s `content` states: absent or blank (of any markup) is the

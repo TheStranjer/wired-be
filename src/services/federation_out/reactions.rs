@@ -148,6 +148,53 @@ mod tests {
         );
     }
 
+    /// A reaction with another instance's emoji still sends the bare
+    /// shortcode as `content`, with the `Emoji` tag whose icon is the remote
+    /// image — what Misskey and Pleroma send for a re-used remote emoji.
+    #[tokio::test]
+    async fn a_remote_emoji_reaction_sends_the_shortcode_and_the_remote_image() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = local(&pool, "alice").await;
+        let bob = remote(&pool, "bob").await;
+        let reacted = remote_status(&pool, &bob, "react-remote-emoji", Visibility::Public).await;
+        let emoji_url = "https://misskey.test/files/misskeycat.png";
+        let new = NewReaction {
+            user_id: alice.id,
+            status_id: reacted.id,
+            emoji: ":misskeycat:",
+            url: Some(emoji_url),
+        };
+        let row = emoji_reaction::react_in_domain(
+            &pool,
+            &new,
+            &format!("{TEST_BASE_URL}/activities/remote-emoji-react"),
+            Some("misskey.test"),
+        )
+        .await
+        .expect("the reaction writes");
+        let state = app_state(&pool);
+
+        after_reaction_changed(&state, &row, true).await;
+
+        let activity = the_single_activity(&pool).await;
+        assert_eq!(activity["type"], "EmojiReact");
+        assert_eq!(
+            activity["content"], ":misskeycat:",
+            "the shortcode alone, without the domain"
+        );
+        assert_eq!(
+            activity["tag"],
+            json!([{
+                "type": "Emoji",
+                "id": emoji_url,
+                "name": ":misskeycat:",
+                "icon": { "type": "Image", "url": emoji_url },
+            }]),
+            "the tag's icon is the remote image"
+        );
+    }
+
     /// A plain unicode reaction carries `content` and no `tag` at all.
     #[tokio::test]
     async fn a_unicode_reaction_carries_no_tag() {

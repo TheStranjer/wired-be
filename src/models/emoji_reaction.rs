@@ -44,10 +44,10 @@ mod read;
 mod test_support;
 mod write;
 
-pub use delete::{delete_all_for_user, unreact};
+pub use delete::{delete_all_for_user, unreact, unreact_in_domain};
 pub use groups::ReactorGroup;
 pub use read::{for_statuses, reactors};
-pub use write::{get_by_ap_id, react, react_with_ap_id};
+pub use write::{get_by_ap_id, react, react_in_domain, react_with_ap_id};
 
 /// How many reactors one `pleroma.emoji_reactions` entry names.
 ///
@@ -73,6 +73,11 @@ pub struct EmojiReaction {
     /// Image URL of the custom emoji as [`react`] recorded it; `None` for a
     /// unicode reaction.
     pub url: Option<String>,
+    /// The instance a custom emoji belongs to, as its `custom_emojis`
+    /// `domain`: `Some` for a remote emoji (`:misskeycat:` of `misskey.test`),
+    /// `None` for a unicode or local one. Together with [`emoji`](Self::emoji)
+    /// it is the emoji's identity.
+    pub emoji_domain: Option<String>,
     /// `ActivityPub` id of the `EmojiReact` activity behind this row
     /// (decision 6): a `{BASE_URL}/activities/{uuid}` id minted for a local
     /// reaction, to be replaced by the remote id for a mirrored one.
@@ -102,7 +107,9 @@ pub struct NewReaction<'a> {
 /// custom emoji's image, and the first [`MAX_SUMMARY_REACTORS`] reactors.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReactionSummary {
-    /// The emoji as stored, which is the text a client sends back to react.
+    /// The emoji's API name, which is the text a client sends back to react:
+    /// the stored text, except that a remote custom emoji is
+    /// `shortcode@domain` (see [`crate::util::emoji::display_name`]).
     pub name: String,
     /// How many accounts reacted with this emoji — all of them, not only the
     /// ones [`account_ids`](Self::account_ids) names.
