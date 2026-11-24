@@ -58,10 +58,10 @@ use crate::{
     extract::{ApiBody, ApiParams},
     models::{
         oauth_app::{self, OauthApp},
-        oauth_token::{self, OauthAuthorization},
+        oauth_token::{self, CodeBinding, OauthAuthorization},
         user::User,
     },
-    oauth::scopes::Scopes,
+    oauth::{pkce, scopes::Scopes},
     state::AppState,
 };
 
@@ -114,6 +114,9 @@ pub(crate) struct Delivery<'a> {
     pub redirect_uri: &'a str,
     /// The client's `state`, when it sent one.
     pub state: Option<&'a str>,
+    /// The validated PKCE challenge a minted code is bound to, when the
+    /// client sent one.
+    pub code_challenge: Option<&'a str>,
 }
 
 /// `GET /oauth/authorize` — validate the request and send the browser on
@@ -173,6 +176,7 @@ async fn redirect_to_frontend(
     let app = load_app(&state.db, query.client_id.as_deref()).await?;
     require_registered_redirect(&app, query.redirect_uri.as_deref().unwrap_or_default())?;
     check_scopes_subset(&requested_scopes(query.scope.as_deref()), &app)?;
+    query.require_valid_pkce()?;
     let location = frontend_location(
         &state.config.frontend_base_url,
         uri.query().unwrap_or_default(),
@@ -227,6 +231,37 @@ struct AuthorizeQuery {
     /// Opaque client value, echoed by the JSON description.
     #[serde(default)]
     state: Option<String>,
+    /// The PKCE challenge (RFC 7636) the code is to be bound to; see
+    /// [`pkce::parse_challenge`].
+    #[serde(default)]
+    code_challenge: Option<String>,
+    /// How the challenge was derived; only `S256` is accepted.
+    #[serde(default)]
+    code_challenge_method: Option<String>,
+}
+
+impl AuthorizeQuery {
+    /// The request's validated PKCE challenge, `None` when it sent none.
+    ///
+    /// # Errors
+    ///
+    /// The 400s of [`pkce::parse_challenge`].
+    fn pkce_challenge(&self) -> AppResult<Option<String>> {
+        pkce::parse_challenge(
+            self.code_challenge.as_deref(),
+            self.code_challenge_method.as_deref(),
+        )
+    }
+
+    /// Checks the PKCE parameters without keeping the challenge: the `GET`
+    /// only validates them, the frontend sends them back with its verdict.
+    ///
+    /// # Errors
+    ///
+    /// The 400s of [`pkce::parse_challenge`].
+    fn require_valid_pkce(&self) -> AppResult<()> {
+        self.pkce_challenge().map(|_bound| ())
+    }
 }
 
 /// What a finished authorization answers with.
@@ -327,7 +362,8 @@ pub(crate) fn check_scopes_subset(requested: &Scopes, app: &OauthApp) -> AppResu
 /// Mints the authorization code for the approved scopes and answers with
 /// it (Pleroma's `after_create_authorization`). The external-login
 /// callback of a login without a second factor ends here; an MFA-enabled
-/// account is refused before it gets this far.
+/// account is refused before it gets this far. The delivery's PKCE
+/// challenge, when it has one, binds the code to its verifier.
 ///
 /// # Errors
 ///
@@ -341,12 +377,16 @@ pub(crate) async fn grant_code(
     scopes: &Scopes,
     delivery: &Delivery<'_>,
 ) -> AppResult<AuthorizeReply> {
-    let authorization = oauth_token::create_authorization(
+    let binding = CodeBinding {
+        redirect_uri: delivery.redirect_uri,
+        code_challenge: delivery.code_challenge,
+    };
+    let authorization = oauth_token::create_authorization_with_challenge(
         &state.db,
         user.id,
         app.id,
         &scopes.to_string(),
-        delivery.redirect_uri,
+        binding,
     )
     .await?;
     deliver_code(&authorization, delivery)

@@ -177,8 +177,8 @@ async fn browser_get_redirects_to_the_frontend() {
 }
 
 /// Every parameter survives the redirect decoded-equal: awkward `state`
-/// characters, a missing `scope` (the frontend applies the default) and
-/// parameters this server does not read, such as a PKCE challenge.
+/// characters, a missing `scope` (the frontend applies the default), a
+/// valid PKCE pair and parameters this server does not read.
 #[tokio::test]
 async fn browser_get_keeps_the_whole_query() {
     let db = common::test_db().await;
@@ -186,7 +186,8 @@ async fn browser_get_keeps_the_whole_query() {
     let (_user, app) = fixtures(&pool, "oscar", "read write").await;
     let http = frontend_app(pool.clone());
     let path = format!(
-        "{}&state=a%20b%26c%3Dd&code_challenge=xyz&code_challenge_method=S256",
+        "{}&state=a%20b%26c%3Dd&code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM\
+         &code_challenge_method=S256&force_login=true",
         authorize_get_url(&app.client_id, REDIRECT, "", "")
     );
     let response = common::TestRequest::get(&path).send(&http).await;

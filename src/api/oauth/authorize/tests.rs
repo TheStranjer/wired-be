@@ -120,8 +120,20 @@ fn query_deserializes_every_wire_field_and_ignores_the_rest() {
         "state": "st",
         "force_login": "true",
         "code_challenge": "abc",
+        "code_challenge_method": "S256",
     }))
     .unwrap();
+    assert_eq!(
+        query.code_challenge.as_deref(),
+        Some("abc"),
+        "the PKCE pair"
+    );
+    assert_eq!(query.code_challenge_method.as_deref(), Some("S256"));
+    assert_eq!(
+        message_of(&query.pkce_challenge().unwrap_err()),
+        pkce::INVALID_CODE_CHALLENGE,
+        "a too-short challenge is refused"
+    );
     assert_eq!(
         query.response_type.as_deref(),
         Some(RESPONSE_TYPE_CODE),

@@ -66,6 +66,10 @@ pub(super) struct TokenParams {
     /// §4.1.3).
     #[serde(default)]
     pub(super) redirect_uri: Option<String>,
+    /// The PKCE verifier (RFC 7636 §4.5) a code bound to a challenge must
+    /// be redeemed with. Renders as `<redacted>` in `Debug` output.
+    #[serde(default)]
+    pub(super) code_verifier: Option<String>,
 }
 
 /// [`password`](Self::password), the [`client`](Self::client) secret,
@@ -82,6 +86,7 @@ impl fmt::Debug for TokenParams {
             .field("refresh_token", &"<redacted>")
             .field("code", &"<redacted>")
             .field("redirect_uri", &self.redirect_uri)
+            .field("code_verifier", &"<redacted>")
             .finish()
     }
 }

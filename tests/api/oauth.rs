@@ -64,6 +64,8 @@ mod password_grant;
 /// The `password` grant's scope rules, the deactivated account and the
 /// grant-type refusals.
 mod password_grant_scopes;
+/// PKCE (`S256`) on the authorize endpoint and the code exchange.
+mod pkce;
 /// The `refresh_token` grant: the rotation, the dead old pair and the
 /// refusals.
 mod refresh;

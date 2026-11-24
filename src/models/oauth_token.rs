@@ -45,7 +45,8 @@ mod tokens;
 mod with_app;
 
 pub use authorizations::{
-    OauthAuthorization, consume_authorization, create_authorization, get_authorization_by_id,
+    CodeBinding, OauthAuthorization, consume_authorization, consume_authorization_with_verifier,
+    create_authorization, create_authorization_with_challenge, get_authorization_by_id,
 };
 pub use deletes::{delete_all_for_user, delete_all_for_user_except, delete_for_user, delete_token};
 pub use listing::{TokenWithAppName, list_valid_with_app_names};

@@ -79,8 +79,10 @@ pub(super) async fn client_credentials_grant(
 /// is redeemed by [`consume_authorization`], whose one statement takes
 /// only an unused, unexpired row of *this* application — and, when the row
 /// stores a redirect URI, only with that same `redirect_uri` (RFC 6749
-/// §4.1.3) — and flips it used, so a replay, an expired code, another app's
-/// code and a missing or different `redirect_uri` all answer the shared 400
+/// §4.1.3) — and, when the row is bound to a PKCE challenge, only with the
+/// `code_verifier` that hashes to it (RFC 7636) — and flips it used, so a
+/// replay, an expired code, another app's code, a missing or different
+/// `redirect_uri` and a missing or wrong `code_verifier` all answer the shared 400
 /// [`INVALID_CREDENTIALS`](super::INVALID_CREDENTIALS). The pair carries the authorization's
 /// approved scopes — not a `scope` the client now asks for — and acts as
 /// the account that consented, which still has to exist and be ready to
@@ -105,10 +107,15 @@ pub(super) async fn authorization_code_grant(
         return Err(AppError::BadRequest(MISSING_CODE.to_owned()));
     };
     let app = validate_app(state, headers, params.client.pair()).await?;
-    let authorized =
-        oauth_token::consume_authorization(&state.db, code, app.id, params.redirect_uri.as_deref())
-            .await?
-            .ok_or_else(invalid_credentials)?;
+    let authorized = oauth_token::consume_authorization_with_verifier(
+        &state.db,
+        code,
+        app.id,
+        params.redirect_uri.as_deref(),
+        params.code_verifier.as_deref(),
+    )
+    .await?
+    .ok_or_else(invalid_credentials)?;
     let owner = user::get_by_id(&state.db, authorized.user_id)
         .await?
         .ok_or_else(invalid_credentials)?;
