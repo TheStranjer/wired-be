@@ -83,6 +83,18 @@ Everything else is forbidden. The gate (`scripts/ci.sh`) and every command that 
 - Making lints stricter is welcome.
 - Run `cargo fmt` before committing.
 
+### Lints that bite
+
+`pedantic`, `nursery` and many `restriction` lints are `deny` in `Cargo.toml`, and `clippy.toml` sets strict thresholds. These are the ones that have cost CI rounds. Check your diff against each before you finish.
+
+- **First doc paragraph** (`too_long_first_doc_paragraph`): the first paragraph of every `///` is one short sentence on one line. Put a blank `///` line after it, then the detail.
+- **More than 5 parameters** (`too_many_arguments`, threshold 5 in `clippy.toml`; `self` counts): group them into a struct, the way the existing request/params types are grouped. Also at most 1 `bool` parameter (`max_fn_params_bools`), and functions stay under 80 lines.
+- **Unused results** (`unused_results`, rustc): a statement that yields a non-`()` value is an error. Never write `let _ =` (`let_underscore_untyped` and `let_underscore_must_use` are denied too), and never `.ok();` (`unused_result_ok`). Bind the value to a named variable and use it (`let deleted = query.execute(pool).await?.rows_affected();`), or turn it into `()` the way the repo does: `.execute(executor).await.map(drop)?;`. For builder chains that return `&mut Self`, bind with a type: `let _bound: &mut _ = builder.push_bind(x);` (see `src/pagination.rs`).
+- **`impl Trait` parameters** (`impl_trait_in_params`): use a named generic, e.g. `fn f<'e, E: PgExecutor<'e>>(executor: E)` or `where E: Executor<'e, Database = Postgres>` as in `src/models/endorsement.rs`.
+- **String slicing** (`string_slice`): no `s[a..b]` on a `str`. Use `split_once`, `strip_prefix`, `char_indices` or `get(a..b)`. Slices of `[T]` are caught by `indexing_slicing`; use `get`, `first`, `split_at_checked` or iterators there.
+- **Long tuple types** (`type_complexity`, threshold 150): give the type a `type` alias (as `StoredActivity` in `src/models/activity.rs`) or a small struct.
+- **Unused imports:** when you delete the last use of an item, delete its `use` in the same edit, and re-read the import block of every file you trimmed. `warnings` is `deny`, so a stale import fails the gate.
+
 ## Database and configuration
 
 - PostgreSQL is the only database. Use `sqlx` with its Postgres driver; don't add other database backends or ORMs.
