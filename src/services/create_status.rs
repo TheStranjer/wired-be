@@ -154,7 +154,9 @@ pub(crate) use build::{Prepared, prepared_new_status};
 pub use build::{render_status_fields, render_status_fields_with_mentions};
 pub use create::{RenderedFields, create_status};
 pub use edit::{EditStatusParams, edit_status};
-pub use idempotency::{create_status_idempotent, create_status_with_key};
+pub use idempotency::{
+    create_status_for_schedule, create_status_idempotent, create_status_with_key,
+};
 pub use params::{CheckedPoll, CreateStatusParams, PollRequest};
 pub use preview::preview_status;
 pub use validate::{Checked, check_body};

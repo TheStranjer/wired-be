@@ -1,5 +1,8 @@
 //! Replacing, filtering and clearing a post's media in an edit.
 
+use chrono::{TimeDelta, Utc};
+use wired_be::models::scheduled_status::{self, NewScheduledStatus};
+
 use super::*;
 
 /// `media_ids` replaces the post's whole attachment set: the named upload
@@ -113,5 +116,53 @@ async fn media_can_be_cleared_and_an_absent_list_touches_nothing() {
     assert!(
         stored_media(&pool, row.id).await.is_empty(),
         "the post wears nothing after the clearing edit"
+    );
+}
+
+/// An upload a pending schedule reserves is not the edit's to take: it
+/// drops out of the replacement like any other id the author may not
+/// attach, the post keeps the attachment it already wore, and the schedule's
+/// reservation is left alone.
+#[tokio::test]
+async fn an_upload_a_schedule_reserves_drops_out_of_the_replacement() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let app = common::test_app(pool.clone());
+    let (alice, token) = editor(&pool, "reserver").await;
+    let row = post(&pool, &alice, "reserved elsewhere").await;
+    let worn = attach(&pool, &alice, &row, 0).await;
+    let reserved = upload(&pool, &alice).await;
+    let _schedule: scheduled_status::ScheduledStatus = scheduled_status::insert(
+        &pool,
+        &NewScheduledStatus {
+            user_id: alice.id,
+            scheduled_at: Utc::now() + TimeDelta::hours(2),
+            params: json!({"status": "later", "media_ids": [reserved.to_string()]}),
+        },
+    )
+    .await
+    .expect("the schedule fixture inserts");
+
+    let response = edit_row(
+        &app,
+        &token,
+        &row,
+        json!({"media_ids": [worn.to_string(), reserved.to_string()]}),
+    )
+    .await;
+
+    common::assert_answer(&response, StatusCode::OK, "the edit passes");
+    assert_eq!(
+        stored_media(&pool, row.id).await,
+        vec![worn],
+        "the reserved upload dropped out and the worn one stayed"
+    );
+    let untouched = media_attachment::get_by_id(&pool, reserved)
+        .await
+        .unwrap()
+        .expect("the reserved upload is stored");
+    assert!(
+        untouched.status_id.is_none(),
+        "the reservation still holds: no status claimed the upload"
     );
 }

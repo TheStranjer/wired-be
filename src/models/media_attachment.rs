@@ -24,12 +24,14 @@
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
+mod claimable;
 mod inserts;
 mod reads;
 #[cfg(test)]
 mod test_support;
 mod writes;
 
+pub use claimable::{claimable_ids, claimable_predicate};
 pub use inserts::insert;
 pub use reads::{for_statuses, get_by_id, get_chat_attachment, get_many, get_own_unattached};
 pub use writes::{

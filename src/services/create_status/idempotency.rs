@@ -14,7 +14,7 @@ use tracing::{debug, warn};
 use uuid::Uuid;
 
 use super::{
-    CreateStatusParams,
+    CheckedPoll, CreateStatusParams,
     build::{Prepared, prepared_new_status},
     create::{created_entity, store_poll},
 };
@@ -93,9 +93,52 @@ pub async fn create_status_with_key(
         return replayed_entity(state, user, &row).await;
     }
     let Prepared { new, poll, .. } = prepared_new_status(state, user, app, &params).await?;
+    store_prepared(state, user, &new, poll.as_ref(), key).await
+}
+
+/// Publishes the schedule `schedule_id` as `user`.
+///
+/// This is the plain keyless create of `params`, except that the schedule's
+/// own reservation of its media does not block the claim.
+///
+/// The schedule's row still stands while it publishes (the caller deletes it
+/// once this answers), so the media gate would otherwise see its own
+/// reservation and refuse; `schedule_id` is what that gate lets through.
+/// Every other reservation still holds.
+///
+/// # Errors
+///
+/// Those of [`crate::services::create_status::create_status`].
+pub async fn create_status_for_schedule(
+    state: &AppState,
+    user: &User,
+    params: CreateStatusParams,
+    schedule_id: Uuid,
+) -> AppResult<Status> {
+    let Prepared { mut new, poll, .. } = prepared_new_status(state, user, None, &params).await?;
+    new.schedule_id = Some(schedule_id);
+    store_prepared(state, user, &new, poll.as_ref(), None).await
+}
+
+/// The write half of the create, answering the author's entity.
+///
+/// Stores the prepared `new` row and its `poll` on one transaction and
+/// settles the optional idempotency `key` on it; a raced key answers the
+/// winner's entity instead.
+///
+/// # Errors
+///
+/// Those of [`create_status_with_key`] past its key read.
+async fn store_prepared(
+    state: &AppState,
+    user: &User,
+    new: &status::NewStatus,
+    poll: Option<&CheckedPoll>,
+    key: Option<&str>,
+) -> AppResult<Status> {
     let mut tx = state.db.begin().await?;
-    let row = status::insert_conn(&mut tx, &state.config.base_url, &new).await?;
-    store_poll(&mut tx, row.id, poll.as_ref()).await?;
+    let row = status::insert_conn(&mut tx, &state.config.base_url, new).await?;
+    store_poll(&mut tx, row.id, poll).await?;
     if let Some(winner) = settle_key(&mut tx, user.id, key, row.id).await? {
         // Ours never happened: the racing create's row is the key's answer,
         // and our uncommitted write goes back with this rollback.

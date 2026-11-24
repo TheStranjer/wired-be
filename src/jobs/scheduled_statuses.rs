@@ -7,7 +7,7 @@
 //! parked until a future moment. When a row's
 //! [`scheduled_at`](ScheduledStatus::scheduled_at) arrives, a [`KIND_PUBLISH`]
 //! job on [`QUEUE_SCHEDULED`] replays the stored params through the ordinary
-//! create path — [`create_status`] as the stored author — and removes the row:
+//! create path — [`create_status_for_schedule`] as the stored author — and removes the row:
 //! Pleroma's `ScheduledActivityWorker`
 //! (`lib/pleroma/workers/scheduled_activity_worker.ex`). The producer side is
 //! the endpoint ticket that stores the row and [schedules](schedule) its fire.
@@ -51,7 +51,7 @@ use crate::{
         scheduled_status::{self, ScheduledStatus},
         user,
     },
-    services::create_status::{CreateStatusParams, create_status},
+    services::create_status::{CreateStatusParams, create_status_for_schedule},
     state::AppState,
 };
 
@@ -212,8 +212,10 @@ async fn roll_back(tx: Transaction<'_, Postgres>) {
 /// LOCKED` only while its moment has passed, so of two runners reaching one
 /// row only one gets it, and a stale fire can never post a schedule that was
 /// moved into the future. The lock is held on the transaction's connection
-/// while [`create_status`] works through the pool — it only reads
-/// `scheduled_statuses`, which the lock does not block — and the delete and
+/// while [`create_status_for_schedule`] works through the pool — it only reads
+/// `scheduled_statuses`, which the lock does not block, and it is told which
+/// row is its own so the row's reservation of its media does not refuse the
+/// claim — and the delete and
 /// commit release it. A runner that finds nothing to claim (the row is gone,
 /// not due, or held by another runner) rolls back and reports `Ok(false)`.
 ///
@@ -306,12 +308,11 @@ async fn publish_locked(
 /// published, refused-for-good, or retry. A refusal is the row's last word
 /// — the same body will be refused again — so it leaves through [`drop_row`]
 /// like the author-less arm. Either way the fire runs the plain
-/// [`create_status`], never its replayable twin, so an `idempotency` key
+/// [`create_status_for_schedule`], never the replayable twin, so an `idempotency` key
 /// parked beside the stored params is inert in every arm: it is the
 /// [`ScheduledStatus`] entity's echo, and nothing claims it on the account's
 /// replay list.
 ///
-/// [`create_status`]: crate::services::create_status::create_status
 /// [`ScheduledStatus`]: crate::entities::scheduled_status::ScheduledStatus
 ///
 /// # Errors
@@ -325,7 +326,7 @@ async fn publish_params(
     author: &user::User,
     params: CreateStatusParams,
 ) -> Result<(), JobError> {
-    match create_status(state, author, None, params).await {
+    match create_status_for_schedule(state, author, params, row.id).await {
         Ok(created) => {
             if let Err(err) = scheduled_status::delete_on(conn, row.id).await {
                 return Err(retry(PASS_JOB, &err));
@@ -515,6 +516,7 @@ mod tests {
 
     mod barred_authors;
     mod claims;
+    mod media;
     mod queueing;
 
     /// The handler's attempt info: the first of however many the job gets.
@@ -741,23 +743,20 @@ mod tests {
         let pool = db.pool().clone();
         let alice = local_user(&pool, "alice").await;
         let now = Utc::now();
-        let pic = upload(&pool, &alice).await;
-        // Both due rows claim the same upload, and only the first fire can
-        // take it: which text ends up posted proves which row the sweep
-        // walked first. The loser is refused it and dropped, itself a
-        // publish through the same arm the per-row handler runs.
+        // Status ids are `UUIDv7`, minted in publish order, so the posts
+        // read back by id show which row the sweep walked first.
         let older = parked(
             &pool,
             &alice,
             now - TimeDelta::hours(2),
-            json!({ "status": "the older one", "media_ids": [pic.id.to_string()] }),
+            json!({ "status": "the older one" }),
         )
         .await;
         let newer = parked(
             &pool,
             &alice,
             now - TimeDelta::hours(1),
-            json!({ "status": "the newer one", "media_ids": [pic.id.to_string()] }),
+            json!({ "status": "the newer one" }),
         )
         .await;
         let future = parked(
@@ -771,23 +770,23 @@ mod tests {
         let outcome = handle_sweep(app_state(&pool), FIRST_ATTEMPT, json!({})).await;
 
         assert_eq!(outcome, Ok(()), "a sweep over due rows succeeds");
-        let posts = posts_of(&pool, &alice).await;
+        let texts: Vec<String> = posts_of(&pool, &alice)
+            .await
+            .into_iter()
+            .map(|post| post.raw_text)
+            .collect();
         assert_eq!(
-            posts.len(),
-            1,
-            "the second claim of the same upload refused"
-        );
-        assert_eq!(
-            posts[0].raw_text, "the older one",
-            "the sweep walked oldest first: {posts:?}"
+            texts,
+            vec!["the older one".to_owned(), "the newer one".to_owned()],
+            "the sweep walked oldest first"
         );
         assert!(
             fetched(&pool, older.id).await.is_none(),
-            "the published row is gone"
+            "the older row is gone"
         );
         assert!(
             fetched(&pool, newer.id).await.is_none(),
-            "the refused row is gone too, not retried forever"
+            "and so is the newer one"
         );
         assert!(
             fetched(&pool, future.id).await.is_some(),
@@ -796,7 +795,7 @@ mod tests {
 
         let empty = handle_sweep(app_state(&pool), FIRST_ATTEMPT, json!({})).await;
         assert_eq!(empty, Ok(()), "the next pass finds nothing new to fire");
-        assert_eq!(post_count(&pool).await, 1, "and fired nothing twice");
+        assert_eq!(post_count(&pool).await, 2, "and fired nothing twice");
     }
 
     #[tokio::test]

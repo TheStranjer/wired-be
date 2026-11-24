@@ -28,12 +28,12 @@
 //! tombstones.
 
 use chrono::{DateTime, Utc};
-use sqlx::{PgConnection, PgPool};
+use sqlx::{AssertSqlSafe, PgConnection, PgPool};
 use uuid::Uuid;
 
 use crate::{
     error::AppResult,
-    models::{hashtag, mention, status::Status},
+    models::{hashtag, media_attachment::claimable_predicate, mention, status::Status},
     util::id::new_id,
 };
 
@@ -88,23 +88,30 @@ const APPLY_SQL: &str = "UPDATE statuses
    WHERE id = $1 AND deleted_at IS NULL
 RETURNING *";
 
-/// [`update_status`]'s media arm, step one: the usable part of the
-/// submitted ids — the author's own rows that no *other* status claims,
-/// deduplicated to their first position and answered in the order the
-/// client sent them. Anything else (an unknown id, another account's
-/// upload, a row already posted elsewhere) names nothing and drops out,
-/// Pleroma's `CommonAPI.Utils.attachments_from_ids` rejecting the nils the
-/// same way.
-const MEDIA_PLAN_SQL: &str = "WITH requested AS (
+/// [`update_status`]'s media arm, step one, as SQL text: the usable part of
+/// the submitted ids.
+///
+/// Those are the rows [`claimable_predicate`] lets the author claim for this
+/// status (their own, held by no *other* status and reserved by no pending
+/// schedule), deduplicated to their first position and answered in the
+/// order the client sent them. Anything else (an unknown id, another
+/// account's upload, a row already posted elsewhere, an upload a schedule
+/// reserves) names nothing and drops out, Pleroma's
+/// `CommonAPI.Utils.attachments_from_ids` rejecting the nils the same way.
+fn media_plan_sql() -> String {
+    format!(
+        "WITH requested AS (
     SELECT id, min(ord) AS ord
       FROM unnest($2::uuid[]) WITH ORDINALITY AS t(id, ord)
      GROUP BY id
 )
 SELECT m.id FROM requested
      JOIN media_attachments m ON m.id = requested.id
-    WHERE m.user_id = $3
-      AND (m.status_id IS NULL OR m.status_id = $1)
-ORDER BY requested.ord";
+    WHERE {}
+ORDER BY requested.ord",
+        claimable_predicate("$3", "$1", "NULL")
+    )
+}
 
 /// [`update_status`]'s media arm, step two: the attachments the replacement
 /// leaves behind are freed (their rows stay, unposted, exactly like an
@@ -114,7 +121,7 @@ const MEDIA_DETACH_SQL: &str = "UPDATE media_attachments
    WHERE status_id = $1 AND NOT (id = ANY($2))";
 
 /// [`update_status`]'s media arm, step three: the surviving ids, in the
-/// order [`MEDIA_PLAN_SQL`] resolved them, take positions from zero. The
+/// order [`media_plan_sql`] resolved them, take positions from zero. The
 /// ordinality is one-based; the column counts from zero.
 const MEDIA_ATTACH_SQL: &str = "UPDATE media_attachments m
      SET status_id = $1, position = v.position, updated_at = now()
@@ -324,7 +331,7 @@ async fn media_ids_of(conn: &mut PgConnection, status_id: Uuid) -> AppResult<Vec
 }
 
 /// Filters `submitted` down to the ids this edit may attach to `status_id`
-/// (see [`MEDIA_PLAN_SQL`]), in the order the client sent them. The
+/// (see [`media_plan_sql`]), in the order the client sent them. The
 /// surviving list is both the new media set and what the post wears once
 /// [`replace_media`] has run.
 async fn resolve_media(
@@ -333,7 +340,8 @@ async fn resolve_media(
     user_id: Uuid,
     submitted: &[Uuid],
 ) -> AppResult<Vec<Uuid>> {
-    let rows = sqlx::query_as::<_, (Uuid,)>(MEDIA_PLAN_SQL)
+    // The statement is assembled from constants only; every value is bound.
+    let rows = sqlx::query_as::<_, (Uuid,)>(AssertSqlSafe(media_plan_sql()))
         .bind(status_id)
         .bind(submitted.to_vec())
         .bind(user_id)

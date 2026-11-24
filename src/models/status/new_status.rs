@@ -95,6 +95,13 @@ pub struct NewStatus {
     /// any id names a row the poster may not claim (see
     /// [`media_attachment::MEDIA_NOT_FOUND`]); empty in the default.
     pub media_ids: Vec<Uuid>,
+    /// The pending schedule this post is the publish of, `None` otherwise.
+    ///
+    /// That schedule's row still stands while it publishes,
+    /// and its reservation of [`media_ids`](Self::media_ids) must not block
+    /// the claim it makes for itself (see
+    /// [`crate::models::media_attachment::attach_to_status`]).
+    pub schedule_id: Option<Uuid>,
     /// Whether this instance owns the post; `false` in the default, as in
     /// [`NewUser`](crate::models::user::NewUser).
     pub local: bool,
@@ -137,6 +144,7 @@ impl Default for NewStatus {
             mentioned_user_ids: Vec::new(),
             hashtags: Vec::new(),
             media_ids: Vec::new(),
+            schedule_id: None,
             local: false,
             application_name: None,
             application_website: None,
@@ -301,6 +309,7 @@ async fn claim_media(
         &new_status.media_ids,
         status_id,
         new_status.user_id,
+        new_status.schedule_id,
     )
     .await?;
     let wanted = u64::try_from(new_status.media_ids.len()).unwrap_or(u64::MAX);

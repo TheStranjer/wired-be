@@ -58,8 +58,6 @@
 //!
 //! [`MEDIA_NOT_FOUND`]: crate::models::media_attachment::MEDIA_NOT_FOUND
 
-use std::collections::HashMap;
-
 use chrono::{DateTime, Utc};
 use serde_json::{Map, Value};
 use sqlx::PgConnection;
@@ -71,7 +69,7 @@ use crate::{
     entities::scheduled_status::ScheduledStatus,
     error::{AppError, AppResult},
     models::{
-        media_attachment::{self, MEDIA_NOT_FOUND, MediaAttachment as AttachmentRow},
+        media_attachment::{self, MEDIA_NOT_FOUND},
         oauth_app::OauthApp,
         scheduled_status::{self, NewScheduledStatus, ScheduledStatus as StoredRow},
         status::NewStatus,
@@ -287,49 +285,25 @@ fn breaches(count: i64, limit: usize) -> bool {
     usize::try_from(count).unwrap_or(usize::MAX) >= limit
 }
 
-/// The media gate: every id the checked body names must be a row that
-/// exists, is this account's own upload, and is claimed by no status —
-/// and no pending schedule (anybody's) may already name it in its stored
-/// `media_ids`. Any failure is the create's own [`MEDIA_NOT_FOUND`] 422,
-/// which never says which of the four the id was. Nothing is written:
-/// the reservation is the pending row's params, read back by
-/// [`reserved_media_ids`], and the publish performs the actual attach
-/// through the ordinary create.
+/// The media gate: every id the checked body names must be claimable.
 ///
-/// [`reserved_media_ids`]: scheduled_status::reserved_media_ids
+/// Claimable is the one shared rule, [`media_attachment::claimable_ids`]:
+/// this account's own upload that no status holds and no pending schedule
+/// (anybody's) already reserves in its stored `media_ids`. Any failure is the create's own [`MEDIA_NOT_FOUND`] 422,
+/// which never says which way the id failed. Nothing is written: the
+/// reservation is the pending row's params, and the publish performs the
+/// actual attach through the ordinary create.
 ///
 /// # Errors
 ///
 /// [`AppError::Unprocessable`] with [`MEDIA_NOT_FOUND`], plus any
 /// database failure as [`AppError::Database`].
 async fn check_media(state: &AppState, user_id: Uuid, ids: &[Uuid]) -> AppResult<()> {
-    if ids.is_empty() {
+    let claimable = media_attachment::claimable_ids(&state.db, user_id, ids).await?;
+    if ids.iter().all(|id| claimable.contains(id)) {
         return Ok(());
     }
-    let rows = media_attachment::get_many(&state.db, ids).await?;
-    let by_id: HashMap<Uuid, &AttachmentRow> = rows.iter().map(|row| (row.id, row)).collect();
-    if !ids
-        .iter()
-        .all(|id| claimable(by_id.get(id).copied(), user_id))
-    {
-        return Err(media_refusal());
-    }
-    let reserved = scheduled_status::reserved_media_ids(&state.db, ids).await?;
-    if ids.iter().any(|id| reserved.contains(id)) {
-        return Err(media_refusal());
-    }
-    Ok(())
-}
-
-/// Whether `row` — the stored attachment behind one submitted id, if any
-/// — is this poster's upload that no status has taken yet.
-fn claimable(row: Option<&AttachmentRow>, user_id: Uuid) -> bool {
-    row.is_some_and(|found| found.user_id == Some(user_id) && found.status_id.is_none())
-}
-
-/// The media refusal, shared by both arms of [`check_media`].
-fn media_refusal() -> AppError {
-    AppError::Unprocessable(MEDIA_NOT_FOUND.to_owned())
+    Err(AppError::Unprocessable(MEDIA_NOT_FOUND.to_owned()))
 }
 
 /// The jsonb the row parks: the request struct as the
