@@ -241,7 +241,7 @@ mod tests {
         assert!(params.local.get(), "`local=true`");
         assert!(params.remote.get(), "`remote=1`");
         assert!(params.only_media.get(), "`only_media` is case-insensitive");
-        assert!(!params.with_muted.get(), "`yes` is not true here");
+        assert!(params.with_muted.get(), "`yes` is a true spelling");
         let off = parsed("local=false&remote=");
         assert!(
             !off.local.get() && !off.remote.get(),

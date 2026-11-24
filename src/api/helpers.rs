@@ -42,7 +42,7 @@ use crate::{
         timeline::TimelineQuery,
     },
     state::AppState,
-    util::id::parse_id,
+    util::{id::parse_id, params::truthy},
 };
 
 /// The `RESTRICT_UNAUTHENTICATED` area that closes anonymous reads of a
@@ -495,13 +495,12 @@ pub fn push_visibility(list: &mut Vec<Visibility>, raw: &str) {
 
 /// Whether a query parameter's text spells a true boolean.
 ///
-/// `true` or `1`, trimmed and matched case-insensitively — the same reading
-/// [`crate::api::search`] gives its flags; anything else (absent, empty,
-/// `false`, junk) is `false`.
+/// [`truthy`] is `Some(true)` — `true`, `1`, `on`, `yes` or `t`, trimmed and
+/// matched case-insensitively, the reading every flag in the crate shares;
+/// anything else (absent, empty, `false`, junk) is `false`.
 #[must_use]
 pub fn is_true(text: &str) -> bool {
-    let text = text.trim();
-    text.eq_ignore_ascii_case("true") || text == "1"
+    truthy(text) == Some(true)
 }
 
 /// Starts `account`'s deletion: the write the admin `DELETE
@@ -810,10 +809,10 @@ mod tests {
 
     #[test]
     fn the_shared_readers_spell_true_and_a_stored_visibility() {
-        for text in ["true", "1", "TRUE", " true "] {
+        for text in ["true", "1", "TRUE", " true ", "yes", "on", "t"] {
             assert!(is_true(text), "`{text}` spells true");
         }
-        for text in ["", " ", "false", "0", "yes"] {
+        for text in ["", " ", "false", "0", "no", "junk"] {
             assert!(!is_true(text), "`{text}` is not true here");
         }
         let mut kept = Vec::new();

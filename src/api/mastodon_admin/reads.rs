@@ -295,7 +295,7 @@ mod tests {
             "staff=false is nobody's role"
         );
 
-        let mixed = v1_params(Some("active=yes&staff&pending=TRUE"));
+        let mixed = v1_params(Some("active=maybe&staff&pending=TRUE"));
         assert_eq!(
             mixed.pending,
             Criterion::Only,
@@ -304,7 +304,12 @@ mod tests {
         assert_eq!(
             mixed.active,
             Criterion::Any,
-            "`yes` is no boolean this listing weighs"
+            "`maybe` is no boolean this listing weighs"
+        );
+        assert_eq!(
+            v1_params(Some("local=yes&remote=no")).local,
+            Criterion::Only,
+            "`yes` is a true spelling"
         );
         assert_eq!(mixed.staff, Criterion::Any, "and a bare key is no value");
     }

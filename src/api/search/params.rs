@@ -7,6 +7,7 @@ use url::form_urlencoded;
 use uuid::Uuid;
 
 use crate::{
+    api::helpers::is_true,
     entities::tag::Tag,
     error::{AppError, AppResult},
     models::{hashtag::Hashtag, user_search::SearchOpts},
@@ -163,15 +164,6 @@ fn account_id_param(text: &str) -> AppResult<Option<Uuid>> {
         .ok_or_else(|| AppError::BadRequest(INVALID_ID.to_owned()))
 }
 
-/// Whether a query parameter's text spells a true boolean: `true` or `1`,
-/// trimmed and matched case-insensitively — the same reading the directory
-/// gives its `local` flag; anything else (absent, empty, `false`, junk)
-/// is `false`.
-fn is_true(text: &str) -> bool {
-    let text = text.trim();
-    text.eq_ignore_ascii_case("true") || text == "1"
-}
-
 /// The hashtag list of a combined-search answer, in the spelling the
 /// answering version renders: v1's plain name strings, v2's [`Tag`]
 /// entities with the (search-side uncomputed) `history` key as the empty
@@ -254,7 +246,7 @@ mod tests {
         assert_eq!(bare.page.offset, None, "no offset means the first page");
         assert_eq!(bare.account_id, None, "no author narrows the status search");
 
-        let junk = parse("q=bob&following=yes&resolve=0");
+        let junk = parse("q=bob&following=maybe&resolve=0");
         assert!(!junk.following, "junk is not a true");
         assert!(!junk.resolve);
 
@@ -453,10 +445,10 @@ mod tests {
 
     #[test]
     fn only_the_true_spellings_of_a_flag_are_true() {
-        for text in ["true", "TRUE", " true ", "1"] {
+        for text in ["true", "TRUE", " true ", "1", "yes", "on"] {
             assert!(is_true(text), "`{text}` asks for the restriction");
         }
-        for text in ["", "false", "0", "yes", "2", " true and then some "] {
+        for text in ["", "false", "0", "no", "2", " true and then some "] {
             assert!(!is_true(text), "`{text}` is not a true flag");
         }
     }

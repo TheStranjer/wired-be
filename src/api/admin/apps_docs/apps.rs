@@ -23,7 +23,7 @@ use crate::{
     models::oauth_app::{self, AdminNewApp, AppChanges},
     oauth::scopes::Scopes,
     state::AppState,
-    util::id::parse_id,
+    util::{id::parse_id, params::truthy},
 };
 
 /// The refusal Ecto renders for a blank required field, the message the
@@ -240,9 +240,9 @@ fn search_params(params: &HashMap<String, String>) -> AppResult<oauth_app::AppSe
     })
 }
 
-/// The `trusted` query parameter as a filter: the same boolean spellings
-/// the body flex readers accept (`true`/`false`, `1`/`0`,
-/// case-insensitively); anything else is the 400 naming the parameter.
+/// The `trusted` query parameter as a filter: the boolean spellings
+/// [`truthy`] reads, the same the body flex readers accept; anything else
+/// is the 400 naming the parameter.
 ///
 /// # Errors
 ///
@@ -251,13 +251,9 @@ fn query_trusted(params: &HashMap<String, String>) -> AppResult<Option<bool>> {
     let Some(text) = super::super::text_of(params, "trusted") else {
         return Ok(None);
     };
-    match text.to_ascii_lowercase().as_str() {
-        "true" | "1" => Ok(Some(true)),
-        "false" | "0" => Ok(Some(false)),
-        _ => Err(AppError::BadRequest(format!(
-            "trusted must be a boolean, not {text}"
-        ))),
-    }
+    truthy(&text)
+        .map(Some)
+        .ok_or_else(|| AppError::BadRequest(format!("trusted must be a boolean, not {text}")))
 }
 
 /// `POST /api/v1/pleroma/admin/oauth_app` — Pleroma's `create`: validate

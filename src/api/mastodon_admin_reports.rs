@@ -115,7 +115,7 @@ use crate::{
         report_moderation::set_report_state,
     },
     state::AppState,
-    util::id::parse_id,
+    util::{id::parse_id, params::truthy},
 };
 
 /// The read endpoint class of [`StaffUser::require`].
@@ -379,18 +379,12 @@ fn list_params(pairs: &QueryPairs) -> AppResult<report::MastodonListParams> {
     })
 }
 
-/// The `resolved` filter: `true` asks for the acted-on pair and `false`
-/// for the open queue, each also spelled the way form-encoded clients
-/// send booleans (`1` / `0`); anything else — absence, emptiness, junk —
-/// is no statement, and the listing keeps its open default (Pleroma's
-/// `restrict_state` reads only the literal `true` as an action request
-/// and falls everything else through to `open`).
+/// The `resolved` filter: a true spelling asks for the acted-on pair and
+/// a false one for the open queue, in every spelling [`truthy`] reads
+/// (`true`, `1`, `yes`, `off`, …); anything else — absence, emptiness,
+/// junk — is no statement, and the listing keeps its open default.
 fn resolved_filter(text: Option<&str>) -> Option<bool> {
-    match text {
-        Some("true" | "1") => Some(true),
-        Some("false" | "0") => Some(false),
-        _ => None,
-    }
+    text.and_then(truthy)
 }
 
 /// One id filter: absent or empty names nothing to filter on, a value
@@ -576,21 +570,21 @@ mod tests {
     /// at all, which the listing also reads as open.
     #[test]
     fn the_resolved_filter_reads_booleans_and_ignores_junk() {
-        for stated in ["true", "1"] {
+        for stated in ["true", "1", "yes", "TRUE"] {
             assert_eq!(
                 resolved_filter(Some(stated)),
                 Some(true),
                 "`{stated}` is the acted-on pair"
             );
         }
-        for stated in ["false", "0"] {
+        for stated in ["false", "0", "no"] {
             assert_eq!(
                 resolved_filter(Some(stated)),
                 Some(false),
                 "`{stated}` states the open queue"
             );
         }
-        for unstated in [None, Some(""), Some("yes"), Some("TRUE"), Some("closed")] {
+        for unstated in [None, Some(""), Some("maybe"), Some("closed")] {
             assert_eq!(
                 resolved_filter(unstated),
                 None,

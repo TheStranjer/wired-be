@@ -4,6 +4,8 @@
 use serde::{Deserialize as _, Deserializer, de::Error as SerdeError};
 use serde_json::Value;
 
+use crate::util::params::truthy;
+
 /// A `bool` that also accepts the form spellings `true`/`false` (any
 /// case), `1`/`0`, `on`/`off`, `yes`/`no` and `t`/`f`.
 ///
@@ -125,11 +127,7 @@ where
 fn coerce_bool(value: &Value) -> Option<bool> {
     match value {
         Value::Bool(found) => Some(*found),
-        Value::String(text) => match text.trim().to_ascii_lowercase().as_str() {
-            "true" | "1" | "on" | "yes" | "t" => Some(true),
-            "false" | "0" | "off" | "no" | "f" => Some(false),
-            _ => None,
-        },
+        Value::String(text) => truthy(text),
         Value::Null | Value::Number(_) | Value::Array(_) | Value::Object(_) => None,
     }
 }
