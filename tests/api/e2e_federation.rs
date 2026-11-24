@@ -218,8 +218,8 @@ async fn a_local_follow_and_post_deliver_one_create_the_mock_can_verify() {
         .expect("the keyed local fixture stores its public key");
     assert_eq!(
         create.path(),
-        peer.inbox_path(&peer.actor(BOB)),
-        "at the mentioned account's own inbox"
+        remote::INBOX,
+        "a public post reaches the mentioned account's host at its shared inbox"
     );
     assert_eq!(
         create.activity()["object"]["id"],

@@ -74,10 +74,10 @@ async fn a_public_note_fans_out_to_the_remote_followers() {
     );
 }
 
-/// A directly addressed remote user is reached at their personal
-/// inbox even when they publish a shared one.
+/// A mentioned remote user of a public note is reached at their shared
+/// inbox when they publish one.
 #[tokio::test]
-async fn a_mentioned_remote_user_gets_their_personal_inbox() {
+async fn a_mentioned_remote_user_gets_their_shared_inbox() {
     let db = crate::test_db::test_db().await.expect("test database slot");
     let pool = db.pool().clone();
     let alice = alice(&pool).await;
@@ -103,8 +103,177 @@ async fn a_mentioned_remote_user_gets_their_personal_inbox() {
     assert_eq!(count, 1, "the mention is the only resolved recipient");
     assert_eq!(
         delivered_inboxes(&pool).await,
+        vec!["https://peer.example/inbox"],
+        "a public activity delivers to the shared inbox"
+    );
+}
+
+/// A mentioned remote user of a public note who publishes no shared inbox
+/// is reached at their personal inbox.
+#[tokio::test]
+async fn a_mentioned_remote_user_without_a_shared_inbox_gets_their_personal_inbox() {
+    let db = crate::test_db::test_db().await.expect("test database slot");
+    let pool = db.pool().clone();
+    let alice = alice(&pool).await;
+    let bob = mirror(
+        &pool,
+        "bob",
+        "peer.example",
+        "https://peer.example/users/bob/inbox",
+        None,
+    )
+    .await;
+    let state = test_state(&pool);
+    let activity = json!({
+        "id": ACTIVITY_ID,
+        "type": "Create",
+        "actor": alice.ap_id,
+        "to": [bob.ap_id, PUBLIC],
+        "cc": [alice.followers_url],
+    });
+
+    let count = publish_ok(&state, &alice, &activity, PublishOpts::default()).await;
+
+    assert_eq!(count, 1, "the mention is the only resolved recipient");
+    assert_eq!(
+        delivered_inboxes(&pool).await,
         vec!["https://peer.example/users/bob/inbox"],
-        "a direct address delivers to the personal inbox, not the shared one"
+        "with no shared inbox known the personal one stands"
+    );
+}
+
+/// A public boost of a remote author who also follows the booster costs
+/// the author's host one delivery, to its shared inbox.
+#[tokio::test]
+async fn a_boost_of_a_following_remote_author_is_delivered_once() {
+    let db = crate::test_db::test_db().await.expect("test database slot");
+    let pool = db.pool().clone();
+    let alice = alice(&pool).await;
+    let carol = mirror(
+        &pool,
+        "carol",
+        "peer.example",
+        "https://peer.example/users/carol/inbox",
+        Some("https://peer.example/inbox"),
+    )
+    .await;
+    followed(&pool, &carol, &alice).await;
+    let state = test_state(&pool);
+    let activity = json!({
+        "id": ACTIVITY_ID,
+        "type": "Announce",
+        "actor": alice.ap_id,
+        "object": "https://peer.example/notes/1",
+        "to": [PUBLIC],
+        "cc": [alice.followers_url, carol.ap_id],
+    });
+
+    let count = publish_ok(&state, &alice, &activity, PublishOpts::default()).await;
+
+    assert_eq!(count, 1, "follower and author share one host");
+    assert_eq!(
+        delivered_inboxes(&pool).await,
+        vec!["https://peer.example/inbox"],
+        "exactly one delivery, to the shared inbox"
+    );
+    assert_eq!(job_count(&pool).await, 1, "and one queued job");
+}
+
+/// A public note mentioning two users on one host, with a follower there
+/// too, costs that host one delivery.
+#[tokio::test]
+async fn two_mentions_and_a_follower_on_one_host_share_one_delivery() {
+    let db = crate::test_db::test_db().await.expect("test database slot");
+    let pool = db.pool().clone();
+    let alice = alice(&pool).await;
+    let shared = Some("https://peer.example/inbox");
+    let bob = mirror(
+        &pool,
+        "bob",
+        "peer.example",
+        "https://peer.example/users/bob/inbox",
+        shared,
+    )
+    .await;
+    let carol = mirror(
+        &pool,
+        "carol",
+        "peer.example",
+        "https://peer.example/users/carol/inbox",
+        shared,
+    )
+    .await;
+    let dave = mirror(
+        &pool,
+        "dave",
+        "peer.example",
+        "https://peer.example/users/dave/inbox",
+        shared,
+    )
+    .await;
+    followed(&pool, &dave, &alice).await;
+    let state = test_state(&pool);
+    let activity = json!({
+        "id": ACTIVITY_ID,
+        "type": "Create",
+        "actor": alice.ap_id,
+        "to": [PUBLIC],
+        "cc": [alice.followers_url, bob.ap_id, carol.ap_id],
+    });
+
+    let count = publish_ok(&state, &alice, &activity, PublishOpts::default()).await;
+
+    assert_eq!(count, 1, "mentions and follower collapse onto one host");
+    assert_eq!(
+        delivered_inboxes(&pool).await,
+        vec!["https://peer.example/inbox"],
+        "the one delivery goes to the shared inbox"
+    );
+}
+
+/// A direct message to two users on one host is delivered to each at
+/// their personal inbox.
+#[tokio::test]
+async fn a_direct_message_to_two_users_on_one_host_goes_to_both_personal_inboxes() {
+    let db = crate::test_db::test_db().await.expect("test database slot");
+    let pool = db.pool().clone();
+    let alice = alice(&pool).await;
+    let shared = Some("https://peer.example/inbox");
+    let bob = mirror(
+        &pool,
+        "bob",
+        "peer.example",
+        "https://peer.example/users/bob/inbox",
+        shared,
+    )
+    .await;
+    let carol = mirror(
+        &pool,
+        "carol",
+        "peer.example",
+        "https://peer.example/users/carol/inbox",
+        shared,
+    )
+    .await;
+    let state = test_state(&pool);
+    let activity = json!({
+        "id": ACTIVITY_ID,
+        "type": "Create",
+        "actor": alice.ap_id,
+        "to": [bob.ap_id, carol.ap_id],
+        "cc": [],
+    });
+
+    let count = publish_ok(&state, &alice, &activity, PublishOpts::default()).await;
+
+    assert_eq!(count, 2, "each addressed actor is its own target");
+    assert_eq!(
+        delivered_inboxes(&pool).await,
+        vec![
+            "https://peer.example/users/bob/inbox",
+            "https://peer.example/users/carol/inbox",
+        ],
+        "a direct activity keeps the personal inboxes"
     );
 }
 

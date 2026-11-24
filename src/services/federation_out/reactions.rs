@@ -143,11 +143,8 @@ mod tests {
         run_publishes(&state, &pool).await;
         assert_eq!(
             delivered_inboxes(&pool).await,
-            vec![
-                "https://remote.example/inbox",
-                "https://remote.example/users/bob/inbox",
-            ],
-            "the author's inbox plus the followers' instance"
+            vec!["https://remote.example/inbox"],
+            "the author and the followers share one instance, hence one delivery"
         );
     }
 
