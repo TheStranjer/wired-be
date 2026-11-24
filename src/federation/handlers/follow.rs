@@ -577,12 +577,21 @@ fn inner_follow_is_the_signers(view: &ActivityView, signer_ap_id: &str) -> bool 
 /// (Pleroma's `Notification.dismiss` beside its undo clause). Returns how
 /// many rows went.
 async fn forget_follow_tellings(pool: &PgPool, target: &User, follower: &User) -> AppResult<u64> {
-    let granted =
-        notification::delete_matching(pool, target.id, follower.id, TYPE_FOLLOW, None).await?;
-    let requested =
-        notification::delete_matching(pool, target.id, follower.id, TYPE_FOLLOW_REQUEST, None)
-            .await?;
-    Ok(granted + requested)
+    let mut gone = 0;
+    for notification_type in [TYPE_FOLLOW, TYPE_FOLLOW_REQUEST] {
+        gone += notification::delete_telling(
+            pool,
+            &notification::Telling {
+                user_id: target.id,
+                from_account_id: follower.id,
+                notification_type,
+                status_id: None,
+                emoji: None,
+            },
+        )
+        .await?;
+    }
+    Ok(gone)
 }
 
 #[cfg(test)]
