@@ -16,7 +16,7 @@ use crate::{
         user::{NOT_INSTANCE_ACTOR, User},
     },
     services::{
-        instance_meta,
+        instance_meta::{self, Federation, PLEROMA_COMPATIBILITY_VERSION},
         runtime_config::RuntimeConfig,
         translate::{Translator, languages_matrix},
         vapid,
@@ -25,10 +25,10 @@ use crate::{
 };
 
 use super::{
-    FIRST_ADMIN_SQL, InstanceStats, MASTODON_API_LEVEL, PEER_LIMIT, PEERS_SQL,
-    PLEROMA_COMPATIBILITY_VERSION, STATS_SQL_LOCAL, STATS_SQL_REST,
+    FIRST_ADMIN_SQL, InstanceStats, MASTODON_API_LEVEL, PEER_LIMIT, PEERS_SQL, STATS_SQL_LOCAL,
+    STATS_SQL_REST,
     domain_blocks::{DomainBlock, ExtendedDescription},
-    pleroma::{Federation, PleromaBlock},
+    pleroma::PleromaBlock,
     v1::{Instance, Rule},
     v2::InstanceV2,
 };

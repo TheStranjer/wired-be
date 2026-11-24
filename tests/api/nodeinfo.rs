@@ -175,8 +175,9 @@ fn expected_document(version: &str) -> Value {
             "skipThreadContainment": true,
             "markup": {
                 "allow_inline_images": true,
-                "allow_headings": false,
+                "allow_headings": true,
                 "allow_tables": false,
+                "allow_fonts": false,
             },
         },
     });
