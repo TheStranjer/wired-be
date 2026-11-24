@@ -60,8 +60,6 @@
 //! deactivated is the shared 404 ([`account_or_404`]), like Pleroma's
 //! `grouped_index` clause that looks the account up before listing.
 
-use std::collections::HashMap;
-
 use axum::{
     Json, Router,
     extract::{OriginalUri, Path, State},
@@ -75,12 +73,13 @@ use tracing::debug;
 use uuid::Uuid;
 
 use crate::{
-    api::helpers::{StringList, account_or_404, distinct, names_of, render_visible},
+    api::helpers::{
+        StringList, account_or_404, distinct, expand_accounts, names_of, render_visible,
+    },
     auth::AuthUser,
     entities::{
         account::{Account, AccountViewer},
         notification::{GroupedNotifications, NotificationGroup},
-        relationship::Relationship,
         status::Status as StatusEntity,
     },
     error::{AppError, AppResult},
@@ -88,7 +87,6 @@ use crate::{
     models::{
         marker::{self, Marker},
         notification::{self, GroupInfo, GroupPageParams, NotificationFilters},
-        user::{self, User},
     },
     oauth::scopes::{READ_NOTIFICATIONS, WRITE_NOTIFICATIONS},
     pagination::{NO_EXTRA_QUERY, PageParams, keyset_link, set_link_header},
@@ -471,35 +469,6 @@ fn collect_actor_ids(groups: &[(&str, &GroupInfo)]) -> Vec<Uuid> {
 /// The distinct status ids the groups name, in group order.
 fn collect_status_ids(groups: &[(&str, &GroupInfo)]) -> Vec<Uuid> {
     distinct(groups.iter().filter_map(|(_, info)| info.status_id))
-}
-
-/// Expands account ids into [`Account`] entities as seen by `viewer`:
-/// every stored account once, in the requested order, with the viewer's
-/// [`Relationship`] embedded through the batched preload
-/// [`Account::from_user_for`] reads. Actors that left no row (deleted
-/// mid-request) simply drop out.
-///
-/// # Errors
-///
-/// [`Database`](crate::error::AppError::Database) from the account and
-/// relationship reads.
-async fn expand_accounts(
-    state: &AppState,
-    viewer: AccountViewer<'_>,
-    ids: &[Uuid],
-) -> AppResult<Vec<Account>> {
-    if ids.is_empty() {
-        return Ok(Vec::new());
-    }
-    let users = user::get_many(&state.db, ids).await?;
-    let mut by_id: HashMap<Uuid, User> = users.into_iter().map(|found| (found.id, found)).collect();
-    let relationships = Relationship::load_map(&state.db, viewer, ids).await?;
-    let accounts = ids
-        .iter()
-        .filter_map(|id| by_id.remove(id))
-        .map(|found| Account::from_user_for(viewer, &found, &state.config, relationships.as_ref()))
-        .collect();
-    Ok(accounts)
 }
 
 /// Expands status ids into [`StatusEntity`]s as seen by `viewer`: every

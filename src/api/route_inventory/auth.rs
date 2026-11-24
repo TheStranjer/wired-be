@@ -80,6 +80,16 @@ pub(super) const ROWS: &[RouteSpec] = &[
     },
     RouteSpec {
         method: "GET",
+        path: "/oauth/external/consent",
+        auth: AuthClass::Public,
+    },
+    RouteSpec {
+        method: "POST",
+        path: "/oauth/external/consent",
+        auth: AuthClass::Public,
+    },
+    RouteSpec {
+        method: "GET",
         path: "/api/oauth_tokens",
         auth: AuthClass::User,
     },

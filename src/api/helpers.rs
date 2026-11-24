@@ -46,8 +46,10 @@ use crate::{
     util::{id::parse_id, params::truthy},
 };
 
+mod accounts;
 mod visible;
 
+pub use accounts::{accounts_with_relationships, expand_accounts};
 pub use visible::{keyed_json, render_visible};
 
 /// The `RESTRICT_UNAUTHENTICATED` area that closes anonymous reads of a

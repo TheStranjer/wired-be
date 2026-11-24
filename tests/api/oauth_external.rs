@@ -22,9 +22,11 @@
 //! endpoints; `support` holds the `Site` fixture and the helpers every
 //! section draws on; `prepare` runs `prepare_request` and the provider
 //! redirect; `callback` walks the callback's successes and
-//! `callback_refusals` its failures and edges; and `registration` and
-//! `registration_modes` cover the hand-off form and the registration modes
-//! that replace its code with a message page.
+//! `callback_refusals` its failures and edges; `callback_untrusted` the
+//! hand-off to consent; `registration` and `registration_modes` cover the
+//! hand-off form and the registration modes that replace its code with a
+//! message page; and `json_registration`, `json_registration_modes` and
+//! `json_consent` the same screens as JSON endpoints for a frontend.
 
 #![cfg(test)]
 
@@ -36,8 +38,15 @@ mod callback;
 mod callback_mfa;
 /// The callback's refusals, the provider-call failures and the route edges.
 mod callback_refusals;
-/// The callback of a linked account for an untrusted application: refused.
+/// The callback of a linked account for an untrusted application: sent to
+/// consent.
 mod callback_untrusted;
+/// The consent endpoints a linked login of an untrusted app is sent to.
+mod json_consent;
+/// The JSON registration details and `POST /oauth/register`.
+mod json_registration;
+/// The JSON registration under the closed, approval and activation modes.
+mod json_registration_modes;
 /// `GET /oauth/prepare_request` and the provider redirect it feeds.
 mod prepare;
 /// The flow's consts and the mock provider on its own loopback port.

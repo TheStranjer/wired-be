@@ -51,8 +51,8 @@ pub mod tags;
 pub mod test_support;
 
 pub use activities::{
-    NoteDeletion, announce_activity_json, create_activity_json, delete_activity_json,
-    litepub_context_json, tombstone_json, update_activity_json,
+    NoteDeletion, announce_activity_json, boost_addressing, create_activity_json,
+    delete_activity_json, litepub_context_json, tombstone_json, update_activity_json,
 };
 pub use fields::note_json;
 pub use load::load_note_context;

@@ -78,14 +78,13 @@ use uuid::Uuid;
 
 use crate::{
     api::helpers::{
-        StringList, capped_distinct_ids, distinct, distinct_ids, keyed_json, names_of,
-        render_visible,
+        StringList, accounts_with_relationships, capped_distinct_ids, distinct, distinct_ids,
+        keyed_json, names_of, render_visible,
     },
     auth::AuthUser,
     entities::{
         account::{Account, AccountViewer},
         conversation::Conversation,
-        relationship::{Relationship, RelationshipMap},
         status::Status as StatusEntity,
     },
     error::{AppError, AppResult},
@@ -512,17 +511,8 @@ pub(crate) async fn conversation_entities(
     let ids: Vec<Uuid> = rows.iter().map(|row| row.id).collect();
     let lists = conversation::recipients_map(&state.db, &ids).await?;
     let account_ids = distinct(lists.values().flatten().copied());
-    let users = user::get_many(&state.db, &account_ids)
-        .await?
-        .into_iter()
-        .map(|found| (found.id, found))
-        .collect::<HashMap<Uuid, User>>();
-    let relationships = Relationship::load_many(&state.db, viewer.id, &account_ids)
-        .await?
-        .into_iter()
-        .zip(account_ids)
-        .map(|(relationship, target)| (target, relationship))
-        .collect::<RelationshipMap>();
+    let (users, relationships) =
+        accounts_with_relationships(state, Some(viewer), &account_ids).await?;
     let last_status_ids = distinct(rows.iter().filter_map(|row| row.last_status_id));
     let last_statuses = visible_statuses(state, Some(viewer), &last_status_ids).await?;
     let entities = rows
@@ -538,7 +528,7 @@ pub(crate) async fn conversation_entities(
                         Some(viewer),
                         account,
                         &state.config,
-                        Some(&relationships),
+                        relationships.as_ref(),
                     )
                 })
                 .collect();

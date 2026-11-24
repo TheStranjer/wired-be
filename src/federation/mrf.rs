@@ -102,6 +102,7 @@ pub use chain::{NoOpPolicy, PolicyChain, active_chain, build_chain};
 pub use config::{MRF_CONFIG_TTL, MrfConfig, MrfConfigCache, load_config};
 pub use filter::{
     filter_actor, filter_incoming, filter_incoming_boxed, filter_outgoing, filter_outgoing_boxed,
+    refuse_rejected,
 };
 pub use transparency::{
     ChainTransparency, Transparency, describe, describe_chain, describe_policies,

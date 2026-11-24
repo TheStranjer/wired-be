@@ -114,7 +114,7 @@ async fn echo_activity(activity: SignedActivity) -> Response {
 
 /// The `Person` actor document a peer serves for `id`, vouching for
 /// `public_pem` as its signing key.
-fn actor_document(id: &str, public_pem: &str) -> Value {
+fn actor_document(id: &str, public_pem: &str, key_id: &str) -> Value {
     json!({
         "@context": "https://www.w3.org/ns/activitystreams",
         "type": "Person",
@@ -123,7 +123,7 @@ fn actor_document(id: &str, public_pem: &str) -> Value {
         "name": "Alice",
         "inbox": format!("{id}/inbox"),
         "publicKey": {
-            "id": format!("{id}#main-key"),
+            "id": key_id,
             "owner": id,
             "publicKeyPem": public_pem,
         },
@@ -149,6 +149,9 @@ pub(super) struct Peer {
     pub(super) hits: Arc<AtomicUsize>,
     /// The public key the actor document carries.
     pub(super) public_pem: String,
+    /// Whether the actor names its key path-style (`{id}/main-key`, as
+    /// `GoToSocial` does) instead of with a `#main-key` fragment.
+    pub(super) path_style_key: bool,
 }
 
 /// A peer at `base` serving `public_pem`.
@@ -157,16 +160,32 @@ pub(super) fn peer(base: String, public_pem: String) -> Peer {
         base,
         hits: Arc::new(AtomicUsize::new(0)),
         public_pem,
+        path_style_key: false,
+    }
+}
+
+/// A peer at `base` whose actor names its key `{id}/main-key`, the
+/// `GoToSocial` shape no fragment strip maps back to the actor.
+pub(super) fn path_key_peer(base: String, public_pem: String) -> Peer {
+    Peer {
+        path_style_key: true,
+        ..peer(base, public_pem)
     }
 }
 
 /// Counts the hit and answers the self-identifying actor document.
+///
+/// Also answers at the path-style key URL, as `GoToSocial` does: the document
+/// names its own `id`, so the fetcher follows it.
 async fn serve_actor(State(peer): State<Peer>) -> Response {
     let _hits = peer.hits.fetch_add(1, Ordering::SeqCst);
-    actor_response(&actor_document(
-        &format!("{}/users/alice", peer.base),
-        &peer.public_pem,
-    ))
+    let id = format!("{}/users/alice", peer.base);
+    let key_id = if peer.path_style_key {
+        format!("{id}/main-key")
+    } else {
+        format!("{id}#main-key")
+    };
+    actor_response(&actor_document(&id, &peer.public_pem, &key_id))
 }
 
 /// Counts the hit and answers the standalone key object whose `owner`
@@ -214,6 +233,7 @@ pub(super) fn peer_app(peer: Peer) -> Router {
     let actor_peer = peer.clone();
     Router::new()
         .route("/users/alice", get(serve_actor))
+        .route("/users/alice/main-key", get(serve_actor))
         .with_state(actor_peer)
         .merge(
             Router::new()

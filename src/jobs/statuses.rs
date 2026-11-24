@@ -32,8 +32,10 @@ use tracing::{debug, warn};
 use uuid::Uuid;
 
 use crate::{
-    error::AppError,
-    jobs::{AttemptInfo, HandlerFuture, JobError, QUEUE_SCHEDULED, scheduler::PeriodicJob},
+    jobs::{
+        AttemptInfo, HandlerFuture, JobError, QUEUE_SCHEDULED, parse_args, retry,
+        scheduler::PeriodicJob,
+    },
     models::{
         job::{NewJob, enqueue},
         status::{self, Status},
@@ -134,23 +136,13 @@ pub async fn schedule_expiration(state: &AppState, row: &Status) {
     }
 }
 
-/// Reads [`ExpireArgs`] out of a claimed job's payload; arguments this
-/// shape cannot deserialize are permanent — the job is discarded, never
-/// retried.
-fn parse_args(args: &Value) -> Result<Uuid, JobError> {
-    serde_json::from_value::<ExpireArgs>(args.clone())
-        .map(|parsed| parsed.status_id)
-        .map_err(|err| {
-            JobError::Discard(format!("status expire job arguments are unusable: {err}"))
-        })
-}
+/// The job name in the discard text of unusable [`ExpireArgs`].
+const EXPIRE_JOB: &str = "status expire";
 
-/// Lifts a database failure into the queue's retry arm; both handlers'
-/// work is idempotent (a second delete of a tombstone deletes nothing), so
-/// another pass costs nothing but the wait.
-fn retry(err: &AppError) -> JobError {
-    JobError::Retry(format!("status expiration pass failed: {err}"))
-}
+/// The job name in the retry text of a failed pass; both handlers' work is
+/// idempotent (a second delete of a tombstone deletes nothing), so another
+/// pass costs nothing but the wait.
+const PASS_JOB: &str = "status expiration pass";
 
 /// The [`JobRegistry`](super::JobRegistry) handler for [`KIND_EXPIRE`]:
 /// delete the status the arguments name, if it is still live.
@@ -161,7 +153,7 @@ fn retry(err: &AppError) -> JobError {
 /// behind even a spent retry budget.
 pub fn handle_expire(state: AppState, _attempt: AttemptInfo, args: Value) -> HandlerFuture {
     Box::pin(async move {
-        let status_id = parse_args(&args)?;
+        let status_id = parse_args::<ExpireArgs>(&args, EXPIRE_JOB)?.status_id;
         expire_one(&state, status_id).await
     })
 }
@@ -180,7 +172,7 @@ async fn expire_one(state: &AppState, status_id: Uuid) -> Result<(), JobError> {
             debug!(status = %status_id, "expiring status is already gone");
             Ok(())
         }
-        Err(err) => Err(retry(&err)),
+        Err(err) => Err(retry(PASS_JOB, &err)),
     }
 }
 
@@ -198,7 +190,7 @@ async fn delete(state: &AppState, row: &Status) -> Result<(), JobError> {
             debug!(status = %row.id, deleted, "status expired");
             Ok(())
         }
-        Err(err) => Err(retry(&err)),
+        Err(err) => Err(retry(PASS_JOB, &err)),
     }
 }
 
@@ -218,7 +210,7 @@ pub fn handle_sweep(state: AppState, _attempt: AttemptInfo, _args: Value) -> Han
         loop {
             let batch = match status::fetch_expired(&state.db, SWEEP_BATCH).await {
                 Ok(rows) => rows,
-                Err(err) => return Err(retry(&err)),
+                Err(err) => return Err(retry(PASS_JOB, &err)),
             };
             let count = i64::try_from(batch.len()).unwrap_or(SWEEP_BATCH);
             delete_batch(&state, &batch).await?;

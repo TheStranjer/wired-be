@@ -33,8 +33,7 @@ use uuid::Uuid;
 
 use crate::{
     config::Config,
-    error::AppError,
-    jobs::{AttemptInfo, HandlerFuture, JobError, QUEUE_BACKGROUND},
+    jobs::{AttemptInfo, HandlerFuture, JobError, QUEUE_BACKGROUND, parse_args, retry},
     models::{
         job::{NewJob, enqueue},
         link_card::{self, LinkCard},
@@ -195,24 +194,13 @@ fn card_url(row: &Status, config: &Config) -> Option<String> {
     (!host_ignored(config, &url)).then_some(url)
 }
 
-/// Reads [`FetchArgs`] out of a claimed job's payload; arguments this shape
-/// cannot deserialize are permanent — the job is discarded, never retried.
-fn parse_args(args: &Value) -> Result<Uuid, JobError> {
-    serde_json::from_value::<FetchArgs>(args.clone())
-        .map(|parsed| parsed.status_id)
-        .map_err(|err| {
-            JobError::Discard(format!(
-                "rich media fetch job arguments are unusable: {err}"
-            ))
-        })
-}
+/// The job name in the discard text of unusable [`FetchArgs`].
+const FETCH_JOB: &str = "rich media fetch";
 
-/// Lifts a database failure into the queue's retry arm; every write the
-/// handler makes is idempotent (the store rewrites its own row, the link
-/// keeps what stands), so another pass costs nothing but the wait.
-fn retry(err: &AppError) -> JobError {
-    JobError::Retry(format!("rich media card fetch pass failed: {err}"))
-}
+/// The job name in the retry text of a failed pass; every write the handler
+/// makes is idempotent (the store rewrites its own row, the link keeps what
+/// stands), so another pass costs nothing but the wait.
+const PASS_JOB: &str = "rich media card fetch pass";
 
 /// The [`JobRegistry`](super::JobRegistry) handler for [`KIND_FETCH`]:
 /// fetch, cache and link the card of the status the arguments name.
@@ -224,7 +212,7 @@ fn retry(err: &AppError) -> JobError {
 /// [`JobError::Discard`]: the id names nothing this job can ever fetch.
 pub fn handle_fetch(state: AppState, _attempt: AttemptInfo, args: Value) -> HandlerFuture {
     Box::pin(async move {
-        let status_id = parse_args(&args)?;
+        let status_id = parse_args::<FetchArgs>(&args, FETCH_JOB)?.status_id;
         fetch_one(&state, status_id).await
     })
 }
@@ -240,7 +228,7 @@ pub fn handle_fetch(state: AppState, _attempt: AttemptInfo, args: Value) -> Hand
 async fn fetch_one(state: &AppState, status_id: Uuid) -> Result<(), JobError> {
     let row = status::get_by_id(&state.db, status_id)
         .await
-        .map_err(|err| retry(&err))?;
+        .map_err(|err| retry(PASS_JOB, &err))?;
     let Some(row) = row else {
         return Err(JobError::Discard(format!(
             "rich media fetch names status {status_id}, which is not stored"
@@ -251,7 +239,7 @@ async fn fetch_one(state: &AppState, status_id: Uuid) -> Result<(), JobError> {
     };
     let cached = link_card::get(&state.db, &url)
         .await
-        .map_err(|err| retry(&err))?;
+        .map_err(|err| retry(PASS_JOB, &err))?;
     let (outcome, card) = match cached.filter(|entry| is_fresh(entry, Utc::now())) {
         Some(entry) => (entry.status, entry.card),
         None => fetch_and_classify(state, &url).await,
@@ -291,10 +279,10 @@ async fn store_and_link(
 ) -> Result<(), JobError> {
     link_card::store(&state.db, url, outcome, card)
         .await
-        .map_err(|err| retry(&err))?;
+        .map_err(|err| retry(PASS_JOB, &err))?;
     link_card::link_status(&state.db, status_id, url)
         .await
-        .map_err(|err| retry(&err))?;
+        .map_err(|err| retry(PASS_JOB, &err))?;
     Ok(())
 }
 

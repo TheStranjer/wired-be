@@ -94,28 +94,24 @@ use tracing::debug;
 use uuid::Uuid;
 
 use crate::{
-    api::helpers::{QueryPairs, link_query},
+    api::{
+        helpers::{QueryPairs, link_query},
+        report_render::{cited_statuses, report_account, report_accounts},
+    },
     auth::admin::StaffUser,
-    entities::{
-        mastodon_admin_report::{
-            MastodonAdminReport, MastodonAdminReportParts, MastodonAdminReportRule,
-        },
-        status::Status,
+    entities::mastodon_admin_report::{
+        MastodonAdminReport, MastodonAdminReportParts, MastodonAdminReportRule,
     },
     error::{AppError, AppResult},
     models::{
         instance_rule,
         report::{self, Report as ReportRow, ReportState},
-        status, user,
         user::User,
     },
     pagination::{PageParams, keyset_link, set_link_header},
-    services::{
-        render_status::{ViewerMode, render_statuses},
-        report_moderation::{assign_report, set_report_state},
-    },
+    services::report_moderation::{assign_report, set_report_state},
     state::AppState,
-    util::{collections::group_pairs, id::parse_id, params::truthy},
+    util::{id::parse_id, params::truthy},
 };
 
 /// The read endpoint class of [`StaffUser::require`].
@@ -416,7 +412,7 @@ async fn entities(
     viewer: &User,
     rows: &[ReportRow],
 ) -> AppResult<Vec<MastodonAdminReport>> {
-    let users = named_users(state, rows).await?;
+    let users = report_accounts(state, rows).await?;
     let rules = cited_rules(state, rows).await?;
     let mut statuses = cited_statuses(state, viewer, rows).await?;
     let mut entities = Vec::with_capacity(rows.len());
@@ -424,8 +420,8 @@ async fn entities(
         entities.push(MastodonAdminReport::from_parts(
             MastodonAdminReportParts {
                 row,
-                reporter: named(&users, row.reporter_id)?,
-                target: named(&users, row.target_id)?,
+                reporter: report_account(&users, row.reporter_id)?,
+                target: report_account(&users, row.target_id)?,
                 assigned: row.assigned_to.and_then(|id| users.get(&id)),
                 acted_by: row.action_taken_by.and_then(|id| users.get(&id)),
                 statuses: statuses.remove(&row.id).unwrap_or_default(),
@@ -440,24 +436,6 @@ async fn entities(
         ));
     }
     Ok(entities)
-}
-
-/// Every account the reports name — reporter, target, assignee and acting
-/// moderator, deduplicated — keyed by id in one read.
-///
-/// # Errors
-///
-/// [`AppError::Database`] from the read.
-async fn named_users(state: &AppState, rows: &[ReportRow]) -> AppResult<HashMap<Uuid, User>> {
-    let mut ids: Vec<Uuid> = Vec::with_capacity(rows.len() * 4);
-    for row in rows {
-        ids.push(row.reporter_id);
-        ids.push(row.target_id);
-        ids.extend(row.assigned_to);
-        ids.extend(row.action_taken_by);
-    }
-    let users = user::get_many(&state.db, &ids).await?;
-    Ok(users.into_iter().map(|user| (user.id, user)).collect())
 }
 
 /// Every rule cited by these reports, keyed by id in one read (an empty
@@ -478,53 +456,6 @@ async fn cited_rules(
         .iter()
         .map(|rule| (rule.id, MastodonAdminReportRule::from_rule(rule)))
         .collect())
-}
-
-/// The rendered `statuses` arrays, keyed per report: the citations in one
-/// batched read, the rows behind them in one [`status::get_many`], and
-/// each report's own page through [`render_statuses`] — the shape the
-/// Pleroma admin surface's renderer established.
-///
-/// # Errors
-///
-/// [`AppError::Database`] from any read.
-async fn cited_statuses(
-    state: &AppState,
-    viewer: &User,
-    rows: &[ReportRow],
-) -> AppResult<HashMap<Uuid, Vec<Status>>> {
-    let report_ids: Vec<Uuid> = rows.iter().map(|row| row.id).collect();
-    let cited = report::statuses_for_reports(&state.db, &report_ids).await?;
-    let status_ids: Vec<Uuid> = cited.iter().map(|&(_, status_id)| status_id).collect();
-    let ids_per_report = group_pairs(cited);
-    let status_rows = status::get_many(&state.db, &status_ids).await?;
-    let by_id: HashMap<Uuid, &status::Status> =
-        status_rows.iter().map(|row| (row.id, row)).collect();
-    let mut rendered: HashMap<Uuid, Vec<Status>> = HashMap::new();
-    for (report_id, ids) in ids_per_report {
-        let owned: Vec<status::Status> = ids
-            .iter()
-            .filter_map(|id| by_id.get(id).copied())
-            .cloned()
-            .collect();
-        let statuses = render_statuses(state, ViewerMode::user(viewer), &owned).await?;
-        let _kept: Option<Vec<Status>> = rendered.insert(report_id, statuses);
-    }
-    Ok(rendered)
-}
-
-/// The account an entity slot names; its absence is the impossible state
-/// the reports' foreign keys rule out, not a client failure.
-///
-/// # Errors
-///
-/// [`AppError::Internal`] as described.
-fn named(users: &HashMap<Uuid, User>, id: Uuid) -> AppResult<&User> {
-    users.get(&id).ok_or_else(|| {
-        AppError::Internal(format!(
-            "a report names the account {id}, which no users row holds"
-        ))
-    })
 }
 
 #[cfg(test)]

@@ -26,6 +26,8 @@ use crate::common::{self, TestRequest};
 /// names their own account in a deletion, and the rejection of an account
 /// nobody had left pending.
 pub(super) const NOT_ALLOWED: &str = "This action is not allowed";
+/// The 400 body of a `disable` or `suspend` aimed at a remote mirror.
+pub(super) const ONLY_LOCAL: &str = "Only local accounts can be disabled";
 /// The 422 body of a `type` word off the five the umbrella knows.
 pub(super) const INVALID_TYPE: &str = "Validation failed: Type is invalid";
 /// The 422 body of a request that states no `type` at all.

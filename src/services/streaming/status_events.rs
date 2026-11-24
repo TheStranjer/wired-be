@@ -238,14 +238,18 @@ mod tests {
         assert_eq!(event.event, "update", "Mastodon's arrival event");
         assert_eq!(
             event.streams,
-            canonical(vec![user_stream(alice.id), user_stream(bob.id)]),
-            "the author's and the accepted follower's home — not the mentioned \
-             non-follower, no public stream"
+            canonical(vec![
+                user_stream(alice.id),
+                user_stream(bob.id),
+                user_stream(erin.id),
+            ]),
+            "the author's, the accepted follower's and the mentioned user's home — \
+             no public stream"
         );
         assert_eq!(
             event.audience,
-            Audience::Users(sorted_ids(vec![alice.id, bob.id])),
-            "exactly those two"
+            Audience::Users(sorted_ids(vec![alice.id, bob.id, erin.id])),
+            "exactly those three"
         );
         assert_eq!(event.render, Some(RenderSpec::Status(row.id)), "the hint");
         assert!(event.payload.is_none(), "and no body");
