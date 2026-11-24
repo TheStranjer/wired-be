@@ -17,7 +17,7 @@ use crate::{
     entities::{
         account::JsonBool,
         poll::Poll,
-        status::{Status, StatusSource},
+        status::{QuoteSlot, Status, StatusSource},
     },
     models::{
         emoji_reaction::ReactionSummary as SummaryRow, hashtag::Hashtag, link_card::LinkCard,
@@ -68,10 +68,9 @@ pub(in crate::entities::status) struct Parts<'a> {
     /// field carries (what the polls batch's three reads would hand the
     /// renderer, already built).
     poll: Option<Poll>,
-    /// The rendered quote, in the serialized shape the quoting
-    /// ticket's batch hands the entity; `None` renders the quote
-    /// null.
-    quote: Option<Value>,
+    /// What the quoting ticket's batch found behind the row's quote;
+    /// `None` is a row that quotes nothing.
+    quote: Option<QuoteSlot>,
     /// Whether the viewer may see the replied-to status, in the same
     /// [`JsonBool`] wrapper the source field carries; `true` unless the
     /// test hides the parent.
@@ -248,7 +247,33 @@ impl<'a> Parts<'a> {
     /// viewer may see.
     pub(in crate::entities::status) fn quoting(self, quote: Value) -> Self {
         Self {
-            quote: Some(quote),
+            quote: Some(QuoteSlot::Visible(quote)),
+            ..self
+        }
+    }
+
+    /// Sets [`quote`](Self::quote) to a quoted row the viewer may not
+    /// see, as the batch's visibility read leaves it.
+    pub(in crate::entities::status) fn quoting_hidden(self) -> Self {
+        Self {
+            quote: Some(QuoteSlot::Hidden),
+            ..self
+        }
+    }
+
+    /// Sets [`quote`](Self::quote) to a quoted row the batch found gone.
+    pub(in crate::entities::status) fn quoting_deleted(self) -> Self {
+        Self {
+            quote: Some(QuoteSlot::Deleted),
+            ..self
+        }
+    }
+
+    /// Sets [`quote`](Self::quote) to the nested reference a quoted
+    /// status carries to its own quote.
+    pub(in crate::entities::status) fn quoting_linked(self) -> Self {
+        Self {
+            quote: Some(QuoteSlot::Linked),
             ..self
         }
     }

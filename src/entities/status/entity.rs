@@ -14,10 +14,12 @@
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use serde_json::Value;
+use uuid::Uuid;
 
 use super::{
     PlainText, PleromaMetadata, StatusApplication, StatusSource,
     pleroma::{BlockViewer, pleroma_block},
+    source::QuoteSlot,
 };
 use crate::{
     config::Config,
@@ -150,13 +152,15 @@ pub struct Status {
     /// emitted whatever the viewer may see of the quoted row, so an
     /// invisible quote still names its target.
     pub quote_id: Option<String>,
-    /// The quoted status as the nested entity the quoting ticket's batch
-    /// rendered for this viewer, mirrored identically in
-    /// [`pleroma.quote`](PleromaMetadata::quote); one level deep — a
-    /// quoted status's own `quote` is `null`. `null` when this status
-    /// quotes nothing or its viewer may not see what it quotes, which is
-    /// exactly when `pleroma.quote_visible` is `false`.
-    pub quote: Option<Value>,
+    /// Mastodon 4.4's Quote entity: `{state, quoted_status}` where the
+    /// quoted status is the nested entity the quoting ticket's batch
+    /// rendered for this viewer (`accepted`), or `null` with state
+    /// `unauthorized` (hidden from the viewer) or `deleted` (gone). The
+    /// bare quoted status is mirrored in
+    /// [`pleroma.quote`](PleromaMetadata::quote). One level deep: a
+    /// quoted status's own `quote` is `{state, quoted_status_id}`. `null`
+    /// when this status quotes nothing.
+    pub quote: Option<StatusQuote>,
     /// The filters that warned over this status, as the v2 `FilterResult`
     /// entities: [`crate::services::filter::apply_filters`] fills it from
     /// the viewer's active filters as a page is post-processed, and an
@@ -239,7 +243,9 @@ impl Status {
             bookmarked: JsonBool(bookmarked),
             pinned: JsonBool(pinned_at.is_some()),
             quote_id: row.quote_of_id.map(|id| id.to_string()),
-            quote: quote.clone(),
+            quote: row
+                .quote_of_id
+                .map(|id| StatusQuote::new(quote.as_ref(), id)),
             filtered: Vec::new(),
             pleroma: pleroma_block(
                 row,
@@ -250,7 +256,7 @@ impl Status {
                     muted,
                     bookmark_folder,
                     direct_participation,
-                    quote,
+                    quote: quote.and_then(QuoteSlot::into_rendered),
                     parent_visible,
                 },
             ),
@@ -272,6 +278,68 @@ fn tag_entities(tags: &[Hashtag], config: &Config) -> Vec<Tag> {
     tags.iter()
         .map(|tag| Tag::from_hashtag(&config.base_url, tag))
         .collect()
+}
+
+/// Mastodon's Quote entity (4.4+, Pleroma 2.10): the state of the quote
+/// and, when the viewer may see it, the quoted status.
+#[derive(Debug, Serialize)]
+pub struct QuoteEntity {
+    /// `accepted`, `unauthorized` or `deleted`.
+    pub state: &'static str,
+    /// The bare quoted status for `accepted`, `null` otherwise.
+    pub quoted_status: Option<Value>,
+}
+
+/// A quote reference without the status itself, as a quoted status's
+/// own quote renders (one level deep, as Pleroma does).
+#[derive(Debug, Serialize)]
+pub struct QuoteRef {
+    /// `accepted`, `unauthorized` or `deleted`.
+    pub state: &'static str,
+    /// The id of the quoted status.
+    pub quoted_status_id: String,
+}
+
+/// The `quote` key: the full [`QuoteEntity`] of a top-level status or the
+/// [`QuoteRef`] of a status rendered inside another's quote.
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+pub enum StatusQuote {
+    /// The Quote entity with the status embedded when visible.
+    Entity(QuoteEntity),
+    /// Just the state and the quoted id.
+    Ref(QuoteRef),
+}
+
+impl StatusQuote {
+    /// The quote of a row quoting `quoted_id`, from what the batch found
+    /// behind it; a missing slot reads as a deleted quote.
+    fn new(slot: Option<&QuoteSlot>, quoted_id: Uuid) -> Self {
+        match slot {
+            Some(QuoteSlot::Visible(rendered)) => Self::Entity(QuoteEntity {
+                state: "accepted",
+                quoted_status: Some(rendered.clone()),
+            }),
+            Some(QuoteSlot::Hidden) => Self::Entity(QuoteEntity {
+                state: "unauthorized",
+                quoted_status: None,
+            }),
+            Some(QuoteSlot::Linked) => Self::reference("accepted", quoted_id),
+            Some(QuoteSlot::LinkedHidden) => Self::reference("unauthorized", quoted_id),
+            Some(QuoteSlot::Deleted) | None => Self::Entity(QuoteEntity {
+                state: "deleted",
+                quoted_status: None,
+            }),
+        }
+    }
+
+    /// The nested form: `state` and the quoted id, no status.
+    fn reference(state: &'static str, quoted_id: Uuid) -> Self {
+        Self::Ref(QuoteRef {
+            state,
+            quoted_status_id: quoted_id.to_string(),
+        })
+    }
 }
 
 /// The `content` key: the row's sanitized HTML, or the empty string for

@@ -127,11 +127,13 @@
 //! - `quote`, `quote_id`, `pleroma.quote` and `pleroma.quote_visible`:
 //!   *filled by the quoting ticket* (steps 2 and 3 above); the quoted
 //!   original the step 2 read brought in and the step 3 visibility read
-//!   admits renders as one nested entity — no new query, and one level
-//!   deep: a quoted status's own quote never renders — mirrored in
+//!   admits renders as `quote: {state: "accepted", quoted_status}` — no
+//!   new query, and one level deep: a quoted status's own quote is only
+//!   `{state, quoted_status_id}` — with the bare status mirrored in
 //!   `pleroma.quote` beside `pleroma.quote_visible`. A quote the viewer
-//!   may not see renders `quote: null` with visibility `false` while
-//!   `quote_id` still names the target.
+//!   may not see renders `{state: "unauthorized", quoted_status: null}`,
+//!   a vanished one `{state: "deleted", quoted_status: null}`, both with
+//!   visibility `false` while `quote_id` still names the target.
 //!
 //! [`models::status`]: crate::models::status
 //! [`Status`]: crate::entities::status::Status
@@ -239,8 +241,9 @@ pub async fn render_statuses(
 ///
 /// - [`ViewerMode::User`] is every ordinary surface: the viewer's own
 ///   account, or `None` for an anonymous request. The rules are in force,
-///   so a quoted original the viewer may not reach renders `quote: null`
-///   with `pleroma.quote_visible` false (the module docs' step 3 read).
+///   so a quoted original the viewer may not reach renders
+///   `quote.state` `unauthorized` with `pleroma.quote_visible` false (the
+///   module docs' step 3 read).
 /// - [`ViewerMode::Admin`] is the staff surface of
 ///   [`crate::api::admin::statuses`] (WBE-201): Pleroma's
 ///   `AdminAPI.StatusController` and its `AdminAPI.StatusView`, which

@@ -240,22 +240,24 @@ async fn a_quoting_status_renders_the_quoted_original_nested() {
         original.id.to_string(),
         "the quoted target's id (decision 4), visible one or not"
     );
+    assert_eq!(value["quote"]["state"], "accepted");
+    let quoted = &value["quote"]["quoted_status"];
     assert_eq!(
-        value["quote"]["id"],
+        quoted["id"],
         original.id.to_string(),
         "the nested entity is the quoted row's own"
     );
     assert_eq!(
-        value["quote"]["content"], "<p>quote me</p>",
+        quoted["content"], "<p>quote me</p>",
         "rendered as the author wrote it"
     );
     assert_eq!(
-        value["quote"]["account"]["acct"], "bob",
+        quoted["account"]["acct"], "bob",
         "with the quoted row's own author"
     );
     assert_eq!(
-        value["pleroma"]["quote"], value["quote"],
-        "pleroma mirrors the same rendered object"
+        value["pleroma"]["quote"], *quoted,
+        "pleroma mirrors the bare quoted status"
     );
     assert_eq!(
         value["pleroma"]["quote_visible"],
@@ -291,33 +293,31 @@ async fn a_rendered_quote_nests_exactly_one_level_deep() {
     let shown = show(&app, None, &a.id.to_string()).await;
     common::assert_answer(&shown, StatusCode::OK, "the outer quote");
     let value = shown.json_value();
-    assert_eq!(value["quote"]["id"], b.id.to_string(), "A nests B");
+    let nested = &value["quote"]["quoted_status"];
+    assert_eq!(nested["id"], b.id.to_string(), "A nests B");
     assert_eq!(
-        value["quote"]["quote"],
-        Value::Null,
-        "and the nested render's own quote is forced null"
+        nested["quote"],
+        json!({ "state": "accepted", "quoted_status_id": c.id.to_string() }),
+        "and the nested render's own quote is only a reference to C"
     );
     assert_eq!(
-        value["quote"]["quote_id"],
+        nested["quote_id"],
         c.id.to_string(),
         "while its quote_id still names C"
     );
     assert_eq!(
-        value["quote"]["pleroma"]["quote_visible"],
+        nested["pleroma"]["quote_visible"],
         json!(false),
-        "the mirror's flag follows the null render"
+        "the mirror's flag follows the missing render"
     );
 
     let middle = show(&app, None, &b.id.to_string()).await;
     common::assert_answer(&middle, StatusCode::OK, "the middle quote");
     let middle_value = middle.json_value();
-    assert_eq!(
-        middle_value["quote"]["id"],
-        c.id.to_string(),
-        "B nests C fully"
-    );
-    assert_eq!(middle_value["quote"]["content"], "<p>the source</p>");
-    assert_eq!(middle_value["quote"]["account"]["acct"], "carol");
+    let middle_quoted = &middle_value["quote"]["quoted_status"];
+    assert_eq!(middle_quoted["id"], c.id.to_string(), "B nests C fully");
+    assert_eq!(middle_quoted["content"], "<p>the source</p>");
+    assert_eq!(middle_quoted["account"]["acct"], "carol");
     assert_eq!(middle_value["pleroma"]["quote_visible"], json!(true));
 }
 
@@ -348,7 +348,11 @@ async fn an_invisible_quote_renders_null_and_keeps_its_id() {
             secret.id.to_string(),
             "{who}: quote_id is emitted regardless of visibility"
         );
-        assert_eq!(value["quote"], Value::Null, "{who}: the render is withheld");
+        assert_eq!(
+            value["quote"],
+            json!({ "state": "unauthorized", "quoted_status": null }),
+            "{who}: the render is withheld"
+        );
         assert_eq!(
             value["pleroma"]["quote"],
             Value::Null,
@@ -357,7 +361,7 @@ async fn an_invisible_quote_renders_null_and_keeps_its_id() {
         assert_eq!(
             value["pleroma"]["quote_visible"],
             json!(false),
-            "{who}: false exactly when quote is null"
+            "{who}: false exactly when the quote is not accepted"
         );
     }
 
@@ -369,11 +373,11 @@ async fn an_invisible_quote_renders_null_and_keeps_its_id() {
     );
     let value = as_author.json_value();
     assert_eq!(
-        value["quote"]["id"],
+        value["quote"]["quoted_status"]["id"],
         secret.id.to_string(),
         "the author of the private original always sees their own quoted post"
     );
-    assert_eq!(value["quote"]["visibility"], "private");
+    assert_eq!(value["quote"]["quoted_status"]["visibility"], "private");
     assert_eq!(value["pleroma"]["quote_visible"], json!(true));
 }
 
@@ -409,15 +413,16 @@ async fn a_thread_page_renders_the_nested_quote_from_its_batch() {
     let body = shown.json_value();
     assert_eq!(context_ids(&body, "descendants"), [quoter.id.to_string()]);
     let entry = &body["descendants"][0];
+    let nested = &entry["quote"]["quoted_status"];
     assert_eq!(
-        entry["quote"]["id"],
+        nested["id"],
         source.id.to_string(),
         "the page's own batch brought the quoted original along"
     );
-    assert_eq!(entry["quote"]["content"], "<p>look at this</p>");
-    assert_eq!(entry["quote"]["account"]["acct"], "carol");
+    assert_eq!(nested["content"], "<p>look at this</p>");
+    assert_eq!(nested["account"]["acct"], "carol");
     assert_eq!(
-        entry["pleroma"]["quote"], entry["quote"],
+        entry["pleroma"]["quote"], *nested,
         "the mirror rides the nested render too"
     );
     assert_eq!(entry["pleroma"]["quote_visible"], json!(true));
