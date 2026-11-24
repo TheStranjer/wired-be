@@ -76,8 +76,11 @@ pub async fn soft_delete(pool: &PgPool, id: Uuid) -> AppResult<Option<Status>> {
     Ok(Some(tombstone))
 }
 
-/// Soft-deletes status `id` **and every reblog of it** in one transaction,
-/// answering `id`'s own tombstone.
+/// Soft-deletes status `id` **and every reblog of it** in one transaction.
+///
+/// The answer is `id`'s own tombstone beside the tombstoned reblog rows (empty
+/// when nobody boosted it), which the caller needs to tell the boosters'
+/// followers.
 ///
 /// A post that is gone takes its boosts with it, so no live row is left
 /// pointing at a tombstone: every reblog of `id` is tombstoned exactly as
@@ -101,19 +104,23 @@ pub async fn soft_delete(pool: &PgPool, id: Uuid) -> AppResult<Option<Status>> {
 /// [`AppError::Database`](crate::error::AppError), and the rollback takes the
 /// half-written delete with it: a status and its reblogs are tombstoned
 /// together or not at all.
-pub async fn soft_delete_with_reblogs(pool: &PgPool, id: Uuid) -> AppResult<Option<Status>> {
+pub async fn soft_delete_with_reblogs(
+    pool: &PgPool,
+    id: Uuid,
+) -> AppResult<Option<(Status, Vec<Status>)>> {
     let mut tx = pool.begin().await?;
     let Some(tombstone) = mark_deleted(&mut tx, id).await? else {
         return Ok(None);
     };
     uncount_deleted(&mut tx, &tombstone).await?;
     clear_pins(&mut tx, id).await?;
-    for reblog in tombstone_reblogs(&mut tx, id).await? {
-        uncount_deleted(&mut tx, &reblog).await?;
+    let reblogs = tombstone_reblogs(&mut tx, id).await?;
+    for reblog in &reblogs {
+        uncount_deleted(&mut tx, reblog).await?;
         clear_pins(&mut tx, reblog.id).await?;
     }
     tx.commit().await?;
-    Ok(Some(tombstone))
+    Ok(Some((tombstone, reblogs)))
 }
 
 /// How many rows one pass of [`soft_delete_all_for_user`] tombstones: the

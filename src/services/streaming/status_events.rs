@@ -13,7 +13,7 @@ use crate::{
     streaming::hub::RenderSpec,
 };
 
-use self::publish::publish_status;
+use self::publish::{Emission, publish_status, publish_withdrawal};
 
 mod publish;
 
@@ -35,7 +35,12 @@ mod publish;
 /// [`targets`]: crate::services::streaming::targets
 /// [never-published cases]: crate::services::streaming#when-a-status-is-never-published
 pub async fn status_created(state: &AppState, row: &Status) {
-    publish_status(state, row, "update", None, Some(RenderSpec::Status(row.id))).await;
+    let emission = Emission {
+        event: "update",
+        payload: None,
+        render: Some(RenderSpec::Status(row.id)),
+    };
+    publish_status(state, row, emission).await;
 }
 
 /// Publish Mastodon's `delete` for the removed status.
@@ -49,12 +54,20 @@ pub async fn status_created(state: &AppState, row: &Status) {
 /// The payload is the deleted id as plain text (Mastodon's `delete`
 /// shape) and no render hint rides along: the row is a tombstone, so no
 /// socket can re-render an entity out of it. Best-effort and silent in
-/// the same refusal cases as [`status_created`].
+/// the same refusal cases as [`status_created`], except that a reblog row
+/// whose original is a tombstone still publishes: that is the state every
+/// reblog tombstoned along with its original is in, and the `delete` is what
+/// removes the boost from the boosters' followers' columns.
 ///
 /// [`after_status_deleted`]: crate::services::delete_status
 /// [`targets`]: crate::services::streaming::targets
 pub async fn status_deleted(state: &AppState, row: &Status) {
-    publish_status(state, row, "delete", Some(row.id.to_string()), None).await;
+    let emission = Emission {
+        event: "delete",
+        payload: Some(row.id.to_string()),
+        render: None,
+    };
+    publish_withdrawal(state, row, emission).await;
 }
 
 /// Publish Mastodon's `status.update` for the edited status `row`, so the
@@ -72,14 +85,12 @@ pub async fn status_deleted(state: &AppState, row: &Status) {
 ///
 /// [`targets`]: crate::services::streaming::targets
 pub async fn status_edited(state: &AppState, row: &Status) {
-    publish_status(
-        state,
-        row,
-        "status.update",
-        None,
-        Some(RenderSpec::Status(row.id)),
-    )
-    .await;
+    let emission = Emission {
+        event: "status.update",
+        payload: None,
+        render: Some(RenderSpec::Status(row.id)),
+    };
+    publish_status(state, row, emission).await;
 }
 
 /// Whether `row` is a reblog whose original is gone: [`status::get_by_id`]
