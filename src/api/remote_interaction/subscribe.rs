@@ -1,7 +1,5 @@
-//! The form endpoints: the `GET/POST /ostatus_subscribe` login pair —
-//! authenticate the named local user, resolve the handle, record the
-//! follow — and the `GET/POST /main/ostatus` remote-subscribe pair, with
-//! the frontend and external redirects they answer with.
+//! The form endpoints: the `GET/POST /main/ostatus` remote-subscribe
+//! pair, and the frontend and external redirects they answer with.
 
 use axum::{
     extract::{Query, State},
@@ -11,121 +9,19 @@ use axum::{
 use tracing::debug;
 
 use crate::{
-    api::accounts::after_follow_changed,
     config::Config,
     error::{AppError, AppResult},
     extract::ApiBody,
-    federation::fetch_actor::get_or_fetch_by_acct,
-    models::{
-        follow,
-        user::{User, get_by_acct, register::authenticate},
-    },
+    models::user::{User, get_by_acct},
     state::AppState,
 };
 
 use super::{
     COULD_NOT_FIND_USER_PAGE, RemoteSubscribeBody, RemoteSubscribeQuery, SOMETHING_WENT_WRONG,
-    SubscribeFields, SubscribeQuery, SubscribeSubmit, WRONG_CREDENTIALS,
+    SubscribeFields,
     interaction::subscribe_url_for,
-    pages::{remote_subscribe_page, required, subscribe_page, success_page, trimmed},
+    pages::{remote_subscribe_page, trimmed},
 };
-
-/// `GET /ostatus_subscribe` (Pleroma's `RemoteInteractionController.follow`
-/// in its form half): the login form that follows `acct`, with every
-/// value escaped. The page itself resolves nothing — an unknown handle
-/// is the `POST`'s re-rendered error, not this route's.
-pub(super) async fn subscribe_form(Query(query): Query<SubscribeQuery>) -> Response {
-    subscribe_page(trimmed(query.acct.as_deref()), None)
-}
-
-/// `POST /ostatus_subscribe` (Pleroma's `do_follow` without its MFA
-/// steps): authenticate the named local user, resolve the `acct` and
-/// record the follow. The success page follows a completed follow; every
-/// failure re-renders the form with an error line and the submitted
-/// `acct` kept.
-pub(super) async fn do_subscribe(
-    State(state): State<AppState>,
-    ApiBody(form): ApiBody<SubscribeSubmit>,
-) -> Response {
-    let acct = trimmed(form.acct.as_deref());
-    match attempt_subscribe(&state, &form).await {
-        Ok(followed) => success_page(&followed),
-        Err(error) => subscribe_page(acct, Some(error.as_str())),
-    }
-}
-
-/// The `POST /ostatus_subscribe` flow, as the outcome the route renders:
-/// the followed `acct` on success, the page-level error line otherwise —
-/// Pleroma's three buckets (bad login, unknown user, something went
-/// wrong) with the follow model's own wording for the refusals it states
-/// for the submitter to read.
-async fn attempt_subscribe(state: &AppState, form: &SubscribeSubmit) -> Result<String, String> {
-    let Some(acct) = required(form.acct.as_deref()) else {
-        return Err(COULD_NOT_FIND_USER_PAGE.to_owned());
-    };
-    let name = form
-        .authorization
-        .as_ref()
-        .and_then(|authorization| required(authorization.name.as_deref()));
-    let password = form
-        .authorization
-        .as_ref()
-        .and_then(|authorization| authorization.password.as_deref())
-        .filter(|password| !password.is_empty());
-    let (Some(name), Some(password)) = (name, password) else {
-        return Err(WRONG_CREDENTIALS.to_owned());
-    };
-    let Some(user) = authenticate(&state.db, name, password).await else {
-        return Err(WRONG_CREDENTIALS.to_owned());
-    };
-    let Some(target) = resolve_subscribe_target(state, acct).await else {
-        return Err(COULD_NOT_FIND_USER_PAGE.to_owned());
-    };
-    match follow::follow(&state.db, &state.config.base_url, &user, &target).await {
-        Ok(created) => {
-            after_follow_changed(state, &user, &target, Some(&created), true).await;
-            Ok(acct.to_owned())
-        }
-        Err(err) => Err(follow_page_error(&err)),
-    }
-}
-
-/// The target of `POST /ostatus_subscribe`: the `acct` resolved by
-/// [`get_or_fetch_by_acct`] (the database mirror first, `WebFinger` for
-/// an unseen handle), live accounts only. A refusal or a deactivated row
-/// is the shared [`None`] — the caller renders no detail beyond
-/// [`COULD_NOT_FIND_USER_PAGE`].
-async fn resolve_subscribe_target(state: &AppState, acct: &str) -> Option<User> {
-    match get_or_fetch_by_acct(state, acct).await {
-        Ok(target) if target.is_active.get() => Some(target),
-        Ok(target) => {
-            debug!(nickname = %target.nickname, "a subscribe target without a live row");
-            None
-        }
-        Err(err) => {
-            debug!(%err, acct, "the subscribe target could not be resolved");
-            None
-        }
-    }
-}
-
-/// The error line a refused follow renders: the model's own client-safe
-/// wording for a refusal it means the submitter to read (a self-follow,
-/// a block), the catch-all for everything else — a database failure's
-/// detail stays in the log (decision 8).
-fn follow_page_error(err: &AppError) -> String {
-    if matches!(
-        err,
-        AppError::Unprocessable(_)
-            | AppError::Forbidden(_)
-            | AppError::BadRequest(_)
-            | AppError::Conflict(_)
-    ) {
-        return err.to_string();
-    }
-    debug!(%err, "the subscribe follow write failed");
-    SOMETHING_WENT_WRONG.to_owned()
-}
 
 /// `GET /main/ostatus` (Pleroma's `show_subscribe_form` in its form
 /// half): the remote-subscribe form, prefilled from the flat `nickname`

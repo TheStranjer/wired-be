@@ -58,7 +58,7 @@ use crate::{
 /// top level, together with the HTML helper pages of
 /// [`api::html_pages`] (`/mailer/unsubscribe/{token}`), the
 /// remote-interaction pages of [`api::remote_interaction`]
-/// (`/ostatus_subscribe`, `/authorize_interaction` and `/main/ostatus`)
+/// (`/authorize_interaction` and `/main/ostatus`)
 /// and the public instance documents of [`api::admin::apps_docs::public_router`]
 /// (`/instance/{name}.html`, the terms-of-service pages an admin
 /// uploads).

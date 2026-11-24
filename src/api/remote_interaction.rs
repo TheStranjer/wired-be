@@ -5,7 +5,11 @@
 //! The reference is Pleroma's `RemoteInteractionController`
 //! (`lib/pleroma/web/remote_interaction/remote_interaction_controller.ex`)
 //! and the routes `lib/pleroma/web/router.ex` serves it on; the ticket
-//! rules here are authoritative where the two differ. The four surfaces:
+//! rules here are authoritative where the two differ. The three surfaces
+//! (Pleroma's `GET/POST /ostatus_subscribe` password-login follow is not
+//! served: it took a password with neither a rate limit nor the second
+//! factor, so remote follow lands on the frontend's `/authorize_interaction`
+//! page and follows with the user's OAuth token):
 //!
 //! - `POST /api/v1/pleroma/remote_interaction` (no auth, form or JSON):
 //!   given `ap_id` (a local actor or object URL on *this* instance) and
@@ -19,12 +23,6 @@
 //!   `ap_id` itself is not validated: it is the value the remote instance
 //!   is asked to carry back, and Pleroma substitutes whatever it is
 //!   given.
-//! - `GET /ostatus_subscribe?acct=<handle>` renders the login form that
-//!   posts `acct`, `authorization[name]` and `authorization[password]`
-//!   to `POST /ostatus_subscribe`, which authenticates the local user,
-//!   resolves the handle through [`get_or_fetch_by_acct`] and records
-//!   the follow — the success page on its way out, the form with an
-//!   error line on any failure.
 //! - `GET /authorize_interaction?uri=<url or handle>` sends the browser
 //!   to the frontend page for whatever the `uri` resolves to: an actor to
 //!   `{FRONTEND_BASE_URL}/users/{id}`, a status to
@@ -52,14 +50,12 @@
 //! This module is a tree. `interaction` answers the JSON endpoint and
 //! `GET /authorize_interaction`: the shared subscribe lookup, its
 //! template reading and macro expansion, and the frontend redirect;
-//! `subscribe` runs the `GET/POST /ostatus_subscribe` login pair and the
-//! `GET/POST /main/ostatus` remote-subscribe pair, with the redirects
-//! they answer with; `pages` renders every page this feature shows — the
-//! bodies, the document, the headers — and holds the parameter trimming
-//! the routes read their requests through; and `test_support` holds the
-//! mock-`WebFinger` fixtures the children's unit tests share.
-//!
-//! [`get_or_fetch_by_acct`]: crate::federation::fetch_actor::get_or_fetch_by_acct
+//! `subscribe` runs the `GET/POST /main/ostatus` remote-subscribe pair,
+//! with the redirects they answer with; `pages` renders every page this
+//! feature shows — the body, the document, the headers — and holds the
+//! parameter trimming the routes read their requests through; and
+//! `test_support` holds the mock-`WebFinger` fixtures the children's unit
+//! tests share.
 
 use axum::{
     Router,
@@ -72,7 +68,7 @@ use crate::state::AppState;
 
 use self::{
     interaction::{authorize_interaction, remote_interaction},
-    subscribe::{do_remote_subscribe, do_subscribe, show_remote_subscribe, subscribe_form},
+    subscribe::{do_remote_subscribe, show_remote_subscribe},
 };
 
 mod interaction;
@@ -94,25 +90,10 @@ const MISSING_PROFILE: &str = "Missing parameter: profile";
 /// The page error line for a handle this instance cannot resolve,
 /// Pleroma's `follow`-page wording.
 const COULD_NOT_FIND_USER_PAGE: &str = "Could not find user";
-/// The page error line for a failed login or absent credentials,
-/// Pleroma's `follow_login` wording.
-const WRONG_CREDENTIALS: &str = "Wrong username or password";
 /// The page error line for any other failure, Pleroma's catch-all.
 const SOMETHING_WENT_WRONG: &str = "Something went wrong.";
-/// The title of the `ostatus_subscribe` login page and its success page.
-const FOLLOW_TITLE: &str = "Remote follow";
 /// The title of the `main/ostatus` remote-subscribe page.
 const REMOTE_SUBSCRIBE_TITLE: &str = "Remote subscribe";
-/// The success line of the follow page, with the followed handle
-/// (escaped) interpolated after it by [`success_body`].
-///
-/// [`success_body`]: crate::api::remote_interaction::pages::success_body
-const FOLLOWED_MESSAGE: &str = "You are now following";
-/// The path of the login-form pair, the `POST` target of the form
-/// [`subscribe_body`] renders.
-///
-/// [`subscribe_body`]: crate::api::remote_interaction::pages::subscribe_body
-const SUBSCRIBE_PATH: &str = "/ostatus_subscribe";
 /// The path of `GET /authorize_interaction`.
 const AUTHORIZE_PATH: &str = "/authorize_interaction";
 /// The path of the remote-subscribe form pair.
@@ -148,12 +129,11 @@ static FRAME_OPTIONS_HEADER: HeaderName = HeaderName::from_static("x-frame-optio
 /// The top-level remote-interaction pages router, merged at the root by
 /// [`crate::app`].
 ///
-/// Mounts `/ostatus_subscribe`, `/authorize_interaction` and
-/// `/main/ostatus`. Do not call [`Router::fallback`] on it: unmatched
-/// paths must reach the app-wide fallback in [`crate::app`].
+/// Mounts `/authorize_interaction` and `/main/ostatus`. Do not call
+/// [`Router::fallback`] on it: unmatched paths must reach the app-wide
+/// fallback in [`crate::app`].
 pub fn router() -> Router<AppState> {
     Router::new()
-        .route(SUBSCRIBE_PATH, get(subscribe_form).post(do_subscribe))
         .route(AUTHORIZE_PATH, get(authorize_interaction))
         .route(
             REMOTE_SUBSCRIBE_PATH,
@@ -187,37 +167,6 @@ struct InteractionReply {
     /// The remote instance's subscribe template with the `ap_id`
     /// substituted for its `{uri}` macro.
     url: String,
-}
-
-/// The query of `GET /ostatus_subscribe`: Pleroma's `%{"acct" => handle}`.
-#[derive(Debug, Default, Deserialize)]
-#[serde(default)]
-struct SubscribeQuery {
-    /// The remote handle the form will follow.
-    acct: Option<String>,
-}
-
-/// The body of `POST /ostatus_subscribe`: the hidden `acct` plus the
-/// Rails-style nested credentials (`authorization[name]`,
-/// `authorization[password]`) the form renders. All fields optional —
-/// any missing piece is the re-rendered form, not a parse error.
-#[derive(Debug, Default, Deserialize)]
-#[serde(default)]
-struct SubscribeSubmit {
-    /// The remote handle to follow.
-    acct: Option<String>,
-    /// The submitted login.
-    authorization: Option<Authorization>,
-}
-
-/// The nested `authorization` map of [`SubscribeSubmit`].
-#[derive(Debug, Default, Deserialize)]
-#[serde(default)]
-struct Authorization {
-    /// The local account's nickname or email.
-    name: Option<String>,
-    /// Its password, taken verbatim (never trimmed).
-    password: Option<String>,
 }
 
 /// The query of `GET /authorize_interaction`.
@@ -269,7 +218,7 @@ mod tests {
 
     /// The routers mount every documented path.
     #[test]
-    fn the_two_routers_carry_the_five_routes() {
+    fn the_two_routers_carry_the_three_routes() {
         // Building them proves the paths are axum-legal; the handlers are
         // exercised over HTTP by the integration suite.
         let _pages: Router<AppState> = router();

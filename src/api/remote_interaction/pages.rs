@@ -1,7 +1,7 @@
-//! The pages this feature renders: the login form and its success page,
-//! the remote-subscribe form, their bodies and the shared error line, and
-//! the document and header plumbing every one of them rides on — plus
-//! the parameter trimming the routes read their requests through.
+//! The pages this feature renders: the remote-subscribe form, its body and
+//! the shared error line, and the document and header plumbing it rides
+//! on — plus the parameter trimming the routes read their requests
+//! through.
 
 use axum::{
     http::{HeaderName, HeaderValue, StatusCode, header},
@@ -11,49 +11,9 @@ use axum::{
 use crate::util::sanitize::escape_html;
 
 use super::{
-    FOLLOW_TITLE, FOLLOWED_MESSAGE, FRAME_OPTIONS_HEADER, PAGE_CONTENT_TYPE, PAGE_CSP, PAGE_STYLE,
-    REMOTE_SUBSCRIBE_PATH, REMOTE_SUBSCRIBE_TITLE, SUBSCRIBE_PATH,
+    FRAME_OPTIONS_HEADER, PAGE_CONTENT_TYPE, PAGE_CSP, PAGE_STYLE, REMOTE_SUBSCRIBE_PATH,
+    REMOTE_SUBSCRIBE_TITLE,
 };
-
-/// The `GET/POST /ostatus_subscribe` page: [`subscribe_body`] under the
-/// module headers.
-pub(super) fn subscribe_page(acct: &str, error: Option<&str>) -> Response {
-    page(FOLLOW_TITLE, &subscribe_body(acct, error))
-}
-
-/// The body of the login page: the message, the optional error line, and
-/// the form posting the hidden `acct` plus the nested credentials to
-/// [`SUBSCRIBE_PATH`]. Every request-sourced value goes through
-/// [`escape_html`].
-pub(super) fn subscribe_body(acct: &str, error: Option<&str>) -> String {
-    let line = error_line(error);
-    let escaped_acct = escape_html(acct);
-    format!(
-        "<h1>{FOLLOW_TITLE}</h1>\n{line}\
-         <form method=\"post\" action=\"{SUBSCRIBE_PATH}\">\n\
-         <input type=\"hidden\" name=\"acct\" value=\"{escaped_acct}\">\n\
-         <label for=\"authorization_name\">Username</label>\n\
-         <input type=\"text\" id=\"authorization_name\" name=\"authorization[name]\" \
-         autocomplete=\"username\" required>\n\
-         <label for=\"authorization_password\">Password</label>\n\
-         <input type=\"password\" id=\"authorization_password\" \
-         name=\"authorization[password]\" autocomplete=\"current-password\" required>\n\
-         <input type=\"submit\" value=\"Follow\">\n\
-         </form>\n",
-    )
-}
-
-/// The page a completed follow answers with: [`success_body`] under the
-/// module headers.
-pub(super) fn success_page(acct: &str) -> Response {
-    page(FOLLOW_TITLE, &success_body(acct))
-}
-
-/// The body of the success page: the followed handle, escaped.
-pub(super) fn success_body(acct: &str) -> String {
-    let escaped_acct = escape_html(acct);
-    format!("<h1>{FOLLOW_TITLE}</h1>\n<p>{FOLLOWED_MESSAGE} <b>{escaped_acct}</b>.</p>\n")
-}
 
 /// The `GET/POST /main/ostatus` page: [`remote_subscribe_body`] under the
 /// module headers.
@@ -152,40 +112,20 @@ mod tests {
     use crate::api::remote_interaction::SOMETHING_WENT_WRONG;
 
     #[test]
-    fn the_subscribe_form_posts_the_documented_fields() {
-        let body = subscribe_body(r#"<i>&"'x"#, Some("bad & worse"));
+    fn a_first_render_shows_no_error_line() {
+        let body = remote_subscribe_body("alice", "bob@remote.example", None);
         assert!(
-            body.contains("action=\"/ostatus_subscribe\""),
-            "the form posts back to the subscribe route: {body}"
-        );
-        assert!(
-            body.contains("name=\"acct\" value=\"&lt;i&gt;&amp;&quot;&#39;x\""),
-            "the hidden acct is escaped: {body}"
-        );
-        assert!(
-            body.contains("name=\"authorization[name]\""),
-            "the username field is the nested authorization name: {body}"
-        );
-        assert!(
-            body.contains("name=\"authorization[password]\""),
-            "the password field is the nested authorization password: {body}"
-        );
-        assert!(
-            body.contains("type=\"password\""),
-            "the password input hides its text: {body}"
-        );
-        assert!(
-            body.contains("<p class=\"error\">bad &amp; worse</p>"),
-            "the error line is escaped: {body}"
+            !body.contains("class=\"error\""),
+            "no failure, no line: {body}"
         );
     }
 
     #[test]
-    fn a_first_render_shows_no_error_line() {
-        let body = subscribe_body("bob@remote.example", None);
+    fn the_error_line_is_escaped() {
+        let body = remote_subscribe_body("alice", "bob@remote.example", Some("bad & worse"));
         assert!(
-            !body.contains("class=\"error\""),
-            "no failure, no line: {body}"
+            body.contains("<p class=\"error\">bad &amp; worse</p>"),
+            "the error line is escaped: {body}"
         );
     }
 
@@ -219,17 +159,6 @@ mod tests {
     }
 
     #[test]
-    fn the_success_page_names_the_followed_acct_escaped() {
-        let body = success_body(r#"eve'"><script>x</script>"#);
-        assert!(body.contains(FOLLOWED_MESSAGE), "the success line");
-        assert!(
-            body.contains("<b>eve&#39;&quot;&gt;&lt;script&gt;x&lt;/script&gt;</b>"),
-            "the acct arrives escaped: {body}"
-        );
-        assert!(!body.contains("<script"), "no tag opens anywhere: {body}");
-    }
-
-    #[test]
     fn the_page_document_escapes_its_title() {
         let html = page_document("<bad> & title", "<p>body</p>");
         assert!(html.starts_with("<!DOCTYPE html>"), "starts at the doctype");
@@ -246,33 +175,28 @@ mod tests {
 
     #[test]
     fn every_page_answers_html_with_the_form_safe_policy() {
-        for response in [
-            subscribe_page("bob@remote.example", None),
-            success_page("bob@remote.example"),
-            remote_subscribe_page("alice", "bob@remote.example", None),
-        ] {
-            assert_eq!(response.status(), StatusCode::OK, "pages render at 200");
-            let headers = response.headers();
-            assert_eq!(
-                headers[header::CONTENT_TYPE],
-                PAGE_CONTENT_TYPE,
-                "answered as HTML"
-            );
-            assert_eq!(
-                headers[header::CONTENT_SECURITY_POLICY],
-                PAGE_CSP,
-                "the CSP allows the form's own submit"
-            );
-            assert!(
-                PAGE_CSP.contains("form-action 'self'"),
-                "and the policy names it: {PAGE_CSP}"
-            );
-            assert_eq!(
-                headers[FRAME_OPTIONS_HEADER.clone()],
-                "DENY",
-                "a login form is not framable"
-            );
-        }
+        let response = remote_subscribe_page("alice", "bob@remote.example", None);
+        assert_eq!(response.status(), StatusCode::OK, "pages render at 200");
+        let headers = response.headers();
+        assert_eq!(
+            headers[header::CONTENT_TYPE],
+            PAGE_CONTENT_TYPE,
+            "answered as HTML"
+        );
+        assert_eq!(
+            headers[header::CONTENT_SECURITY_POLICY],
+            PAGE_CSP,
+            "the CSP allows the form's own submit"
+        );
+        assert!(
+            PAGE_CSP.contains("form-action 'self'"),
+            "and the policy names it: {PAGE_CSP}"
+        );
+        assert_eq!(
+            headers[FRAME_OPTIONS_HEADER.clone()],
+            "DENY",
+            "a form page is not framable"
+        );
     }
 
     #[test]
