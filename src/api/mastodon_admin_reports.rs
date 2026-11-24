@@ -86,7 +86,7 @@ use std::collections::HashMap;
 use axum::{
     Json, Router,
     extract::{OriginalUri, Path, State},
-    http::{HeaderMap, Uri},
+    http::HeaderMap,
     routing::{get, post},
 };
 use sqlx::PgPool;
@@ -109,7 +109,7 @@ use crate::{
         status, user,
         user::User,
     },
-    pagination::{PageParams, link_header, set_link_header},
+    pagination::{PageParams, keyset_link, set_link_header},
     services::{
         render_status::{ViewerMode, render_statuses},
         report_moderation::{assign_report, set_report_state},
@@ -181,7 +181,13 @@ async fn list_reports(
     let rows = report::mastodon_list(&state.db, &params, page).await?;
     debug!(listed = rows.len(), "admin mastodon reports listed");
     let entities = entities(&state, &staff.0, &rows).await?;
-    let link = page_link(&state, &uri, &rows);
+    let link = keyset_link(
+        &state.config.base_url,
+        uri.path(),
+        &link_query(uri.query()),
+        &rows,
+        |row: &ReportRow| row.id,
+    );
     let mut headers = HeaderMap::new();
     set_link_header(&mut headers, link.as_deref())?;
     Ok((headers, Json(entities)))
@@ -509,22 +515,6 @@ async fn cited_statuses(
         let _kept: Option<Vec<Status>> = rendered.insert(report_id, statuses);
     }
     Ok(rendered)
-}
-
-/// The `Link` header value for one fetched page: [`link_header`] over the
-/// first (newest) and last (oldest) row's id — the report ids the ticket
-/// keys this listing's cursors on — with the request's own filters
-/// repeated, and `None` for an empty page.
-fn page_link(state: &AppState, uri: &Uri, rows: &[ReportRow]) -> Option<String> {
-    let newest = rows.first()?.id.to_string();
-    let oldest = rows.last()?.id.to_string();
-    link_header(
-        &state.config.base_url,
-        uri.path(),
-        &link_query(uri.query()),
-        &newest,
-        &oldest,
-    )
 }
 
 /// The account an entity slot names; its absence is the impossible state

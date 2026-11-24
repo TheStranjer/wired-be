@@ -20,7 +20,7 @@ use crate::{
         self, User,
         admin::{self, Criterion, MastodonListParams},
     },
-    pagination::{PageParams, link_header, set_link_header},
+    pagination::{PageParams, keyset_link, set_link_header},
     state::AppState,
     util::id::parse_id,
 };
@@ -123,7 +123,13 @@ async fn page_response(
     let page = PageParams::from_query_with_default(uri.query(), DEFAULT_LIMIT, MAX_LIMIT)?;
     let rows = admin::mastodon_list(&state.db, &params, page).await?;
     debug!(listed = rows.len(), "admin accounts listed");
-    let link = page_link(state, uri, &rows);
+    let link = keyset_link(
+        &state.config.base_url,
+        uri.path(),
+        &link_query(uri.query()),
+        &rows,
+        |row: &User| row.id,
+    );
     let mut headers = HeaderMap::new();
     set_link_header(&mut headers, link.as_deref())?;
     let accounts = rows
@@ -131,22 +137,6 @@ async fn page_response(
         .map(|row| AdminAccount::from_user(row, &state.config))
         .collect();
     Ok((headers, Json(accounts)))
-}
-
-/// The `Link` header value for one fetched page: [`link_header`] over the
-/// first (newest) and last (oldest) row's id — Pleroma's `add_link_headers`
-/// cursors, keyed on the account rows this listing pages through — with the
-/// request's own filters repeated, and `None` for an empty page.
-fn page_link(state: &AppState, uri: &Uri, rows: &[User]) -> Option<String> {
-    let newest = rows.first()?.id.to_string();
-    let oldest = rows.last()?.id.to_string();
-    link_header(
-        &state.config.base_url,
-        uri.path(),
-        &link_query(uri.query()),
-        &newest,
-        &oldest,
-    )
 }
 
 /// v1's criteria: the six booleans, each read by [`Criterion::parse`] so that

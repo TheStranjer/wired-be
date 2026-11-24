@@ -36,7 +36,7 @@ use crate::{
         status_visibility,
         user::{self, AccountStatus, User, admin},
     },
-    pagination::{link_header, set_link_header},
+    pagination::{keyset_link, set_link_header},
     services::{
         filter,
         render_status::{ViewerMode, render_statuses},
@@ -422,7 +422,13 @@ pub async fn timeline_response(
     uri: &Uri,
 ) -> AppResult<(HeaderMap, Json<Vec<StatusEntity>>)> {
     let rows = query.fetch(&state.db).await?;
-    let link = page_link(state, uri, &rows);
+    let link = keyset_link(
+        &state.config.base_url,
+        uri.path(),
+        &link_query(uri.query()),
+        &rows,
+        |row| row.id,
+    );
     let rendered = render_statuses(state, ViewerMode::User(query.viewer.as_ref()), &rows).await?;
     let statuses = match query.source.filter_context() {
         Some(context) => {
@@ -433,23 +439,6 @@ pub async fn timeline_response(
     let mut headers = HeaderMap::new();
     set_link_header(&mut headers, link.as_deref())?;
     Ok((headers, Json(statuses)))
-}
-
-/// The `Link` header value for one fetched page: [`link_header`] over the
-/// first (newest) and last (oldest) row's id — the same
-/// [`add_link_headers`](crate::pagination::link_header) cursors every other
-/// listing here writes — with the request's own parameters repeated per
-/// Pleroma's `build_pagination_fields`, and `None` for an empty page.
-fn page_link(state: &AppState, uri: &Uri, rows: &[Status]) -> Option<String> {
-    let newest = rows.first()?.id.to_string();
-    let oldest = rows.last()?.id.to_string();
-    link_header(
-        &state.config.base_url,
-        uri.path(),
-        &link_query(uri.query()),
-        &newest,
-        &oldest,
-    )
 }
 
 /// The query parameters a page's `Link` targets repeat: the request's own
