@@ -35,8 +35,6 @@ use axum::{
     response::{IntoResponse as _, Response},
     routing::get,
 };
-use hmac::Hmac;
-use sha2_011::Sha256;
 
 use crate::{state::AppState, util::sanitize::escape_html};
 
@@ -72,11 +70,6 @@ const UNSUBSCRIBED_MESSAGE: &str = "You have been unsubscribed";
 /// every refusal with: a forged, malformed or un-mintable token is told
 /// the same, so the page never leaks which it was.
 const INVALID_TOKEN_MESSAGE: &str = "Invalid token";
-
-/// The HMAC flavor unsubscribe tokens carry: HMAC-SHA256 over the
-/// user-id text, the [`crate::services::media_proxy`] signing recipe
-/// with a different message.
-type HmacSha256 = Hmac<Sha256>;
 
 /// The HTML helper-pages router, merged at the root by [`crate::app`].
 ///
