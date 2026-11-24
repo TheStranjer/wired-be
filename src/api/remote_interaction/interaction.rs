@@ -1,33 +1,23 @@
-//! The interaction endpoints: `POST /api/v1/pleroma/remote_interaction`
-//! and `GET /authorize_interaction`. The subscribe lookup, its
-//! `WebFinger` template reading and macro expansion, and the frontend
-//! redirect for whatever a `uri` resolves to.
+//! The interaction endpoint: `POST /api/v1/pleroma/remote_interaction`.
+//! The subscribe lookup, its `WebFinger` template reading and macro
+//! expansion, and the parameter trimming the request is read through.
 
-use axum::{
-    Json,
-    extract::{Query, State},
-    response::Response,
-};
+use axum::{Json, extract::State};
 use serde_json::Value;
 use tracing::debug;
 use url::form_urlencoded;
 
 use crate::{
-    api::pleroma_account_settings::looks_like_ap_id,
     error::{AppError, AppResult},
     extract::ApiBody,
-    federation::{
-        fetch_actor::{get_or_fetch_by_acct, get_or_fetch_by_ap_id},
-        fetch_object::resolve_status,
-        webfinger_client::{URI_MACRO, URI_MACRO_ENCODED, finger_with_base, strip_finger_prefixes},
-    },
+    federation::webfinger_client::{URI_MACRO, URI_MACRO_ENCODED, finger_with_base},
     http_client::HttpClient,
     state::AppState,
 };
 
 use super::{
-    COULD_NOT_FIND_USER, InteractionParams, InteractionQuery, InteractionReply, MISSING_AP_ID,
-    MISSING_PROFILE, SUBSCRIBE_REL, pages::required, subscribe::frontend_redirect,
+    COULD_NOT_FIND_USER, InteractionParams, InteractionReply, MISSING_AP_ID, MISSING_PROFILE,
+    SUBSCRIBE_REL,
 };
 
 /// `POST /api/v1/pleroma/remote_interaction` (Pleroma's
@@ -132,49 +122,16 @@ pub(super) fn expand_subscribe_url(document: &Value, target: &str) -> Option<Str
     None
 }
 
-/// `GET /authorize_interaction` (Pleroma's `authorize_interaction`,
-/// which bounces to its own subscribe form; this instance keeps the page
-/// flow on the frontend instead): the 302 to the frontend page for
-/// whatever `uri` resolves to.
-///
-/// # Errors
-///
-/// [`AppError::NotFound`] — the 404 JSON — for an absent or blank `uri`
-/// and for one that resolves to no actor and no status.
-pub(super) async fn authorize_interaction(
-    State(state): State<AppState>,
-    Query(query): Query<InteractionQuery>,
-) -> AppResult<Response> {
-    let Some(uri) = required(query.uri.as_deref()) else {
-        return Err(AppError::NotFound);
-    };
-    interaction_redirect(&state, uri).await
+/// `value` trimmed, or the empty string when the request carried none.
+fn trimmed(value: Option<&str>) -> &str {
+    value.map_or("", str::trim)
 }
 
-/// The `GET /authorize_interaction` resolution rule: an `http(s)` URL is
-/// tried as an actor first and as a status second (Pleroma's own check
-/// distinguishes the same two shapes); anything else is a handle through
-/// [`get_or_fetch_by_acct`] with its `@`/`acct:` prefixes folded. A local
-/// row answers from the database in either direction; only an unseen
-/// remote address touches the network.
-async fn interaction_redirect(state: &AppState, uri: &str) -> AppResult<Response> {
-    if looks_like_ap_id(uri) {
-        if let Ok(user) = get_or_fetch_by_ap_id(state, uri).await {
-            return frontend_redirect(&state.config, &format!("users/{}", user.id));
-        }
-        if let Ok(Some(status)) = resolve_status(state, uri).await {
-            return frontend_redirect(&state.config, &format!("notice/{}", status.id));
-        }
-        debug!(uri, "authorize_interaction resolved no actor and no status");
-        return Err(AppError::NotFound);
-    }
-    match get_or_fetch_by_acct(state, strip_finger_prefixes(uri)).await {
-        Ok(user) => frontend_redirect(&state.config, &format!("users/{}", user.id)),
-        Err(err) => {
-            debug!(%err, uri, "authorize_interaction could not resolve the handle");
-            Err(AppError::NotFound)
-        }
-    }
+/// The parameter `value` when the request carried it non-blank after
+/// trimming — the presence rule of every required parameter here.
+fn required(value: Option<&str>) -> Option<&str> {
+    let text = trimmed(value);
+    (!text.is_empty()).then_some(text)
 }
 
 #[cfg(test)]
@@ -194,6 +151,23 @@ mod tests {
         },
         federation::webfinger_client::{JRD_JSON, XRD_XML},
     };
+
+    #[test]
+    fn required_parameters_are_present_and_non_blank() {
+        assert_eq!(required(None), None, "an absent parameter");
+        assert_eq!(required(Some("")), None, "an empty one");
+        assert_eq!(required(Some("   ")), None, "a blank one");
+        assert_eq!(
+            required(Some(" https://x.example/a ")),
+            Some("https://x.example/a"),
+            "a value is trimmed"
+        );
+        assert_eq!(trimmed(None), "", "and an absent value reads as empty");
+        assert_eq!(
+            trimmed(Some(" https://x.example/a ")),
+            "https://x.example/a"
+        );
+    }
 
     #[tokio::test]
     async fn the_json_endpoint_answers_the_interaction_url() {

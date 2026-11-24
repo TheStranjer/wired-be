@@ -1,7 +1,8 @@
 //! Remote interaction over HTTP (WBE-188): the `POST
 //! /api/v1/pleroma/remote_interaction` endpoint, the retired
 //! `/ostatus_subscribe` pair (WBE-741: answered by the fallback alone),
-//! `GET /authorize_interaction`'s frontend redirects and the retired
+//! the retired `GET /authorize_interaction` (WBE-752: the frontend serves
+//! it, the fallback answers here and nothing is fetched) and the retired
 //! `/main/ostatus` pair, also answered by the fallback alone
 //! (`src/api/remote_interaction.rs`).
 //!
@@ -10,21 +11,18 @@
 //! unit tests; what this suite pins over the real router is the
 //! parameter refusals (every case is network-free: an unresolvable
 //! profile is spelled with a single-label domain that the `WebFinger`
-//! client rejects before any request), and the redirects a locally
-//! stored actor, handle and status get.
+//! client rejects before any request).
 
 #![cfg(test)]
 
 use axum::http::StatusCode;
 use serde_json::json;
-use wired_be::models::{follow, status::Visibility};
+use wired_be::models::follow;
 
 use crate::common;
 
 /// The JSON endpoint under test.
 const ROUTE: &str = "/api/v1/pleroma/remote_interaction";
-/// The instance origin every fixture URL is built from.
-const BASE: &str = "https://test.example";
 /// A local actor URL, the `ap_id` the endpoint is asked to expand.
 const AP_ID: &str = "https://test.example/users/alice";
 /// A handle `WebFinger` refuses before any request (single-label
@@ -32,8 +30,6 @@ const AP_ID: &str = "https://test.example/users/alice";
 const UNRESOLVABLE: &str = "ghost@invalid";
 /// The 400 body both unresolvable-profile paths share.
 const COULD_NOT_FIND_USER: &str = r#"{"error":"Couldn't find user"}"#;
-/// The 404 body of `GET /authorize_interaction`.
-const NOT_FOUND: &str = r#"{"error":"Record not found"}"#;
 
 /// The 400 an absent, blank or `null` `ap_id` is refused with.
 #[tokio::test]
@@ -175,115 +171,35 @@ async fn the_subscribe_form_is_answered_by_the_fallback() {
     );
 }
 
-/// `GET /authorize_interaction?uri=<local actor url>` 302s the browser
-/// to the frontend profile page, `{FRONTEND_BASE_URL}/users/{id}` — the
-/// configured frontend origin, not `BASE_URL`, is what the redirect
-/// names.
+/// `GET /authorize_interaction` is not routed (the frontend serves it):
+/// the fallback answers 404, and an anonymous caller cannot make the
+/// server fetch or store the remote actor the `uri` names.
 #[tokio::test]
-async fn authorize_interaction_redirects_an_actor_url() {
+async fn authorize_interaction_is_answered_by_the_fallback_and_fetches_nothing() {
     let db = common::test_db().await;
     let pool = db.pool().clone();
-    let alice = common::create_local_user(&pool, "alice").await;
-    let mut config = common::test_config();
-    config.frontend_base_url = "https://frontend.example".to_owned();
-    let app = common::test_app_with_config(pool, config);
+    let app = common::test_app(pool.clone());
 
-    let response = common::TestRequest::get(&format!(
-        "/authorize_interaction?uri={}",
-        urlencoding(AP_ID)
-    ))
-    .send(&app)
-    .await;
-
-    common::assert_answer(&response, StatusCode::FOUND, "the actor redirect");
-    assert_eq!(
-        response.header("location"),
-        Some(format!("https://frontend.example/users/{}", alice.id).as_str()),
-        "the frontend page for the resolved actor"
-    );
-}
-
-/// A `user@domain` handle stored as a remote mirror resolves from the
-/// database (no network), with its `@` prefix folded.
-#[tokio::test]
-async fn authorize_interaction_redirects_a_handle() {
-    let db = common::test_db().await;
-    let pool = db.pool().clone();
-    let bob = common::create_remote_user(&pool, "bob", "remote.example").await;
-    let app = common::test_app(pool);
-
-    let response = common::TestRequest::get(&format!(
-        "/authorize_interaction?uri={}",
-        urlencoding("@bob@remote.example")
-    ))
-    .send(&app)
-    .await;
-
-    common::assert_answer(&response, StatusCode::FOUND, "the handle redirect");
-    assert_eq!(
-        response.header("location"),
-        Some(format!("{BASE}/users/{}", bob.id).as_str()),
-        "the default frontend origin is the instance origin"
-    );
-}
-
-/// A status URL resolves through the object reader and 302s to
-/// `{FRONTEND_BASE_URL}/notice/{id}`.
-#[tokio::test]
-async fn authorize_interaction_redirects_a_status_url() {
-    let db = common::test_db().await;
-    let pool = db.pool().clone();
-    let alice = common::create_local_user(&pool, "alice").await;
-    let note = common::create_status(&pool, &alice, "an interacted note", Visibility::Public).await;
-    let app = common::test_app(pool);
-
-    let response = common::TestRequest::get(&format!(
-        "/authorize_interaction?uri={}",
-        urlencoding(&note.uri)
-    ))
-    .send(&app)
-    .await;
-
-    common::assert_answer(&response, StatusCode::FOUND, "the status redirect");
-    assert_eq!(
-        response.header("location"),
-        Some(format!("{BASE}/notice/{}", note.id).as_str()),
-        "the frontend page for the resolved status"
-    );
-}
-
-/// Whatever the `uri` cannot resolve to — a handle that fails the
-/// grammar, an unknown actor URL on this instance's own origin, or no
-/// `uri` at all — is the 404 JSON. None of these reach the network.
-#[tokio::test]
-async fn authorize_interaction_refuses_unresolvable_uris() {
-    let db = common::test_db().await;
-    let app = common::test_app(db.pool().clone());
-
-    let handle = common::TestRequest::get(&format!(
-        "/authorize_interaction?uri={}",
-        urlencoding(UNRESOLVABLE)
-    ))
-    .send(&app)
-    .await;
-    let unknown_actor = common::TestRequest::get(&format!(
-        "/authorize_interaction?uri={}",
-        urlencoding("https://test.example/users/nobody")
-    ))
-    .send(&app)
-    .await;
-    let missing = common::TestRequest::get("/authorize_interaction")
-        .send(&app)
-        .await;
-    for response in [&handle, &unknown_actor, &missing] {
-        common::assert_answer(response, StatusCode::NOT_FOUND, "an unresolvable uri");
+    let remote_actor = "https://remote.example/users/x";
+    for uri in [remote_actor, "@x@remote.example", ""] {
+        let response =
+            common::TestRequest::get(&format!("/authorize_interaction?uri={}", urlencoding(uri)))
+                .send(&app)
+                .await;
+        common::assert_answer(&response, StatusCode::NOT_FOUND, "the retired page");
         assert_eq!(
-            response.text(),
-            NOT_FOUND,
-            "the 404 is JSON: {}",
-            response.text()
+            response.header("x-wired-fallback"),
+            Some("1"),
+            "only the fallback answers the path"
         );
     }
+
+    let stored: i64 = sqlx::query_scalar("SELECT count(*) FROM users WHERE ap_id = $1")
+        .bind(remote_actor)
+        .fetch_one(&pool)
+        .await
+        .expect("the users count");
+    assert_eq!(stored, 0, "no actor row was created for the uri");
 }
 
 /// `GET /main/ostatus` and `POST /main/ostatus` are not routed: the

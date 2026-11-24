@@ -516,8 +516,8 @@ changed. Four families make it up:
 - **federation and discovery** — the `ActivityPub` actors, objects, activities,
   inboxes and outboxes (`/users/…`, `/objects/…`, `/activities/…`, `/inbox`,
   `/relay`, `/internal/fetch`), `WebFinger`, host-meta, `NodeInfo`, the media and
-  emoji files, the proxy, the OAuth endpoints, the
-  remote-interaction pages and the streaming WebSocket.
+  emoji files, the proxy, the OAuth endpoints
+  and the streaming WebSocket.
 
 `src/api/route_inventory.rs` is the table of that surface: one row per route,
 with its method, its `:name`-style path and the credential its handler demands
@@ -540,9 +540,10 @@ Routes Pleroma has and Wired deliberately does not:
 | `GET/POST /frontend_switcher` | Pleroma's `FrontendSwitcherController`: an HTML radio-list of installed frontends whose POST sets a year-long `preferred_frontend` cookie and redirects to `/`. Wired is API-only and serves no frontend at `/`, so the cookie would select nothing; both methods fall through to the JSON 404. |
 | `GET /embed/:id` and `GET /notice/:id/embed_player` | Pleroma's `EmbedController.show` and `OStatus.notice_player`: server-rendered HTML pages (a status card and a one-attachment media player) served without `X-Frame-Options` so other sites can iframe them. Wired is API-only and serves no framable page; both paths fall through to the JSON 404 (`x-wired-fallback: 1`). A client that wants an embed renders its own from `GET /api/v1/statuses/:id`. `GET /notice/:id` still negotiates the `ActivityPub` Note JSON. |
 | `GET /registration/:token` | Pleroma's invite-link page, which redirects to its own frontend's registration page. Wired is API-only: the invite letter links straight to `{FRONTEND_BASE_URL}/registration/{token}` (the frontend registers through `POST /api/v1/accounts` with the `token` field), so this path falls through to the JSON 404. |
-| `GET/POST /ostatus_subscribe` | Pleroma's remote-follow login page: it takes a username and password from an anonymous client, with no rate limit and without the second factor the OAuth password grant demands, so it is a credential oracle and an MFA bypass. Wired serves no password form outside the throttled `POST /oauth/token`; remote follow lands on the frontend's `/authorize_interaction` page (`GET /authorize_interaction` redirects there) and follows through `POST /api/v1/accounts/:id/follow` with the user's OAuth token. Both methods fall through to the JSON 404 (`x-wired-fallback: 1`). |
+| `GET/POST /ostatus_subscribe` | Pleroma's remote-follow login page: it takes a username and password from an anonymous client, with no rate limit and without the second factor the OAuth password grant demands, so it is a credential oracle and an MFA bypass. Wired serves no password form outside the throttled `POST /oauth/token`; remote follow lands on the frontend's `/authorize_interaction` page and follows through `POST /api/v1/accounts/:id/follow` with the user's OAuth token. Both methods fall through to the JSON 404 (`x-wired-fallback: 1`). |
 | `GET/POST /main/ostatus` | Pleroma's server-rendered remote-subscribe form (`router.ex` `/main/ostatus`): an HTML page that takes a local nickname and a remote handle and redirects to the remote instance's subscribe template. Wired is API-only; the same lookup is `POST /api/v1/pleroma/remote_interaction` (JSON) and the page flow lives on the frontend's `/authorize_interaction`. The `pleroma:get:main/ostatus` feature flag is no longer advertised, and both methods fall through to the JSON 404 (`x-wired-fallback: 1`). |
 | `GET /manifest.json` | The PWA manifest (`ManifestController`). It is the frontend's asset and the backend serves no HTML that would link it, so the path falls through to the JSON 404; a frontend that wants to be installable ships its own manifest. |
+| `GET /authorize_interaction` | Pleroma's remote-interaction landing page: given a `uri` (actor URL, status URL or handle) it fetches and stores the remote actor or status and redirects the browser to it. Served anonymously that is an unthrottled amplifier that lets any caller make the server fetch and persist remote objects of their choosing (Mastodon's equivalent requires a logged-in user). The frontend serves `/authorize_interaction` (the `WebFinger` subscribe template points at it); the backend path falls through to the JSON 404 (`x-wired-fallback: 1`). |
 | The Shout channels socket (`GET /socket`) | Pleroma's browser-notification WebSocket. Wired delivers the same events on `/api/v1/streaming` and over Web Push. |
 
 ## Development
