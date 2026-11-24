@@ -19,13 +19,15 @@ use crate::{
     models::{
         chat,
         chat::ChatMessageReference,
+        custom_emoji::CustomEmoji as EmojiRow,
         media_attachment,
         user::{self, User},
     },
     oauth::scopes::{READ_CHATS, WRITE_CHATS},
     pagination::{MAX_LIMIT, NO_EXTRA_QUERY, PageParams, keyset_link, set_link_header},
+    services::render_status::{EmojiText, load_emojis},
     state::AppState,
-    util::id::parse_id,
+    util::{emoji::shortcodes_in, id::parse_id},
 };
 
 use super::{chats_list::owned_chat, events::after_chat_message_deleted};
@@ -157,11 +159,41 @@ pub(crate) async fn message_of(
         Some(media_id) => media_attachment::get_by_id(&state.db, media_id).await?,
         None => None,
     };
-    Ok(ChatMessage::from_reference(
-        reference,
-        attachment.as_ref(),
-        &state.config,
-    ))
+    let emojis = message_emojis(state, reference).await?;
+    Ok(
+        ChatMessage::from_reference(reference, attachment.as_ref(), &state.config)
+            .with_emojis(&emojis, &state.config),
+    )
+}
+
+/// The enabled `custom_emojis` rows the message text names under its
+/// sender's domain (local emojis for a local sender).
+///
+/// Asks the database nothing when the text holds no `:shortcode:`, and
+/// answers none for a sender whose row is gone.
+///
+/// # Errors
+///
+/// As [`chat_json`]'s.
+///
+/// [`chat_json`]: crate::api::chats::chats_list::chat_json
+async fn message_emojis(
+    state: &AppState,
+    reference: &ChatMessageReference,
+) -> AppResult<Vec<EmojiRow>> {
+    if shortcodes_in(&reference.content).is_empty() {
+        return Ok(Vec::new());
+    }
+    let Some(sender) = user::get_by_id(&state.db, reference.sender_id).await? else {
+        return Ok(Vec::new());
+    };
+    let items = [EmojiText {
+        key: reference.id,
+        domain: sender.domain.as_deref(),
+        texts: vec![reference.content.as_str()],
+    }];
+    let mut found = load_emojis(&state.db, &items).await?;
+    Ok(found.remove(&reference.id).unwrap_or_default())
 }
 
 /// The [`ChatMessage`] entity for a freshly marked reference.

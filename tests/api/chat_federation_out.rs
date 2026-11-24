@@ -32,7 +32,7 @@ use wired_be::{
     config::TEST_BASE_URL,
     federation::{delivery, publisher},
     jobs::AttemptInfo,
-    models::{chat, user::User},
+    models::{chat, custom_emoji, user::User},
     pagination::{MAX_LIMIT, PageParams},
     util::{id::new_id, time::mastodon_time},
 };
@@ -329,6 +329,61 @@ async fn a_message_with_media_publishes_the_first_attachment() {
         delivered(&pool).await,
         vec!["https://remote.example/users/erin/inbox"],
         "and the one delivery it always had"
+    );
+}
+
+/// A message naming a local custom emoji federates a `tag` with one `Emoji`
+/// entry in the note builder's shape; a disabled or unknown shortcode adds
+/// none, and a message without emoji carries no `tag` key.
+#[tokio::test]
+async fn a_message_with_a_local_emoji_publishes_its_emoji_tag() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let app = common::test_app(pool.clone());
+    let (_alice, token) = chatter(&pool, "alice").await;
+    let erin = common::create_remote_user(&pool, "erin", HOST).await;
+    let _wiredcat = custom_emoji::upsert(
+        &pool,
+        &custom_emoji::NewCustomEmoji::local("wiredcat", &format!("{BASE}/emoji/wiredcat.png")),
+    )
+    .await
+    .expect("the emoji stores");
+    let _hidden = custom_emoji::upsert(
+        &pool,
+        &custom_emoji::NewCustomEmoji {
+            disabled: true,
+            ..custom_emoji::NewCustomEmoji::local("hidden", &format!("{BASE}/emoji/hidden.png"))
+        },
+    )
+    .await
+    .expect("the disabled emoji stores");
+
+    let chat_id = open_chat(&app, &token, &erin.id).await;
+    let _plain = send_message(&app, &token, &chat_id, json!({"content": "no emoji"})).await;
+    assert!(
+        the_published_activity(&pool).await["object"]
+            .get("tag")
+            .is_none(),
+        "a message without emoji has no tag key"
+    );
+
+    let _tagged = send_message(
+        &app,
+        &token,
+        &chat_id,
+        json!({"content": "reply :wiredcat: :hidden: :unknown:"}),
+    )
+    .await;
+    let activity = the_latest_activity(&pool).await;
+    assert_eq!(
+        activity["object"]["tag"],
+        json!([{
+            "type": "Emoji",
+            "id": format!("{BASE}/emoji/wiredcat.png"),
+            "name": ":wiredcat:",
+            "icon": {"type": "Image", "url": format!("{BASE}/emoji/wiredcat.png")},
+        }]),
+        "one Emoji tag, with the right name and icon"
     );
 }
 
