@@ -138,6 +138,19 @@ pub async fn generate_keypair_async() -> AppResult<KeyPair> {
         .map_err(|err| AppError::Internal(format!("the RSA key generation task failed: {err}")))?
 }
 
+/// Rewrites `pem` into the one shape the strict RFC 7468 parsers accept.
+///
+/// `\r\n` becomes `\n`, leading and trailing whitespace is trimmed, and
+/// exactly one `\n` is appended. Pleroma serves `publicKeyPem` ending in two
+/// newlines, which the parsers refuse; Windows line endings and stray
+/// padding are repaired the same way. The key material itself is untouched.
+#[must_use]
+pub fn normalize_pem(pem: &str) -> String {
+    let mut normalized = pem.replace("\r\n", "\n").trim().to_owned();
+    normalized.push('\n');
+    normalized
+}
+
 /// Parses a PEM-encoded RSA private key, accepting both PKCS#8
 /// (`-----BEGIN PRIVATE KEY-----`) and the legacy PKCS#1
 /// (`-----BEGIN RSA PRIVATE KEY-----`) label Mastodon and older Pleroma
@@ -148,9 +161,10 @@ pub async fn generate_keypair_async() -> AppResult<KeyPair> {
 /// [`AppError::BadRequest`] if `pem` parses as neither; the message carries
 /// both format-specific causes.
 pub fn parse_private_key(pem: &str) -> AppResult<RsaPrivateKey> {
-    match RsaPrivateKey::from_pkcs8_pem(pem) {
+    let pem = normalize_pem(pem);
+    match RsaPrivateKey::from_pkcs8_pem(&pem) {
         Ok(key) => Ok(key),
-        Err(pkcs8_err) => RsaPrivateKey::from_pkcs1_pem(pem).map_err(|pkcs1_err| {
+        Err(pkcs8_err) => RsaPrivateKey::from_pkcs1_pem(&pem).map_err(|pkcs1_err| {
             AppError::BadRequest(format!(
                 "private key PEM is neither PKCS#8 ({pkcs8_err}) nor PKCS#1 ({pkcs1_err})"
             ))
@@ -167,9 +181,10 @@ pub fn parse_private_key(pem: &str) -> AppResult<RsaPrivateKey> {
 /// [`AppError::BadRequest`] if `pem` parses as neither; the message carries
 /// both format-specific causes.
 pub fn parse_public_key(pem: &str) -> AppResult<RsaPublicKey> {
-    match RsaPublicKey::from_public_key_pem(pem) {
+    let pem = normalize_pem(pem);
+    match RsaPublicKey::from_public_key_pem(&pem) {
         Ok(key) => Ok(key),
-        Err(spki_err) => RsaPublicKey::from_pkcs1_pem(pem).map_err(|pkcs1_err| {
+        Err(spki_err) => RsaPublicKey::from_pkcs1_pem(&pem).map_err(|pkcs1_err| {
             AppError::BadRequest(format!(
                 "public key PEM is neither SPKI ({spki_err}) nor PKCS#1 ({pkcs1_err})"
             ))
@@ -385,6 +400,81 @@ mod tests {
         assert!(
             verify_sha256(&keys().public_pem, SIGNED_DATA, &signature),
             "and it signs so the SPKI public key verifies"
+        );
+    }
+
+    #[test]
+    fn normalize_pem_leaves_exactly_one_trailing_newline() {
+        let clean = "-----BEGIN PUBLIC KEY-----\nQUJD\n-----END PUBLIC KEY-----\n";
+        assert_eq!(normalize_pem(clean), clean, "a clean PEM is unchanged");
+        assert_eq!(
+            normalize_pem(&format!("{clean}\n")),
+            clean,
+            "Pleroma's blank trailing line is dropped"
+        );
+        assert_eq!(
+            normalize_pem(&clean.replace('\n', "\r\n")),
+            clean,
+            "CRLF becomes LF"
+        );
+        assert_eq!(
+            normalize_pem("  \n\t-----BEGIN PUBLIC KEY-----\nQUJD\n-----END PUBLIC KEY-----  \n\n"),
+            clean,
+            "surrounding whitespace is trimmed"
+        );
+        assert_eq!(
+            normalize_pem("-----BEGIN PUBLIC KEY-----\nQUJD\n-----END PUBLIC KEY-----"),
+            clean,
+            "a missing final newline is added"
+        );
+    }
+
+    #[test]
+    fn spki_pems_with_odd_whitespace_parse_and_verify() {
+        let keys = keys();
+        let signature = sign_sha256(&keys.private_pem, SIGNED_DATA).unwrap();
+        let blank_lines = format!("{}\n", keys.public_pem);
+        let crlf = keys.public_pem.replace('\n', "\r\n");
+        let padded = format!("  \n  {}  \n\n", keys.public_pem);
+        for (label, pem) in [
+            ("trailing blank line", blank_lines),
+            ("CRLF line endings", crlf),
+            ("leading and trailing spaces", padded),
+        ] {
+            assert!(parse_public_key(&pem).is_ok(), "{label} parses");
+            assert!(
+                verify_sha256(&pem, SIGNED_DATA, &signature),
+                "{label} still verifies a genuine signature"
+            );
+        }
+    }
+
+    #[test]
+    fn pkcs1_pems_with_trailing_blank_lines_parse() {
+        let public = format!("{FIXTURE_PUBLIC_PKCS1_PEM}\n\n");
+        let private = format!("{FIXTURE_PRIVATE_PKCS1_PEM}\n\n");
+        let parsed = parse_public_key(&public).unwrap();
+        assert_eq!(
+            parsed.n(),
+            parse_public_key(FIXTURE_PUBLIC_PKCS1_PEM).unwrap().n(),
+            "the same PKCS#1 public key"
+        );
+        let signature = sign_sha256(&private, SIGNED_DATA).unwrap();
+        assert!(
+            verify_sha256(&public, SIGNED_DATA, &signature),
+            "PKCS#1 with trailing blank lines signs and verifies"
+        );
+    }
+
+    #[test]
+    fn private_pems_with_odd_whitespace_parse() {
+        let keys = keys();
+        let odd = format!("\n {} \r\n\r\n", keys.private_pem.replace('\n', "\r\n"));
+        let parsed = parse_private_key(&odd).unwrap();
+        assert_eq!(
+            parsed.n(),
+            parse_private_key(&keys.private_pem).unwrap().n(),
+            "the same private key"
         );
     }
 

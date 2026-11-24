@@ -275,6 +275,50 @@ mod tests {
         server.abort();
     }
 
+    /// A peer whose served PEM ends in a blank line (Pleroma's shape)
+    /// authenticates instead of failing with `Invalid signature`.
+    #[tokio::test]
+    async fn a_pem_with_trailing_blank_lines_authenticates_the_signer() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let listener = bind().await;
+        let base = origin(&listener);
+        let ap_id = format!("{base}/users/alice");
+        let pleroma_pem = format!("{FIXTURE_PUBLIC_PKCS1_PEM}\n");
+        assert!(
+            pleroma_pem.ends_with("-----\n\n"),
+            "the PEM has two newlines"
+        );
+        let server = spawn(listener, peer_app(peer(base.clone(), pleroma_pem)));
+        let app = inbox_app(test_state(pool.clone()));
+
+        let body = activity(&ap_id, "https://test.example/users/bob");
+        let answer = send(
+            &app,
+            &deliver(
+                &format!("{ap_id}#main-key"),
+                FIXTURE_PRIVATE_PKCS1_PEM,
+                &body,
+            ),
+        )
+        .await;
+        assert_eq!(
+            answer.status,
+            StatusCode::OK,
+            "the delivery is authenticated, not 401"
+        );
+        let stored: String = sqlx::query_scalar("SELECT public_key FROM users WHERE ap_id = $1")
+            .bind(&ap_id)
+            .fetch_one(&pool)
+            .await
+            .expect("the mirror row");
+        assert_eq!(
+            stored, FIXTURE_PUBLIC_PKCS1_PEM,
+            "the mirror stores the key with exactly one trailing newline"
+        );
+        server.abort();
+    }
+
     /// A path-style `keyId` is fetched once, then served from the mirror.
     ///
     /// `GoToSocial`'s `{actor}/main-key` has no fragment, so it strips to

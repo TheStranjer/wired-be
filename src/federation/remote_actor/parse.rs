@@ -17,6 +17,7 @@ use crate::{
     federation::json::{as_array, first_string, value_or_id},
     models::user::{DEFAULT_ACTOR_TYPE, Flag},
     util::{
+        keys::normalize_pem,
         sanitize::{sanitize_html, strip_html},
         url::{host_with_port, http_host, is_http_url, parse_http_url},
     },
@@ -164,10 +165,14 @@ fn parse_actor_type(json: &Value) -> Result<String, ActorError> {
     }
 }
 
-/// The signing key of `publicKey`: the field is required, may be given as
-/// an array (Pleroma has emitted `[key]`), its `publicKeyPem` must be a
-/// non-empty string, and a `publicKey.owner` that is present must equal
-/// `id` — the key only stands for the actor whose id it names. An absent
+/// The signing key of `publicKey`, normalized for storage.
+///
+/// The field is required and may be given as an array (Pleroma has emitted
+/// `[key]`). Its `publicKeyPem` must be a non-blank string and is returned
+/// through [`normalize_pem`], so the stored form ends in exactly one newline
+/// even when the peer sends Pleroma's `\n\n`. A `publicKey.owner` that is
+/// present must equal `id` — the key only stands for the actor whose id it
+/// names. An absent
 /// `owner` is tolerated; Pleroma's `object_to_user_data` never reads the
 /// field.
 fn parse_public_key(json: &Value, id: &str) -> Result<String, ActorError> {
@@ -186,8 +191,8 @@ fn parse_public_key(json: &Value, id: &str) -> Result<String, ActorError> {
     }
     key.get("publicKeyPem")
         .and_then(Value::as_str)
-        .filter(|pem| !pem.is_empty())
-        .map(str::to_owned)
+        .filter(|pem| !pem.trim().is_empty())
+        .map(normalize_pem)
         .ok_or_else(|| ActorError::Invalid("`publicKey.publicKeyPem` is missing".to_owned()))
 }
 
