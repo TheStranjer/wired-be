@@ -13,7 +13,10 @@ use crate::{
     config::Config,
     error::{AppError, AppResult},
     extract::multipart::MultipartForm,
-    federation::{actor::actor_json, json as ap_json},
+    federation::{
+        actor::{actor_json, profile_emojis},
+        json as ap_json,
+    },
     models::{
         media_attachment,
         status::{self, Status},
@@ -39,7 +42,12 @@ use super::negotiation::document_response;
 /// and the `read` check.
 pub(super) async fn whoami(State(state): State<AppState>, auth: AuthUser) -> AppResult<Response> {
     auth.require(READ)?;
-    Ok(document_response(&actor_json(&auth.0, &state.config)))
+    let emojis = profile_emojis(&state.db, &auth.0).await?;
+    Ok(document_response(&actor_json(
+        &auth.0,
+        &state.config,
+        &emojis,
+    )))
 }
 
 /// `POST /api/ap/upload_media` — the C2S media upload, Pleroma's

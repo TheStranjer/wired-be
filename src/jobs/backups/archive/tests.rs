@@ -147,7 +147,7 @@ async fn the_archive_holds_the_four_entries_and_owns_its_temp_file() {
     }
     assert_eq!(
         entry_json(&archive, ACTOR_ENTRY),
-        actor_json(&alice, &state.config),
+        actor_json(&alice, &state.config, &[]),
         "actor.json is the federation actor verbatim"
     );
 

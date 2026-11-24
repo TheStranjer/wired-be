@@ -15,10 +15,11 @@ use crate::{
     config::Config,
     error::{AppError, AppResult},
     federation::{
-        actor::{actor_json, instance_actor_json},
+        actor::{actor_json, instance_actor_json, profile_emojis},
         vocab::{ACTIVITY_JSON, AP_MEDIA_TYPES},
     },
     models::user::User,
+    state::AppState,
 };
 
 use super::{CHARSET_SUFFIX, HTML_MEDIA_TYPE, VARY_ACCEPT};
@@ -69,14 +70,30 @@ pub(super) fn frontend_redirect(config: &Config, path: &str) -> AppResult<Respon
     Ok((StatusCode::FOUND, [(header::LOCATION, value)]).into_response())
 }
 
-/// The actor document for `user` as an `ActivityPub` response.
-pub(super) fn actor_response(user: &User, config: &Config) -> Response {
-    document_response(&actor_json(user, config))
+/// The actor document for `user` as an `ActivityPub` response, carrying
+/// the `Emoji` tags of the custom emojis the profile uses.
+///
+/// # Errors
+///
+/// Any database failure of the emoji lookup.
+pub(super) async fn actor_response(state: &AppState, user: &User) -> AppResult<Response> {
+    let emojis = profile_emojis(&state.db, user).await?;
+    Ok(document_response(&actor_json(user, &state.config, &emojis)))
 }
 
-/// The instance actor document for `user` as an `ActivityPub` response.
-pub(super) fn instance_actor_response(user: &User, config: &Config) -> Response {
-    document_response(&instance_actor_json(user, config))
+/// The instance actor document for `user` as an `ActivityPub` response,
+/// without `featured` and with the `Emoji` tags its profile text uses.
+///
+/// # Errors
+///
+/// Any database failure of the emoji lookup.
+pub(super) async fn instance_actor_response(state: &AppState, user: &User) -> AppResult<Response> {
+    let emojis = profile_emojis(&state.db, user).await?;
+    Ok(document_response(&instance_actor_json(
+        user,
+        &state.config,
+        &emojis,
+    )))
 }
 
 /// A built document's answer, the collection routes' shared ending.

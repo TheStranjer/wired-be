@@ -17,19 +17,30 @@
 //! remote mirror.
 //!
 //! Deliberately absent, unlike Pleroma: the `uploadMedia` endpoint (no
-//! upload-over-AP endpoint yet), `webfinger`, `vcard:bday` and the emoji
-//! `tag` list, which arrive with their own tickets.
+//! upload-over-AP endpoint yet), `webfinger` and `vcard:bday`, which
+//! arrive with their own tickets.
+//!
+//! The `tag` list carries one `Emoji` tag per local custom emoji the profile
+//! text uses. The document stays pure by taking those rows as an argument;
+//! [`profile_emojis`] is the async lookup its callers run first.
+
+use std::collections::{BTreeSet, HashSet};
 
 use serde_json::{Value, json};
+use sqlx::PgPool;
 
 use crate::{
     config::Config,
+    error::AppResult,
     federation::{
-        note::{LANGUAGE_UNDETERMINED, LITEPUB_SCHEMA_PATH, SECURITY_VOCABULARY},
+        note::{LANGUAGE_UNDETERMINED, LITEPUB_SCHEMA_PATH, SECURITY_VOCABULARY, tags::emoji_tag},
         vocab::AS_VOCABULARY,
     },
-    models::user::{User, featured, followers, following, inbox, outbox},
-    util::time::mastodon_time,
+    models::{
+        custom_emoji::{self, CustomEmoji},
+        user::{User, featured, followers, following, inbox, outbox},
+    },
+    util::{emoji::shortcodes_in, time::mastodon_time},
 };
 
 /// Fragment appended to the actor id for the key's own id (Pleroma's
@@ -51,10 +62,14 @@ const IMAGE_TYPE: &str = "Image";
 /// row's stored aliases) and `capabilities`, plus `icon` and `image` only
 /// when the row carries an avatar or a banner and `movedTo` only when the
 /// row records a move.
+///
+/// `emojis` is the pool of custom emojis the caller knows; the `tag` array
+/// holds an `Emoji` tag for each local, enabled one whose `:shortcode:` the
+/// profile text uses (see [`profile_emojis`]), once each, in `emojis` order.
 #[must_use]
-pub fn actor_json(user: &User, config: &Config) -> Value {
+pub fn actor_json(user: &User, config: &Config, emojis: &[CustomEmoji]) -> Value {
     Value::Object(
-        actor_fields(user, config)
+        actor_fields(user, config, emojis)
             .into_iter()
             .map(|(name, value)| (name.to_owned(), value))
             .collect(),
@@ -68,8 +83,8 @@ pub fn actor_json(user: &User, config: &Config) -> Value {
 /// peers fetch a 404. Its `outbox`, `followers` and `following` stay, as
 /// the empty collections `/internal/fetch` serves.
 #[must_use]
-pub fn instance_actor_json(user: &User, config: &Config) -> Value {
-    let mut document = actor_json(user, config);
+pub fn instance_actor_json(user: &User, config: &Config, emojis: &[CustomEmoji]) -> Value {
+    let mut document = actor_json(user, config, emojis);
     if let Some(fields) = document.as_object_mut() {
         drop(fields.remove("featured"));
     }
@@ -80,7 +95,11 @@ pub fn instance_actor_json(user: &User, config: &Config) -> Value {
 /// order Pleroma's renderer assembles them; the media fields come in only
 /// when the row has the media, and `movedTo` only when the row records a
 /// move.
-fn actor_fields(user: &User, config: &Config) -> Vec<(&'static str, Value)> {
+fn actor_fields(
+    user: &User,
+    config: &Config,
+    emojis: &[CustomEmoji],
+) -> Vec<(&'static str, Value)> {
     let ap_id = user.ap_id.as_str();
     let mut fields = vec![
         ("@context", json_ld_context(config)),
@@ -109,7 +128,7 @@ fn actor_fields(user: &User, config: &Config) -> Vec<(&'static str, Value)> {
     fields.extend([
         ("attachment", attachments(user)),
         ("published", json!(mastodon_time(&user.inserted_at))),
-        ("tag", json!([])),
+        ("tag", Value::Array(emoji_tags(user, emojis))),
         ("alsoKnownAs", json!(user.also_known_as)),
     ]);
     if let Some(moved_to) = user.moved_to_ap_id.as_deref() {
@@ -117,6 +136,63 @@ fn actor_fields(user: &User, config: &Config) -> Vec<(&'static str, Value)> {
     }
     fields.push(("capabilities", capabilities()));
     fields
+}
+
+/// Every text of the profile that renders custom emoji: display name, bio
+/// (source and rendered), and each stored profile field's name and value.
+fn profile_texts(user: &User) -> Vec<&str> {
+    let mut texts = vec![user.name.as_str(), user.raw_bio.as_str(), user.bio.as_str()];
+    for stored in [&user.fields, &user.raw_fields] {
+        for entry in stored.as_array().into_iter().flatten() {
+            texts.extend(
+                ["name", "value"]
+                    .iter()
+                    .filter_map(|key| entry.get(*key).and_then(Value::as_str)),
+            );
+        }
+    }
+    texts
+}
+
+/// The distinct shortcodes the profile text uses, sorted.
+fn used_shortcodes(user: &User) -> BTreeSet<&str> {
+    profile_texts(user)
+        .into_iter()
+        .flat_map(shortcodes_in)
+        .collect()
+}
+
+/// The local, enabled emojis among `user`'s profile shortcodes.
+///
+/// Shortcodes with no local row are simply absent from the result; with no
+/// shortcode in the profile no query runs.
+///
+/// # Errors
+///
+/// Any database failure arrives as [`AppError::Database`](crate::error::AppError).
+pub async fn profile_emojis(pool: &PgPool, user: &User) -> AppResult<Vec<CustomEmoji>> {
+    let codes: Vec<String> = used_shortcodes(user)
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+    if codes.is_empty() {
+        return Ok(Vec::new());
+    }
+    let rows = custom_emoji::get_by_shortcodes(pool, &codes, None).await?;
+    Ok(rows.into_iter().filter(|emoji| !emoji.disabled).collect())
+}
+
+/// The `tag` array: an `Emoji` tag for each distinct local emoji of
+/// `emojis` that the profile text of `user` uses.
+fn emoji_tags(user: &User, emojis: &[CustomEmoji]) -> Vec<Value> {
+    let wanted = used_shortcodes(user);
+    let mut seen: HashSet<&str> = HashSet::new();
+    emojis
+        .iter()
+        .filter(|emoji| emoji.domain.is_none() && wanted.contains(emoji.shortcode.as_str()))
+        .filter(|emoji| seen.insert(emoji.shortcode.as_str()))
+        .map(emoji_tag)
+        .collect()
 }
 
 /// The `@context` of an actor document: the `ActivityStreams` and
@@ -203,7 +279,10 @@ mod tests {
     use super::*;
     use crate::{
         federation::note::{litepub_context_json, test_support::undefined_terms},
-        models::user::{DEFAULT_SCOPE, Flag},
+        models::{
+            custom_emoji::NewCustomEmoji,
+            user::{DEFAULT_SCOPE, Flag},
+        },
         test_fixtures::json_keys,
         util::time::parse_time,
     };
@@ -326,7 +405,44 @@ mod tests {
 
     /// The document `user` renders on the test instance.
     fn render(user: &User) -> Value {
-        actor_json(user, &Config::for_tests())
+        actor_json(user, &Config::for_tests(), &[])
+    }
+
+    /// A local, enabled emoji row named `shortcode`, its image under `BASE`.
+    fn fixture_emoji(shortcode: &str) -> CustomEmoji {
+        CustomEmoji {
+            id: Uuid::parse_str(ACCOUNT_ID).unwrap(),
+            shortcode: shortcode.to_owned(),
+            domain: None,
+            image_url: format!("{BASE}/emoji/{shortcode}.png"),
+            static_url: None,
+            category: None,
+            tags: Vec::new(),
+            visible_in_picker: true,
+            disabled: false,
+            inserted_at: parse_time("2024-01-31T12:34:56.789Z").unwrap(),
+            updated_at: parse_time("2024-01-31T12:34:56.789Z").unwrap(),
+        }
+    }
+
+    /// The `Emoji` tag `shortcode`'s fixture row renders as.
+    fn expected_tag(shortcode: &str) -> Value {
+        let url = format!("{BASE}/emoji/{shortcode}.png");
+        json!({
+            "type": "Emoji",
+            "id": url,
+            "name": format!(":{shortcode}:"),
+            "icon": {"type": "Image", "url": url},
+        })
+    }
+
+    /// A user whose name, bio and one field use `:wiredcat:` and `:other:`.
+    fn emoji_alice() -> User {
+        let mut alice = local_alice();
+        alice.name = "Alice :wiredcat: A".to_owned();
+        alice.raw_bio = "bio :wiredcat: and :other:".to_owned();
+        alice.fields = json!([{"name": "emoji :wiredcat:", "value": ":other:"}]);
+        alice
     }
 
     #[test]
@@ -334,14 +450,14 @@ mod tests {
         let mut user = base_user("internal.fetch", "https://test.example/internal/fetch");
         "Application".clone_into(&mut user.actor_type);
         let config = Config::for_tests();
-        let document = instance_actor_json(&user, &config);
+        let document = instance_actor_json(&user, &config, &[]);
         let expected: Vec<&str> = BASE_KEYS
             .iter()
             .copied()
             .filter(|key| *key != "featured")
             .collect();
         assert_eq!(json_keys(&document), expected, "every key but featured");
-        let mut with_featured = actor_json(&user, &config);
+        let mut with_featured = actor_json(&user, &config, &[]);
         assert!(
             with_featured
                 .as_object_mut()
@@ -658,5 +774,81 @@ mod tests {
         expected.push("movedTo");
         expected.sort_unstable();
         assert_eq!(json_keys(&document), expected, "one more key");
+    }
+
+    #[test]
+    fn used_emojis_render_once_each_in_the_given_order() {
+        let emojis = [fixture_emoji("other"), fixture_emoji("wiredcat")];
+        let document = actor_json(&emoji_alice(), &Config::for_tests(), &emojis);
+        assert_eq!(
+            document["tag"],
+            json!([expected_tag("other"), expected_tag("wiredcat")]),
+            "one tag per emoji, though each shortcode is used twice"
+        );
+    }
+
+    #[test]
+    fn a_bio_and_a_field_alone_are_enough_to_use_an_emoji() {
+        let mut alice = local_alice();
+        alice.bio = "<p>:wiredcat:</p>".to_owned();
+        let emojis = [fixture_emoji("wiredcat")];
+        assert_eq!(
+            actor_json(&alice, &Config::for_tests(), &emojis)["tag"],
+            json!([expected_tag("wiredcat")]),
+            "the rendered bio counts"
+        );
+        let mut bob = local_alice();
+        bob.raw_fields = json!([{"name": ":wiredcat:", "value": "x"}]);
+        assert_eq!(
+            actor_json(&bob, &Config::for_tests(), &emojis)["tag"],
+            json!([expected_tag("wiredcat")]),
+            "a raw field name counts"
+        );
+    }
+
+    #[test]
+    fn a_profile_without_emoji_renders_an_empty_tag_list() {
+        let emojis = [fixture_emoji("wiredcat")];
+        let document = actor_json(&local_alice(), &Config::for_tests(), &emojis);
+        assert_eq!(document["tag"], json!([]), "known emojis the text skips");
+    }
+
+    #[test]
+    fn a_shortcode_without_an_emoji_row_makes_no_tag() {
+        let emojis = [fixture_emoji("wiredcat")];
+        let document = actor_json(&emoji_alice(), &Config::for_tests(), &emojis);
+        assert_eq!(
+            document["tag"],
+            json!([expected_tag("wiredcat")]),
+            "`other` has no row, so only `wiredcat` is tagged"
+        );
+    }
+
+    #[test]
+    fn a_remote_emoji_makes_no_tag() {
+        let mut remote = fixture_emoji("wiredcat");
+        remote.domain = Some("remote.example".to_owned());
+        let document = actor_json(&emoji_alice(), &Config::for_tests(), &[remote]);
+        assert_eq!(document["tag"], json!([]), "only local emojis federate");
+    }
+
+    #[tokio::test]
+    async fn profile_emojis_loads_the_local_enabled_rows_the_profile_uses() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        for code in ["wiredcat", "unused"] {
+            let row = NewCustomEmoji::local(code, &format!("{BASE}/emoji/{code}.png"));
+            let _stored = custom_emoji::upsert(&pool, &row).await.unwrap();
+        }
+        let mut off = NewCustomEmoji::local("other", &format!("{BASE}/emoji/other.png"));
+        off.disabled = true;
+        let _stored = custom_emoji::upsert(&pool, &off).await.unwrap();
+
+        let rows = profile_emojis(&pool, &emoji_alice()).await.unwrap();
+        let codes: Vec<&str> = rows.iter().map(|row| row.shortcode.as_str()).collect();
+        assert_eq!(codes, ["wiredcat"], "used and enabled; `other` is disabled");
+
+        let none = profile_emojis(&pool, &local_alice()).await.unwrap();
+        assert!(none.is_empty(), "no shortcode, no rows");
     }
 }
