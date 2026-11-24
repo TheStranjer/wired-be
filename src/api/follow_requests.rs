@@ -60,7 +60,7 @@ use crate::{
         user::User,
     },
     oauth::scopes::{FOLLOW, READ_FOLLOWS, WRITE_FOLLOWS},
-    pagination::{PageParams, link_header, set_link_header},
+    pagination::{NO_EXTRA_QUERY, PageParams, keyset_link, set_link_header},
     services::{federation_out, notify},
     state::AppState,
     util::id::parse_id,
@@ -74,11 +74,6 @@ const DEFAULT_LIMIT: i64 = 40;
 /// Page size cap of the queue: Mastodon's account-list limit (80), above
 /// [`crate::pagination::MAX_LIMIT`].
 const MAX_LIMIT: i64 = 80;
-
-/// The `Link` header's query parameters carry nothing but the cursor: the
-/// queue has no filter to repeat on either link (the relationship
-/// listings' constant, same rule).
-const NO_EXTRA_QUERY: [(String, String); 0] = [];
 
 /// The `/api/v1/follow_requests` router, merged into [`crate::api::v1`].
 pub fn router() -> Router<AppState> {
@@ -113,7 +108,15 @@ async fn list_follow_requests(
         user = %auth.0.id,
         "follow requests listed"
     );
-    let link = page_link(&state.config.base_url, uri.path(), &entries);
+    // The cursors key on the `follows` row ([`FollowPageEntry::follow_id`]),
+    // not on the requesters.
+    let link = keyset_link(
+        &state.config.base_url,
+        uri.path(),
+        &NO_EXTRA_QUERY,
+        &entries,
+        |e| e.follow_id,
+    );
     let mut headers = HeaderMap::new();
     set_link_header(&mut headers, link.as_deref())?;
     // The queue is answered for its owner; Pleroma's index renders no
@@ -220,18 +223,6 @@ async fn answered_relationship(
         AppError::Internal("the relationship loader skipped its only target".to_owned())
     })?;
     Ok(Json(relationship))
-}
-
-/// The `Link` header value for a fetched request page: Pleroma's
-/// `add_link_headers` over the first (newest) and last (oldest) entry's
-/// [`FollowPageEntry::follow_id`] — the cursors key on the `follows` row,
-/// not on the requesters — and `None` for an empty page.
-///
-/// [`FollowPageEntry::follow_id`]: crate::models::follow::FollowPageEntry::follow_id
-fn page_link(base_url: &str, path: &str, entries: &[follow::FollowPageEntry]) -> Option<String> {
-    let newest = entries.first()?.follow_id.to_string();
-    let oldest = entries.last()?.follow_id.to_string();
-    link_header(base_url, path, &NO_EXTRA_QUERY, &newest, &oldest)
 }
 
 /// Post-resolution hook of both answer routes: the notification telling the

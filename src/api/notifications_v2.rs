@@ -22,7 +22,7 @@
 //! - `GET /api/v2/notifications` answers `{accounts, statuses,
 //!   notification_groups}`: one [`PageParams`] page of groups ordered by
 //!   each group's `most_recent_notification_id` — the cursor walks compare
-//!   that id, and the [`Link`](link_header) header carries it — with
+//!   that id, and the [`Link`](crate::pagination::link_header) header carries it — with
 //!   `types[]`, `exclude_types[]`, `account_id` and `grouped_types[]`
 //!   filters. Sample actors land in `accounts` and group statuses in
 //!   `statuses`, expanded once per response; a status the reader may not
@@ -87,13 +87,13 @@ use crate::{
     extract::{ApiParams, flex},
     models::{
         marker::{self, Marker},
-        notification::{self, GroupEntry, GroupInfo, GroupPageParams, NotificationFilters},
+        notification::{self, GroupInfo, GroupPageParams, NotificationFilters},
         status::{self, Status as StatusRow},
         status_visibility,
         user::{self, User},
     },
     oauth::scopes::{READ_NOTIFICATIONS, WRITE_NOTIFICATIONS},
-    pagination::{PageParams, link_header, set_link_header},
+    pagination::{NO_EXTRA_QUERY, PageParams, keyset_link, set_link_header},
     services::render_status::{ViewerMode, render_statuses},
     state::AppState,
     util::id::parse_id,
@@ -109,10 +109,6 @@ const EXPAND_FULL: &str = "full";
 /// The other accepted `expand_accounts` spelling (Mastodon's
 /// `partial_avatars`).
 const EXPAND_PARTIAL_AVATARS: &str = "partial_avatars";
-/// The `Link` header's query parameters carry nothing but the cursor: the
-/// listing's filters are not repeated on either link, as in no other paged
-/// listing here (the relationship listings' constant, same rule).
-pub(crate) const NO_EXTRA_QUERY: [(String, String); 0] = [];
 
 /// The `/api/v2` grouped-notifications router, merged into
 /// [`crate::api::v2`].
@@ -308,7 +304,15 @@ async fn list_groups(
         user = %auth.0.id,
         "notification groups listed"
     );
-    let link = groups_link(&state.config.base_url, uri.path(), &entries);
+    // The cursor is each group's `most_recent_notification_id`, the id the
+    // listing walks on.
+    let link = keyset_link(
+        &state.config.base_url,
+        uri.path(),
+        &NO_EXTRA_QUERY,
+        &entries,
+        |entry| entry.info.most_recent_id,
+    );
     let mut headers = HeaderMap::new();
     set_link_header(&mut headers, link.as_deref())?;
     let groups: Vec<(&str, &GroupInfo)> = entries
@@ -451,16 +455,6 @@ async fn dismiss_group(
 async fn read_marker(pool: &PgPool, user_id: Uuid) -> AppResult<Option<Uuid>> {
     let rows: Vec<Marker> = marker::get_many(pool, user_id, &[marker::NOTIFICATIONS]).await?;
     Ok(rows.first().and_then(|row| parse_id(&row.last_read_id)))
-}
-
-/// The `Link` header value for one fetched group page: [`link_header`]
-/// over the first (newest) and last (oldest) group's
-/// `most_recent_notification_id` — the cursor the listing walks on — and
-/// `None` for an empty page.
-fn groups_link(base_url: &str, path: &str, entries: &[GroupEntry]) -> Option<String> {
-    let newest = entries.first()?.info.most_recent_id.to_string();
-    let oldest = entries.last()?.info.most_recent_id.to_string();
-    link_header(base_url, path, &NO_EXTRA_QUERY, &newest, &oldest)
 }
 
 /// The `{accounts, statuses, notification_groups}` envelope for `groups`:

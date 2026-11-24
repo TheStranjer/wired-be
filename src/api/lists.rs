@@ -89,7 +89,7 @@ use crate::{
         list, user,
     },
     oauth::scopes::{READ_LISTS, WRITE_LISTS},
-    pagination::{MAX_LIMIT, OrdinalPageParams, link_header, set_link_header},
+    pagination::{MAX_LIMIT, OrdinalPageParams, link_for_page, set_link_header},
     state::AppState,
     util::id::parse_id,
 };
@@ -107,10 +107,6 @@ const POLICY_INVALID: &str = "Validation failed: Replies policy is not included 
 /// 422 body for an account the caller does not follow (Mastodon's changeset
 /// wording for `List`'s `account_ids` validation; the ticket's exact text).
 const NOT_FOLLOWED: &str = "Validation failed: Account is not followed";
-/// The `Link` header's query parameters carry nothing but the cursor: the
-/// members page has no filter to repeat on either link (the relationship
-/// listings' constant, same rule).
-const NO_EXTRA_QUERY: [(String, String); 0] = [];
 
 /// The `/api/v1/lists` router, merged into [`crate::api::v1`].
 pub fn router() -> Router<AppState> {
@@ -317,7 +313,9 @@ async fn list_list_accounts(
         user = %auth.0.id,
         "list members listed"
     );
-    let link = page_link(&state.config.base_url, uri.path(), &entries);
+    // The cursors key on the membership ordinal
+    // ([`list::MemberEntry::position`]), not on the members' ids.
+    let link = link_for_page(&state.config.base_url, uri.path(), &entries, |e| e.position);
     let mut headers = HeaderMap::new();
     set_link_header(&mut headers, link.as_deref())?;
     let viewer: AccountViewer<'_> = Some(&auth.0);
@@ -470,18 +468,6 @@ async fn ensure_followed(state: &AppState, follower: Uuid, targets: &[Uuid]) -> 
         }
     }
     Ok(())
-}
-
-/// The `Link` header value for a fetched members page: Pleroma's
-/// `add_link_headers` over the first (newest) and last (oldest) entry's
-/// [`list::MemberEntry::position`] — the cursors key on the membership
-/// ordinal, not on the members' ids — and `None` for an empty page.
-///
-/// [`list::MemberEntry::position`]: crate::models::list::MemberEntry::position
-fn page_link(base_url: &str, path: &str, entries: &[list::MemberEntry]) -> Option<String> {
-    let newest = entries.first()?.position.to_string();
-    let oldest = entries.last()?.position.to_string();
-    link_header(base_url, path, &NO_EXTRA_QUERY, &newest, &oldest)
 }
 
 /// The body both membership writes answer: `{}`, Pleroma's

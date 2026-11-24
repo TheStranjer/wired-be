@@ -74,7 +74,7 @@ use crate::{
     error::{AppError, AppResult},
     models::{endorsement, follow},
     oauth::scopes::{READ_ACCOUNTS, WRITE_ACCOUNTS},
-    pagination::{PageParams, link_header, set_link_header},
+    pagination::{NO_EXTRA_QUERY, PageParams, keyset_link, set_link_header},
     state::AppState,
 };
 
@@ -82,11 +82,6 @@ use crate::{
 /// follow of the target: this endpoint's ticket pins the wording (in place
 /// of Pleroma's nickname-carrying refusal).
 const NOT_FOLLOWING: &str = "You must follow this user to endorse them";
-
-/// The `Link` header's query parameters carry nothing but the cursor: the
-/// endorsement listings have no filter to repeat on either link (the
-/// relationship listings' constant, same rule).
-const NO_EXTRA_QUERY: [(String, String); 0] = [];
 
 /// The `/api/v1` endorsements router, merged into [`crate::api::v1`].
 pub fn router() -> Router<AppState> {
@@ -295,7 +290,7 @@ fn empty_page() -> (HeaderMap, Json<Vec<Account>>) {
 /// Renders one fetched endorsement page for `viewer`: every entry's
 /// [`User`] as an [`Account`] with the viewer's relationship embedded
 /// where one is preloaded (see [`preload_page_relationships`]), under the
-/// `Link` header [`page_link`] derives from the endorsement ids.
+/// `Link` header [`keyset_link`] derives from the endorsement ids.
 async fn page_response(
     state: &AppState,
     viewer: AccountViewer<'_>,
@@ -303,7 +298,16 @@ async fn page_response(
     path: &str,
 ) -> AppResult<(HeaderMap, Json<Vec<Account>>)> {
     let relationships = preload_page_relationships(state, viewer, entries).await?;
-    let link = page_link(&state.config.base_url, path, entries);
+    // The cursors key on the `endorsements` row
+    // ([`endorsement::EndorsementPageEntry::endorsement_id`]), not on the
+    // accounts.
+    let link = keyset_link(
+        &state.config.base_url,
+        path,
+        &NO_EXTRA_QUERY,
+        entries,
+        |e| e.endorsement_id,
+    );
     let mut headers = HeaderMap::new();
     set_link_header(&mut headers, link.as_deref())?;
     let accounts = entries
@@ -337,19 +341,4 @@ async fn preload_page_relationships(
         .map(|(relationship, target)| (target, relationship))
         .collect();
     Ok(Some(map))
-}
-
-/// The `Link` header value for a fetched endorsement page: Pleroma's
-/// `add_link_headers` over the first (newest) and last (oldest) entry's
-/// [`endorsement::EndorsementPageEntry::endorsement_id`] — the cursors key
-/// on the `endorsements` row, not on the accounts — and `None` for an
-/// empty page.
-fn page_link(
-    base_url: &str,
-    path: &str,
-    entries: &[endorsement::EndorsementPageEntry],
-) -> Option<String> {
-    let newest = entries.first()?.endorsement_id.to_string();
-    let oldest = entries.last()?.endorsement_id.to_string();
-    link_header(base_url, path, &NO_EXTRA_QUERY, &newest, &oldest)
 }

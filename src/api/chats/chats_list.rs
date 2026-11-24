@@ -23,14 +23,13 @@ use crate::{
     extract::{ApiParams, flex},
     models::{block, chat, chat::ChatFilter, user::User},
     oauth::scopes::{READ_CHATS, WRITE_CHATS},
-    pagination::{MAX_LIMIT, PageParams, link_header, set_link_header},
+    pagination::{MAX_LIMIT, NO_EXTRA_QUERY, PageParams, keyset_link, set_link_header},
     state::AppState,
     util::id::parse_id,
 };
 
 use super::{
-    CANT_CHAT_WITH_SELF, CHAT_NOT_ALLOWED, LEGACY_MAX_LIMIT, NEWEST_PAGE, NO_EXTRA_QUERY,
-    RECIPIENT_REJECTS_CHATS,
+    CANT_CHAT_WITH_SELF, CHAT_NOT_ALLOWED, LEGACY_MAX_LIMIT, NEWEST_PAGE, RECIPIENT_REJECTS_CHATS,
     messages::{chat_recipient, message_of},
 };
 
@@ -153,7 +152,7 @@ pub(super) async fn list_chats_v2(
 }
 
 /// The chats of `user_id` as one listed page: the [`Chat`] entities in
-/// activity order under the `Link` header [`page_link`] derives from their
+/// activity order under the `Link` header [`keyset_link`] derives from their
 /// ids ([`page_for_user`] does the id keyset and the activity sort; opening
 /// a chat never bumps it, a message always does).
 ///
@@ -172,7 +171,15 @@ async fn list_page(
     path: &str,
 ) -> AppResult<(HeaderMap, Json<Vec<Chat>>)> {
     let rows = chat::page_for_user(&state.db, user_id, page, filter).await?;
-    let link = page_link(&state.config.base_url, path, &rows);
+    // The page's activity order stands, so the cursors name the first and
+    // last rows' chat ids.
+    let link = keyset_link(
+        &state.config.base_url,
+        path,
+        &NO_EXTRA_QUERY,
+        &rows,
+        |row| row.id,
+    );
     let mut headers = HeaderMap::new();
     set_link_header(&mut headers, link.as_deref())?;
     debug!(
@@ -181,17 +188,6 @@ async fn list_page(
         "chats listed"
     );
     Ok((headers, Json(chat_entities(state, &rows).await?)))
-}
-
-/// The `Link` header value for a fetched chat page: Pleroma's
-/// `add_link_headers` over the first and last row's chat id — the page's
-/// activity order stands, so the cursors name those two rows' ids — and
-/// `None` for an empty page. [`crate::api::admin::chats`] links its paged
-/// admin lists through the same rule.
-pub(crate) fn page_link(base_url: &str, path: &str, rows: &[chat::Chat]) -> Option<String> {
-    let newest = rows.first()?.id.to_string();
-    let oldest = rows.last()?.id.to_string();
-    link_header(base_url, path, &NO_EXTRA_QUERY, &newest, &oldest)
 }
 
 /// The [`Chat`] entities for `rows`, each rendered the way [`chat_json`]

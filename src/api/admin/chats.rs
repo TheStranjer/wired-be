@@ -63,12 +63,12 @@ use sqlx::PgPool;
 use tracing::debug;
 
 use crate::{
-    api::chats::{chat_entities, chat_entity, message_of, message_page_link, page_link},
+    api::chats::{chat_entities, chat_entity, message_of},
     auth::admin::AdminUser,
     entities::chat::{Chat, ChatMessage},
     error::{AppError, AppResult},
     models::{chat, chat::ChatFilter, moderation_log, user::admin},
-    pagination::{MAX_LIMIT, PageParams, set_link_header},
+    pagination::{MAX_LIMIT, NO_EXTRA_QUERY, PageParams, keyset_link, set_link_header},
     services::federation_out,
     state::AppState,
     util::id::parse_id,
@@ -124,7 +124,13 @@ async fn list_user_chats(
         .ok_or(AppError::RouteNotFound)?;
     let page = PageParams::from_query(uri.query(), MAX_LIMIT)?;
     let rows = chat::page_for_user(&state.db, target.id, page, ChatFilter::default()).await?;
-    let link = page_link(&state.config.base_url, uri.path(), &rows);
+    let link = keyset_link(
+        &state.config.base_url,
+        uri.path(),
+        &NO_EXTRA_QUERY,
+        &rows,
+        |row| row.id,
+    );
     let mut headers = HeaderMap::new();
     set_link_header(&mut headers, link.as_deref())?;
     debug!(
@@ -181,7 +187,13 @@ async fn list_messages(
     let row = chat_by_id(&state.db, &raw).await?;
     let page = PageParams::from_query(uri.query(), MAX_LIMIT)?;
     let references = chat::messages_page(&state.db, row.id, page).await?;
-    let link = message_page_link(&state.config.base_url, uri.path(), &references);
+    let link = keyset_link(
+        &state.config.base_url,
+        uri.path(),
+        &NO_EXTRA_QUERY,
+        &references,
+        |reference| reference.id,
+    );
     let mut headers = HeaderMap::new();
     set_link_header(&mut headers, link.as_deref())?;
     debug!(

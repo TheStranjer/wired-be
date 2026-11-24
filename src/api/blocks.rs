@@ -69,7 +69,7 @@ use crate::{
     error::{AppError, AppResult},
     models::{block, block::Block, user::User},
     oauth::scopes::{FOLLOW, READ_BLOCKS, WRITE_BLOCKS},
-    pagination::{PageParams, link_header, set_link_header},
+    pagination::{NO_EXTRA_QUERY, PageParams, keyset_link, set_link_header},
     state::AppState,
 };
 
@@ -77,11 +77,6 @@ use crate::{
 /// above [`crate::pagination::MAX_LIMIT`] — the follow-request queue's
 /// counterpart constant, with Pleroma's global 20 as the default.
 const MAX_LIMIT: i64 = 80;
-
-/// The `Link` header's query parameters carry nothing but the cursor: the
-/// blocked list has no filter to repeat on either link (the relationship
-/// listings' constant, same rule).
-const NO_EXTRA_QUERY: [(String, String); 0] = [];
 
 /// The `/api/v1` blocks router, merged into [`crate::api::v1`].
 pub fn router() -> Router<AppState> {
@@ -226,7 +221,7 @@ async fn one_relationship(
 /// Renders one fetched blocked page for `viewer`: every entry's [`User`] as
 /// an [`Account`] with the viewer's relationship embedded where one is
 /// preloaded (see [`preload_page_relationships`]), under the `Link` header
-/// [`page_link`] derives from the block row ids.
+/// [`keyset_link`] derives from the block row ids.
 async fn page_response(
     state: &AppState,
     viewer: AccountViewer<'_>,
@@ -234,7 +229,15 @@ async fn page_response(
     path: &str,
 ) -> AppResult<(HeaderMap, Json<Vec<Account>>)> {
     let relationships = preload_page_relationships(state, viewer, entries).await?;
-    let link = page_link(&state.config.base_url, path, entries);
+    // The cursors key on the `blocks` row ([`Block::id`]), not on the
+    // blocked accounts.
+    let link = keyset_link(
+        &state.config.base_url,
+        path,
+        &NO_EXTRA_QUERY,
+        entries,
+        |e| e.0.id,
+    );
     let mut headers = HeaderMap::new();
     set_link_header(&mut headers, link.as_deref())?;
     let accounts = entries
@@ -266,18 +269,6 @@ async fn preload_page_relationships(
         .map(|(relationship, target)| (target, relationship))
         .collect();
     Ok(Some(map))
-}
-
-/// The `Link` header value for a fetched blocked page: Pleroma's
-/// `add_link_headers` over the first (newest) and last (oldest) entry's
-/// [`Block::id`] — the cursors key on the `blocks` row, not on the blocked
-/// accounts — and `None` for an empty page.
-///
-/// [`Block::id`]: crate::models::block::Block::id
-fn page_link(base_url: &str, path: &str, entries: &[(Block, User)]) -> Option<String> {
-    let newest = entries.first()?.0.id.to_string();
-    let oldest = entries.last()?.0.id.to_string();
-    link_header(base_url, path, &NO_EXTRA_QUERY, &newest, &oldest)
 }
 
 /// Post-write hook of both block routes: hands the write to

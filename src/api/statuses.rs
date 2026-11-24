@@ -82,7 +82,6 @@ use crate::{
     entities::status::Status,
     error::{AppError, AppResult},
     models::{status, user::User},
-    pagination::link_header,
     services::render_status::{ViewerMode, render_status},
     state::AppState,
 };
@@ -207,13 +206,6 @@ pub(crate) const CANNOT_REBLOG: &str = "Could not reblog private status";
 /// default the plain [`PageParams::from_query`] keeps.
 const FAVOURITED_BY_MAX_LIMIT: i64 = 80;
 
-/// The `Link` headers' query parameters carry nothing but the cursor:
-/// none of the favourites and bookmarks listings repeats a filter on
-/// either link (the relationship listings' constant, same rule) — the
-/// bookmarks listing's `folder_id` is not repeated either, the cursors
-/// alone pick up the walk where the page left it.
-const NO_EXTRA_QUERY: [(String, String); 0] = [];
-
 /// The `/api/v1` statuses router, merged into [`crate::api::v1`].
 ///
 /// `state` reaches the seven status writes that mount the
@@ -312,17 +304,6 @@ async fn current_entity(state: &AppState, viewer: &User, id: Uuid) -> AppResult<
     Ok(Json(entity))
 }
 
-/// The `Link` header of a favourites or bookmarks page: [`link_header`]
-/// over the first (newest) and last (oldest) like or bookmark row id of
-/// the page, the follow lists' [`page_link`](crate::api::accounts) shape
-/// with the row id in place of the relationship id's. An empty page names
-/// no cursor and links nowhere.
-fn page_link(base_url: &str, path: &str, entry_ids: &[Uuid]) -> Option<String> {
-    let newest = entry_ids.first()?.to_string();
-    let oldest = entry_ids.last()?.to_string();
-    link_header(base_url, path, &NO_EXTRA_QUERY, &newest, &oldest)
-}
-
 /// The status a like or a boost lands on: `row` itself for a plain post,
 /// and its **original** for a reblog row — Mastodon's behaviour for liking
 /// a boost, mirrored here for the like and for the reblog write
@@ -352,7 +333,10 @@ fn in_requested_order(requested: &[Uuid], visible: Vec<status::Status>) -> Vec<s
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::statuses::test_support::{ids, row};
+    use crate::{
+        api::statuses::test_support::{ids, row},
+        pagination::link_for_page,
+    };
 
     #[test]
     fn the_answer_follows_the_request_not_the_row_order() {
@@ -390,10 +374,11 @@ mod tests {
     #[test]
     fn the_link_pages_off_the_first_and_last_like_ids() {
         let (newest, middle, oldest) = (Uuid::now_v7(), Uuid::now_v7(), Uuid::now_v7());
-        let link = page_link(
+        let link = link_for_page(
             "https://host",
             "/api/v1/favourites",
             &[newest, middle, oldest],
+            |id| *id,
         )
         .expect("a page with ids links");
         assert_eq!(
@@ -409,8 +394,9 @@ mod tests {
 
     #[test]
     fn an_empty_page_links_nowhere() {
+        let none: [Uuid; 0] = [];
         assert_eq!(
-            page_link("https://host", "/api/v1/favourites", &[]),
+            link_for_page("https://host", "/api/v1/favourites", &none, |id| *id),
             None,
             "no rows, no cursors, no Link header"
         );

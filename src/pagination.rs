@@ -19,6 +19,7 @@
 //! `add_link_headers` (`lib/pleroma/web/controller_helper.ex`).
 
 use std::borrow::Cow;
+use std::fmt;
 use std::future::{self, Future};
 
 use axum::{
@@ -466,6 +467,44 @@ pub fn link_header(
     let next = page_url(base_url, path, extra_query, "max_id", oldest_id);
     let prev = page_url(base_url, path, extra_query, "min_id", newest_id);
     Some(format!(r#"<{next}>; rel="next", <{prev}>; rel="prev""#))
+}
+
+/// The `extra_query` of a [`keyset_link`] whose links carry no query
+/// parameters beyond the cursor.
+pub const NO_EXTRA_QUERY: [(String, String); 0] = [];
+
+/// The `Link` header value for a newest-first page of rows keyed on a UUID.
+///
+/// [`link_header`] over `cursor` of the first (newest) and last (oldest) row,
+/// repeating `extra_query` on both links; `None` for an empty page.
+#[must_use]
+pub fn keyset_link<T, C: Fn(&T) -> Uuid>(
+    base_url: &str,
+    path: &str,
+    extra_query: &[(String, String)],
+    rows: &[T],
+    cursor: C,
+) -> Option<String> {
+    let newest = cursor(rows.first()?).to_string();
+    let oldest = cursor(rows.last()?).to_string();
+    link_header(base_url, path, extra_query, &newest, &oldest)
+}
+
+/// The `Link` header value for a newest-first page of rows keyed on any
+/// displayable cursor (an ordinal position, say) with no extra query.
+///
+/// [`link_header`] over `cursor` of the first (newest) and last (oldest) row;
+/// `None` for an empty page.
+#[must_use]
+pub fn link_for_page<T, D: fmt::Display, C: Fn(&T) -> D>(
+    base_url: &str,
+    path: &str,
+    entries: &[T],
+    cursor: C,
+) -> Option<String> {
+    let newest = cursor(entries.first()?).to_string();
+    let oldest = cursor(entries.last()?).to_string();
+    link_header(base_url, path, &NO_EXTRA_QUERY, &newest, &oldest)
 }
 
 /// Builds the `Link` header value for an offset-paginated response.

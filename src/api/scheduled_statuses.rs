@@ -78,7 +78,7 @@ use crate::{
         scheduled_status::{self, ScheduledStatus as StoredRow},
     },
     oauth::scopes::{READ_STATUSES, WRITE_STATUSES},
-    pagination::{PageParams, link_header, set_link_header},
+    pagination::{NO_EXTRA_QUERY, PageParams, keyset_link, set_link_header},
     services::schedule_status::check_window,
     state::AppState,
     util::{id::parse_id, time::parse_time},
@@ -88,10 +88,6 @@ use crate::{
 /// included: the create's own wording, so an unreadable moment is refused the
 /// same way whichever route was asked.
 const INVALID_SCHEDULED_AT: &str = "Invalid scheduled_at";
-
-/// The `Link` header's query parameters carry nothing but the cursor: this
-/// listing has no filter to repeat on either link.
-const NO_EXTRA_QUERY: [(String, String); 0] = [];
 
 /// The `/api/v1/scheduled_statuses` router, merged into [`crate::api::v1`].
 pub fn router() -> Router<AppState> {
@@ -108,7 +104,7 @@ pub fn router() -> Router<AppState> {
 /// `GET /api/v1/scheduled_statuses` — the caller's pending schedules, one
 /// [`PageParams`] page at a time.
 ///
-/// The `Link` header is [`link_header`] over the first and last row's id, and
+/// The `Link` header is [`keyset_link`] over the first and last row's id, and
 /// an empty page answers `[]` with no `Link` header at all. Its path is the
 /// request's own [`OriginalUri`], not the [`Uri`] the router hands a nested
 /// handler: axum strips the `/api/v1` prefix off the latter, and Pleroma links
@@ -132,7 +128,13 @@ async fn list_scheduled_statuses(
     auth.require(READ_STATUSES)?;
     let rows = scheduled_status::page_for_user(&state.db, auth.0.id, page).await?;
     let entities = entities_for(&state, &rows).await?;
-    let link = page_link(&state.config.base_url, uri.path(), &rows);
+    let link = keyset_link(
+        &state.config.base_url,
+        uri.path(),
+        &NO_EXTRA_QUERY,
+        &rows,
+        |row| row.id,
+    );
     let mut headers = HeaderMap::new();
     set_link_header(&mut headers, link.as_deref())?;
     debug!(
@@ -358,14 +360,6 @@ async fn media_by_id(state: &AppState, ids: &[Uuid]) -> AppResult<HashMap<Uuid, 
     Ok(rows.into_iter().map(|found| (found.id, found)).collect())
 }
 
-/// The `Link` header value for a fetched page: [`link_header`] over the
-/// newest (first) and oldest (last) row's id, `None` for an empty page.
-fn page_link(base_url: &str, path: &str, rows: &[StoredRow]) -> Option<String> {
-    let newest = rows.first()?.id.to_string();
-    let oldest = rows.last()?.id.to_string();
-    link_header(base_url, path, &NO_EXTRA_QUERY, &newest, &oldest)
-}
-
 #[cfg(test)]
 mod tests {
     use chrono::TimeDelta;
@@ -405,7 +399,7 @@ mod tests {
         }
     }
 
-    /// The rows of a page in the order [`page_link`] receives them: `ids`
+    /// The rows of a page in the order [`keyset_link`] receives them: `ids`
     /// verbatim, newest id first.
     fn stored_page(ids: &[&str]) -> Vec<StoredRow> {
         ids.iter()
@@ -591,8 +585,14 @@ mod tests {
         let middle = "01934567-89ab-7cde-f012-3456789abcdf";
         let oldest = "01934567-89ab-7cde-f012-3456789abcde";
         let path = "/api/v1/scheduled_statuses";
-        let link = page_link(TEST_BASE_URL, path, &stored_page(&[newest, middle, oldest]))
-            .expect("a full page links");
+        let link = keyset_link(
+            TEST_BASE_URL,
+            path,
+            &NO_EXTRA_QUERY,
+            &stored_page(&[newest, middle, oldest]),
+            |row| row.id,
+        )
+        .expect("a full page links");
         assert_eq!(
             link,
             format!(
@@ -606,13 +606,25 @@ mod tests {
     #[test]
     fn an_empty_page_links_nowhere() {
         assert_eq!(
-            page_link(TEST_BASE_URL, "/api/v1/scheduled_statuses", &[]),
+            keyset_link(
+                TEST_BASE_URL,
+                "/api/v1/scheduled_statuses",
+                &NO_EXTRA_QUERY,
+                &stored_page(&[]),
+                |row| row.id
+            ),
             None,
             "no rows, no Link header"
         );
         let only = "01934567-89ab-7cde-f012-3456789abcde";
-        let link =
-            page_link(TEST_BASE_URL, "/p", &stored_page(&[only])).expect("a one-row page links");
+        let link = keyset_link(
+            TEST_BASE_URL,
+            "/p",
+            &NO_EXTRA_QUERY,
+            &stored_page(&[only]),
+            |row| row.id,
+        )
+        .expect("a one-row page links");
         assert!(
             link.contains(&format!("max_id={only}")) && link.contains(&format!("min_id={only}")),
             "and its single id is both cursors: {link}"
