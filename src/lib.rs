@@ -57,7 +57,7 @@ use crate::{
 /// `/oauth` ([`api::oauth`]), the `/oauth` provider-login paths
 /// ([`api::oauth_external`]), `POST /auth/password` ([`api::password_reset`],
 /// Pleroma routes the reset request outside `/api`), and the `MongooseIM`
-/// auth endpoints plus `/manifest.json` ([`api::misc`]) — are merged at the
+/// auth endpoints ([`api::misc`]) — are merged at the
 /// top level, together with the HTML helper pages of
 /// [`api::html_pages`] (`/mailer/unsubscribe/{token}`), the
 /// remote-interaction page of [`api::remote_interaction`]
