@@ -11,6 +11,7 @@ use crate::{
         mention,
         notification::{TYPE_FAVOURITE, TYPE_MENTION, TYPE_REBLOG},
         status::{self, Status as StatusRow},
+        status_visibility,
         user::{self, User},
     },
     state::AppState,
@@ -43,7 +44,10 @@ pub async fn on_mention(state: &AppState, row: &StatusRow) {
 /// `status_mentions` links ([`mention::for_statuses`], the same rows the
 /// create linked in its transaction), so what is told matches what was
 /// written, and the replied-to author joins by id when the text did not
-/// already name them.
+/// already name them — but only when the reply is visible to that author
+/// ([`status_visibility::can_view`]): a `private` or `direct` reply that
+/// leaves them out of its audience must not push its text to them. A stored
+/// mention link is the addressing, so those recipients are told as written.
 async fn mention_telling(state: &AppState, row: &StatusRow) -> AppResult<()> {
     if row.reblog_of_id.is_some() {
         return Ok(());
@@ -55,6 +59,7 @@ async fn mention_telling(state: &AppState, row: &StatusRow) -> AppResult<()> {
     if let Some(parent_author_id) = row.in_reply_to_account_id
         && !recipients.iter().any(|found| found.id == parent_author_id)
         && let Some(parent_author) = user::get_by_id(&state.db, parent_author_id).await?
+        && status_visibility::can_view(&state.db, row, Some(&parent_author)).await?
     {
         recipients.push(parent_author);
     }
@@ -308,6 +313,96 @@ mod tests {
         assert!(
             rows(pool, alice.id).await.is_empty(),
             "mentioning and answering yourself tells yourself nothing"
+        );
+    }
+
+    /// A reply by the remote `author` to `parent` (by `parent_author`) with
+    /// the given `visibility`, storing mention links to `linked`.
+    async fn remote_reply(
+        pool: &PgPool,
+        author: &User,
+        visibility: Visibility,
+        linked: &[&User],
+        parent: (&User, &StatusRow),
+    ) -> StatusRow {
+        status::insert(
+            pool,
+            BASE,
+            &NewStatus {
+                uri: Some(format!("https://remote.example/objects/{}", Uuid::now_v7())),
+                visibility,
+                local: false,
+                mentioned_user_ids: linked.iter().map(|found| found.id).collect(),
+                in_reply_to_id: Some(parent.1.id),
+                in_reply_to_account_id: Some(parent.0.id),
+                ..NewStatus::local(author, "a remote answer")
+            },
+        )
+        .await
+        .expect("the remote reply inserts")
+    }
+
+    #[tokio::test]
+    async fn a_public_reply_tells_the_parent_author_once() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool();
+        let state = app_state(pool);
+        let alice = local(pool, "pv-alice").await;
+        let bob = local(pool, "pv-bob").await;
+
+        let parent = post(pool, &alice, "a root").await;
+        let row = mentioned(pool, &bob, "an answer", &[], Some((&alice, &parent))).await;
+        on_mention(&state, &row).await;
+        assert_eq!(
+            facts(pool, alice.id).await,
+            vec![(TYPE_MENTION.to_owned(), bob.id, Some(row.id))],
+            "a public reply is visible to the parent author, who is told once"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reply_the_parent_author_cannot_see_tells_them_nothing() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool();
+        let state = app_state(pool);
+        let alice = local(pool, "iv-alice").await;
+        let mallory = remote(pool, "iv-mallory", "remote.example").await;
+
+        let parent = post(pool, &alice, "a root").await;
+        let private_reply =
+            remote_reply(pool, &mallory, Visibility::Private, &[], (&alice, &parent)).await;
+        on_mention(&state, &private_reply).await;
+        let direct_reply =
+            remote_reply(pool, &mallory, Visibility::Direct, &[], (&alice, &parent)).await;
+        on_mention(&state, &direct_reply).await;
+        assert!(
+            rows(pool, alice.id).await.is_empty(),
+            "a private or direct reply that does not address her tells her nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_direct_reply_that_mentions_the_parent_author_tells_them_once() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool();
+        let state = app_state(pool);
+        let alice = local(pool, "dm-alice").await;
+        let mallory = remote(pool, "dm-mallory", "remote.example").await;
+
+        let parent = post(pool, &alice, "a root").await;
+        let row = remote_reply(
+            pool,
+            &mallory,
+            Visibility::Direct,
+            &[&alice],
+            (&alice, &parent),
+        )
+        .await;
+        on_mention(&state, &row).await;
+        assert_eq!(
+            facts(pool, alice.id).await,
+            vec![(TYPE_MENTION.to_owned(), mallory.id, Some(row.id))],
+            "the mention link addresses her: told once, not duplicated"
         );
     }
 
