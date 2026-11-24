@@ -5,11 +5,15 @@ use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
 
 use super::{
-    ActorError, MAX_ALIASES, MAX_FIELD_NAME_CHARS, MAX_FIELD_VALUE_CHARS, MAX_REMOTE_FIELDS,
-    PROPERTY_VALUE_TYPE, truncate_chars,
+    ActorError, MAX_ALIASES, MAX_FIELD_NAME_CHARS, MAX_FIELD_VALUE_CHARS, MAX_REMOTE_EMOJIS,
+    MAX_REMOTE_FIELDS, PROPERTY_VALUE_TYPE, truncate_chars,
 };
 use crate::{
-    federation::json::{as_array, first_string, value_or_id},
+    federation::{
+        emoji_tag::parse_emoji_tag,
+        json::{as_array, first_string, value_or_id},
+        note_parser::RemoteEmoji,
+    },
     models::user::Flag,
     util::{time::parse_time, url::is_http_url},
 };
@@ -102,6 +106,21 @@ pub(super) fn parse_also_known_as(json: &Value) -> Vec<String> {
         .filter_map(Value::as_str)
         .take(MAX_ALIASES)
         .map(str::to_owned)
+        .collect()
+}
+
+/// The `Emoji` entries of the actor's `tag` array, filed under `domain`.
+///
+/// Read the way a note's emoji tags are (see [`parse_emoji_tag`]); only the
+/// first [`MAX_REMOTE_EMOJIS`] entries are examined, and entries of other
+/// types or without a usable name and icon are skipped.
+pub(super) fn parse_emojis(json: &Value, domain: &str) -> Vec<RemoteEmoji> {
+    json.get("tag")
+        .map_or_default(as_array)
+        .iter()
+        .take(MAX_REMOTE_EMOJIS)
+        .filter(|entry| entry.get("type").and_then(Value::as_str) == Some("Emoji"))
+        .filter_map(|entry| parse_emoji_tag(entry, Some(domain)))
         .collect()
 }
 

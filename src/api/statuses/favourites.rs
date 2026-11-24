@@ -77,6 +77,7 @@ use crate::{
     oauth::scopes::{READ_FAVOURITES, READ_STATUSES, WRITE_FAVOURITES},
     pagination::{PageParams, link_for_page, set_link_header},
     services::{
+        account_emojis::AccountEmojis,
         federation_out, notify,
         render_status::{ViewerMode, render_statuses},
     },
@@ -215,9 +216,14 @@ pub(super) async fn list_favourited_by(
     // accounts leave only the rendered list.
     let entries = without_blocked(&state, auth.0.as_ref(), entries, |entry| entry.user.id).await?;
     let viewer: AccountViewer<'_> = auth.0.as_ref();
+    let users: Vec<_> = entries.iter().map(|entry| &entry.user).collect();
+    let emojis = AccountEmojis::load(&state.db, &users).await?;
     let accounts = entries
         .iter()
-        .map(|entry| Account::from_user_for(viewer, &entry.user, &state.config, None))
+        .map(|entry| {
+            let account = Account::from_user_for(viewer, &entry.user, &state.config, None);
+            emojis.fill(account, &entry.user, &state.config)
+        })
         .collect();
     Ok((headers, Json(accounts)))
 }

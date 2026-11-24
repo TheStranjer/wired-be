@@ -104,7 +104,7 @@ use crate::{
     },
     oauth::scopes::{READ_NOTIFICATIONS, WRITE_NOTIFICATIONS},
     pagination::{NO_EXTRA_QUERY, PageParams, keyset_link, set_link_header},
-    services::filter::FilterContext,
+    services::{account_emojis::AccountEmojis, filter::FilterContext},
     state::AppState,
     util::id::parse_id,
 };
@@ -603,6 +603,8 @@ pub(crate) async fn render_notifications(
     let status_ids = distinct(rows.iter().filter_map(|row| row.status_id));
     let (users, relationships) =
         accounts_with_relationships(state, Some(viewer), &actor_ids).await?;
+    let actors: Vec<&User> = users.values().collect();
+    let emojis = AccountEmojis::load(&state.db, &actors).await?;
     let statuses = visible_statuses(state, Some(viewer), &status_ids, filters).await?;
     let chat_messages = rendered_chat_messages(state, viewer, rows).await?;
     let mut entities = Vec::with_capacity(rows.len());
@@ -624,7 +626,11 @@ pub(crate) async fn render_notifications(
             .and_then(|id| chat_messages.get(&id).cloned());
         entities.push(NotificationEntity::from_row(
             row,
-            Account::from_user_for(Some(viewer), actor, &state.config, relationships.as_ref()),
+            emojis.fill(
+                Account::from_user_for(Some(viewer), actor, &state.config, relationships.as_ref()),
+                actor,
+                &state.config,
+            ),
             status,
             chat_message,
             relationships

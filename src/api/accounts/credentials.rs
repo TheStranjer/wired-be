@@ -98,6 +98,7 @@ use crate::{
         user::{self, User},
     },
     oauth::scopes::{READ_ACCOUNTS, WRITE_ACCOUNTS},
+    services::account_emojis::AccountEmojis,
     state::AppState,
 };
 
@@ -142,6 +143,8 @@ pub(super) async fn verify_credentials(
 async fn owner_view(state: &AppState, owner: &User) -> AppResult<Json<Account>> {
     let requests = follow::pending_count(&state.db, owner.id).await?;
     let account = Account::for_owner(owner, &state.config, requests);
+    let emojis = AccountEmojis::load_one(&state.db, owner).await?;
+    let account = emojis.fill(account, owner, &state.config);
     Ok(Json(with_moved(state, account, owner).await?))
 }
 

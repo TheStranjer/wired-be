@@ -13,7 +13,10 @@ use super::{Account, JsonBool};
 use crate::{
     config::{Config, TEST_BASE_URL, TEST_DATABASE_URL},
     entities::relationship::{Relationship, RelationshipMap},
-    models::user::{DEFAULT_SCOPE, Flag, User, notification_settings::NotificationSettings},
+    models::{
+        custom_emoji::CustomEmoji as EmojiRow,
+        user::{DEFAULT_SCOPE, Flag, User, notification_settings::NotificationSettings},
+    },
     util::time::parse_time,
 };
 
@@ -132,6 +135,24 @@ pub(super) const PLEROMA_KEYS_FOR_OWNER: [&str; 23] = [
 /// inserted and last updated at.
 pub(super) fn stamped() -> DateTime<Utc> {
     parse_time("2024-01-31T12:34:56.789Z").unwrap()
+}
+
+/// A stored custom emoji row named `shortcode` of `domain` (`None` is the
+/// local set), in the `cats` pack, with a still variant.
+pub(super) fn emoji_row(shortcode: &str, domain: Option<&str>) -> EmojiRow {
+    EmojiRow {
+        id: Uuid::now_v7(),
+        shortcode: shortcode.to_owned(),
+        domain: domain.map(str::to_owned),
+        image_url: format!("{BASE}/emoji/cats/{shortcode}.gif"),
+        static_url: Some(format!("{BASE}/emoji/cats/{shortcode}.png")),
+        category: Some("cats".to_owned()),
+        tags: Vec::new(),
+        visible_in_picker: true,
+        disabled: false,
+        inserted_at: stamped(),
+        updated_at: stamped(),
+    }
 }
 
 /// A [`User`] row named `nickname` with actor id `ap_id`, at the field

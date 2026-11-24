@@ -52,7 +52,10 @@ use crate::{
         user::{self, User},
     },
     oauth::scopes::READ_STATUSES,
-    services::render_status::{EmojiText, load_emojis, row_texts},
+    services::{
+        account_emojis::AccountEmojis,
+        render_status::{EmojiText, load_emojis, row_texts},
+    },
     state::AppState,
 };
 
@@ -101,6 +104,14 @@ pub(super) async fn get_status_history(
         .map_or_default(|rows| rows.iter().map(|attachment| attachment.id).collect());
     let attachments = history_attachments(&state, &revisions, &current).await?;
     let emojis = history_emojis(&state, &author, &row, &revisions).await?;
+    let author_emojis = AccountEmojis::load_one(&state.db, &author).await?;
+    let render_author = || {
+        author_emojis.fill(
+            Account::from_user_for(viewer, &author, &state.config, None),
+            &author,
+            &state.config,
+        )
+    };
     let mut history = Vec::with_capacity(revisions.len() + 1);
     for revision in &revisions {
         history.push(StatusEdit::from_source(StatusEditSource {
@@ -108,7 +119,7 @@ pub(super) async fn get_status_history(
             spoiler_text: &revision.spoiler_text,
             sensitive: revision.sensitive,
             created_at: revision.created_at,
-            account: Account::from_user_for(viewer, &author, &state.config, None),
+            account: render_author(),
             media: media_entities(&revision.media_ids, &attachments, &state.config),
             emojis: emoji_entities(revision.id, &emojis, &state.config),
         }));
@@ -118,7 +129,7 @@ pub(super) async fn get_status_history(
         spoiler_text: &row.spoiler_text,
         sensitive: row.sensitive,
         created_at: row.edited_at.unwrap_or(row.inserted_at),
-        account: Account::from_user_for(viewer, &author, &state.config, None),
+        account: render_author(),
         media: media_entities(&current, &attachments, &state.config),
         emojis: emoji_entities(row.id, &emojis, &state.config),
     }));

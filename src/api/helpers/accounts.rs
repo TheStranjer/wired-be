@@ -13,6 +13,7 @@ use crate::{
     },
     error::AppResult,
     models::user::{self, User},
+    services::account_emojis::AccountEmojis,
     state::AppState,
 };
 
@@ -60,10 +61,15 @@ pub async fn expand_accounts(
         return Ok(Vec::new());
     }
     let (mut users, relationships) = accounts_with_relationships(state, viewer, ids).await?;
-    let accounts = ids
+    let found: Vec<User> = ids.iter().filter_map(|id| users.remove(id)).collect();
+    let emojis = AccountEmojis::load_all(&state.db, &found).await?;
+    let accounts = found
         .iter()
-        .filter_map(|id| users.remove(id))
-        .map(|found| Account::from_user_for(viewer, &found, &state.config, relationships.as_ref()))
+        .map(|user| {
+            let account =
+                Account::from_user_for(viewer, user, &state.config, relationships.as_ref());
+            emojis.fill(account, user, &state.config)
+        })
         .collect();
     Ok(accounts)
 }

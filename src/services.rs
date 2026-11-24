@@ -118,6 +118,7 @@
 //!
 //! [`timeline_response`]: crate::api::helpers::timeline_response
 
+pub mod account_emojis;
 pub mod config_registry;
 pub mod create_status;
 pub mod delete_status;

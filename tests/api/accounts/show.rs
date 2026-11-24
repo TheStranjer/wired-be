@@ -67,7 +67,7 @@ async fn show_renders_a_local_account_without_auth() {
     assert_eq!(
         body["emojis"],
         json!([]),
-        "emojis is the empty list for now"
+        "an account whose profile uses no emoji lists none"
     );
 }
 

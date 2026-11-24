@@ -22,7 +22,10 @@ use crate::{
         status::{self, NewStatus},
         user::{self, User},
     },
-    services::render_status::{load_emojis, row_texts},
+    services::{
+        account_emojis::AccountEmojis,
+        render_status::{load_emojis, row_texts},
+    },
     state::AppState,
     util::id::{new_id, object_ap_id},
 };
@@ -80,7 +83,8 @@ pub async fn preview_status(
         user = %user.id,
         "status previewed"
     );
-    Ok(Status::from_source(
+    let author_emojis = AccountEmojis::load_one(&state.db, user).await?;
+    let mut preview = Status::from_source(
         StatusSource {
             row: &row,
             author: user,
@@ -106,7 +110,9 @@ pub async fn preview_status(
         Some(user),
         None,
         &state.config,
-    ))
+    );
+    preview.account = author_emojis.fill(preview.account, user, &state.config);
+    Ok(preview)
 }
 
 /// The `tags` entries a preview renders: one per usable name

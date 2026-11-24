@@ -290,12 +290,9 @@ async fn account_search(
     let rows = account_rows(&state, viewer, &params).await?;
     let request = Resolver::new(&params, Arms::AccountsOnly, viewer, &rows);
     let resolved = resolve_query(&state, &request).await;
-    Ok(Json(account_entities(
-        &state,
-        viewer,
-        &rows,
-        resolved.account(),
-    )))
+    Ok(Json(
+        account_entities(&state, viewer, &rows, resolved.account()).await?,
+    ))
 }
 
 /// `GET /api/v1/search` — the combined search document in the v1
@@ -356,7 +353,7 @@ async fn search_document(
     };
     let request = Resolver::new(&params, Arms::Combined, viewer, &rows);
     let resolved = resolve_query(&state, &request).await;
-    let accounts = account_entities(&state, viewer, &rows, resolved.account());
+    let accounts = account_entities(&state, viewer, &rows, resolved.account()).await?;
     let statuses = if params.searches(Resource::Statuses) && statuses_are_searchable(&state, viewer)
     {
         find_statuses(&state, viewer, &params, resolved.status()).await?

@@ -49,7 +49,7 @@ mod upsert;
 use chrono::{DateTime, Utc};
 use serde_json::Value;
 
-use crate::models::user::Flag;
+use crate::{federation::note_parser::RemoteEmoji, models::user::Flag};
 
 pub use self::{error::ActorError, parse::parse_actor, upsert::upsert_remote_user};
 
@@ -73,6 +73,8 @@ const MAX_REMOTE_FIELDS: usize = 50;
 const MAX_FIELD_NAME_CHARS: usize = 512;
 /// Longest profile-field value kept, in characters.
 const MAX_FIELD_VALUE_CHARS: usize = 2048;
+/// Most `tag` entries examined for profile emojis; later ones are dropped.
+const MAX_REMOTE_EMOJIS: usize = 100;
 /// Most `alsoKnownAs` aliases kept; later entries are dropped.
 const MAX_ALIASES: usize = 256;
 /// Longest `preferredUsername` accepted, in characters; longer is rejected.
@@ -132,6 +134,10 @@ pub struct NewRemoteUser {
     /// The `PropertyValue` entries of `attachment` as `{name, value}`
     /// objects, the shape of the `fields` column.
     pub fields: Value,
+    /// The `Emoji` entries of `tag`, filed under [`domain`](Self::domain):
+    /// the custom emojis the name, summary and fields may use. Not a `users`
+    /// column; [`upsert_remote_user`] writes them to `custom_emojis`.
+    pub emojis: Vec<RemoteEmoji>,
     /// The required `inbox` endpoint.
     pub inbox: String,
     /// The `endpoints.sharedInbox` endpoint, when present and usable.
