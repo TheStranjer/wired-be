@@ -37,6 +37,7 @@
 mod audience;
 mod counters;
 mod delete;
+mod dependents;
 mod familiar;
 mod guards;
 mod lookup;

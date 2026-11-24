@@ -7,6 +7,8 @@ use uuid::Uuid;
 
 use crate::error::AppResult;
 
+use super::dependents::clear_all_for_user;
+
 /// [`delete_all_for_user_with_counts`]: every *accepted* relationship naming
 /// the account, together with the counters those rows fed, in one statement
 /// — a departed account has however many followers it had, so the steps are
@@ -61,6 +63,9 @@ const DELETE_REST_FOR_USER_SQL: &str =
 /// go: the account's own follows and the follows *of* it, which is how the
 /// local followers of a departed remote account stop following it. A
 /// `pending` request and a mirrored `rejected` row go too, moving nothing.
+/// The endorsements and list memberships that ride on those follows (anything
+/// the account gave or received, in either direction) go in the same
+/// transaction.
 ///
 /// Returns how many rows went, both states together.
 ///
@@ -79,6 +84,7 @@ pub async fn delete_all_for_user_with_counts(pool: &PgPool, user_id: Uuid) -> Ap
         .execute(&mut *tx)
         .await?
         .rows_affected();
+    clear_all_for_user(&mut tx, user_id).await?;
     tx.commit().await?;
     // `count(*)` over deleted rows is never negative, so this cannot fail.
     let accepted = u64::try_from(accepted).unwrap_or_default();

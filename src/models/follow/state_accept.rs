@@ -9,6 +9,7 @@ use crate::error::AppResult;
 
 use super::{
     counters::step_counters,
+    dependents::clear_dependents,
     lookup::{by_id, required},
     types::{Follow, FollowState},
 };
@@ -74,6 +75,7 @@ pub async fn reject(pool: &PgPool, follow_id: Uuid) -> AppResult<Follow> {
     if follow.state == FollowState::Accepted {
         step_counters(&mut tx, &follow, -1).await?;
     }
+    clear_dependents(&mut tx, follow.follower_id, follow.followee_id).await?;
     tx.commit().await?;
     Ok(follow)
 }
