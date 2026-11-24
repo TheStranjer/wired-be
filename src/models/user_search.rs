@@ -20,9 +20,10 @@
 //! ([`approval_pending`](User::approval_pending) unset,
 //! [`email_confirmed`](User::email_confirmed) set), as Mastodon's
 //! `Account.searchable` is `without_unapproved.without_suspended`
-//! (`app/models/account.rb`); a remote mirror is exempt from that test. The
-//! instance actor ([`NOT_INSTANCE_ACTOR_U`]) is never listed, as Pleroma's
-//! `filter_internal_users` drops internal actors. For an authenticated
+//! (`app/models/account.rb`); a remote mirror is exempt from that test. No
+//! `Application` actor (a relay, the instance actor) is ever listed, and the
+//! instance actor ([`NOT_INSTANCE_ACTOR_U`]) is dropped by nickname as well,
+//! as Pleroma's `filter_internal_users` drops internal actors. For an authenticated
 //! viewer, accounts that blocked the viewer never appear, and the viewer's
 //! own blocks, blocked domains (Pleroma's `filter_blocked_domains`,
 //! `lib/pleroma/user/search.ex`; the `user_domain_blocks` timelines honour)
@@ -73,11 +74,13 @@ pub struct SearchOpts {
 }
 
 /// The shared head of every [`search_accounts`] statement: active accounts
-/// only (Pleroma's `filter_deactivated_users`), and a local account only
-/// once approved and confirmed (Mastodon's `without_unapproved`; remote
-/// mirrors carry neither flag's meaning, so they pass whatever the flags
-/// say). [`NOT_INSTANCE_ACTOR_U`] and [`MATCH_OPEN_SQL`] follow it.
+/// only (Pleroma's `filter_deactivated_users`), never an `Application`
+/// actor (the instance actor, relays: Pleroma's `filter_internal_users`),
+/// and a local account only once approved and confirmed (Mastodon's
+/// `without_unapproved`; remote mirrors carry neither flag's meaning, so
+/// they pass whatever the flags say). [`NOT_INSTANCE_ACTOR_U`] and [`MATCH_OPEN_SQL`] follow it.
 const BASE_SQL: &str = "SELECT u.* FROM users u WHERE u.is_active \
+                        AND u.actor_type <> 'Application' \
                         AND (NOT u.local OR (NOT u.approval_pending AND u.email_confirmed))";
 
 /// The opening of the match clause [`push_match_arms`] fills and closes.
@@ -806,6 +809,58 @@ mod tests {
         assert!(
             !ids(&search(&pool, Some(&viewer), "internal.fetch").await).contains(&actor.id),
             "and from an exact-nickname search by a viewer"
+        );
+    }
+
+    /// A local user named `nickname` with the given `actor_type`.
+    async fn actor_of_type(pool: &PgPool, nickname: &str, actor_type: &str) -> User {
+        insert(
+            pool,
+            &NewUser {
+                actor_type: actor_type.to_owned(),
+                ..NewUser::local(nickname, &local_ap_id(BASE, nickname))
+            },
+        )
+        .await
+        .expect("the typed actor fixture inserts")
+    }
+
+    #[tokio::test]
+    async fn an_application_actor_is_never_found() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let relay = actor_of_type(&pool, "relayhub", "Application").await;
+        let person = actor_of_type(&pool, "relayfan", "Person").await;
+        let viewer = user(&pool, "viewer").await;
+
+        assert_eq!(
+            ids(&search(&pool, None, "relay").await),
+            vec![person.id],
+            "an anonymous search drops the Application actor and keeps the Person"
+        );
+        let seen = ids(&search(&pool, Some(&viewer), "relay").await);
+        assert_eq!(
+            seen,
+            vec![person.id],
+            "an authenticated search does the same: {seen:?}"
+        );
+        assert!(
+            !ids(&search(&pool, Some(&viewer), "relayhub").await).contains(&relay.id),
+            "not even the exact nickname finds it"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_service_actor_is_still_found() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let bot = actor_of_type(&pool, "helperbot", "Service").await;
+        let _relay = actor_of_type(&pool, "helperrelay", "Application").await;
+
+        assert_eq!(
+            ids(&search(&pool, None, "helper").await),
+            vec![bot.id],
+            "a bot account is a Service actor and stays searchable"
         );
     }
 
