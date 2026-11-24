@@ -535,8 +535,8 @@ pub mod remote;
 
 /// Remote interaction over HTTP (`src/api/remote_interaction.rs`): the
 /// `POST /api/v1/pleroma/remote_interaction` refusals, the
-/// retired `/ostatus_subscribe` pair, the `/authorize_interaction`
-/// frontend redirects and the retired `/main/ostatus` pair.
+/// retired `/ostatus_subscribe` pair, the retired `/authorize_interaction`
+/// and the retired `/main/ostatus` pair.
 mod remote_interaction;
 
 /// `POST /api/v1/accounts/{id}/remove_from_followers`.

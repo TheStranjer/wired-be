@@ -152,11 +152,6 @@ pub(super) const ROWS: &[RouteSpec] = &[
     },
     RouteSpec {
         method: "GET",
-        path: "/authorize_interaction",
-        auth: AuthClass::Public,
-    },
-    RouteSpec {
-        method: "GET",
         path: "/proxy/:sig/:url",
         auth: AuthClass::Public,
     },

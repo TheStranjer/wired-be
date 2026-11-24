@@ -59,9 +59,7 @@ use crate::{
 /// Pleroma routes the reset request outside `/api`), and the `MongooseIM`
 /// auth endpoints ([`api::misc`]) — are merged at the
 /// top level, together with the HTML helper pages of
-/// [`api::html_pages`] (`/mailer/unsubscribe/{token}`), the
-/// remote-interaction page of [`api::remote_interaction`]
-/// (`/authorize_interaction`).
+/// [`api::html_pages`] (`/mailer/unsubscribe/{token}`).
 /// Paths no route matches get the standard JSON error response (decision 8),
 /// marked with `x-wired-fallback: 1` so a test can tell the fallback's own
 /// 404 from a handler's.
@@ -88,7 +86,6 @@ pub fn app(state: AppState) -> Router {
             .merge(api::emoji_packs::files_router())
             .merge(api::misc::router())
             .merge(api::html_pages::router())
-            .merge(api::remote_interaction::router())
             .fallback(not_found)
             .with_state(state),
     )
