@@ -26,6 +26,7 @@ pub(super) fn params_with_grant(grant: Option<&str>) -> TokenParams {
         refresh_token: None,
         code: None,
         redirect_uri: None,
+        code_verifier: None,
     }
 }
 

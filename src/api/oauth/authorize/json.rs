@@ -49,10 +49,10 @@ use crate::{
     extract::into_params,
     models::{
         oauth_app::OauthApp,
-        oauth_token::{self, OauthToken},
+        oauth_token::{self, CodeBinding, OauthToken},
         user::User,
     },
-    oauth::scopes::Scopes,
+    oauth::{pkce, scopes::Scopes},
     state::AppState,
 };
 
@@ -166,9 +166,15 @@ impl IntoResponse for JsonFailure {
 
 /// The request body of the JSON `POST`. Every field is optional at the
 /// shape level; the handler answers the missing ones with their own
-/// refusals. Unknown fields (`code_challenge` and friends) are ignored.
+/// refusals. Unknown fields are ignored.
 #[derive(Debug, Default, Deserialize)]
 struct ApprovalRequest {
+    /// The PKCE challenge the minted code is bound to.
+    #[serde(default)]
+    code_challenge: Option<String>,
+    /// How the challenge was derived; only `S256` is accepted.
+    #[serde(default)]
+    code_challenge_method: Option<String>,
     /// The application being authorized.
     #[serde(default)]
     client_id: Option<String>,
@@ -226,6 +232,7 @@ async fn describe_request(state: &AppState, query: &AuthorizeQuery) -> Result<Va
         query.scope.as_deref(),
     )
     .await?;
+    query.require_valid_pkce()?;
     Ok(json!({
         "app": { "name": app.client_name, "website": app.website },
         "scopes": scopes.names(),
@@ -291,22 +298,31 @@ async fn apply_verdict(
             SCOPE_ESCALATION,
         ));
     }
+    let code_challenge = pkce::parse_challenge(
+        request.code_challenge.as_deref(),
+        request.code_challenge_method.as_deref(),
+    )?;
     let Some(approved) = request.approve else {
         return Err(JsonFailure::invalid_request(MISSING_APPROVE));
     };
     let delivery = Delivery {
         redirect_uri,
         state: request.state.as_deref(),
+        code_challenge: code_challenge.as_deref(),
     };
     if !approved {
         return Ok(json!({ "redirect_uri": redirect_with(&delivery, ("error", ACCESS_DENIED)) }));
     }
-    let authorization = oauth_token::create_authorization(
+    let binding = CodeBinding {
+        redirect_uri,
+        code_challenge: delivery.code_challenge,
+    };
+    let authorization = oauth_token::create_authorization_with_challenge(
         &state.db,
         user.id,
         app.id,
         &scopes.to_string(),
-        redirect_uri,
+        binding,
     )
     .await?;
     if redirect_uri == OOB_REDIRECT_URI {
@@ -464,6 +480,7 @@ mod tests {
         let with_state = Delivery {
             redirect_uri: "https://c.example/cb",
             state: Some("a b"),
+            code_challenge: None,
         };
         assert_eq!(
             redirect_with(&with_state, ("code", "xyz")),
@@ -473,6 +490,7 @@ mod tests {
         let without = Delivery {
             redirect_uri: "https://c.example/cb",
             state: None,
+            code_challenge: None,
         };
         assert_eq!(
             redirect_with(&without, ("error", ACCESS_DENIED)),

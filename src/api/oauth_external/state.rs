@@ -20,7 +20,7 @@ use crate::{
         oauth_login_state::{self, OauthLoginState},
         user::User,
     },
-    oauth::scopes::Scopes,
+    oauth::{pkce, scopes::Scopes},
     state::AppState,
     util::token::random_token,
 };
@@ -58,6 +58,12 @@ pub(super) struct PrepareQuery {
     /// Opaque client value, round-tripped to `redirect_uri`.
     #[serde(default)]
     state: Option<String>,
+    /// The PKCE challenge (RFC 7636) the finished login's code is bound to.
+    #[serde(default)]
+    code_challenge: Option<String>,
+    /// How the challenge was derived; only `S256` is accepted.
+    #[serde(default)]
+    code_challenge_method: Option<String>,
 }
 
 /// The `GET /oauth/{provider}` parameters.
@@ -118,17 +124,23 @@ pub(super) struct StoredParams {
     /// stored document when the client sent none, rather than a null.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) state: Option<String>,
+    /// The validated PKCE challenge the code is bound to, when the client
+    /// sent one. Absent from the stored document otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) code_challenge: Option<String>,
 }
 
 impl StoredParams {
     /// The parameters of a validated prepare request: the application
-    /// fields as checked, the scopes in their granted spelling.
-    fn of_query(query: &PrepareQuery, scopes: &Scopes) -> Self {
+    /// fields as checked, the scopes in their granted spelling and the
+    /// validated PKCE `code_challenge`.
+    fn of_query(query: &PrepareQuery, scopes: &Scopes, code_challenge: Option<String>) -> Self {
         Self {
             client_id: query.client_id.clone().unwrap_or_default(),
             redirect_uri: query.redirect_uri.clone().unwrap_or_default(),
             scope: scopes.to_string(),
             state: query.state.clone(),
+            code_challenge,
         }
     }
 
@@ -147,6 +159,7 @@ impl StoredParams {
         Delivery {
             redirect_uri: self.redirect_uri.as_str(),
             state: self.state.as_deref(),
+            code_challenge: self.code_challenge.as_deref(),
         }
     }
 
@@ -176,7 +189,11 @@ pub(super) async fn prepared(state: &AppState, query: PrepareQuery) -> AppResult
     authorize::require_registered_redirect(&app, redirect_uri)?;
     let scopes = authorize::requested_scopes(query.scope.as_deref());
     authorize::check_scopes_subset(&scopes, &app)?;
-    let params = StoredParams::of_query(&query, &scopes);
+    let challenge = pkce::parse_challenge(
+        query.code_challenge.as_deref(),
+        query.code_challenge_method.as_deref(),
+    )?;
+    let params = StoredParams::of_query(&query, &scopes, challenge);
     let issued = oauth_login_state::create(&state.db, &provider.name, &json!(params)).await?;
     Ok(PrepareReply {
         url: authorize::with_query_params(
@@ -304,6 +321,7 @@ mod tests {
             redirect_uri: "https://client.example/callback".to_owned(),
             scope: "read".to_owned(),
             state: Some("client-state".to_owned()),
+            code_challenge: None,
         }
     }
 
@@ -318,7 +336,7 @@ mod tests {
             "state": "client-state",
         }))
         .expect("every field is optional at the shape level");
-        let params = StoredParams::of_query(&query, &Scopes::parse("read write"));
+        let params = StoredParams::of_query(&query, &Scopes::parse("read write"), None);
         assert_eq!(params.client_id, "client-id", "the application");
         assert_eq!(
             params.redirect_uri, "https://client.example/callback",
@@ -332,10 +350,34 @@ mod tests {
         assert_eq!(round_trip, params, "serialize and deserialize round-trip");
 
         let empty: PrepareQuery = crate::extract::into_params(json!({})).unwrap();
-        let defaults = StoredParams::of_query(&empty, &Scopes::default());
+        let defaults = StoredParams::of_query(&empty, &Scopes::default(), None);
         assert_eq!(defaults.client_id, "", "an absent app id stores empty");
         assert_eq!(defaults.scope, "read", "no scope asked is the default");
         assert_eq!(defaults.state, None, "and no client state echoes");
+    }
+
+    #[test]
+    fn a_pkce_challenge_is_stored_and_reads_back() {
+        let challenge = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
+        let query: PrepareQuery = crate::extract::into_params(json!({
+            "code_challenge": challenge,
+            "code_challenge_method": "S256",
+        }))
+        .unwrap();
+        let stored = pkce::parse_challenge(
+            query.code_challenge.as_deref(),
+            query.code_challenge_method.as_deref(),
+        )
+        .unwrap();
+        let params = StoredParams::of_query(&query, &Scopes::default(), stored);
+        assert_eq!(params.code_challenge.as_deref(), Some(challenge), "kept");
+        let round_trip = serde_json::from_value::<StoredParams>(json!(params))
+            .expect("the stored document reads back");
+        assert_eq!(round_trip, params, "serialize and deserialize round-trip");
+        assert!(
+            json!(stored_params()).get("code_challenge").is_none(),
+            "an unbound document carries no key"
+        );
     }
 
     #[test]

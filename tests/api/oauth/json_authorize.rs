@@ -25,7 +25,7 @@ async fn trust(pool: &PgPool, app: &OauthApp) {
 
 /// A token with `token_scopes` from a trusted "frontend" app for a fresh
 /// user `nickname`, plus a third-party app registered for `app_scopes`.
-async fn frontend_token(
+pub(super) async fn frontend_token(
     pool: &PgPool,
     nickname: &str,
     token_scopes: &str,
@@ -68,7 +68,11 @@ async fn get_json_status(
 }
 
 /// POSTs `body` as JSON, with `token` as the bearer when given.
-async fn post_verdict(http: &Router, token: Option<&str>, body: &Value) -> common::TestResponse {
+pub(super) async fn post_verdict(
+    http: &Router,
+    token: Option<&str>,
+    body: &Value,
+) -> common::TestResponse {
     let request = common::TestRequest::post("/oauth/authorize").json(body);
     match token {
         Some(bearer) => request.bearer(bearer).send(http).await,
@@ -77,7 +81,7 @@ async fn post_verdict(http: &Router, token: Option<&str>, body: &Value) -> commo
 }
 
 /// The verdict body for `app` asking `scope`, approved or not.
-fn verdict(app: &OauthApp, redirect: &str, scope: &str, approve: bool) -> Value {
+pub(super) fn verdict(app: &OauthApp, redirect: &str, scope: &str, approve: bool) -> Value {
     json!({
         "client_id": app.client_id,
         "redirect_uri": redirect,
