@@ -172,6 +172,14 @@ async fn change_email_lands_a_free_address() {
         alice_now.email_confirmed.get(),
         "no confirmation is required by default"
     );
+    assert!(
+        alice_now.confirmation_token.is_none(),
+        "no token is stored when none is needed"
+    );
+    assert!(
+        queued_jobs(&pool, KIND_SEND).await.is_empty(),
+        "and no letter is queued"
+    );
     assert_eq!(
         token_count(&pool, alice.id).await,
         1,
@@ -297,12 +305,86 @@ async fn change_email_queues_a_confirmation_letter_when_required() {
         "the confirmation subject: {}",
         letters[0].1["subject"]
     );
-    assert!(
-        letters[0].1["text_body"]
-            .as_str()
-            .is_some_and(|body| body.contains(&format!("confirm_email/{}", alice.id))),
-        "the letter links to the account's confirmation path"
+    let stored_token = changed
+        .confirmation_token
+        .clone()
+        .expect("the change stored the token its letter carries");
+    assert_eq!(stored_token.len(), 43, "32 CSPRNG bytes, base64url");
+    assert_eq!(
+        letter_path(&letters[0].1),
+        format!("/api/account/confirm_email/{}/{stored_token}", alice.id),
+        "the letter links to the route that serves the stored token"
     );
+
+    let confirmed = common::TestRequest::get(&letter_path(&letters[0].1))
+        .send(&app)
+        .await;
+    assert_eq!(confirmed.status, StatusCode::FOUND, "the link redirects");
+    let after = stored(&pool, alice.id).await;
+    assert!(after.email_confirmed.get(), "the link confirms the address");
+    assert!(after.confirmation_token.is_none(), "and spends the token");
+}
+
+/// A second `change_email` mints a new token: the first letter's link no
+/// longer confirms, the second one's does.
+#[tokio::test]
+async fn a_second_change_email_rotates_the_token_and_voids_the_first_link() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let (alice, token) = fixture(&pool, "alice", "write:accounts").await;
+    let mut config = common::test_config();
+    config.account_activation_required = wired_be::config::Toggle::new(true);
+    config.smtp_host = Some("smtp.test.example".to_owned());
+    let app = common::test_app_with_config(pool.clone(), config);
+
+    for address in ["first-new@example.org", "second-new@example.org"] {
+        let response = post_json(
+            &app,
+            CHANGE_EMAIL,
+            &token,
+            json!({"password": PASSWORD, "email": address}),
+        )
+        .await;
+        assert_eq!(
+            response.json_value(),
+            json!({"status": "success"}),
+            "the change lands"
+        );
+    }
+
+    let letters = queued_jobs(&pool, KIND_SEND).await;
+    assert_eq!(letters.len(), 2, "one letter per change");
+    let (first, second) = (letter_path(&letters[0].1), letter_path(&letters[1].1));
+    assert_ne!(first, second, "the second letter carries a fresh token");
+
+    let stale = common::TestRequest::get(&first).send(&app).await;
+    assert_eq!(
+        stale.status,
+        StatusCode::FOUND,
+        "a stale link still redirects"
+    );
+    assert!(
+        !stored(&pool, alice.id).await.email_confirmed.get(),
+        "but the first link confirms nothing"
+    );
+
+    let _fresh = common::TestRequest::get(&second).send(&app).await;
+    assert!(
+        stored(&pool, alice.id).await.email_confirmed.get(),
+        "the second link confirms the account"
+    );
+}
+
+/// The path (no scheme or host) of the confirmation link inside a queued
+/// mailer job's text body.
+fn letter_path(job: &serde_json::Value) -> String {
+    let body = job["text_body"].as_str().expect("a text body");
+    let prefix = "/api/account/confirm_email/";
+    let (_, after) = body
+        .split_once(prefix)
+        .expect("the letter carries the confirmation link");
+    let rest = after.split_whitespace().next().expect("a link follows");
+    format!("{prefix}{rest}")
 }
 
 /// Confirmation required without a relay still resets the flag — the

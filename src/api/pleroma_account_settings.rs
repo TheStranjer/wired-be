@@ -176,11 +176,6 @@ const EMAIL_TAKEN: &str = "Email has already been taken";
 /// 403 error body of `delete_account` on an instance that switched
 /// account deletion off (the ticket's wording, no period).
 const DELETION_DISABLED: &str = "Account deletion is disabled";
-/// Path a `change_email` confirmation letter links to, before the
-/// account id and its confirmation token. The endpoint that consumes the
-/// token is the later confirmation ticket's; the address is fixed here so
-/// a letter already sent keeps pointing at it.
-const CONFIRM_EMAIL_PATH: &str = "/api/pleroma/account/confirm_email";
 /// 404 error body when the move target cannot be resolved (Pleroma's
 /// `move_account` `:not_found` branch, period included).
 const TARGET_NOT_FOUND: &str = "Target account not found.";

@@ -9,21 +9,20 @@ use serde_json::Value;
 use tracing::debug;
 
 use super::{
-    CONFIRM_EMAIL_PATH, EMAIL_INVALID_FORMAT, EMAIL_TAKEN, INVALID_PASSWORD, PASSWORD_MISMATCH,
-    PASSWORD_TOO_SHORT, error_body, password_accepted, success_body,
+    EMAIL_INVALID_FORMAT, EMAIL_TAKEN, INVALID_PASSWORD, PASSWORD_MISMATCH, PASSWORD_TOO_SHORT,
+    error_body, password_accepted, success_body,
 };
 use crate::{
     auth::AuthUser,
     error::AppResult,
     extract::ApiBody,
-    mailer::{self, templates},
     models::{
         oauth_token,
-        user::{self, User, get_by_email},
+        user::{self, User, confirmation, get_by_email},
     },
     oauth::scopes::WRITE_ACCOUNTS,
     state::AppState,
-    util::{password::hash_password, token::sha256_hex},
+    util::password::hash_password,
 };
 
 /// The parameters of `POST /api/pleroma/change_password`.
@@ -150,8 +149,8 @@ pub(super) async fn change_email(
     }
     let confirmed = !state.config.account_activation_required.get();
     user::set_email(&state.db, auth.0.id, email, confirmed).await?;
-    if !confirmed {
-        send_confirmation_mail(&state, &auth.0, email).await?;
+    if !confirmed && let Some(updated) = user::get_by_id(&state.db, auth.0.id).await? {
+        confirmation::send(&state, &updated).await?;
     }
     debug!(account = %auth.0.nickname, confirmed, "email changed");
     Ok(success_body())
@@ -167,45 +166,11 @@ async fn email_is_taken(state: &AppState, account: &User, email: &str) -> AppRes
         .is_some_and(|holder| holder.id != account.id))
 }
 
-/// Queues the letter [`change_email`] sends a confirmation-requiring
-/// instance: the registration-confirmation template addressed to the new
-/// email, linking to [`CONFIRM_EMAIL_PATH`] with the account id and its
-/// [`confirmation_token`].
-async fn send_confirmation_mail(state: &AppState, account: &User, email: &str) -> AppResult<()> {
-    let link = format!(
-        "{}/{}/{}",
-        CONFIRM_EMAIL_PATH,
-        account.id,
-        confirmation_token(account, email)
-    );
-    mailer::deliver_later(
-        state,
-        templates::registration_confirmation(&state.config, email, &link),
-    )
-    .await
-}
-
-/// The email-confirmation token for `email`: the lowercase hex `SHA-256`
-/// of the account id, the address and the account's creation time. It is
-/// derived rather than stored — the confirmation ticket that serves the
-/// link can re-derive it from the row it reads, and because the address
-/// is part of the digest, changing the email again invalidates the
-/// letters already sent.
-#[must_use]
-fn confirmation_token(account: &User, email: &str) -> String {
-    sha256_hex(&format!(
-        "{}|{email}|{}",
-        account.id,
-        account.inserted_at.to_rfc3339()
-    ))
-}
-
 #[cfg(test)]
 mod tests {
-    use chrono::Duration;
     use serde_json::json;
 
-    use super::super::{PasswordParams, test_support::template_user};
+    use super::super::PasswordParams;
     use super::*;
 
     #[test]
@@ -244,36 +209,6 @@ mod tests {
         assert!(
             !bare_shown.contains("hunter2"),
             "the lone-password params hide their secret: {bare_shown}"
-        );
-    }
-
-    #[test]
-    fn the_confirmation_token_is_stable_and_address_bound() {
-        let account = template_user("alice");
-        let first = confirmation_token(&account, "new@example.org");
-        assert_eq!(first.len(), 64, "a SHA-256 digest in lowercase hex");
-        assert!(
-            first
-                .chars()
-                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
-            "lowercase hex, nothing else: {first}"
-        );
-        assert_eq!(
-            first,
-            confirmation_token(&account, "new@example.org"),
-            "the same account and address derive the same token"
-        );
-        assert_ne!(
-            first,
-            confirmation_token(&account, "other@example.org"),
-            "a different address invalidates the letter already sent"
-        );
-        let mut renamed = template_user("alice");
-        renamed.inserted_at = account.inserted_at + Duration::seconds(1);
-        assert_ne!(
-            first,
-            confirmation_token(&renamed, "new@example.org"),
-            "the creation time salts the digest"
         );
     }
 }
