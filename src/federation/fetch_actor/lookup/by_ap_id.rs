@@ -38,10 +38,12 @@ pub async fn get_or_fetch_by_ap_id(state: &AppState, ap_id: &str) -> Result<User
     get_or_fetch(state, ap_id, Naming::Confirm).await
 }
 
-/// [`get_or_fetch_by_ap_id`] for an actor id the caller has just taken
-/// from a `WebFinger` answer, and whose handle the caller settles from that
-/// answer itself (as [`get_or_fetch_by_acct`](super::get_or_fetch_by_acct)
-/// does). A fetch here asks `WebFinger` nothing more: the mirror is written
+/// [`get_or_fetch_by_ap_id`] for an actor id just taken from a `WebFinger`
+/// answer.
+///
+/// The caller settles the handle from that answer itself (as
+/// [`get_or_fetch_by_acct`](super::get_or_fetch_by_acct) does), so a fetch
+/// here asks `WebFinger` nothing more: the mirror is written
 /// under the parser's derived nickname, or under the stored one when its
 /// local part still matches, so a split-domain handle survives a refetch.
 /// One handle lookup is one `WebFinger` request.
