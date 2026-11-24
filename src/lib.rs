@@ -31,6 +31,8 @@ pub mod streaming;
 pub mod test_db;
 #[cfg(any(test, feature = "integration-tests"))]
 pub mod test_fixtures;
+#[cfg(test)]
+pub mod test_server;
 pub mod uploads;
 pub mod util;
 

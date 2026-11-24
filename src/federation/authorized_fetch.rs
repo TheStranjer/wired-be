@@ -214,7 +214,6 @@ mod tests {
     use chrono::Utc;
     use serde_json::json;
     use sqlx::PgPool;
-    use tokio::net::TcpListener;
 
     use super::*;
     use crate::{
@@ -223,6 +222,7 @@ mod tests {
         http_client::HttpClient,
         models::user::{NewUser, get_by_ap_id, insert},
         services::instance_actor::{ensure_instance_actor, instance_actor_ap_id},
+        test_server::{bind, origin, spawn},
         util::keys::{KeyPair, generate_keypair},
     };
 
@@ -365,15 +365,6 @@ mod tests {
         state_with(db, config)
     }
 
-    /// Serves `app` on `listener` until the test aborts the task.
-    fn spawn(listener: TcpListener, app: Router) -> tokio::task::JoinHandle<()> {
-        tokio::spawn(async move {
-            if let Err(err) = axum::serve(listener, app).await {
-                tracing::debug!("test server stopped: {err}");
-            }
-        })
-    }
-
     /// The remote signer's key pair, made once for the process (RSA-2048
     /// generation is slow in debug builds).
     fn remote_keys() -> &'static KeyPair {
@@ -491,8 +482,8 @@ mod tests {
     /// Serves a counting peer; returns its server task, its origin and its
     /// hit counter.
     async fn counting_server() -> (tokio::task::JoinHandle<()>, String, Arc<AtomicUsize>) {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let base = format!("http://{}", listener.local_addr().unwrap());
+        let listener = bind().await;
+        let base = origin(&listener);
         let hits = Arc::new(AtomicUsize::new(0));
         let peer = CountingPeer {
             base: base.clone(),
@@ -598,8 +589,8 @@ mod tests {
     #[tokio::test]
     async fn an_unknown_key_id_is_dereferenced_and_stored() {
         let db = crate::test_db::test_db().await.expect("test database slot");
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let base = format!("http://{}", listener.local_addr().unwrap());
+        let listener = bind().await;
+        let base = origin(&listener);
         let server = spawn(
             listener,
             Router::new()
@@ -688,8 +679,8 @@ mod tests {
     #[tokio::test]
     async fn an_unknown_key_id_names_the_mirrored_signer() {
         let db = crate::test_db::test_db().await.expect("test database slot");
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let base = format!("http://{}", listener.local_addr().unwrap());
+        let listener = bind().await;
+        let base = origin(&listener);
         let server = spawn(
             listener,
             Router::new()

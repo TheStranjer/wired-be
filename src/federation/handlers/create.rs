@@ -190,7 +190,6 @@ mod tests {
     };
     use serde_json::json;
     use sqlx::PgPool;
-    use tokio::{net::TcpListener, task::JoinHandle};
 
     use super::*;
     use crate::{
@@ -199,6 +198,7 @@ mod tests {
             status,
             user::{self, Flag, NewUser, User},
         },
+        test_server::{bind, origin, spawn},
     };
 
     /// The actor every fixture here is delivered by.
@@ -245,25 +245,6 @@ mod tests {
     /// Normalizes `activity` the way the dispatcher does.
     fn view_of(activity: &Value) -> ActivityView {
         ActivityView::parse(activity).expect("the fixture is a dispatchable activity")
-    }
-
-    /// Binds an unused loopback port.
-    async fn bind() -> TcpListener {
-        TcpListener::bind("127.0.0.1:0").await.unwrap()
-    }
-
-    /// The `http://{addr}` origin a listener answers on.
-    fn origin(listener: &TcpListener) -> String {
-        format!("http://{}", listener.local_addr().unwrap())
-    }
-
-    /// Serves `app` on `listener` until the test aborts the task.
-    fn spawn(listener: TcpListener, app: Router) -> JoinHandle<()> {
-        tokio::spawn(async move {
-            if let Err(err) = axum::serve(listener, app).await {
-                tracing::debug!("test server stopped: {err}");
-            }
-        })
     }
 
     /// The mirror of `bob` living on the mock peer's origin `base`: the
