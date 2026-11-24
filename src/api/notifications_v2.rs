@@ -75,7 +75,7 @@ use tracing::debug;
 use uuid::Uuid;
 
 use crate::{
-    api::helpers::{account_or_404, distinct},
+    api::helpers::{StringList, account_or_404, distinct, names_of},
     auth::AuthUser,
     entities::{
         account::{Account, AccountViewer},
@@ -123,33 +123,6 @@ pub fn router() -> Router<AppState> {
         .route("/notifications/{group_key}", get(show_group))
         .route("/notifications/{group_key}/accounts", get(group_accounts))
         .route("/notifications/{group_key}/dismiss", post(dismiss_group))
-}
-
-/// One name list of a repeated parameter: one value or a list (a JSON
-/// array, or `types[]=…` keys in a query string) — the two spellings
-/// Mastodon clients and forms both send, like the markers' timeline names.
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
-pub(crate) enum StringList {
-    /// A lone name.
-    Single(String),
-    /// A list of names.
-    Multiple(Vec<String>),
-}
-
-impl StringList {
-    /// The names, borrowed, in the order sent.
-    pub(crate) fn names(&self) -> Vec<&str> {
-        match self {
-            Self::Single(name) => vec![name.as_str()],
-            Self::Multiple(names) => names.iter().map(String::as_str).collect(),
-        }
-    }
-}
-
-/// The names behind an optional list parameter, none when it was absent.
-pub(crate) fn names_of(list: Option<&StringList>) -> Vec<&str> {
-    list.map_or_else(Vec::new, StringList::names)
 }
 
 /// `GET /api/v2/notifications`' non-cursor parameters ([`ApiParams`],
@@ -206,11 +179,7 @@ impl ListParams {
     /// The `types[]` / `exclude_types[]` half of the read filters; the
     /// account half arrives through [`account_filter`].
     fn type_filters(&self) -> NotificationFilters<'_> {
-        NotificationFilters {
-            types: names_of(self.types.as_ref()),
-            exclude_types: names_of(self.exclude_types.as_ref()),
-            account_id: None,
-        }
+        type_filters(self.types.as_ref(), self.exclude_types.as_ref())
     }
 }
 
@@ -237,11 +206,21 @@ struct UnreadCountParams {
 impl UnreadCountParams {
     /// The `types[]` / `exclude_types[]` half of the read filters.
     fn type_filters(&self) -> NotificationFilters<'_> {
-        NotificationFilters {
-            types: names_of(self.types.as_ref()),
-            exclude_types: names_of(self.exclude_types.as_ref()),
-            account_id: None,
-        }
+        type_filters(self.types.as_ref(), self.exclude_types.as_ref())
+    }
+}
+
+/// The `types[]` / `exclude_types[]` half of the read filters, shared by
+/// every notification listing; the account half arrives through
+/// [`account_filter`].
+pub(crate) fn type_filters<'a>(
+    types: Option<&'a StringList>,
+    exclude: Option<&'a StringList>,
+) -> NotificationFilters<'a> {
+    NotificationFilters {
+        types: names_of(types),
+        exclude_types: names_of(exclude),
+        account_id: None,
     }
 }
 

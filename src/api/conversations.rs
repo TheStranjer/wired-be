@@ -78,8 +78,8 @@ use uuid::Uuid;
 
 use crate::{
     api::{
-        helpers::{distinct, distinct_ids},
-        notifications_v2::{NO_EXTRA_QUERY, StringList, names_of},
+        helpers::{StringList, distinct, distinct_ids, names_of},
+        notifications_v2::NO_EXTRA_QUERY,
     },
     auth::AuthUser,
     entities::{

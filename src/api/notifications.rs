@@ -84,8 +84,8 @@ use uuid::Uuid;
 use crate::{
     api::{
         chats::message_of,
-        helpers::{distinct, distinct_ids},
-        notifications_v2::{NO_EXTRA_QUERY, StringList, account_filter, names_of},
+        helpers::{StringList, distinct, distinct_ids},
+        notifications_v2::{NO_EXTRA_QUERY, account_filter, type_filters},
     },
     auth::AuthUser,
     entities::{
@@ -282,20 +282,14 @@ struct ListParams {
 }
 
 impl ListParams {
-    /// The kept type names: `types[]` when it came, else the
-    /// `include_types[]` alias, and neither means no restriction.
-    fn kept_types(&self) -> Vec<&str> {
-        names_of(self.types.as_ref().or(self.include_types.as_ref()))
-    }
-
-    /// The `types[]` / `exclude_types[]` half of the read filters; the
-    /// account half arrives through [`account_filter`].
+    /// The `types[]` / `exclude_types[]` half of the read filters: `types[]`
+    /// when it came, else the `include_types[]` alias, and neither means no
+    /// restriction. The account half arrives through [`account_filter`].
     fn type_filters(&self) -> NotificationFilters<'_> {
-        NotificationFilters {
-            types: self.kept_types(),
-            exclude_types: names_of(self.exclude_types.as_ref()),
-            account_id: None,
-        }
+        type_filters(
+            self.types.as_ref().or(self.include_types.as_ref()),
+            self.exclude_types.as_ref(),
+        )
     }
 
     /// Whether muted causes stay in the page.
@@ -448,35 +442,14 @@ async fn destroy_multiple(
 struct DestroyParams {
     /// The notifications to dismiss; absent asks for none.
     #[serde(default)]
-    ids: Option<IdList>,
-}
-
-/// One value or a list (a JSON array, or `ids[]=…` keys) — the two
-/// spellings Mastodon clients and forms both send.
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
-enum IdList {
-    /// A lone id.
-    Single(String),
-    /// A list of ids.
-    Multiple(Vec<String>),
-}
-
-impl IdList {
-    /// The values, borrowed, in the order sent.
-    fn values(&self) -> Vec<&str> {
-        match self {
-            Self::Single(value) => vec![value.as_str()],
-            Self::Multiple(values) => values.iter().map(String::as_str).collect(),
-        }
-    }
+    ids: Option<StringList>,
 }
 
 impl DestroyParams {
     /// The parsed ids, in the order sent, each named once; values that
     /// are not id text are skipped — they can name no row anyway.
     fn parsed_ids(&self) -> Vec<Uuid> {
-        let values = self.ids.as_ref().map_or_else(Vec::new, IdList::values);
+        let values = self.ids.as_ref().map_or_else(Vec::new, StringList::names);
         distinct_ids(values).0
     }
 }
