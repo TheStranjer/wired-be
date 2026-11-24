@@ -73,6 +73,7 @@ pub mod note;
 pub mod note_parser;
 pub mod policy;
 pub mod publisher;
+pub mod quotes;
 pub mod remote_actor;
 pub mod signature;
 pub mod vocab;

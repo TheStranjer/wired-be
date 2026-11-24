@@ -202,7 +202,7 @@ pub(super) fn expected_context() -> Value {
 }
 
 /// Every key a bare note object carries.
-pub(super) const NOTE_KEYS: [&str; 18] = [
+pub(super) const NOTE_KEYS: [&str; 19] = [
     "@context",
     "actor",
     "attachment",
@@ -213,6 +213,7 @@ pub(super) const NOTE_KEYS: [&str; 18] = [
     "conversation",
     "id",
     "inReplyTo",
+    "interactionPolicy",
     "published",
     "sensitive",
     "source",

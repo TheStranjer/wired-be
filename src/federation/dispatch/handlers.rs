@@ -280,9 +280,9 @@ mod tests {
         let handlers = Handlers::default();
         assert_table(
             &handlers.by_type,
-            "Accept Add Announce Block EmojiReact Flag Follow Like Move Reject Remove",
+            "Accept Add Announce Block EmojiReact Flag Follow Like Move QuoteRequest Reject Remove",
             "the misc five, the interaction trio, the follow handshake's three, \
-             and nothing further: `Create` and the rest ride the other tables",
+             the quote request, and nothing further: `Create` and the rest ride the other tables",
         );
         assert_table(
             &handlers.undo_by_type,

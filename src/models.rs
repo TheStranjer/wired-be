@@ -66,6 +66,7 @@ pub mod oauth_token;
 pub mod password_reset;
 pub mod pinned_status;
 pub mod poll;
+pub mod quote_authorization;
 pub mod relationship;
 pub mod relay;
 pub mod report;

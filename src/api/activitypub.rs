@@ -122,6 +122,11 @@
 //! row, tombstone, `local`, a mismatched nickname and an unsigned private
 //! read are all the same 404 JSON.
 //!
+//! The quote consent document, `GET /quote_authorizations/{uuid}`, is the
+//! `QuoteAuthorization` an `Accept` of a `QuoteRequest` names as its
+//! `result` (FEP-044f): 404 for an id that names no grant, 410 once the
+//! grant was revoked or the quoted status deleted.
+//!
 //! With `AUTHORIZED_FETCH` on, every `ActivityPub` document route — the
 //! actor, the collections, the object replies, the object reads and the
 //! activity reads — additionally demands a valid HTTP Signature (see
@@ -181,6 +186,7 @@ use self::{
     negotiation::{frontend_redirect, wants_activity_json, wants_html},
     objects::{get_notice, get_object, get_replies, get_scoped_object},
     outbox_create::update_outbox,
+    quote_authorizations::get_quote_authorization,
 };
 
 /// The activity reads: `GET /activities/{uuid}` and the `Create` of a
@@ -208,6 +214,8 @@ mod outbox_create;
 /// The C2S outbox's relationship arms: the `Follow`, `Like`, `Announce`,
 /// `Block` and `Undo` activities it folds.
 mod outbox_relations;
+/// The `QuoteAuthorization` read: `GET /quote_authorizations/{uuid}`.
+mod quote_authorizations;
 /// The scrobble documents: the `Audio` object and the `Listen` activity
 /// the object and activity routes fall back to for a scrobble id.
 mod scrobbles;
@@ -294,6 +302,7 @@ pub fn router(config: &Config) -> Router<AppState> {
         .route("/users/{nickname}/statuses/{uuid}", get(get_scoped_object))
         .route("/notice/{id}", get(get_notice))
         .route("/activities/{uuid}", get(get_activity))
+        .route("/quote_authorizations/{uuid}", get(get_quote_authorization))
         .route(
             "/users/{nickname}/statuses/{uuid}/activity",
             get(get_notice_activity),

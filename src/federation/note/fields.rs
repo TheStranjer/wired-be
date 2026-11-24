@@ -10,7 +10,7 @@ use std::collections::HashSet;
 use serde_json::{Value, json};
 
 use crate::{
-    federation::vocab::AS_PUBLIC,
+    federation::{quotes::interaction_policy_json, vocab::AS_PUBLIC},
     models::{
         status::{Status, Visibility},
         user::{User, followers_address},
@@ -44,6 +44,9 @@ pub fn note_json(ctx: &NoteContext) -> Option<Value> {
     if let Some(quote_uri) = &ctx.quote_uri {
         fields.push(("quoteUrl", json!(quote_uri)));
         fields.push(("quoteUri", json!(quote_uri)));
+    }
+    if let Some(policy) = interaction_policy_json(ctx.status.visibility, &ctx.author) {
+        fields.push(("interactionPolicy", policy));
     }
     Some(Value::Object(
         fields
@@ -221,10 +224,42 @@ mod tests {
                 "conversation": format!("{BASE}/contexts/{STATUS_ID}"),
                 "tag": [],
                 "attachment": [],
+                "interactionPolicy": {
+                    "canQuote": {
+                        "automaticApproval": [AS_PUBLIC],
+                        "manualApproval": [],
+                    }
+                },
             }),
             "the whole document, field for field"
         );
         assert_eq!(json_keys(&document), NOTE_KEYS, "and nothing else");
+    }
+
+    #[test]
+    fn the_quote_policy_follows_the_visibility() {
+        for visibility in [Visibility::Public, Visibility::Unlisted] {
+            assert_eq!(
+                render(visibility)["interactionPolicy"]["canQuote"]["automaticApproval"],
+                json!([AS_PUBLIC]),
+                "public and unlisted posts may be quoted by anyone"
+            );
+        }
+        let private = render(Visibility::Private);
+        assert_eq!(
+            private["interactionPolicy"]["canQuote"],
+            json!({
+                "automaticApproval": [format!("{AUTHOR_AP}/followers")],
+                "manualApproval": [],
+            }),
+            "a private post may be quoted by its author's followers"
+        );
+        assert!(
+            render(Visibility::Direct)
+                .get("interactionPolicy")
+                .is_none(),
+            "a direct post carries no policy, so peers read it as unquotable"
+        );
     }
 
     #[test]

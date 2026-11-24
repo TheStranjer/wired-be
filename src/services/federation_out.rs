@@ -189,6 +189,7 @@ mod moves;
 mod notes;
 mod polls;
 mod profile;
+mod quotes;
 mod reactions;
 mod reports;
 mod scrobbles;
@@ -211,6 +212,7 @@ pub use polls::{
     handle_publish_update,
 };
 pub use profile::{after_account_deleted, after_account_disabled, after_profile_updated};
+pub use quotes::{QuoteRequestAnswer, answer_quote_request};
 pub use reactions::after_reaction_changed;
 pub use reports::after_report_created;
 pub use scrobbles::after_scrobble_created;

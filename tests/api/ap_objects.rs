@@ -55,7 +55,7 @@ const REFUSAL: &str = "This instance requires authenticated fetches";
 const NOT_FOUND: &str = "Not found";
 /// Every field of a bare public `Note` — no poll, no mentions, no media —
 /// in sorted order, the exact key-set assertion the golden pairs with.
-const NOTE_KEYS: [&str; 18] = [
+const NOTE_KEYS: [&str; 19] = [
     "@context",
     "actor",
     "attachment",
@@ -66,6 +66,7 @@ const NOTE_KEYS: [&str; 18] = [
     "conversation",
     "id",
     "inReplyTo",
+    "interactionPolicy",
     "published",
     "sensitive",
     "source",

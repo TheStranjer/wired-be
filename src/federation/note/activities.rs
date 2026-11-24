@@ -69,48 +69,58 @@ fn wrapped_context(note: &Value, config: &Config) -> Value {
 /// JSON-LD processor never drops one as undefined.
 #[must_use]
 pub fn litepub_context_json() -> Value {
-    json!({
-        "@context": {
-            "as": "https://www.w3.org/ns/activitystreams#",
-            "fedibird": "http://fedibird.com/ns#",
-            "litepub": "http://litepub.social/ns#",
-            "ostatus": "http://ostatus.org#",
-            "schema": "http://schema.org#",
-            "sm": "http://smithereen.software/ns#",
-            "toot": "http://joinmastodon.org/ns#",
-            "vcard": "http://www.w3.org/2006/vcard/ns#",
-            "_misskey_quote": "https://misskey-hub.net/ns#_misskey_quote",
-            "alsoKnownAs": { "@id": "as:alsoKnownAs", "@type": "@id" },
-            "blurhash": "toot:blurhash",
-            "capabilities": "litepub:capabilities",
-            "ChatMessage": "litepub:ChatMessage",
-            "conversation": { "@id": "ostatus:conversation", "@type": "@id" },
-            "directMessage": "litepub:directMessage",
-            "discoverable": "toot:discoverable",
-            "Emoji": "toot:Emoji",
-            "EmojiReact": "litepub:EmojiReact",
-            "featured": { "@id": "toot:featured", "@type": "@id" },
-            "focalPoint": { "@container": "@list", "@id": "toot:focalPoint" },
-            "formerRepresentations": "litepub:formerRepresentations",
-            "formerType": "as:formerType",
-            "Hashtag": "as:Hashtag",
-            "invisible": "litepub:invisible",
-            "listMessage": { "@id": "litepub:listMessage", "@type": "@id" },
-            "manuallyApprovesFollowers": "as:manuallyApprovesFollowers",
-            "movedTo": { "@id": "as:movedTo", "@type": "@id" },
-            "nonAnonymous": "sm:nonAnonymous",
-            "oauthRegistrationEndpoint": {
-                "@id": "litepub:oauthRegistrationEndpoint",
-                "@type": "@id"
-            },
-            "PropertyValue": "schema:PropertyValue",
-            "quoteUri": "fedibird:quoteUri",
-            "quoteUrl": "as:quoteUrl",
-            "sensitive": "as:sensitive",
-            "value": "schema:value",
-            "votersCount": "toot:votersCount",
-        }
-    })
+    let mut terms = json!({
+        "as": "https://www.w3.org/ns/activitystreams#",
+        "fedibird": "http://fedibird.com/ns#",
+        "gts": "https://gotosocial.org/ns#",
+        "litepub": "http://litepub.social/ns#",
+        "ostatus": "http://ostatus.org#",
+        "schema": "http://schema.org#",
+        "sm": "http://smithereen.software/ns#",
+        "toot": "http://joinmastodon.org/ns#",
+        "vcard": "http://www.w3.org/2006/vcard/ns#",
+        "_misskey_quote": "https://misskey-hub.net/ns#_misskey_quote",
+        "blurhash": "toot:blurhash",
+        "capabilities": "litepub:capabilities",
+        "ChatMessage": "litepub:ChatMessage",
+        "directMessage": "litepub:directMessage",
+        "discoverable": "toot:discoverable",
+        "Emoji": "toot:Emoji",
+        "EmojiReact": "litepub:EmojiReact",
+        "formerRepresentations": "litepub:formerRepresentations",
+        "formerType": "as:formerType",
+        "Hashtag": "as:Hashtag",
+        "invisible": "litepub:invisible",
+        "manuallyApprovesFollowers": "as:manuallyApprovesFollowers",
+        "nonAnonymous": "sm:nonAnonymous",
+        "PropertyValue": "schema:PropertyValue",
+        "QuoteRequest": "https://w3id.org/fep/044f#QuoteRequest",
+        "quoteUri": "fedibird:quoteUri",
+        "quoteUrl": "as:quoteUrl",
+        "sensitive": "as:sensitive",
+        "value": "schema:value",
+        "votersCount": "toot:votersCount",
+    });
+    let linked = json!({
+        "alsoKnownAs": { "@id": "as:alsoKnownAs", "@type": "@id" },
+        "automaticApproval": { "@id": "gts:automaticApproval", "@type": "@id" },
+        "canQuote": { "@id": "gts:canQuote", "@type": "@id" },
+        "conversation": { "@id": "ostatus:conversation", "@type": "@id" },
+        "featured": { "@id": "toot:featured", "@type": "@id" },
+        "focalPoint": { "@container": "@list", "@id": "toot:focalPoint" },
+        "interactionPolicy": { "@id": "gts:interactionPolicy", "@type": "@id" },
+        "listMessage": { "@id": "litepub:listMessage", "@type": "@id" },
+        "manualApproval": { "@id": "gts:manualApproval", "@type": "@id" },
+        "movedTo": { "@id": "as:movedTo", "@type": "@id" },
+        "oauthRegistrationEndpoint": {
+            "@id": "litepub:oauthRegistrationEndpoint",
+            "@type": "@id"
+        },
+    });
+    if let (Some(target), Value::Object(extra)) = (terms.as_object_mut(), linked) {
+        target.extend(extra);
+    }
+    json!({ "@context": terms })
 }
 
 /// The `Create` activity carrying `note` for `status`, whose `UUIDv7` also
@@ -350,6 +360,16 @@ mod tests {
         );
         assert_eq!(context["ChatMessage"], "litepub:ChatMessage", "chats");
         assert_eq!(context["toot"], "http://joinmastodon.org/ns#", "toot iri");
+        assert_eq!(context["gts"], "https://gotosocial.org/ns#", "gts iri");
+        assert_eq!(
+            context["interactionPolicy"],
+            json!({"@id": "gts:interactionPolicy", "@type": "@id"}),
+            "the FEP-044f interaction policy"
+        );
+        assert_eq!(
+            context["QuoteRequest"], "https://w3id.org/fep/044f#QuoteRequest",
+            "the quote request type"
+        );
     }
 
     #[test]
