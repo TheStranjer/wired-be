@@ -225,7 +225,7 @@ pub(super) const NOTE_KEYS: [&str; 18] = [
 
 /// Terms of the `ActivityStreams` and `security` vocabularies the first two
 /// `@context` entries define, so the served schema does not have to.
-const CORE_TERMS: [&str; 34] = [
+const CORE_TERMS: [&str; 36] = [
     "actor",
     "anyOf",
     "attachment",
@@ -238,6 +238,7 @@ const CORE_TERMS: [&str; 34] = [
     "endTime",
     "endpoints",
     "followers",
+    "height",
     "href",
     "following",
     "icon",
@@ -260,6 +261,7 @@ const CORE_TERMS: [&str; 34] = [
     "type",
     "updated",
     "url",
+    "width",
 ];
 
 /// A media row at `url` of `content_type`: no description, no blurhash and
