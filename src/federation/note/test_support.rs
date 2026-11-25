@@ -154,6 +154,7 @@ pub(super) fn base_status(visibility: Visibility) -> Status {
         reblog_of_id: None,
         quote_of_id: None,
         quote_policy: None,
+        quote_approval_policy: None,
         local: true,
         application_name: None,
         application_website: None,

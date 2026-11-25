@@ -218,16 +218,44 @@ mod tests {
         config::{Config, TEST_BASE_URL},
         models::{
             quote_request::QuoteRequestState,
-            status::{self, NewStatus, Visibility},
+            status::{self, NewStatus, QuoteApprovalPolicy, Visibility},
         },
         services::federation_out::{
-            after_status_created,
+            after_status_created, after_status_edited,
             test_support::{
-                app_state, delivery_jobs, job_count, local, local_post, remote, remote_status,
-                state_with, unfederated,
+                accepted_follow, app_state, delivery_jobs, job_count, local, local_post, remote,
+                remote_status, state_with, the_single_activity, unfederated,
             },
         },
     };
+
+    /// An edit that changes the author's quote policy announces the note
+    /// again, and the `Update` carries the new `interactionPolicy`.
+    #[tokio::test]
+    async fn a_policy_edit_publishes_an_update_with_the_new_interaction_policy() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = local(&pool, "alice").await;
+        let carol = remote(&pool, "carol").await;
+        accepted_follow(&pool, &carol, &alice).await;
+        let before = local_post(&pool, &alice, "quote me", Visibility::Public).await;
+        status::set_quote_approval_policy(&pool, before.id, Some(QuoteApprovalPolicy::Nobody))
+            .await
+            .expect("the policy writes");
+
+        after_status_edited(&app_state(&pool), &before).await;
+
+        let activity = the_single_activity(&pool).await;
+        assert_eq!(activity["type"], "Update", "the note is re-announced");
+        assert_eq!(
+            activity["object"]["interactionPolicy"],
+            json!({"canQuote": {
+                "automaticApproval": [alice.ap_id],
+                "manualApproval": [],
+            }}),
+            "with the policy the author chose"
+        );
+    }
 
     /// A public post of `author` quoting `quoted`.
     async fn quoting(pool: &sqlx::PgPool, author: &User, quoted: &Status) -> Status {

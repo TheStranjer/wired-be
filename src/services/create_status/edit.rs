@@ -66,6 +66,11 @@ pub struct EditStatusParams {
     /// [`edit_media`](super::edit_media).
     #[serde(default, deserialize_with = "super::edit_media::deserialize")]
     media_attributes: Option<Vec<MediaAttribute>>,
+    /// Who may quote the post from now on (`public`, `followers` or
+    /// `nobody`); the empty string restores the default, and an absent key
+    /// leaves the stored policy alone.
+    #[serde(default)]
+    quote_approval_policy: Option<String>,
 }
 
 /// The edit body merged over the stored row: every [`CreateStatusParams`]
@@ -98,6 +103,10 @@ fn merged_body(row: &status::Status, params: &EditStatusParams) -> CreateStatusP
         // cap and the poll rule itself and tells [`check_body`] whether
         // an attachment or poll stands behind an empty text.
         quote_id: None,
+        quote_approval_policy: kept(params.quote_approval_policy.clone(), || {
+            row.quote_approval_policy
+                .map_or_else(String::new, |policy| policy.as_str().to_owned())
+        }),
         preview: None,
         expires_in: None,
         in_reply_to_id: None,
@@ -224,6 +233,9 @@ pub async fn edit_status(
         media_attributes,
         media_refresh: Vec::new(),
     };
+    if params.quote_approval_policy.is_some() {
+        status::set_quote_approval_policy(&state.db, row.id, checked.quote_approval_policy).await?;
+    }
     let Some(updated) = status_edit::update_status(&state.db, row.id, edit).await? else {
         return Ok(None);
     };

@@ -18,7 +18,7 @@ use uuid::Uuid;
 
 use super::{
     CheckedPoll, CreateStatusParams, QUOTE_NOT_ALLOWED, after_status_created,
-    idempotency::create_status_with_key,
+    idempotency::create_status_with_key, quote_consent::require_consent,
 };
 use crate::{
     entities::status::Status,
@@ -167,13 +167,15 @@ pub(super) async fn created_entity(
         "status created"
     );
     crate::jobs::statuses::schedule_expiration(state, &row).await;
+    // The hook runs first: it records the `quote_requests` row of a quote of
+    // a remote post, and the entity reads that row to render `pending`.
+    after_status_created(state, &row).await;
     let entity = render_status(state, ViewerMode::user(user), &row)
         .await?
         // Unreachable for what was written a moment ago — live, local and no
         // reblog, so the renderer has nothing to drop it for — and a 500
         // rather than a panic if it ever happens.
         .ok_or_else(|| AppError::Internal(format!("the status {} did not render", row.id)))?;
-    after_status_created(state, &row).await;
     Ok(entity)
 }
 
@@ -192,13 +194,16 @@ pub(super) async fn created_entity(
 /// [`Visibility::Unlisted`] original may be quoted, its own author excepted:
 /// whoever may see their own `private`, `direct` or `local` post may quote
 /// it, and anybody quoting somebody else's gets the 422 wording of
-/// [`QUOTE_NOT_ALLOWED`].
+/// [`QUOTE_NOT_ALLOWED`]. Last, the quoted author's own policy is asked
+/// (see [`require_consent`]): a target whose `quote_approval` is `denied`
+/// for the poster is the 422 Mastodon answers it with.
 ///
 /// # Errors
 ///
 /// [`AppError::NotFound`] for a malformed, unknown, deleted or unseen
 /// target, [`AppError::Unprocessable`] with [`QUOTE_NOT_ALLOWED`] for a
-/// visible but unquotable one. Any database failure arrives through `?` as
+/// visible but unquotable one, and with `QUOTE_DENIED` for one whose author
+/// refuses the poster. Any database failure arrives through `?` as
 /// [`AppError::Database`].
 pub(super) async fn quote_target(
     state: &AppState,
@@ -219,6 +224,7 @@ pub(super) async fn quote_target(
     {
         return Err(AppError::Unprocessable(QUOTE_NOT_ALLOWED.to_owned()));
     }
+    require_consent(state, user, &target).await?;
     Ok(Some(target))
 }
 
