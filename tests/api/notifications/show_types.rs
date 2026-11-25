@@ -12,8 +12,10 @@ use super::support::{
 };
 use crate::common;
 
-/// The ten documented types, and whether each fixture row names the status.
-const TYPE_SPREAD: [(&str, bool); 10] = [
+/// The twelve documented types, and whether each fixture row names the status.
+const TYPE_SPREAD: [(&str, bool); 12] = [
+    ("quote", true),
+    ("quoted_update", true),
     ("mention", true),
     ("follow", false),
     ("follow_request", false),

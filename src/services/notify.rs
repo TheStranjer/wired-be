@@ -6,8 +6,7 @@
 //! ends in one telling of the affected local account, with the same rules
 //! Pleroma's `skip?` list applies. This module is the single place those
 //! tellings are decided, and the action hooks in [`crate::api`] and
-//! [`crate::services`] are thin landings that call exactly one of its eleven
-//! functions:
+//! [`crate::services`] are thin landings that call one of its functions:
 //!
 //! - [`on_follow`] — the follow endpoint's telling: `follow` when the
 //!   follow is accepted, `follow_request` when a locked account let it
@@ -40,6 +39,11 @@
 //!   its `notify` toggle on) is told `status` of the fresh post, whenever
 //!   its visibility can reach them — never of a `direct` post, and never
 //!   of a reblog row.
+//! - [`on_quote`], [`on_quote_linked`] and [`on_quoted_update`] — the
+//!   quote tellings (Mastodon 4.5): the local author of a quoted post is
+//!   told `quote` of the quoting status, once, when the quote is created or
+//!   linked after the fact, and `quoted_update` whenever that status is
+//!   edited; never of a self-quote, a refused quote or one they cannot see.
 //! - [`on_reaction_changed`] — the reaction routes' telling: the status's
 //!   author is told `pleroma:emoji_reaction` naming the emoji, and the
 //!   withdrawal takes exactly that telling back (one emoji's row, not the
@@ -101,6 +105,7 @@ use crate::{
 
 mod edits;
 mod polls;
+mod quotes;
 mod reactions;
 mod social;
 mod statuses;
@@ -111,6 +116,7 @@ mod test_support;
 
 pub use edits::on_status_edited;
 pub use polls::on_poll_ended;
+pub use quotes::{on_quote, on_quote_linked, on_quoted_update};
 pub use reactions::on_reaction_changed;
 pub use social::{on_follow, on_follow_request_resolved, on_move};
 pub use statuses::{on_favourite, on_mention, on_reblog};
