@@ -179,8 +179,9 @@ pub(super) async fn with_moved(
 /// parameters before the changeset). The booleans arrive through
 /// [`flex::opt_bool`], so a form's `"true"`/`"on"`/`"1"` spells the same
 /// as JSON `true`, and an unknown string is the extractor's 422. That
-/// covers the eleven Pleroma preference flags and `source[sensitive]` as
-/// well as the three Mastodon booleans.
+/// covers the ten Pleroma preference flags and `source[sensitive]` as
+/// well as the three Mastodon booleans. `skip_thread_containment` is the
+/// eleventh flag and not writable here: any value is a 422.
 ///
 /// The `source` block is [`SourceParams`], read from the form's
 /// `source[privacy]=…` keys or the JSON object of the same shape;
@@ -260,9 +261,10 @@ pub(super) struct ProfileParams {
     /// Whether the admin/moderator flags may be shown to others.
     #[serde(default, deserialize_with = "flex::opt_bool")]
     pub(super) show_role: Option<bool>,
-    /// Whether this account's statuses skip thread containment.
-    #[serde(default, deserialize_with = "flex::opt_bool")]
-    pub(super) skip_thread_containment: Option<bool>,
+    /// Present only so the merge can answer it with a 422: the flag is a
+    /// moderation control only an admin credentials write may change.
+    #[serde(default)]
+    pub(super) skip_thread_containment: Option<Value>,
     /// Whether a `Move` of the account may take the following list with it.
     #[serde(default, deserialize_with = "flex::opt_bool")]
     pub(super) allow_following_move: Option<bool>,
@@ -360,8 +362,9 @@ where
 /// # Errors
 ///
 /// [`AppError::Unauthorized`] / [`AppError::Forbidden`] from [`AuthUser`]
-/// and the `write:accounts` check; [`AppError::Unprocessable`] when
-/// `display_name` or `note` is too long, when `fields_attributes` breaks
+/// and the `write:accounts` check; [`AppError::Unprocessable`] when the
+/// body carries `skip_thread_containment` (an admin-only moderation flag),
+/// when `display_name` or `note` is too long, when `fields_attributes` breaks
 /// one of its limits, when `source[privacy]` (or the flat `default_scope`)
 /// names no visibility, when `source[language]` is over
 /// [`MAX_LANGUAGE_CHARS`] characters, when `actor_type` is neither `Person`

@@ -158,6 +158,37 @@ async fn a_credentials_patch_writes_every_field_it_carries() {
     assert_eq!(subjects, vec!["plain".to_owned()], "the named subject");
 }
 
+/// The admin credentials write is the only way to set
+/// `skip_thread_containment`: it lands in the row and the change is logged
+/// as `updated_users`.
+#[tokio::test]
+async fn an_admin_can_set_the_thread_containment_flag_and_it_is_logged() {
+    let db = common::test_db().await;
+    let seeded = seed(&db).await;
+    let token = write_token(&seeded).await;
+    let sql = "SELECT skip_thread_containment FROM users WHERE id = $1";
+    assert!(
+        !flag_of(&seeded.pool, sql, &plain(&seeded.pool).await).await,
+        "the seeded account starts contained"
+    );
+
+    let response = patch_json(
+        &seeded.app,
+        &token,
+        &credentials("plain"),
+        &json!({ "skip_thread_containment": true }),
+    )
+    .await;
+    common::assert_answer(&response, StatusCode::OK, "the admin write");
+    assert!(
+        flag_of(&seeded.pool, sql, &plain(&seeded.pool).await).await,
+        "the flag is stored"
+    );
+    let (message, subjects) = one_entry(&seeded.pool, "updated_users").await;
+    assert_eq!(message, "@root updated users: @plain", "the moderation log");
+    assert_eq!(subjects, vec!["plain".to_owned()], "names the subject");
+}
+
 /// One body that fails six rules reports ALL of them at once, Ecto-style,
 /// and changes nothing: the entity still reads as stored, the blob kept its
 /// old shape and no `updated_users` entry exists.

@@ -6,11 +6,13 @@
 //!
 //! [`settings_store`]: crate::models::user::User::settings_store
 //!
-//! The eleven Pleroma preference flags — `hide_followers`, `hide_follows`,
+//! The ten Pleroma preference flags — `hide_followers`, `hide_follows`,
 //! `hide_followers_count`, `hide_follows_count`, `hide_favorites`,
-//! `show_role`, `skip_thread_containment`, `allow_following_move`,
+//! `show_role`, `allow_following_move`,
 //! `accepts_chat_messages`, `no_rich_text` and `show_birthday` — are
-//! [`flex::opt_bool`] booleans like the three Mastodon ones. `birthday` is
+//! [`flex::opt_bool`] booleans like the three Mastodon ones.
+//! `skip_thread_containment` is not among them: it is admin-only and any
+//! value sent here is a 422. `birthday` is
 //! `YYYY-MM-DD` text (the empty string clears it, anything else that is not a
 //! date is 422, and a date after today is 422 as Pleroma's age check refuses
 //! it). `pleroma_settings_store` is a JSON object — the JSON *text* of one

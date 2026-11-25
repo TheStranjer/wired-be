@@ -1,5 +1,5 @@
 //! The posting defaults of the `source` block (`privacy`, `sensitive`,
-//! `language`), the eleven Pleroma preference flags and `birthday`.
+//! `language`), the ten Pleroma preference flags and `birthday`.
 
 use axum::http::StatusCode;
 use chrono::{NaiveDate, Utc};
@@ -12,15 +12,14 @@ use super::support::{
 };
 use crate::common;
 
-/// The eleven Pleroma preference flags `update_credentials` writes, in the
+/// The ten Pleroma preference flags `update_credentials` writes, in the
 /// order the entity renders them.
-const PREF_FLAGS: [&str; 11] = [
+const PREF_FLAGS: [&str; 10] = [
     "hide_followers",
     "hide_follows",
     "hide_followers_count",
     "hide_follows_count",
     "hide_favorites",
-    "skip_thread_containment",
     "allow_following_move",
     "accepts_chat_messages",
     "show_birthday",
@@ -50,13 +49,12 @@ fn stored_flag(row: &User, field: &str) -> bool {
         "hide_followers_count" => row.hide_followers_count.get(),
         "hide_follows_count" => row.hide_follows_count.get(),
         "hide_favorites" => row.hide_favorites.get(),
-        "skip_thread_containment" => row.skip_thread_containment.get(),
         "allow_following_move" => row.allow_following_move.get(),
         "accepts_chat_messages" => row.accepts_chat_messages.get(),
         "show_birthday" => row.show_birthday.get(),
         "show_role" => row.show_role.get(),
         "no_rich_text" => row.no_rich_text.get(),
-        other => panic!("`{other}` is not one of the eleven preference flags"),
+        other => panic!("`{other}` is not one of the ten preference flags"),
     }
 }
 
@@ -268,9 +266,9 @@ async fn source_language_is_capped_and_the_empty_tag_clears() {
     );
 }
 
-/// Each of the eleven preference flags updates on its own, through JSON,
+/// Each of the ten preference flags updates on its own, through JSON,
 /// form and multipart bodies, reaching the entity wherever Pleroma renders
-/// that key and never moving any of the other ten.
+/// that key and never moving any of the other nine.
 #[tokio::test]
 async fn each_pleroma_flag_updates_on_its_own() {
     let db = common::test_db().await;
@@ -322,8 +320,43 @@ async fn each_pleroma_flag_updates_on_its_own() {
     assert_eq!(row.default_scope, "direct", "the stored privacy too");
 }
 
+/// `skip_thread_containment` is a moderation flag: any value, in any body
+/// spelling, is the 422 and the stored flag stays off.
+#[tokio::test]
+async fn the_thread_containment_flag_is_refused_to_the_account() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let (app, token, alice) = authed_app(&pool, "alice").await;
+
+    let via_json = patch_json(&app, &token, &one_flag("skip_thread_containment", true)).await;
+    common::assert_answer(&via_json, StatusCode::UNPROCESSABLE_ENTITY, "a JSON true");
+    let via_form = patch_form(&app, &token, &[("skip_thread_containment", "false")]).await;
+    common::assert_answer(&via_form, StatusCode::UNPROCESSABLE_ENTITY, "a form false");
+    let with_others = patch_json(
+        &app,
+        &token,
+        &json!({"display_name": "Ada", "skip_thread_containment": true}),
+    )
+    .await;
+    common::assert_answer(
+        &with_others,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "beside a valid field",
+    );
+
+    let row = stored(&pool, alice.id).await;
+    assert!(
+        !row.skip_thread_containment.get(),
+        "no refused write turned the flag on"
+    );
+    assert_ne!(row.name, "Ada", "the refusal wrote nothing at all");
+
+    let nulled = patch_json(&app, &token, &json!({"skip_thread_containment": null})).await;
+    common::assert_answer(&nulled, StatusCode::OK, "a JSON null reads as absent");
+}
+
 /// Assert every preference flag of the answer against `expect` — the running
-/// stored state, so each round also proves the ten flags it did not send
+/// stored state, so each round also proves the nine flags it did not send
 /// stayed where they were.
 fn assert_pref_flags(body: &Value, expect: &Value, why: &str) {
     for field in PREF_FLAGS {
