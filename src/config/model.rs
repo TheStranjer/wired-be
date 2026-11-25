@@ -15,6 +15,7 @@ use super::{
     federation_types::{FetchSettings, MrfSettings, RateLimitConfig, Toggle},
     frontend::StaticSettings,
     integrations::{MediaProxyConfig, OauthProvider, SmtpTls, TranslationConfig, VapidConfig},
+    protocols::EnabledProtocols,
 };
 
 #[cfg(doc)]
@@ -341,4 +342,7 @@ pub struct Config {
     /// The rate limiter settings, from `RATE_LIMITS_ENABLED`, `RATE_LIMITS`
     /// and `TRUST_PROXY_HEADERS` (see [`crate::rate_limit`]).
     pub rate_limit: RateLimitConfig,
+    /// The protocols this instance runs, from `PROTOCOLS`, in
+    /// [`ProtocolId::ALL`](crate::protocols::ProtocolId::ALL) order.
+    pub protocols: EnabledProtocols,
 }
