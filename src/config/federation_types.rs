@@ -271,7 +271,18 @@ mod tests {
             (1, std::time::Duration::from_secs(3_600)),
             "imports is 1 per 3600 seconds"
         );
-        assert_eq!(config.rate_limit.limits.len(), 10, "exactly ten buckets");
+        let interaction = config
+            .rate_limit
+            .limits
+            .get("remote_interaction")
+            .copied()
+            .unwrap();
+        assert_eq!(
+            (interaction.max, interaction.window),
+            (5, std::time::Duration::from_secs(60)),
+            "remote_interaction is 5 per 60 seconds"
+        );
+        assert_eq!(config.rate_limit.limits.len(), 11, "exactly eleven buckets");
     }
 
     /// `RATE_LIMITS` overrides entries of the default table and adds
@@ -284,7 +295,7 @@ mod tests {
         )]);
         assert_eq!(
             config.rate_limit.limits.len(),
-            10,
+            11,
             "no bucket left the table"
         );
         assert_eq!(

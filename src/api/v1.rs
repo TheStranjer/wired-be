@@ -32,7 +32,8 @@ use crate::{
 /// each set a fallback panics.
 ///
 /// `state` reaches [`accounts::router`], [`apps::router`],
-/// [`polls::router`], [`reports::router`], [`search::router`] and
+/// [`polls::router`], [`remote_interaction::pleroma_router`],
+/// [`reports::router`], [`search::router`] and
 /// [`statuses::router`], the merged routers whose routes mount the rate
 /// limiter, and — as
 /// [`state.config`] — [`media::router`], [`pleroma_settings::router`],
@@ -68,7 +69,7 @@ pub fn router(state: &AppState) -> Router<AppState> {
         .merge(pleroma_settings::router(&state.config))
         .merge(polls::router(state))
         .merge(push::router())
-        .merge(remote_interaction::pleroma_router())
+        .merge(remote_interaction::pleroma_router(state))
         .merge(reports::router(state))
         .merge(scheduled_statuses::router())
         .merge(scrobbles::router())
