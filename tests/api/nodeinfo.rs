@@ -18,7 +18,10 @@ use axum::http::StatusCode;
 use chrono::{DateTime, Duration, Utc};
 use serde_json::{Value, json};
 use wired_be::{
-    config::Toggle,
+    config::{
+        BASE_URL_VAR, Config, DATABASE_URL_VAR, PROTOCOLS_VAR, TEST_BASE_URL, TEST_DATABASE_URL,
+        Toggle,
+    },
     models::{
         status::{self, NewStatus, Visibility},
         user::NewUser,
@@ -711,4 +714,27 @@ async fn federation_is_enabled_by_default() {
     let app = common::test_app(db.pool().clone());
     let nodeinfo = get_document(&app, "/nodeinfo/2.0").await;
     assert_eq!(nodeinfo["metadata"]["federation"]["enabled"], true);
+}
+
+/// With `PROTOCOLS=activitypub,fixture` both schema documents still list only
+/// `activitypub`: `NodeInfo` has no name for the fixture, so it is omitted.
+#[tokio::test]
+async fn a_protocol_without_a_nodeinfo_name_is_not_listed() {
+    let db = common::test_db().await;
+    let config = Config::from_lookup(|key| match key {
+        DATABASE_URL_VAR => Some(TEST_DATABASE_URL.to_owned()),
+        BASE_URL_VAR => Some(TEST_BASE_URL.to_owned()),
+        PROTOCOLS_VAR => Some("activitypub,fixture".to_owned()),
+        _ => None,
+    })
+    .expect("the fixed protocols test config is valid");
+    let app = common::test_app_with_config(db.pool().clone(), config);
+    for path in ["/nodeinfo/2.0", "/nodeinfo/2.1"] {
+        let document = get_document(&app, path).await;
+        assert_eq!(
+            document["protocols"],
+            json!(["activitypub"]),
+            "{path} omits the fixture"
+        );
+    }
 }
