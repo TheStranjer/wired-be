@@ -16,6 +16,7 @@ use tracing::{debug, warn};
 use uuid::Uuid;
 
 use super::{
+    audience::{Kind, extra_inboxes},
     load_status, load_user,
     notes::{NoteActivity, note_document, note_publisher},
     queue_activity,
@@ -137,7 +138,11 @@ async fn run_publish_update(state: &AppState, args: Value) -> Result<(), JobErro
     let Some(document) = note_document(state, status.id, NoteActivity::Update).await else {
         return Ok(());
     };
-    publisher::publish(state, &author, &document, PublishOpts::default())
+    let opts = PublishOpts {
+        extra_inboxes: extra_inboxes(state, &author, status.id, Kind::Update).await,
+        only_to: None,
+    };
+    publisher::publish(state, &author, &document, opts)
         .await
         .map(drop)
         .map_err(|err| JobError::Retry(format!("could not publish a poll Update: {err}")))

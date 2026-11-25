@@ -23,6 +23,13 @@ const STANDING_SQL: &str = "SELECT id, multiple FROM polls WHERE status_id = $1"
 /// The titles of one poll's options, in order.
 const TITLES_SQL: &str = "SELECT title FROM poll_options WHERE poll_id = $1 ORDER BY position";
 
+/// The voters of a poll about to be reset, remembered (`$1` the status, `$2`
+/// the poll) so the edit's `Update` can still reach their servers once the
+/// ballots are gone.
+const KEEP_VOTERS_SQL: &str = "INSERT INTO poll_departed_voters (status_id, user_id)
+     SELECT DISTINCT $1::uuid, user_id FROM poll_votes WHERE poll_id = $2
+     ON CONFLICT DO NOTHING";
+
 /// A restated question's write: new choice mode and totals flag, counters
 /// back to zero, the deadline replaced only when the edit gave one (`$4`),
 /// and the end notification owed again.
@@ -144,6 +151,12 @@ pub async fn apply_edit(
             .map(drop)?;
         return Ok(());
     }
+    sqlx::query(KEEP_VOTERS_SQL)
+        .bind(status_id)
+        .bind(stand.poll_id)
+        .execute(&mut *conn)
+        .await
+        .map(drop)?;
     sqlx::query("DELETE FROM poll_votes WHERE poll_id = $1")
         .bind(stand.poll_id)
         .execute(&mut *conn)

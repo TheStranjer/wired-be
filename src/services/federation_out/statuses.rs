@@ -6,10 +6,16 @@
 //! the publishing gate — is [`super::notes`]', and the withdrawal a deleted
 //! post is owed is [`super::withdrawals`]' arm.
 
+use tracing::warn;
+
+use super::audience::{Kind, queue_with_audience};
 use super::notes::{NoteActivity, note_document, note_publisher};
 use super::queue_activity;
 use super::quotes::request_quote;
-use crate::{models::status::Status, state::AppState};
+use crate::{
+    models::status::{Status, clear_departed_voters},
+    state::AppState,
+};
 
 /// Announce the status the caller just posted: the `Create` activity
 /// carrying the note as this instance federates it.
@@ -79,7 +85,12 @@ pub async fn after_status_edited(state: &AppState, status: &Status) {
     let Some(document) = note_document(state, status.id, NoteActivity::Update).await else {
         return;
     };
-    queue_activity(state, &author, &document, "note edit").await;
+    queue_with_audience(state, &author, status.id, &document, Kind::Update).await;
+    // The edit's `Update` has been queued to the voters of the poll it may
+    // have reset; they are no longer owed anything.
+    if let Err(err) = clear_departed_voters(&state.db, status.id).await {
+        warn!(%err, status = %status.id, "could not forget the voters of an edited poll");
+    }
 }
 
 #[cfg(test)]
