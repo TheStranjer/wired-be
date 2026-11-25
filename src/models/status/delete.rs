@@ -261,10 +261,13 @@ pub async fn insert_tombstone(
         .await?)
 }
 
-/// The `SELECT` behind [`fetch_expired`]: live statuses whose expiration has
-/// run out, soonest-expiring first, at most `limit` of them.
+/// The `SELECT` behind [`fetch_expired`]: live local statuses whose
+/// expiration has run out, soonest-expiring first, at most `limit` of them.
+/// A remote status is never expired here, whatever its `expires_at` says:
+/// only a received `Delete` removes it.
 const EXPIRED_SQL: &str = "SELECT * FROM statuses
      WHERE deleted_at IS NULL
+       AND local
        AND expires_at IS NOT NULL
        AND expires_at <= now()
      ORDER BY expires_at, id

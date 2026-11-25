@@ -113,8 +113,8 @@ mod tests {
         );
         assert_eq!(poll.voters_count, Some(10), "votersCount");
         assert_eq!(
-            parsed.status.expires_at, poll.expires_at,
-            "the status expires with its poll"
+            parsed.status.expires_at, None,
+            "a remote status never expires with its poll: only a Delete removes it"
         );
     }
 

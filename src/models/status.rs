@@ -75,6 +75,8 @@ mod threads;
 mod types;
 
 #[cfg(test)]
+mod remote_poll_repair;
+#[cfg(test)]
 mod test_support;
 
 pub mod admin;
