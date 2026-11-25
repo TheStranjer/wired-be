@@ -22,8 +22,8 @@ use crate::{
     models::{
         invite_token::{self, INVALID_INVITE_MESSAGE, InviteToken},
         user::{
-            Flag, NewUser, User, featured, followers, following, get_by_email, get_by_nickname,
-            inbox, insert, local_ap_id, outbox,
+            Flag, NewUser, User, featured, followers, following, get_by_email, inbox, insert,
+            local_ap_id, nickname_taken, outbox,
         },
     },
     state::AppState,
@@ -132,7 +132,7 @@ pub(super) async fn check_taken(
     email: Option<&str>,
     errors: &mut FieldErrors,
 ) -> Result<(), RegisterError> {
-    if get_by_nickname(&state.db, nickname).await?.is_some() {
+    if nickname_taken(&state.db, nickname).await? {
         add_error(errors, "nickname", HAS_ALREADY_BEEN_TAKEN);
     }
     if let Some(email) = email

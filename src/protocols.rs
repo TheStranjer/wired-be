@@ -38,13 +38,15 @@
 //! [`ProtocolAdapter::well_known_routes`](adapter::ProtocolAdapter::well_known_routes)
 //! and are mounted by [`crate::discovery`].
 //!
-//! Identities and events will live here too. This file only names
-//! the protocols and declares the submodules.
+//! [`identity`] holds the identifier schemes: how an account gets its ID on
+//! each protocol (see its docs). Events will live here too. This file only
+//! names the protocols and declares the submodules.
 
 pub mod activitypub;
 pub mod adapter;
 #[cfg(any(test, feature = "integration-tests"))]
 pub mod fixture;
+pub mod identity;
 pub mod registry;
 
 #[cfg(not(any(feature = "activitypub")))]

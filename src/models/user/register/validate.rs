@@ -12,7 +12,7 @@
 //! email-changing endpoints reuse; [`is_valid_email_local`] and
 //! [`is_valid_email_domain`] are its two halves.
 
-use super::{FieldErrors, error::add_error, is_plausible_email};
+use super::{FieldErrors, NICKNAME_FIELD, error::add_error, is_plausible_email};
 use crate::config::Config;
 
 /// Ecto's `validate_required` message: a value the account cannot be
@@ -82,17 +82,17 @@ fn at_most(count: usize) -> String {
 /// `~r/^[a-zA-Z0-9_-]+$/` format and `validate_not_restricted_nickname`.
 pub(super) fn validate_nickname(nickname: &str, errors: &mut FieldErrors) {
     if nickname.is_empty() {
-        add_error(errors, "nickname", CANNOT_BE_BLANK);
+        add_error(errors, NICKNAME_FIELD, CANNOT_BE_BLANK);
         return;
     }
     if nickname.chars().count() > NICKNAME_MAX_LEN {
-        add_error(errors, "nickname", &at_most(NICKNAME_MAX_LEN));
+        add_error(errors, NICKNAME_FIELD, &at_most(NICKNAME_MAX_LEN));
     }
     if !is_local_nickname(nickname) {
-        add_error(errors, "nickname", HAS_INVALID_FORMAT);
+        add_error(errors, NICKNAME_FIELD, HAS_INVALID_FORMAT);
     }
     if is_reserved(nickname) {
-        add_error(errors, "nickname", INVALID_NICKNAME);
+        add_error(errors, NICKNAME_FIELD, INVALID_NICKNAME);
     }
 }
 
