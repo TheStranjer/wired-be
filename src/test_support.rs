@@ -5,7 +5,10 @@
 use sqlx::{PgPool, postgres::PgPoolOptions};
 
 use crate::{
-    config::{Config, Toggle},
+    config::{
+        BASE_URL_VAR, Config, DATABASE_URL_VAR, PROTOCOLS_VAR, TEST_BASE_URL, TEST_DATABASE_URL,
+        Toggle,
+    },
     state::AppState,
 };
 
@@ -25,6 +28,26 @@ where
 {
     let mut config = Config::for_tests();
     tweak(&mut config);
+    AppState::for_tests(pool.clone(), config)
+}
+
+/// Test state over `pool` that runs `ActivityPub` and the fixture protocol.
+///
+/// The fixture records every account hook call (see
+/// [`recorded_for`](crate::protocols::fixture::recorded_for)).
+///
+/// # Panics
+///
+/// Never in practice: the fixed config is valid.
+#[must_use]
+pub fn app_state_with_fixture(pool: &PgPool) -> AppState {
+    let config = Config::from_lookup(|key| match key {
+        DATABASE_URL_VAR => Some(TEST_DATABASE_URL.to_owned()),
+        BASE_URL_VAR => Some(TEST_BASE_URL.to_owned()),
+        PROTOCOLS_VAR => Some("activitypub,fixture".to_owned()),
+        _ => None,
+    })
+    .expect("the fixed fixture config is valid");
     AppState::for_tests(pool.clone(), config)
 }
 

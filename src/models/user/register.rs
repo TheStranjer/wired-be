@@ -66,7 +66,10 @@ use std::{collections::BTreeMap, fmt};
 use super::confirmation;
 use crate::{
     models::{invite_token::InviteToken, user::User},
-    protocols::ProtocolId,
+    protocols::{
+        ProtocolId,
+        events::{self, AccountEvent},
+    },
     services::webhooks,
     state::AppState,
 };
@@ -185,7 +188,9 @@ impl fmt::Debug for RegisterParams {
 /// signed `account.created` event for every subscribed webhook, the way
 /// Pleroma's `User.handle_creation` triggers it for any account the instance
 /// creates — which is why the event hangs off this one path instead of off a
-/// single endpoint.
+/// single endpoint. Last of all, once the transaction has committed, every
+/// enabled protocol hears [`AccountEvent::Registered`]; a protocol that fails
+/// to handle it is logged and does not fail the registration.
 ///
 /// # Errors
 ///
@@ -218,6 +223,7 @@ pub async fn create_local_user(
         confirmation::send(state, &user).await?;
     }
     webhooks::account_created(state, &user).await;
+    events::dispatch(state, &user, AccountEvent::Registered).await;
     Ok(user)
 }
 
@@ -267,7 +273,8 @@ mod tests {
             featured, followers, following, get_by_nickname, inbox, outbox,
             register::test_support::*,
         },
-        test_support::app_state,
+        protocols::fixture::{Recorded, recorded_for},
+        test_support::{app_state, app_state_with_fixture},
         util::{
             format::text_to_html,
             keys::{parse_private_key, parse_public_key, sign_sha256, verify_sha256},
@@ -437,5 +444,43 @@ mod tests {
             "the redaction marker names the field"
         );
         assert!(debug.contains("alice"), "the rest is visible");
+    }
+
+    /// A registration tells every enabled protocol, once, that the account was created.
+    #[tokio::test]
+    async fn register_fires_the_registered_event() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let state = app_state_with_fixture(db.pool());
+
+        let user = create_local_user(&state, params_for("announced"), None)
+            .await
+            .expect("the registration lands");
+
+        assert_eq!(
+            recorded_for(user.id),
+            vec![Recorded::Event(AccountEvent::Registered)],
+            "the fixture saw the registration"
+        );
+    }
+
+    /// A protocol that fails on `Registered` does not undo or fail the registration.
+    #[tokio::test]
+    async fn a_failing_registered_hook_does_not_fail_the_registration() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let state = app_state_with_fixture(db.pool());
+
+        let user = create_local_user(&state, params_for("fail-hook-register"), None)
+            .await
+            .expect("the registration lands despite the hook");
+
+        assert_eq!(
+            recorded_for(user.id),
+            vec![Recorded::Event(AccountEvent::Registered)],
+            "the failing hook ran"
+        );
+        let stored = get_by_nickname(&state.db, "fail-hook-register")
+            .await
+            .expect("the lookup runs");
+        assert!(stored.is_some(), "the account stays");
     }
 }

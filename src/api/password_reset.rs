@@ -51,6 +51,7 @@ use crate::{
         oauth_token, password_reset,
         user::{self, User},
     },
+    protocols::events::{self, AccountEvent},
     state::AppState,
     util::password::hash_password,
 };
@@ -297,7 +298,7 @@ async fn reset_attempt(
         return Ok(ResetOutcome::Refused(PASSWORD_MISMATCH));
     }
     let new_hash = hash_password(password)?;
-    if !complete_reset(state, &target, record.id, &new_hash).await? {
+    if !complete_reset(state, &target, record.id, password, &new_hash).await? {
         return Ok(ResetOutcome::Refused(INVALID_TOKEN));
     }
     debug!(account = %target.nickname, "password reset: password changed");
@@ -328,10 +329,17 @@ async fn live_reset(
 /// already spent the token it answers `false`, the transaction rolls back
 /// with nothing written, and so does this function (`false`: the token is
 /// no longer valid). `true` means the reset landed.
+///
+/// Right after the hash is set, every enabled protocol is handed the
+/// plaintext `new_password` inside the transaction
+/// ([`events::password_changed_in_tx`]); a protocol that refuses rolls the
+/// whole reset back. Once the transaction commits they all hear
+/// [`AccountEvent::PasswordChanged`].
 async fn complete_reset(
     state: &AppState,
     target: &User,
     token_id: Uuid,
+    new_password: &str,
     hash: &str,
 ) -> AppResult<bool> {
     let mut tx = state.db.begin().await?;
@@ -340,9 +348,11 @@ async fn complete_reset(
         return Ok(false);
     }
     user::set_password(&mut *tx, target.id, hash).await?;
+    events::password_changed_in_tx(&mut tx, state, target, new_password).await?;
     let others = password_reset::delete_others(&mut *tx, target.id, token_id).await?;
     let revoked = oauth_token::delete_all_for_user(&mut *tx, target.id).await?;
     tx.commit().await?;
+    events::dispatch(state, target, AccountEvent::PasswordChanged).await;
     debug!(account = %target.nickname, others, revoked, "password reset: tokens revoked");
     Ok(true)
 }
@@ -354,6 +364,16 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    use crate::{
+        protocols::fixture::{Recorded, recorded_for},
+        test_support::app_state_with_fixture,
+        util::password::verify_password,
+    };
+
+    /// The password an account has before a reset.
+    const OLD_PASSWORD: &str = "old-password-1";
+    /// The password a reset sets.
+    const NEW_PASSWORD: &str = "new-password-2";
 
     #[test]
     fn request_body_reads_email_and_nickname() {
@@ -521,9 +541,15 @@ mod tests {
                 .expect("the rival spend runs"),
             "the rival wins the spend"
         );
-        let landed = complete_reset(&state, &target, record.row.id, "$argon2id$loser")
-            .await
-            .expect("the losing completion runs");
+        let landed = complete_reset(
+            &state,
+            &target,
+            record.row.id,
+            "loser-password",
+            "$argon2id$loser",
+        )
+        .await
+        .expect("the losing completion runs");
         assert!(!landed, "the loser is told the token is spent");
         assert_eq!(
             stored_hash(&state, target.id).await,
@@ -536,6 +562,72 @@ mod tests {
                 .expect("the lookup runs")
                 .is_some(),
             "the loser's rollback kept the account's other tokens"
+        );
+    }
+
+    /// Inserts the local account `nickname` whose password is `password`.
+    async fn account_with_password(state: &AppState, nickname: &str, password: &str) -> User {
+        let ap_id = user::local_ap_id(&state.config.base_url, nickname);
+        let new = user::NewUser {
+            password_hash: Some(hash_password(password).expect("the password hashes")),
+            ..user::NewUser::local(nickname, &ap_id)
+        };
+        user::insert(&state.db, &new)
+            .await
+            .expect("the account fixture inserts")
+    }
+
+    #[tokio::test]
+    async fn a_reset_runs_the_in_transaction_hook_then_announces_it() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let state = app_state_with_fixture(db.pool());
+        let target = account_with_password(&state, "reset_events", OLD_PASSWORD).await;
+        let record = password_reset::create_for_user(&state.db, target.id)
+            .await
+            .expect("the token mints");
+
+        let outcome = reset_attempt(&state, &record.token, NEW_PASSWORD, NEW_PASSWORD)
+            .await
+            .expect("the reset runs");
+
+        assert_eq!(outcome, ResetOutcome::Changed, "the reset lands");
+        assert_eq!(
+            recorded_for(target.id),
+            vec![
+                Recorded::PasswordChangedInTx,
+                Recorded::Event(AccountEvent::PasswordChanged),
+            ],
+            "the in-transaction call came first, the event after the commit"
+        );
+        let stored = stored_hash(&state, target.id).await.expect("a hash");
+        assert!(verify_password(NEW_PASSWORD, &stored), "the new password");
+    }
+
+    #[tokio::test]
+    async fn a_failing_in_transaction_hook_rolls_the_reset_back() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let state = app_state_with_fixture(db.pool());
+        let target = account_with_password(&state, "fail-hook-reset", OLD_PASSWORD).await;
+        let record = password_reset::create_for_user(&state.db, target.id)
+            .await
+            .expect("the token mints");
+
+        let outcome = reset_attempt(&state, &record.token, NEW_PASSWORD, NEW_PASSWORD).await;
+
+        assert!(outcome.is_err(), "the hook's failure fails the reset");
+        let stored = stored_hash(&state, target.id).await.expect("a hash");
+        assert!(verify_password(OLD_PASSWORD, &stored), "the old password");
+        assert!(
+            password_reset::get_valid(&state.db, &record.token, Duration::from_hours(1))
+                .await
+                .expect("the lookup runs")
+                .is_some(),
+            "the token was not spent"
+        );
+        assert_eq!(
+            recorded_for(target.id),
+            vec![Recorded::PasswordChangedInTx],
+            "no event for a change that never committed"
         );
     }
 }
