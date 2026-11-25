@@ -83,4 +83,15 @@ pub trait ProtocolAdapter: Sync {
     fn host_meta_links(&self, _config: &Config) -> Vec<FingerLink> {
         Vec::new()
     }
+
+    /// The name `NodeInfo` lists this protocol under in `protocols`.
+    ///
+    /// `NodeInfo` has its own fixed vocabulary of protocol names
+    /// (<https://nodeinfo.diaspora.software>), which is not always the
+    /// `WiredBE` [`ProtocolId`]. A protocol `NodeInfo` has no name for returns
+    /// `None` and is left out of the list. Core lists the names of the enabled
+    /// protocols in registry order. The default is no name.
+    fn nodeinfo_protocol(&self) -> Option<&'static str> {
+        None
+    }
 }

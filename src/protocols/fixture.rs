@@ -107,4 +107,9 @@ impl ProtocolAdapter for Fixture {
             template: None,
         }]
     }
+
+    /// No name: `NodeInfo` has no protocol called `fixture`.
+    fn nodeinfo_protocol(&self) -> Option<&'static str> {
+        None
+    }
 }

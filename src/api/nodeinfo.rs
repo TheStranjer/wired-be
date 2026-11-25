@@ -74,8 +74,6 @@ const CONTENT_TYPE_20: &str =
 /// The same for the 2.1 document.
 const CONTENT_TYPE_21: &str =
     "application/json; profile=\"http://nodeinfo.diaspora.software/ns/schema/2.1#\"";
-/// The only protocol this server federates with.
-const PROTOCOLS: [&str; 1] = ["activitypub"];
 
 /// The path of the `NodeInfo` discovery document.
 pub const DISCOVERY_PATH: &str = "/.well-known/nodeinfo";

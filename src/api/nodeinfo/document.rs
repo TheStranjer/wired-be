@@ -3,11 +3,10 @@
 
 use serde::Serialize;
 
-use super::{
-    PROTOCOLS, REL_20, REL_21, SOFTWARE_NAME, SchemaVersion, metadata::Metadata, usage::Usage,
-};
+use super::{REL_20, REL_21, SOFTWARE_NAME, SchemaVersion, metadata::Metadata, usage::Usage};
 use crate::{
     config::{Config, Toggle},
+    protocols::{adapter::ProtocolAdapter, registry},
     services::instance_meta::{PLEROMA_COMPATIBILITY_VERSION, SOURCE_URL},
 };
 
@@ -56,8 +55,9 @@ pub(super) struct NodeInfo {
     version: &'static str,
     /// Which software this instance runs.
     software: Software,
-    /// The federation protocols this instance speaks.
-    protocols: &'static [&'static str],
+    /// The federation protocols this instance speaks, as `NodeInfo` names
+    /// them, one per enabled protocol that has a name.
+    protocols: Vec<&'static str>,
     /// Third-party sign-in and sharing services; this server integrates
     /// with none (Pleroma's own answer is the same two empty lists).
     services: Services,
@@ -83,7 +83,9 @@ impl NodeInfo {
         Self {
             version: version.as_str(),
             software: Software::for_version(version),
-            protocols: &PROTOCOLS,
+            protocols: registry::enabled(config)
+                .filter_map(ProtocolAdapter::nodeinfo_protocol)
+                .collect(),
             services: Services::empty(),
             open_registrations: config.registrations_open,
             usage,
@@ -151,7 +153,10 @@ mod tests {
 
     use super::super::usage::UserCounts;
     use super::*;
-    use crate::services::instance_meta::{self, Federation};
+    use crate::{
+        config::{BASE_URL_VAR, DATABASE_URL_VAR, PROTOCOLS_VAR, TEST_BASE_URL, TEST_DATABASE_URL},
+        services::instance_meta::{self, Federation},
+    };
 
     /// The empty-usage document for `version`, built on the test config.
     fn document(version: SchemaVersion) -> Value {
@@ -174,6 +179,50 @@ mod tests {
             Metadata::build(config, Vec::new(), Federation::federating()),
         );
         serde_json::to_value(&document).unwrap()
+    }
+
+    /// The test configuration with `PROTOCOLS` set to `protocols`.
+    fn config_with_protocols(protocols: &str) -> Config {
+        Config::from_lookup(|key| match key {
+            DATABASE_URL_VAR => Some(TEST_DATABASE_URL.to_owned()),
+            BASE_URL_VAR => Some(TEST_BASE_URL.to_owned()),
+            PROTOCOLS_VAR => Some(protocols.to_owned()),
+            _ => None,
+        })
+        .expect("the fixed protocols test config is valid")
+    }
+
+    #[test]
+    fn the_default_config_lists_activitypub_in_both_versions() {
+        for version in [SchemaVersion::V20, SchemaVersion::V21] {
+            assert_eq!(
+                document(version)["protocols"],
+                json!(["activitypub"]),
+                "the default PROTOCOLS names only ActivityPub"
+            );
+        }
+    }
+
+    #[test]
+    fn a_protocol_nodeinfo_has_no_name_for_is_omitted() {
+        let config = config_with_protocols("activitypub,fixture");
+        for version in [SchemaVersion::V20, SchemaVersion::V21] {
+            assert_eq!(
+                document_with(version, &config)["protocols"],
+                json!(["activitypub"]),
+                "the fixture returns no NodeInfo name"
+            );
+        }
+    }
+
+    #[test]
+    fn a_fixture_only_instance_lists_no_protocol() {
+        let config = config_with_protocols("fixture");
+        assert_eq!(
+            document_with(SchemaVersion::V20, &config)["protocols"],
+            json!([]),
+            "no enabled protocol has a NodeInfo name"
+        );
     }
 
     #[test]

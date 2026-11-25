@@ -106,4 +106,9 @@ impl ProtocolAdapter for ActivityPub {
     fn host_meta_links(&self, config: &Config) -> Vec<FingerLink> {
         well_known::activitypub_host_meta_links(config)
     }
+
+    /// `NodeInfo` names it `activitypub`.
+    fn nodeinfo_protocol(&self) -> Option<&'static str> {
+        Some("activitypub")
+    }
 }
