@@ -10,7 +10,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use wired_be::config::{
     BASE_URL_VAR, DATABASE_URL_VAR, HTTP_ALLOW_PRIVATE_HOSTS_VAR, RATE_LIMITS_ENABLED_VAR,
-    TEST_BASE_URL, TEST_DATABASE_URL,
+    REGISTRATIONS_OPEN_VAR, TEST_BASE_URL, TEST_DATABASE_URL,
 };
 
 use crate::common;
@@ -317,7 +317,7 @@ fn test_config_is_the_fixed_configuration() {
     let expected = wired_be::config::Config::from_lookup(|key| match key {
         DATABASE_URL_VAR => Some(TEST_DATABASE_URL.to_owned()),
         BASE_URL_VAR => Some(TEST_BASE_URL.to_owned()),
-        HTTP_ALLOW_PRIVATE_HOSTS_VAR => Some("true".to_owned()),
+        HTTP_ALLOW_PRIVATE_HOSTS_VAR | REGISTRATIONS_OPEN_VAR => Some("true".to_owned()),
         RATE_LIMITS_ENABLED_VAR => Some("false".to_owned()),
         _ => None,
     })

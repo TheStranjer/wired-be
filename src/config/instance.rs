@@ -250,8 +250,8 @@ mod tests {
             "the healthcheck is off by default"
         );
         assert!(
-            config.registrations_open.get(),
-            "registration is open by default (Pleroma's default)"
+            !config.registrations_open.get(),
+            "registration is closed by default"
         );
         assert_eq!(config.domain(), "social.example", "domain without port");
         assert!(config.is_https(), "https base_url");
