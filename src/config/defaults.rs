@@ -394,6 +394,9 @@ pub const DEFAULT_MAX_FETCHES_PER_ACTIVITY: usize = 20;
 /// federates, the way Pleroma's `[:federator, :enabled]` default does;
 /// going quiet is an explicit operator decision.
 pub const DEFAULT_FEDERATION_ENABLED: bool = true;
+/// Protocol list used when `PROTOCOLS` is unset: `ActivityPub` alone, which
+/// is what the instance ran before it could choose.
+pub const DEFAULT_PROTOCOLS: &str = "activitypub";
 /// Unsolicited-public state used when `ACCEPT_UNSOLICITED_PUBLIC` is unset:
 /// public and unlisted remote statuses are stored even from authors nobody
 /// follows.

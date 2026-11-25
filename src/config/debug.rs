@@ -140,4 +140,5 @@ fn debug_delivery_and_federation<'a, 'b, 'd>(
         .field("unreachable_grace_secs", &config.unreachable_grace_secs)
         .field("mrf", &config.mrf)
         .field("rate_limit", &config.rate_limit)
+        .field("protocols", &config.protocols)
 }

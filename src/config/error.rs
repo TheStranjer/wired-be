@@ -4,10 +4,12 @@
 
 use std::{error::Error, fmt, net::AddrParseError};
 
+use crate::protocols::ProtocolId;
+
 use super::{
     defaults::MIN_MEDIA_PROXY_SECRET_CHARS,
     vars::{
-        BASE_URL_VAR, BIND_ADDR_VAR, OAUTH_PROVIDERS_VAR, RATE_LIMITS_VAR,
+        BASE_URL_VAR, BIND_ADDR_VAR, OAUTH_PROVIDERS_VAR, PROTOCOLS_VAR, RATE_LIMITS_VAR,
         RESTRICT_UNAUTHENTICATED_AREAS, RESTRICT_UNAUTHENTICATED_VAR, VAPID_PRIVATE_KEY_VAR,
     },
 };
@@ -49,6 +51,14 @@ pub enum ConfigError {
     /// the instance holds no private half for can never verify a push
     /// signature; the value is the public key's variable name.
     VapidPublicWithoutPrivate(&'static str),
+    /// `PROTOCOLS` names no protocol at all, as `""` or `" , "` do.
+    EmptyProtocols,
+    /// `PROTOCOLS` names something that is not a [`ProtocolId`]; the value is
+    /// the entry as written, trimmed.
+    UnknownProtocol(String),
+    /// `PROTOCOLS` names a [`ProtocolId`] whose Cargo feature this binary was
+    /// built without.
+    ProtocolNotCompiled(ProtocolId),
 }
 
 impl fmt::Display for ConfigError {
@@ -91,6 +101,25 @@ impl fmt::Display for ConfigError {
                 "invalid {var}: it is set without {VAPID_PRIVATE_KEY_VAR}, and a public key \
                  with no matching private key can never verify a push signature"
             ),
+            Self::EmptyProtocols => write!(
+                f,
+                "{PROTOCOLS_VAR}: the list is empty; name at least one protocol, one of {}",
+                known_protocols()
+            ),
+            Self::UnknownProtocol(name) => {
+                write!(
+                    f,
+                    "{PROTOCOLS_VAR}: \"{name}\" is not a protocol WiredBE knows"
+                )
+            }
+            Self::ProtocolNotCompiled(protocol) => {
+                let id = protocol.as_str();
+                write!(
+                    f,
+                    "{PROTOCOLS_VAR}: \"{id}\" is a known protocol, but this binary was built \
+                     without the \"{id}\" feature"
+                )
+            }
         }
     }
 }
@@ -109,9 +138,23 @@ impl Error for ConfigError {
             | Self::ShortMediaProxySecret(_)
             | Self::InvalidRateLimits(_)
             | Self::InvalidRestrictUnauthenticated(_)
-            | Self::VapidPublicWithoutPrivate(_) => None,
+            | Self::VapidPublicWithoutPrivate(_)
+            | Self::EmptyProtocols
+            | Self::UnknownProtocol(_)
+            | Self::ProtocolNotCompiled(_) => None,
         }
     }
+}
+
+/// The ids of the protocols in this build, comma-separated, for a message
+/// that tells the operator what `PROTOCOLS` may name.
+fn known_protocols() -> String {
+    ProtocolId::ALL
+        .iter()
+        .copied()
+        .map(ProtocolId::as_str)
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 #[cfg(test)]

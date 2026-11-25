@@ -269,6 +269,10 @@ pub const MAX_FETCHES_PER_ACTIVITY_VAR: &str = "MAX_FETCHES_PER_ACTIVITY";
 /// while off the `ActivityPub` inbox routes answer 403 and outbound
 /// delivery queues nothing.
 pub const FEDERATION_ENABLED_VAR: &str = "FEDERATION_ENABLED";
+/// Environment variable holding the comma-separated ids of the protocols this
+/// instance runs; each id is a [`ProtocolId`](crate::protocols::ProtocolId)
+/// string and must be compiled into the binary.
+pub const PROTOCOLS_VAR: &str = "PROTOCOLS";
 /// Environment variable holding whether uninvited public remote posts are
 /// stored, as `ACCEPT_UNSOLICITED_PUBLIC`.
 ///

@@ -10,7 +10,7 @@
 //! [`frontend`], [`integrations`]); the readers take it group by group
 //! ([`instance`], [`fetch`], [`federation`], [`jobs`], [`mail`], [`auth`],
 //! [`registration`], [`limits`], [`wording`], [`uploads`], [`urls`],
-//! [`exposure`], [`media`]) on the shared primitives of [`parse`],
+//! [`exposure`], [`media`], [`protocols`]) on the shared primitives of [`parse`],
 //! reported as [`ConfigError`] from [`error`] and rendered redacted by
 //! [`debug`]. Everything the rest of the crate imports is re-exported
 //! here, so the `crate::config::…` paths outside this module keep
@@ -32,6 +32,7 @@ use self::{
     jobs::streaming_heartbeat,
     mail::domain_of,
     media::{media_proxy_settings, rich_media_ignore_hosts, rich_media_remote},
+    protocols::enabled_protocols,
     urls::{directory, frontend_base_url},
 };
 
@@ -55,6 +56,7 @@ pub mod mail;
 pub mod media;
 pub mod model;
 pub mod parse;
+pub mod protocols;
 pub mod registration;
 pub mod uploads;
 pub mod urls;
@@ -65,7 +67,8 @@ pub mod wording;
 pub mod test_support;
 
 pub use self::{
-    defaults::*, error::*, federation_types::*, frontend::*, integrations::*, model::*, vars::*,
+    defaults::*, error::*, federation_types::*, frontend::*, integrations::*, model::*,
+    protocols::EnabledProtocols, vars::*,
 };
 
 impl Config {
@@ -161,6 +164,7 @@ impl Config {
             unreachable_grace_secs: unreachable_grace_secs(&lookup)?,
             mrf: mrf_settings(&lookup)?,
             rate_limit: rate_limit_settings(&lookup)?,
+            protocols: enabled_protocols(&lookup)?,
         })
     }
 
@@ -335,6 +339,7 @@ impl Config {
             unreachable_grace_secs: DEFAULT_UNREACHABLE_GRACE_SECS,
             mrf: MrfSettings::test_defaults(),
             rate_limit: test_rate_limit(),
+            protocols: EnabledProtocols::activitypub_only(),
         }
     }
 }
