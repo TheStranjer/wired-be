@@ -26,7 +26,7 @@
 use axum::Router;
 
 use crate::{
-    api::well_known::{self, WebfingerContribution},
+    api::well_known::{self, FingerLink, WebfingerContribution},
     config::Config,
     federation,
     jobs::{HandlerFn, QUEUE_FEDERATOR_INCOMING, QUEUE_FEDERATOR_OUTGOING},
@@ -100,5 +100,10 @@ impl ProtocolAdapter for ActivityPub {
     /// The actor id and profile aliases, and the profile-page, self and subscribe links.
     fn webfinger(&self, config: &Config, user: &User) -> WebfingerContribution {
         well_known::activitypub_contribution(user, config)
+    }
+
+    /// The `lrdd` link naming the `WebFinger` template.
+    fn host_meta_links(&self, config: &Config) -> Vec<FingerLink> {
+        well_known::activitypub_host_meta_links(config)
     }
 }

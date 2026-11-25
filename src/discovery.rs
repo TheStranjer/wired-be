@@ -12,8 +12,9 @@
 //!   Core mounts them whatever `PROTOCOLS` says. The hooks through which
 //!   protocols fill them are on [`ProtocolAdapter`]:
 //!   [`webfinger`](ProtocolAdapter::webfinger) adds aliases and links to a
-//!   user's `WebFinger` document. A host-meta hook and a `NodeInfo` hook come
-//!   in follow-up tickets.
+//!   user's `WebFinger` document, and
+//!   [`host_meta_links`](ProtocolAdapter::host_meta_links) adds links to
+//!   host-meta. A `NodeInfo` hook comes in a follow-up ticket.
 //!
 //! `/.well-known/oauth-authorization-server` is a future shared document:
 //! more than one protocol may want to describe its authorization server

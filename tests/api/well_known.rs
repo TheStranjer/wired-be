@@ -601,3 +601,51 @@ async fn a_fixture_only_instance_answers_without_activitypub_links() {
         "the XML carries the same subject and alias"
     );
 }
+
+/// The `lrdd` link every `ActivityPub` host-meta carries.
+fn lrdd_link() -> String {
+    format!(r#"<Link rel="lrdd" template="{BASE}/.well-known/webfinger?resource={{uri}}"/>"#)
+}
+
+/// The host-meta document `app` serves.
+async fn host_meta_of(app: &axum::Router) -> String {
+    let response = common::TestRequest::get("/.well-known/host-meta")
+        .send(app)
+        .await;
+    assert_eq!(response.status, StatusCode::OK, "host-meta status");
+    response.text()
+}
+
+/// With `activitypub,fixture` the fixture's link follows the LRDD link.
+#[tokio::test]
+async fn the_fixture_host_meta_link_follows_the_lrdd_link() {
+    let db = common::test_db().await;
+    let app = common::test_app_with_config(
+        db.pool().clone(),
+        config_with_protocols("activitypub,fixture"),
+    );
+    assert_eq!(
+        host_meta_of(&app).await,
+        format!(
+            r#"<XRD xmlns="{XRD_NS}">{}<Link rel="urn:wired:fixture" href="{BASE}/.well-known/fixture"/></XRD>"#,
+            lrdd_link()
+        ),
+        "the LRDD link, then the fixture link"
+    );
+}
+
+/// With only `fixture` enabled the LRDD link is absent.
+#[tokio::test]
+async fn a_fixture_only_host_meta_has_no_lrdd_link() {
+    let db = common::test_db().await;
+    let app = common::test_app_with_config(db.pool().clone(), config_with_protocols("fixture"));
+    let body = host_meta_of(&app).await;
+    assert!(!body.contains("lrdd"), "no LRDD link: {body}");
+    assert_eq!(
+        body,
+        format!(
+            r#"<XRD xmlns="{XRD_NS}"><Link rel="urn:wired:fixture" href="{BASE}/.well-known/fixture"/></XRD>"#
+        ),
+        "only the fixture link"
+    );
+}
