@@ -200,7 +200,7 @@ async fn the_status_purge_window_comes_from_the_config() {
 /// maintenance queue once a day.
 #[test]
 fn the_deleted_statuses_kind_is_registered_and_scheduled() {
-    let registry = crate::job_registry();
+    let registry = crate::job_registry(&Config::for_tests());
     assert!(
         registry.get(KIND_DELETED_STATUSES).is_some(),
         "the worker knows `{KIND_DELETED_STATUSES}`"
@@ -229,7 +229,7 @@ async fn the_registered_status_handler_is_this_purge() {
     let alice = user(&pool, "alice").await;
     let stale_local = deleted_status_row(&pool, &alice, true, 31 * DAY).await;
     let stale_remote = deleted_status_row(&pool, &alice, false, 31 * DAY).await;
-    let registry = crate::job_registry();
+    let registry = crate::job_registry(&Config::for_tests());
     let handler = registry
         .get(KIND_DELETED_STATUSES)
         .expect("the purge's kind is registered");

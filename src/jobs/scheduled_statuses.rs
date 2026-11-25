@@ -861,7 +861,7 @@ mod tests {
     /// minutes.
     #[test]
     fn the_kinds_are_registered_and_the_sweep_is_scheduled() {
-        let registry = crate::job_registry();
+        let registry = crate::job_registry(&crate::config::Config::for_tests());
         assert!(
             registry.get(KIND_PUBLISH).is_some(),
             "the worker knows `{KIND_PUBLISH}`"

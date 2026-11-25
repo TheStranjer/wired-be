@@ -223,7 +223,7 @@ async fn the_jobs_prune_leaves_the_received_activities_ledger_alone() {
 /// maintenance queue once a day.
 #[test]
 fn the_jobs_kind_is_registered_and_scheduled() {
-    let registry = crate::job_registry();
+    let registry = crate::job_registry(&crate::config::Config::for_tests());
     assert!(
         registry.get(KIND_JOBS).is_some(),
         "the worker knows `{KIND_JOBS}`"
@@ -246,7 +246,7 @@ async fn the_registered_jobs_handler_is_this_prune() {
     let pool = db.pool().clone();
     let stale = aged_job(&pool, "done.stale", "completed", 8).await;
     let live = aged_job(&pool, "done.live", "completed", 1).await;
-    let registry = crate::job_registry();
+    let registry = crate::job_registry(&crate::config::Config::for_tests());
     let handler = registry
         .get(KIND_JOBS)
         .expect("the prune's kind is registered");

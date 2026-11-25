@@ -235,7 +235,7 @@ mod tests {
     /// The worker knows the background publish kind.
     #[test]
     fn the_kind_is_registered_with_its_handler() {
-        let registry = crate::job_registry();
+        let registry = crate::job_registry(&crate::config::Config::for_tests());
         assert!(
             registry.get(KIND_PUBLISH).is_some(),
             "the worker knows `{KIND_PUBLISH}`"

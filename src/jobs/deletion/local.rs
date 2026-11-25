@@ -694,7 +694,7 @@ mod tests {
     /// handler is this module's sweep.
     #[tokio::test]
     async fn the_kind_is_registered_to_this_handler() {
-        let registry = crate::job_registry();
+        let registry = crate::job_registry(&crate::config::Config::for_tests());
         let handler = registry
             .get(KIND_DELETE)
             .expect("the account delete kind is registered");

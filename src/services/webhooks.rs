@@ -223,7 +223,7 @@ mod tests {
 
     #[test]
     fn the_kind_is_registered_with_the_ticket_budget() {
-        let registry = crate::job_registry();
+        let registry = crate::job_registry(&crate::config::Config::for_tests());
         assert!(
             registry.get(KIND_DELIVER).is_some(),
             "the worker knows `{KIND_DELIVER}`"

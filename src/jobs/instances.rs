@@ -794,7 +794,7 @@ mod tests {
     /// queue every six hours.
     #[test]
     fn the_kind_is_registered_and_scheduled() {
-        let registry = crate::job_registry();
+        let registry = crate::job_registry(&Config::for_tests());
         assert!(
             registry.get(KIND_PROBE).is_some(),
             "the worker knows `{KIND_PROBE}`"
@@ -814,7 +814,7 @@ mod tests {
     async fn the_registered_handler_is_this_sweep() {
         let db = crate::test_db::test_db().await.expect("test database slot");
         let pool = db.pool().clone();
-        let registry = crate::job_registry();
+        let registry = crate::job_registry(&Config::for_tests());
         let handler = registry
             .get(KIND_PROBE)
             .expect("the probe's kind is registered");

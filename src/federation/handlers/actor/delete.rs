@@ -124,7 +124,7 @@ mod tests {
         assert_eq!(job.1, KIND_DELETE_REMOTE, "as the remote sweep");
         assert_eq!(job.2, json!({"user_id": alice_id}), "carrying the account");
 
-        let sweep = crate::job_registry()
+        let sweep = crate::job_registry(&crate::config::Config::for_tests())
             .get(KIND_DELETE_REMOTE)
             .expect("the sweep kind is registered");
         let attempt = AttemptInfo {

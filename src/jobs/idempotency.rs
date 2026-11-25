@@ -168,7 +168,7 @@ mod tests {
     /// queue every ten minutes.
     #[test]
     fn the_kind_is_registered_and_scheduled() {
-        let registry = crate::job_registry();
+        let registry = crate::job_registry(&crate::config::Config::for_tests());
         assert!(
             registry.get(KIND_CLEANUP).is_some(),
             "the worker knows `{KIND_CLEANUP}`"
@@ -198,7 +198,7 @@ mod tests {
                 .is_some_and(|status| status.id == aged),
             "the aged mapping stands before the sweep"
         );
-        let registry = crate::job_registry();
+        let registry = crate::job_registry(&crate::config::Config::for_tests());
         let handler = registry
             .get(KIND_CLEANUP)
             .expect("the sweep's kind is registered");

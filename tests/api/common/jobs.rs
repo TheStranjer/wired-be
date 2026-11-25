@@ -26,7 +26,7 @@ use wired_be::{
 ///
 /// If a claim or a terminal write fails, or a handler panics.
 pub async fn run_all_jobs(state: &AppState) -> usize {
-    let registry = job_registry();
+    let registry = job_registry(&state.config);
     let queues: Vec<&str> = state.config.job_queues.iter().map(String::as_str).collect();
     let mut run = 0;
     while let Some(job) = claim_next(&state.db, &queues)
