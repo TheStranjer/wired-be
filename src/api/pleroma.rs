@@ -15,8 +15,9 @@
 //! the same controller's `update_notification_settings/2` at
 //! `PUT /notification_settings`, and
 //! [`pleroma_account_settings`] adds the account utilities of the same
-//! controller: `aliases`, `move_account`, `change_password`,
-//! `change_email`, `delete_account` and `disable_account`. The
+//! controller, split by the rule in [`crate::api`]: `change_password`,
+//! `change_email`, `delete_account` and `disable_account` are core, while
+//! `aliases` and `move_account` are `ActivityPub`-backed. The other
 //! `ActivityPub`-backed part is [`pleroma_import`], the CSV imports of
 //! `UserImportController`: `follow_import`, `blocks_import` and
 //! `mutes_import`. Do not call [`Router::fallback`] here: unmatched paths
@@ -38,14 +39,18 @@ pub fn core_router() -> Router<AppState> {
         .nest("/notifications", notifications::pleroma_router())
         .merge(misc::frontend_configurations_router())
         .merge(notification_settings::router())
-        .merge(pleroma_account_settings::router())
+        .merge(pleroma_account_settings::core_router())
 }
 
-/// The `/api/pleroma` routes that import follows, blocks and mutes.
+/// The `/api/pleroma` routes backed by `ActivityPub` data.
+///
+/// They import follows, blocks and mutes, and manage aliases and account moves.
 ///
 /// Mounted by the `ActivityPub` adapter only
 /// ([`crate::protocols::adapter::ProtocolAdapter::client_api_router`]).
 /// `state` reaches [`pleroma_import::router`], whose routes mount the rate limiter.
 pub fn activitypub_router(state: &AppState) -> Router<AppState> {
-    Router::new().merge(pleroma_import::router(state))
+    Router::new()
+        .merge(pleroma_account_settings::activitypub_router())
+        .merge(pleroma_import::router(state))
 }

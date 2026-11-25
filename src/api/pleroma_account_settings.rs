@@ -8,6 +8,24 @@
 //! write and the same `Move`/`Update` federation keyed by the destination's
 //! account id and answered with the caller's relationship entity.
 //!
+//! The routes are split by the rule in [`crate::api`]:
+//!
+//! | Route | Class |
+//! |---|---|
+//! | `POST /api/pleroma/change_password` | core |
+//! | `POST /api/pleroma/change_email` | core |
+//! | `POST /api/pleroma/delete_account` | core |
+//! | `POST /api/pleroma/disable_account` | core |
+//! | `GET`/`PUT`/`DELETE /api/pleroma/aliases` | `ActivityPub`-backed |
+//! | `POST /api/pleroma/move_account` | `ActivityPub`-backed |
+//! | `POST /api/v1/accounts/move` | `ActivityPub`-backed |
+//!
+//! The four credential and departure routes touch only the caller's own
+//! login and `users` row, so [`core_router`] holds them. The aliases are
+//! `ActivityPub` actor ids and a move federates a `Move` and re-follows
+//! through remote accounts, so [`activitypub_router`] and
+//! [`mastodon_router`] hold those.
+//!
 //! The reference is `list_aliases`, `add_alias`, `delete_alias`,
 //! `move_account`, `change_password`, `change_email`, `delete_account` and
 //! `disable_account` in `lib/pleroma/web/pleroma_api/controllers/
@@ -191,30 +209,47 @@ const MOVE_COOLDOWN: &str = "You can't move your account more than once in 30 da
 /// once-per-30-days `move_account` cooldown).
 const MOVE_COOLDOWN_WINDOW: Duration = Duration::days(30);
 
-/// The `/api/pleroma` account-settings router, merged into
-/// [`crate::api::pleroma`].
+/// The core `/api/pleroma` account-settings routes, merged into
+/// [`crate::api::pleroma::core_router`].
+///
+/// They change the caller's own credentials or departure state and need no
+/// `ActivityPub` data: `change_password`, `change_email`, `delete_account`
+/// and `disable_account`.
 ///
 /// Do not call [`Router::fallback`] here (or on anything merged into this
 /// tree): the app-wide JSON fallback in [`crate::app`] must answer the
 /// unmatched paths.
-pub fn router() -> Router<AppState> {
+pub fn core_router() -> Router<AppState> {
     Router::new()
-        .route(
-            "/aliases",
-            get(list_aliases).put(add_alias).delete(delete_alias),
-        )
-        .route("/move_account", post(move_account))
         .route("/change_password", post(change_password))
         .route("/change_email", post(change_email))
         .route("/delete_account", post(delete_account))
         .route("/disable_account", post(disable_account))
 }
 
+/// The `ActivityPub`-backed `/api/pleroma` account-settings routes, merged
+/// into [`crate::api::pleroma::activitypub_router`].
+///
+/// They hold the alias list of `ActivityPub` actor ids and the account move:
+/// `aliases` and `move_account`.
+///
+/// Do not call [`Router::fallback`] here (or on anything merged into this
+/// tree): the app-wide JSON fallback in [`crate::app`] must answer the
+/// unmatched paths.
+pub fn activitypub_router() -> Router<AppState> {
+    Router::new()
+        .route(
+            "/aliases",
+            get(list_aliases).put(add_alias).delete(delete_alias),
+        )
+        .route("/move_account", post(move_account))
+}
+
 /// The `/api/v1/accounts/move` twin of the Pleroma `move_account` action.
 ///
-/// Merged into [`crate::api::v1`]: the same gates and the same `Move`
-/// federation, keyed by the destination's account id and answered with the
-/// caller's [`Relationship`] entity.
+/// `ActivityPub`-backed, merged into [`crate::api::v1::activitypub_router`]:
+/// the same gates and the same `Move` federation, keyed by the destination's
+/// account id and answered with the caller's [`Relationship`] entity.
 ///
 /// Do not call [`Router::fallback`] here (or on anything merged into the
 /// `/api/v1` tree): the app-wide JSON fallback in [`crate::app`] must answer
