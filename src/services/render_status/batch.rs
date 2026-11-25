@@ -442,7 +442,8 @@ impl<'a> Batch<'a> {
             self.poll_options.get(&row.id).map_or(&[], Vec::as_slice),
             self.poll_votes.get(&row.id).map_or(&[], Vec::as_slice),
             Utc::now(),
-        );
+        )
+        .with_author_view(self.viewer.is_some_and(|viewer| viewer.id == row.user_id));
         Some(entity.with_emojis(
             self.emojis.get(&row.id).map_or(&[], Vec::as_slice),
             self.config,

@@ -68,7 +68,10 @@ async fn a_json_poll_create_stores_its_poll_and_renders_the_entity() {
         "the roll-up columns render, at zero"
     );
     assert_eq!(value["poll"]["voters_count"], 0);
-    assert_eq!(value["poll"]["voted"], false, "nobody has voted yet");
+    assert_eq!(
+        value["poll"]["voted"], true,
+        "the author reads their own poll as voted"
+    );
     assert_eq!(value["poll"]["own_votes"], json!([]));
     assert!(
         value["poll"]["expires_at"].is_string(),

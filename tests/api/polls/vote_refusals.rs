@@ -55,9 +55,10 @@ async fn the_author_cannot_vote_on_their_own_poll() {
     assert_eq!(stand.voters_count, 0);
     let own = read_poll(&app, &poll_id, Some(&token)).await.json_value();
     assert_eq!(
-        own["voted"], false,
-        "and the author is not a voter of her own question"
+        own["voted"], true,
+        "the author reads her own poll as voted, as Mastodon and Pleroma do"
     );
+    assert_eq!(own["own_votes"], json!([]), "though she marked nothing");
     assert!(
         !poll::has_voted(&pool, stand.id, alice.id)
             .await

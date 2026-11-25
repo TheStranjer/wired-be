@@ -201,3 +201,39 @@ async fn the_poll_read_gates_its_user_token_by_read_statuses() {
     );
     common::assert_error(&bogus, "The access token is invalid", "a bogus token");
 }
+
+/// The poll's author reads it as `voted` with no `own_votes`, while a
+/// user who has not voted reads `voted: false` and, once they vote,
+/// `true` with their marks.
+#[tokio::test]
+async fn the_author_reads_her_own_poll_as_voted_with_no_marks() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let (_alice, token) = user_with_token(&pool, "alice", "read:statuses write:statuses").await;
+    let (_bob, bob_token) = user_with_token(&pool, "bob", "read:statuses write:statuses").await;
+    let app = common::test_app(pool.clone());
+
+    let poll_id = ballot(&app, &token, json!({})).await;
+
+    let own = read_poll(&app, &poll_id, Some(&token)).await.json_value();
+    assert_eq!(own["voted"], true, "the author reads her poll as voted");
+    assert_eq!(own["own_votes"], json!([]), "though she marked nothing");
+
+    let before = read_poll(&app, &poll_id, Some(&bob_token))
+        .await
+        .json_value();
+    assert_eq!(before["voted"], false, "bob has not voted yet");
+    assert_eq!(before["own_votes"], json!([]));
+
+    let cast = marks(&app, &bob_token, &poll_id, json!([0])).await;
+    common::assert_answer(&cast, StatusCode::OK, "bob's ballot");
+    let after = read_poll(&app, &poll_id, Some(&bob_token))
+        .await
+        .json_value();
+    assert_eq!(after["voted"], true, "bob has voted now");
+    assert_eq!(after["own_votes"], json!([0]), "his mark");
+
+    let own_again = read_poll(&app, &poll_id, Some(&token)).await.json_value();
+    assert_eq!(own_again["voted"], true, "the author still reads voted");
+    assert_eq!(own_again["own_votes"], json!([]), "and still no marks");
+}
