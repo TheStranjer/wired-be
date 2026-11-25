@@ -126,6 +126,23 @@ cite these decisions by number.
     name the relevant files (`lib/pleroma/web/...`). Treat them as behavioural
     reference only; the ticket body is authoritative.
 
+17. **Wired extensions**: Wired layers its own API additions over Pleroma's
+    the way Pleroma and Akkoma layer theirs over Mastodon's: Mastodon at the
+    bottom, Pleroma's extensions (`pleroma` key, `/api/pleroma`,
+    `/api/v1/pleroma`), Akkoma's (`akkoma` key, `/api/v1/akkoma`), then
+    Wired's. A Wired extension only adds; it never changes what a Mastodon or
+    Pleroma field or route means.
+    - Extra entity data goes under a `wired` key on the Mastodon entity.
+    - New routes go under `/api/v1/wired/*`.
+    - A capability is advertised as a `wired:<name>` entry in the shared
+      feature list, `services::instance_meta::features()`, which both
+      `/api/v1/instance`'s `pleroma.metadata.features` and NodeInfo publish.
+    - Clients must check the flag before they rely on a Wired extension.
+
+    The first one is `wired:protocols`: `wired.protocols` on
+    `GET /api/v1/instance` and `GET /api/v2/instance` lists the ids
+    (`ProtocolId::as_str()`) of the enabled protocols in registry order.
+
 ## Writing tests
 
 `tests/api/common.rs` holds the HTTP test harness (decision 13). It is
