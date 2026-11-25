@@ -12,6 +12,7 @@ use crate::{
         status, user,
     },
     state::AppState,
+    util::emoji::qualified,
 };
 
 use super::{announce, told_row};
@@ -48,12 +49,15 @@ async fn reaction_telling(
     let Some(reacted) = status::get_by_id(&state.db, reaction.status_id).await? else {
         return Ok(());
     };
+    // The notification names the emoji fully qualified, so a client renders
+    // `❤️` however the reactor's server spelled it.
+    let emoji = qualified(&reaction.emoji);
     let telling = Telling {
         user_id: reacted.user_id,
         from_account_id: reaction.user_id,
         notification_type: TYPE_EMOJI_REACTION,
         status_id: Some(reaction.status_id),
-        emoji: Some(reaction.emoji.as_str()),
+        emoji: Some(emoji.as_str()),
     };
     if !reacting {
         return notification::delete_telling(&state.db, &telling)

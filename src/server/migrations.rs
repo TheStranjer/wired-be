@@ -12,6 +12,8 @@ mod auth;
 #[cfg(test)]
 mod base;
 #[cfg(test)]
+mod canonical_reactions;
+#[cfg(test)]
 mod chats;
 #[cfg(test)]
 mod oauth_token_digests;

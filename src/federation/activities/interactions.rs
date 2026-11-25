@@ -12,6 +12,7 @@ use super::{
     },
     relations::answered_json,
 };
+use crate::util::emoji::qualified;
 
 /// The reaction emoji as its `Emoji` tag, in the shape the note builder's
 /// `emoji_tag` writes: the image URL as both `id` and `icon.url`, the
@@ -46,11 +47,15 @@ pub fn like_json(ctx: &ObjectActivityContext<'_>) -> Value {
 /// Pleroma's answer to a `Like` that names its emoji in `content`. A
 /// custom emoji (a `url` in `ctx`) also carries the emoji as a `tag`, in
 /// the shape the note builder writes; a unicode reaction carries none.
+///
+/// A unicode `content` goes out fully qualified (`❤️`, what Pleroma expects)
+/// even though the row stores its selector-free grouping key.
 #[must_use]
 pub fn emoji_react_json(ctx: &EmojiReactContext<'_>) -> Value {
-    let mut extra = vec![("content", json!(ctx.emoji))];
+    let emoji = qualified(ctx.emoji);
+    let mut extra = vec![("content", json!(emoji))];
     if let Some(url) = ctx.emoji_url {
-        extra.push(("tag", Value::Array(vec![react_emoji_tag(ctx.emoji, url)])));
+        extra.push(("tag", Value::Array(vec![react_emoji_tag(&emoji, url)])));
     }
     document_json(ActivityDocument {
         config: ctx.config,
@@ -157,6 +162,41 @@ mod tests {
         keys.push("content");
         keys.sort_unstable();
         assert_eq!(json_keys(&document), keys, "content, and no tag");
+    }
+
+    #[test]
+    fn a_stored_heart_goes_out_fully_qualified() {
+        let config = config();
+        let published = published();
+        let id = stored_id();
+        let react = |emoji: &str| {
+            emoji_react_json(&EmojiReactContext {
+                config: &config,
+                id: &id,
+                actor_ap_id: ALICE_AP,
+                object_uri: STATUS_URI,
+                to: &AUTHOR_TO,
+                cc: &FOLLOWERS_CC,
+                emoji,
+                emoji_url: None,
+                published: &published,
+            })
+        };
+        assert_eq!(
+            react("\u{2764}")["content"],
+            "\u{2764}\u{FE0F}",
+            "the stored key regains its selector"
+        );
+        assert_eq!(
+            react("1\u{20E3}")["content"],
+            "1\u{FE0F}\u{20E3}",
+            "and so does a keycap"
+        );
+        assert_eq!(
+            react("\u{1F3F3}\u{FE0F}\u{200D}\u{1F308}")["content"],
+            "\u{1F3F3}\u{FE0F}\u{200D}\u{1F308}",
+            "a ZWJ sequence goes out as stored"
+        );
     }
 
     #[test]

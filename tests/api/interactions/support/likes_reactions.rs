@@ -338,3 +338,96 @@ async fn an_undo_takes_back_one_emojis_reaction_and_its_telling() {
         "one party (bob's), one cat (mallory's), in first-reaction order"
     );
 }
+
+// --- U+FE0F variants --------------------------------------------------------------
+
+/// Misskey's bare heart: U+2764 with no variation selector.
+const BARE_HEART: &str = "\u{2764}";
+/// The fully qualified heart Pleroma and Mastodon clients send.
+const QUALIFIED_HEART: &str = "\u{2764}\u{FE0F}";
+/// The Misskey-side reactor of the heart tests.
+const CAROL: &str = "https://remote.example/users/carol";
+/// A second Misskey-side reactor.
+const DAVE: &str = "https://remote.example/users/dave";
+/// The Pleroma-side reactor.
+const FRANK: &str = "https://remote.example/users/frank";
+
+#[tokio::test]
+async fn a_misskey_heart_and_a_pleroma_heart_are_one_reaction_group() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let state = delivering_state(&pool);
+    let carol = common::create_remote_user(&pool, "carol", "remote.example").await;
+    let dave = common::create_remote_user(&pool, "dave", "remote.example").await;
+    let frank = common::create_remote_user(&pool, "frank", "remote.example").await;
+    let (alice, posted) = alice_post(&pool, "a post worth a heart").await;
+
+    // Misskey's `Like` carries the selector-free heart in `content`, Pleroma's
+    // `EmojiReact` the fully qualified one.
+    for (actor, who, n) in [(CAROL, &carol, 1), (DAVE, &dave, 2)] {
+        let like = interaction(
+            "Like",
+            actor,
+            &target_of(&posted),
+            n,
+            json!({"content": BARE_HEART, "_misskey_reaction": BARE_HEART}),
+        );
+        deliver(&state, &like, who).await;
+    }
+    let react = interaction(
+        "EmojiReact",
+        FRANK,
+        &target_of(&posted),
+        3,
+        json!({"content": QUALIFIED_HEART}),
+    );
+    deliver(&state, &react, &frank).await;
+
+    let rows = reaction_rows(&pool).await;
+    assert_eq!(
+        rows.iter().map(|row| row.2.as_str()).collect::<Vec<_>>(),
+        vec![BARE_HEART; 3],
+        "all three are stored under the one grouping key"
+    );
+    let seen = viewer(&pool, &alice).await;
+    let status = seen.status(posted.id).await;
+    assert_eq!(
+        status["pleroma"]["emoji_reactions"],
+        json!([{
+            "name": QUALIFIED_HEART,
+            "count": 3,
+            "me": false,
+            "url": null,
+            "account_ids": [carol.id.to_string(), dave.id.to_string(), frank.id.to_string()],
+        }]),
+        "one chip, named fully qualified, counting all three"
+    );
+    let told = seen.told_of(TYPE_EMOJI_REACTION).await;
+    assert!(
+        told.iter()
+            .all(|note| note["emoji"] == json!(QUALIFIED_HEART)),
+        "every telling names the heart fully qualified: {told:?}"
+    );
+
+    // Misskey takes its Like back: the merged group loses that one reactor.
+    let like_id = interaction_id("Like", CAROL, 1);
+    deliver(&state, &undo(CAROL, &json!(like_id), 4), &carol).await;
+
+    let after_undo = seen.status(posted.id).await;
+    assert_eq!(
+        after_undo["pleroma"]["emoji_reactions"],
+        json!([{
+            "name": QUALIFIED_HEART,
+            "count": 2,
+            "me": false,
+            "url": null,
+            "account_ids": [dave.id.to_string(), frank.id.to_string()],
+        }]),
+        "the undo of the bare heart leaves the other two in the group"
+    );
+    assert_eq!(
+        seen.told_of(TYPE_EMOJI_REACTION).await.len(),
+        2,
+        "and its telling is withdrawn"
+    );
+}

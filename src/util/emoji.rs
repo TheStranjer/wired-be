@@ -15,9 +15,17 @@
 //! knows neither HTTP nor SQL; the 400 an unusable emoji gets is the
 //! endpoint's to send.
 
+use std::borrow::Cow;
+
 use unicode_segmentation::UnicodeSegmentation as _;
 
 mod table;
+
+/// The U+FE0F variation selector that asks for emoji presentation.
+const VARIATION_SELECTOR: char = '\u{FE0F}';
+
+/// The U+200D joiner that glues the parts of a ZWJ sequence together.
+const ZERO_WIDTH_JOINER: char = '\u{200D}';
 
 /// A reaction emoji as the API names it, classified from its text.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -126,8 +134,40 @@ pub fn display_name(emoji: &str, domain: Option<&str>) -> String {
     match (domain, shortcode(emoji)) {
         (Some(domain), Some(code)) => format!("{code}@{domain}"),
         (None, Some(code)) => code.to_owned(),
-        _ => emoji.to_owned(),
+        _ => qualified(emoji),
     }
+}
+
+/// The grouping key of a unicode reaction: `emoji` with every U+FE0F removed
+/// unless it holds a zero-width joiner, in which case it is returned as it is.
+///
+/// This is Misskey's own rule (`ReactionService.normalize`), so `❤` and `❤️`
+/// are one reaction and a keycap with or without its selector is too. Text
+/// without a U+FE0F, a `:shortcode:` among it, is its own key.
+#[must_use]
+pub fn canonical(emoji: &str) -> Cow<'_, str> {
+    if emoji.contains(ZERO_WIDTH_JOINER) || !emoji.contains(VARIATION_SELECTOR) {
+        return Cow::Borrowed(emoji);
+    }
+    Cow::Owned(
+        emoji
+            .chars()
+            .filter(|&ch| ch != VARIATION_SELECTOR)
+            .collect(),
+    )
+}
+
+/// The fully qualified spelling of a unicode reaction: what Mastodon and
+/// Pleroma clients render with emoji presentation (`❤️`, not `❤`).
+///
+/// A sequence with a zero-width joiner, and any text the emoji table does not
+/// know (a `:shortcode:` among it), comes back as it is.
+#[must_use]
+pub fn qualified(emoji: &str) -> String {
+    if emoji.contains(ZERO_WIDTH_JOINER) {
+        return emoji.to_owned();
+    }
+    table::qualify(emoji).map_or_else(|| emoji.to_owned(), str::to_owned)
 }
 
 /// Whether `ch` may appear between the colons of a shortcode.
@@ -412,6 +452,53 @@ mod tests {
             display_name("👍", Some("misskey.test")),
             "👍",
             "a domain cannot rename text that is no shortcode"
+        );
+    }
+
+    #[test]
+    fn the_grouping_key_drops_every_selector_unless_a_joiner_is_there() {
+        for (text, key) in [
+            ("\u{2764}\u{FE0F}", "\u{2764}"),
+            ("\u{2764}", "\u{2764}"),
+            ("1\u{FE0F}\u{20E3}", "1\u{20E3}"),
+            ("1\u{20E3}", "1\u{20E3}"),
+            ("\u{1F44D}", "\u{1F44D}"),
+            (":cat:", ":cat:"),
+        ] {
+            assert_eq!(canonical(text), key, "{text:?}");
+        }
+        for sequence in [
+            "\u{1F469}\u{1F3FD}\u{200D}\u{1F4BB}",
+            "\u{1F3F3}\u{FE0F}\u{200D}\u{1F308}",
+            "\u{1F3F4}\u{200D}\u{2620}\u{FE0F}",
+        ] {
+            assert_eq!(canonical(sequence), sequence, "a ZWJ sequence is kept");
+        }
+    }
+
+    #[test]
+    fn the_qualified_form_restores_the_selector() {
+        for (text, name) in [
+            ("\u{2764}", "\u{2764}\u{FE0F}"),
+            ("\u{2764}\u{FE0F}", "\u{2764}\u{FE0F}"),
+            ("1\u{20E3}", "1\u{FE0F}\u{20E3}"),
+            ("\u{1F44D}", "\u{1F44D}"),
+            (
+                "\u{1F3F3}\u{FE0F}\u{200D}\u{1F308}",
+                "\u{1F3F3}\u{FE0F}\u{200D}\u{1F308}",
+            ),
+            (
+                "\u{1F3F4}\u{200D}\u{2620}\u{FE0F}",
+                "\u{1F3F4}\u{200D}\u{2620}\u{FE0F}",
+            ),
+            (":cat:", ":cat:"),
+        ] {
+            assert_eq!(qualified(text), name, "{text:?}");
+        }
+        assert_eq!(
+            display_name("\u{2764}", None),
+            "\u{2764}\u{FE0F}",
+            "a stored heart is named with emoji presentation"
         );
     }
 

@@ -20,6 +20,13 @@
 //! here: see [`crate::util::emoji`] and the endpoint that resolves a shortcode
 //! against [`crate::models::custom_emoji`].
 //!
+//! The stored `emoji` of a unicode reaction is its grouping key,
+//! [`canonical`](crate::util::emoji::canonical): every U+FE0F removed unless
+//! the emoji holds a zero-width joiner, which is Misskey's own rule. Every
+//! write and lookup here applies it, so Misskey's `❤` and Pleroma's `❤️` are
+//! one reaction, and [`display_name`](crate::util::emoji::display_name) names
+//! the group fully qualified (`❤️`) on the way out.
+//!
 //! The two reads are both batched by design because the Status entity needs a
 //! reaction roll-up per rendered status: [`for_statuses`] answers every emoji
 //! of a whole page of statuses in one statement, keyed by status, and
@@ -42,6 +49,8 @@ mod groups;
 mod read;
 #[cfg(test)]
 mod test_support;
+#[cfg(test)]
+mod variants;
 mod write;
 
 pub use delete::{delete_all_for_user, unreact, unreact_in_domain};

@@ -201,7 +201,7 @@ async fn a_like_carrying_an_emoji_is_a_reaction_and_resemblances_fold_nothing() 
         vec![(
             BOB.to_owned(),
             posted.uri.clone(),
-            "❤️".to_owned(),
+            "❤".to_owned(),
             None,
             interaction_id("Like", BOB, 1),
         )],

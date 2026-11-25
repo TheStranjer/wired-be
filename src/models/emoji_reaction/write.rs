@@ -7,11 +7,15 @@ use uuid::Uuid;
 use super::{EmojiReaction, NewReaction};
 use crate::{
     error::AppResult,
-    util::id::{new_activity_ap_id, new_id},
+    util::{
+        emoji::canonical,
+        id::{new_activity_ap_id, new_id},
+    },
 };
 
 /// [`react_in_domain`]: the write, idempotent on `(user_id, status_id, emoji,
-/// emoji_domain)` — the unique index `emoji_reactions_user_status_emoji_key`,
+/// emoji_domain)` with the emoji in its [`canonical`] spelling, so `❤` and
+/// `❤️` are one key — the unique index `emoji_reactions_user_status_emoji_key`,
 /// which reads a NULL domain as the empty string. A pair that already reacted
 /// keeps its row — id, `ap_id`, `inserted_at` and so its place in the roll-up's
 /// order — and only picks up the `url` the caller brings, which is how a repeat
@@ -71,11 +75,12 @@ pub async fn react_in_domain(
     ap_id: &str,
     domain: Option<&str>,
 ) -> AppResult<EmojiReaction> {
+    let key = canonical(reaction.emoji);
     let row = sqlx::query_as::<_, EmojiReaction>(REACT_SQL)
         .bind(new_id())
         .bind(reaction.user_id)
         .bind(reaction.status_id)
-        .bind(reaction.emoji)
+        .bind(&*key)
         .bind(reaction.url)
         .bind(ap_id)
         .bind(domain)

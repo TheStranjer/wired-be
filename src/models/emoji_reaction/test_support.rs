@@ -15,7 +15,7 @@ use crate::{
         status::{NewStatus, insert},
         user::User,
     },
-    util::time::parse_time,
+    util::{emoji::canonical, time::parse_time},
 };
 
 pub(super) use crate::test_fixtures::local_user as user;
@@ -77,8 +77,9 @@ pub(super) async fn react_with(
     .await
     .expect("the fixture reaction stores");
     assert_eq!(
-        stored_row.emoji, emoji,
-        "the fixture row is the emoji asked for"
+        stored_row.emoji,
+        canonical(emoji),
+        "the fixture row is the emoji asked for, as its grouping key"
     );
     assert_eq!(stored_row.user_id, reactor.id, "and the reactor's own");
 }
@@ -139,7 +140,7 @@ pub(super) async fn stamp(
     .bind(status_id)
     .bind(reactor.id)
     .bind(when)
-    .bind(emoji)
+    .bind(&*canonical(emoji))
     .execute(pool)
     .await
     .expect("the stamp updates")
