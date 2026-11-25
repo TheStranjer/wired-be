@@ -73,6 +73,7 @@ pub(super) async fn profile_fields(
     current: &User,
     params: ProfileParams,
 ) -> AppResult<ProfileFields> {
+    refuse_admin_only(&params)?;
     let name = params
         .display_name
         .as_deref()
@@ -136,6 +137,23 @@ pub(super) async fn profile_fields(
     })
 }
 
+/// The 422 body for a body that names `skip_thread_containment`.
+const ADMIN_ONLY: &str = "skip_thread_containment: can only be changed by an administrator";
+
+/// Refuses a body that names `skip_thread_containment`, whatever its value:
+/// the flag exempts the account from federation thread containment, so only
+/// the admin credentials endpoint may write it (and it logs the change).
+///
+/// # Errors
+///
+/// [`AppError::Unprocessable`] with [`ADMIN_ONLY`].
+fn refuse_admin_only(params: &ProfileParams) -> AppResult<()> {
+    if params.skip_thread_containment.is_some() {
+        return Err(AppError::Unprocessable(ADMIN_ONLY.to_owned()));
+    }
+    Ok(())
+}
+
 /// The `default_scope` to store: `submitted` — the body's
 /// `source[privacy]`, which wins over Pleroma's flat `default_scope` because
 /// that is the order `update_credentials` applies them — checked against
@@ -174,9 +192,11 @@ fn merged_language(submitted: Option<&str>, stored: Option<&str>) -> AppResult<O
     Ok((!raw.is_empty()).then(|| raw.to_owned()))
 }
 
-/// The eleven `pleroma` preference flags after this body: every one of them
-/// the submitted [`flex`] boolean or, absent, the flag the row holds. No
-/// validation beyond the coercion itself: these are plain booleans.
+/// The eleven `pleroma` preference flags after this body: ten of them the
+/// submitted [`flex`] boolean or, absent, the flag the row holds. No
+/// validation beyond the coercion itself: these are plain booleans. The
+/// eleventh, `skip_thread_containment`, always keeps the stored value (see
+/// [`refuse_admin_only`]).
 fn merged_prefs(params: &ProfileParams, current: &User) -> PleromaPrefs {
     PleromaPrefs {
         hide_followers: params
@@ -193,9 +213,7 @@ fn merged_prefs(params: &ProfileParams, current: &User) -> PleromaPrefs {
             .hide_favorites
             .map_or(current.hide_favorites, Flag::from),
         show_role: params.show_role.map_or(current.show_role, Flag::from),
-        skip_thread_containment: params
-            .skip_thread_containment
-            .map_or(current.skip_thread_containment, Flag::from),
+        skip_thread_containment: current.skip_thread_containment,
         allow_following_move: params
             .allow_following_move
             .map_or(current.allow_following_move, Flag::from),
@@ -270,6 +288,32 @@ mod tests {
             err.to_string(),
             "Language is too long (maximum is 10 characters)",
             "the length message names the cap"
+        );
+    }
+
+    #[test]
+    fn the_moderation_flag_is_refused_in_any_spelling() {
+        refuse_admin_only(&params("{}")).expect("no flag is no refusal");
+        refuse_admin_only(&params(r#"{"skip_thread_containment": null}"#))
+            .expect("a JSON null reads as absent");
+        for text in [
+            r#"{"skip_thread_containment": true}"#,
+            r#"{"skip_thread_containment": false}"#,
+            r#"{"skip_thread_containment": "on"}"#,
+        ] {
+            let err = refuse_admin_only(&params(text)).expect_err("the flag is admin-only");
+            assert_eq!(err.to_string(), ADMIN_ONLY, "{text}");
+        }
+    }
+
+    #[test]
+    fn the_moderation_flag_keeps_the_stored_value() {
+        let mut current = stored_user();
+        current.skip_thread_containment = Flag::new(true);
+        let prefs = merged_prefs(&params(r#"{"hide_follows": true}"#), &current);
+        assert!(
+            prefs.skip_thread_containment.get(),
+            "the stored flag survives an unrelated write"
         );
     }
 
