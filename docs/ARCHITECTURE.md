@@ -153,6 +153,10 @@ cite these decisions by number.
     `GET /api/v1/instance` and `GET /api/v2/instance` lists the ids
     (`ProtocolId::as_str()`) of the enabled protocols in registry order.
 
+    The same flag covers `GET /api/v1/wired/protocols` (`src/api/wired.rs`),
+    which says, for each enabled protocol, whether the account is on it and
+    under which ID, or else suggests one.
+
 ## Writing tests
 
 `tests/api/common.rs` holds the HTTP test harness (decision 13). It is

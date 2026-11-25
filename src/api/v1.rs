@@ -16,7 +16,7 @@ use crate::{
         mastodon_admin_reports, media, misc, mutes, notifications, oauth_tokens, password_reset,
         pleroma_account_settings, pleroma_accounts, pleroma_bookmark_folders, pleroma_settings,
         polls, preferences, push, remote_interaction, reports, scheduled_statuses, scrobbles,
-        search, statuses, streaming, tags, timelines,
+        search, statuses, streaming, tags, timelines, wired,
     },
     state::AppState,
 };
@@ -65,6 +65,7 @@ pub fn core_router(state: &AppState) -> Router<AppState> {
         .nest("/pleroma/apps", oauth_tokens::apps_router())
         .nest("/pleroma/backups", backups::router())
         .nest("/pleroma/emoji", emoji_packs::router(&state.config))
+        .nest("/wired", wired::router())
         .nest("/admin", mastodon_admin::v1_router())
 }
 

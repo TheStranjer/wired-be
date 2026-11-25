@@ -20,6 +20,9 @@
 //! the table spells it that way. The test turns a parameter into a concrete
 //! segment before sending.
 //!
+//! The one exception is the Wired extension section, whose routes Pleroma
+//! does not have (`docs/ARCHITECTURE.md` decision 17).
+//!
 //! The table holds one row per Pleroma route this backend replicates, in the
 //! order of the router file's scopes. Routes Pleroma has and Wired does not —
 //! the frontend uploader's `POST /api/v1/pleroma/uploader_callback/:upload_path`,
@@ -78,6 +81,7 @@ mod pleroma_admin_other;
 mod pleroma_admin_users;
 mod pleroma_misc;
 mod statuses;
+mod wired;
 
 /// The inventory's sections, in table order: one entry per child module,
 /// each entry that module's rows.
@@ -98,6 +102,7 @@ pub const ROUTES: &[&[RouteSpec]] = &[
     pleroma_admin_users::ROWS,
     pleroma_admin_other::ROWS,
     mastodon_admin::ROWS,
+    wired::ROWS,
     activitypub::ROWS,
 ];
 
@@ -113,12 +118,12 @@ mod tests {
 
     use super::{AuthClass, ROUTES, RouteSpec, routes};
 
-    /// The assembled table is well formed: twelve sections, none of them
+    /// The assembled table is well formed: thirteen sections, none of them
     /// empty, no `(method, path)` pair listed twice, opening with the
     /// instance metadata route and closing with the custom emoji files.
     #[test]
     fn routes_assembles_the_whole_table_in_order() {
-        assert_eq!(ROUTES.len(), 12, "one section per surface");
+        assert_eq!(ROUTES.len(), 13, "one section per surface");
         assert!(
             ROUTES.iter().all(|section| !section.is_empty()),
             "every section contributes rows"
