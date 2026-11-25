@@ -271,12 +271,13 @@ fn a_quote_that_is_gone_is_deleted() {
 }
 
 #[test]
-fn a_refused_or_revoked_quote_names_its_state_and_withholds_the_status() {
+fn an_unanswered_refused_or_revoked_quote_names_its_state_and_withholds_the_status() {
     let alice = base_user("alice");
     let quoted_id = Uuid::parse_str("01955555-5555-7555-8555-555555555555").unwrap();
     let mut row = base_row();
     row.quote_of_id = Some(quoted_id);
     for (slot, state) in [
+        (QuoteSlot::Pending, "pending"),
         (QuoteSlot::Rejected, "rejected"),
         (QuoteSlot::Revoked, "revoked"),
     ] {

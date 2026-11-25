@@ -67,6 +67,12 @@ pub struct CreateStatusParams {
     /// [`ApiBody`]: crate::extract::ApiBody
     #[serde(default, alias = "quoted_status_id")]
     pub quote_id: Option<String>,
+    /// Mastodon's `quote_approval_policy`: who may quote the post, one of
+    /// `public`, `followers` or `nobody`. It only narrows what the
+    /// visibility allows; absent or empty is the default. Anything else is
+    /// the 422 `Invalid quote_approval_policy`.
+    #[serde(default)]
+    pub quote_approval_policy: Option<String>,
     /// Whether this is a preview: validate and render, answer the entity a
     /// create would have, write nothing — see
     /// [`crate::services::create_status::preview_status`]. Absent,

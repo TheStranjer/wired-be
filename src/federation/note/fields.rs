@@ -50,7 +50,11 @@ pub fn note_json(ctx: &NoteContext) -> Option<Value> {
             fields.push(("quoteAuthorization", json!(authorization)));
         }
     }
-    if let Some(policy) = interaction_policy_json(ctx.status.visibility, &ctx.author) {
+    if let Some(policy) = interaction_policy_json(
+        ctx.status.visibility,
+        ctx.status.quote_approval_policy,
+        &ctx.author,
+    ) {
         fields.push(("interactionPolicy", policy));
     }
     Some(Value::Object(
@@ -199,6 +203,7 @@ mod tests {
     use crate::{
         config::Config,
         federation::note::{create_activity_json, test_support::*, update_activity_json},
+        models::status::QuoteApprovalPolicy,
         util::{id::new_id, time::parse_time},
     };
 
@@ -266,6 +271,50 @@ mod tests {
                 .get("interactionPolicy")
                 .is_none(),
             "a direct post carries no policy, so peers read it as unquotable"
+        );
+    }
+
+    /// The `canQuote` of a public note whose author chose `policy`.
+    fn can_quote_under(policy: QuoteApprovalPolicy, visibility: Visibility) -> Option<Value> {
+        let mut ctx = note_context(visibility);
+        ctx.status.quote_approval_policy = Some(policy);
+        let document = note_json(&ctx);
+        assert!(document.is_some(), "a note renders");
+        document?
+            .get("interactionPolicy")
+            .map(|found| found["canQuote"].clone())
+    }
+
+    #[test]
+    fn the_authors_quote_policy_narrows_the_advertised_one() {
+        assert_eq!(
+            can_quote_under(QuoteApprovalPolicy::Nobody, Visibility::Public),
+            Some(json!({
+                "automaticApproval": [AUTHOR_AP],
+                "manualApproval": [],
+            })),
+            "nobody leaves only the author, as Mastodon spells it"
+        );
+        assert_eq!(
+            can_quote_under(QuoteApprovalPolicy::Followers, Visibility::Public),
+            Some(json!({
+                "automaticApproval": [format!("{AUTHOR_AP}/followers")],
+                "manualApproval": [],
+            })),
+            "followers narrows a public post to the author's followers"
+        );
+        assert_eq!(
+            can_quote_under(QuoteApprovalPolicy::Public, Visibility::Private),
+            Some(json!({
+                "automaticApproval": [format!("{AUTHOR_AP}/followers")],
+                "manualApproval": [],
+            })),
+            "a private post is never opened to everyone"
+        );
+        assert_eq!(
+            can_quote_under(QuoteApprovalPolicy::Nobody, Visibility::Direct),
+            None,
+            "a direct post stays policy-less"
         );
     }
 

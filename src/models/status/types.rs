@@ -8,7 +8,7 @@ use chrono::{DateTime, Utc};
 use sqlx::types::Json;
 use uuid::Uuid;
 
-use super::QuotePolicy;
+use super::{QuoteApprovalPolicy, QuotePolicy};
 use crate::models::user::User;
 
 /// The `text/plain` value of [`content_type`](super::NewStatus::content_type), which
@@ -176,6 +176,9 @@ pub struct Status {
     /// when it advertised nothing, and for every local status (whose policy
     /// follows from its visibility).
     pub quote_policy: Option<Json<QuotePolicy>>,
+    /// Who the author lets quote this local post; `None` is the default,
+    /// whatever the visibility allows. Always `None` for a remote status.
+    pub quote_approval_policy: Option<QuoteApprovalPolicy>,
     /// Whether this instance owns the post.
     pub local: bool,
     /// Name of the client that posted this status, if it reported one.

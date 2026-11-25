@@ -141,6 +141,7 @@ fn new_status(
         media_ids: checked.media_ids.clone(),
         local: true,
         quote_of_id,
+        quote_approval_policy: checked.quote_approval_policy,
         application_name: app.map(|found| found.client_name.clone()),
         application_website: app.and_then(|found| found.website.clone()),
         ..NewStatus::default()

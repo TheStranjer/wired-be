@@ -254,8 +254,9 @@ async fn a_reblog_nests_the_original_and_keeps_its_own_identity() {
 
 /// The quoted author's answer decides the quote's state: a refusal or a
 /// revocation renders `rejected` or `revoked` with no status nested, a
-/// pending or granted request keeps the ordinary `accepted` render, and the
-/// quote's target id stays in every case.
+/// request nobody answered yet renders `pending` the same way, a granted
+/// one keeps the ordinary `accepted` render, and the quote's target id stays
+/// in every case.
 #[tokio::test]
 async fn the_quoted_authors_answer_is_the_quotes_state() {
     let db = crate::test_db::test_db().await.expect("test database slot");
@@ -278,7 +279,7 @@ async fn the_quoted_authors_answer_is_the_quotes_state() {
     .expect("the request writes");
 
     for (answer, expected) in [
-        (QuoteRequestState::Pending, "accepted"),
+        (QuoteRequestState::Pending, "pending"),
         (QuoteRequestState::Rejected, "rejected"),
         (QuoteRequestState::Revoked, "revoked"),
         (QuoteRequestState::Accepted, "accepted"),

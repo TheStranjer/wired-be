@@ -436,6 +436,13 @@ fn write_resolved(map: &mut Map<String, Value>, new: &NewStatus) {
     put(map, "content_type", Value::String(new.content_type.clone()));
     put(
         map,
+        "quote_approval_policy",
+        new.quote_approval_policy.map_or(Value::Null, |policy| {
+            Value::String(policy.as_str().to_owned())
+        }),
+    );
+    put(
+        map,
         "media_ids",
         Value::Array(
             new.media_ids
