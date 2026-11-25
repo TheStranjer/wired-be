@@ -10,6 +10,7 @@
 
 use axum::{
     Json,
+    body::Bytes,
     extract::{Path, State},
 };
 use serde::Deserialize;
@@ -24,14 +25,15 @@ use crate::{
     extract::multipart::{MultipartForm, UploadedFile, UploadedFiles as _},
     models::media_attachment::{self, MediaMetadata},
     oauth::scopes::{READ_STATUSES, WRITE_MEDIA},
+    services::media_processing::normalize_upload,
     state::AppState,
     uploads,
     util::id::parse_id,
 };
 
 use super::{
-    MAX_AXIS, MIN_AXIS, THUMBNAIL_FIELD, UPDATE_FOCUS_INVALID, analyze::detect_media_type,
-    check_description,
+    MAX_AXIS, MIN_AXIS, THUMBNAIL_FIELD, UNSUPPORTED_FILE_TYPE, UPDATE_FOCUS_INVALID,
+    analyze::detect_media_type, check_description,
 };
 
 /// `GET /api/v1/media/{id}` and `GET /api/v2/media/{id}` — the entity of
@@ -206,23 +208,32 @@ fn updated_focus(
 }
 
 /// Store `file` as the attachment's preview image, answering its public
-/// URL. A client-supplied preview is stored as it arrived — the analysis
-/// and thumbnailing services run on upload, not on every edit — but the
-/// [`detect_media_type`] gate and the detected type's extension in
-/// [`uploads::media_key`] are shared with the upload endpoint, so a preview
-/// is only ever a file the media route will serve as the type its bytes
-/// carry. The row's stored preview dimensions keep describing the generated
-/// preview; re-detecting a replaced one belongs to a later ticket.
+/// URL. A client-supplied preview goes through the same image analysis as
+/// an upload: the [`detect_media_type`] gate, then
+/// [`normalize_upload`] — decoded, held to `MAX_IMAGE_PIXELS` and encoded
+/// again, so no metadata is published and no image bomb is served. The
+/// stored file is the re-encoding, keyed by the type the encoder wrote. The
+/// row's stored preview dimensions keep describing the generated preview;
+/// re-detecting a replaced one belongs to a later ticket.
 ///
 /// # Errors
 ///
 /// [`AppError::Unprocessable`] with [`UNSUPPORTED_FILE_TYPE`](super::UNSUPPORTED_FILE_TYPE)
-/// for bytes no accepted matcher names; storage failures arrive as
-/// [`AppError::Internal`].
+/// for bytes no accepted matcher names or that name a video or audio type
+/// (a preview is an image), with `Invalid image` for an image that does
+/// not decode and with `Image too large` for one over `MAX_IMAGE_PIXELS`;
+/// storage failures arrive as [`AppError::Internal`].
 async fn store_preview(state: &AppState, user_id: Uuid, file: UploadedFile) -> AppResult<String> {
-    let content_type = detect_media_type(&file.bytes)?;
-    let key = uploads::media_key(user_id, file.filename.as_deref(), content_type);
-    state.uploader.put(&key, file.bytes, content_type).await?;
+    let detected = detect_media_type(&file.bytes)?;
+    if !detected.starts_with("image/") {
+        return Err(AppError::Unprocessable(UNSUPPORTED_FILE_TYPE.to_owned()));
+    }
+    let image = normalize_upload(&state.config, file.bytes).await?;
+    let key = uploads::media_key(user_id, file.filename.as_deref(), image.content_type);
+    state
+        .uploader
+        .put(&key, Bytes::from(image.bytes), image.content_type)
+        .await?;
     Ok(state.uploader.public_url(&key))
 }
 

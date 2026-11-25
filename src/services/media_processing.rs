@@ -46,6 +46,10 @@ use image::{GenericImageView as _, ImageEncoder as _, Pixel as _};
 
 use crate::error::{AppError, AppResult};
 
+mod normalize;
+
+pub use normalize::{NormalizedImage, normalize_image, normalize_upload};
+
 /// 422 body for bytes whose content type claims an image but which no
 /// decoder can read dimensions from, the wording the ticket fixes.
 pub const INVALID_IMAGE: &str = "Invalid image";

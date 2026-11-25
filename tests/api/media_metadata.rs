@@ -25,7 +25,7 @@ use wired_be::models::{
     user::User,
 };
 
-use crate::common::{self, MultipartPart};
+use crate::common::{self, MultipartPart, images};
 
 /// Boundary the multipart bodies are framed with.
 const BOUNDARY: &str = "wired-media-meta-test-boundary";
@@ -40,8 +40,6 @@ const BOTH_SCOPES: &str = "read:statuses write:media";
 
 /// A `PNG`: the signature `infer` matches on, plus the start of an `IHDR`.
 const PNG: &[u8] = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01";
-/// A `JPEG`: `SOI` followed by the `APP0` marker.
-const JPEG: &[u8] = b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01";
 /// Text: bytes no matcher can name at all.
 const TEXT: &[u8] = b"a plain text file, neither image, video nor audio\n";
 
@@ -599,7 +597,7 @@ async fn a_thumbnail_part_replaces_the_preview() {
         &v1_path(row.id),
         &writer,
         &[
-            file_part("thumbnail", "thumb.jpg", JPEG),
+            file_part("thumbnail", "thumb.jpg", &images::jpeg()),
             MultipartPart::text("description", "with a preview"),
         ],
     )
@@ -650,8 +648,8 @@ async fn a_thumbnail_part_replaces_the_preview() {
     assert_eq!(served.status, StatusCode::OK, "and the file serves");
     assert_eq!(
         served.body,
-        Bytes::from_static(JPEG),
-        "as the bytes that were uploaded"
+        Bytes::from(images::normalized(&images::jpeg())),
+        "as the upload, decoded and encoded again"
     );
     assert_eq!(
         served.header("content-type"),
@@ -676,7 +674,7 @@ async fn a_second_thumbnail_replaces_the_first() {
         &app,
         &path,
         &writer,
-        &[file_part("thumbnail", "one.png", PNG)],
+        &[file_part("thumbnail", "one.png", &images::png())],
     )
     .await
     .json_value();
@@ -684,7 +682,7 @@ async fn a_second_thumbnail_replaces_the_first() {
         &app,
         &path,
         &writer,
-        &[file_part("thumbnail", "two.jpg", JPEG)],
+        &[file_part("thumbnail", "two.jpg", &images::jpeg())],
     )
     .await
     .json_value();

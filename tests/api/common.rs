@@ -27,6 +27,7 @@ mod config;
 mod credentials;
 mod federation;
 mod fixtures;
+pub mod images;
 mod jobs;
 mod json;
 mod request;

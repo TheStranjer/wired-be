@@ -6,7 +6,7 @@ use axum::{body::Bytes, http::StatusCode};
 use serde_json::{Value, json};
 
 use super::support::{
-    BOUNDARY, DEFAULT_AVATAR, DEFAULT_HEADER, INVALID_TOKEN, MEDIA, NO_SCOPE, NO_TOKEN, PNG, ROUTE,
+    BOUNDARY, DEFAULT_AVATAR, DEFAULT_HEADER, INVALID_TOKEN, MEDIA, NO_SCOPE, NO_TOKEN, ROUTE,
     USER_REQUIRED, authed_app, authed_app_with_uploads, extension_of, file_part, ok_body, one_flag,
     part, patch_form, patch_json, patch_multipart, prefilled_app, served, source_of, stored,
     stored_files, uploads_dir, url_of,
@@ -401,7 +401,7 @@ async fn an_avatar_upload_rides_along_with_the_text_fields() {
             &token,
             &[
                 part("display_name", "Ada"),
-                file_part("avatar", PNG),
+                file_part("avatar", &common::images::png()),
                 part("avatar_description", "alt text the endpoint ignores"),
                 part("header_description", "and so this one"),
             ],
@@ -432,8 +432,8 @@ async fn an_avatar_upload_rides_along_with_the_text_fields() {
     assert_eq!(row.avatar_url.as_deref(), Some(avatar.as_str()), "stored");
     assert_eq!(
         served(&dir, &avatar),
-        Some(PNG.to_vec()),
-        "the announced URL serves the uploaded bytes"
+        Some(common::images::normalized(&common::images::png())),
+        "the announced URL serves the uploaded image, encoded again"
     );
 }
 
@@ -455,7 +455,7 @@ async fn a_file_part_under_another_name_is_ignored() {
                     "file",
                     "cat.png",
                     "image/png",
-                    Bytes::from_static(PNG),
+                    Bytes::from(common::images::png()),
                 ),
             ],
         )

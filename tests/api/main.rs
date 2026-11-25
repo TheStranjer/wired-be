@@ -411,6 +411,9 @@ mod media;
 /// The media metadata endpoints (`GET`/`PUT`/`DELETE /api/v1/media/{id}`).
 mod media_metadata;
 
+/// The image processing a replacement media preview (`PUT /api/v1/media/{id}` `thumbnail`) passes.
+mod media_preview_processing;
+
 /// The media proxy route (`GET /proxy/{sig}/{url}[/{filename}]`) against a mock upstream.
 mod media_proxy;
 

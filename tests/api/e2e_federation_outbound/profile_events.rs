@@ -12,10 +12,20 @@ use wired_be::models::user::{Flag, NewUser};
 
 use super::expectations::{Expected, assert_delivered, assert_flags};
 use super::support::{
-    ACCOUNTS, AS_PUBLIC, BOB, PNG, SCOPES, followers_of, get_json, instance_actor,
-    keyed_with_password, local, lookup, peer_follows, personal, publishes_with_key,
+    ACCOUNTS, AS_PUBLIC, BOB, SCOPES, followers_of, get_json, instance_actor, keyed_with_password,
+    local, lookup, peer_follows, personal, publishes_with_key,
 };
 use crate::{common, remote};
+
+/// The `avatar` file part of the profile writes: a real, decodable `PNG`.
+fn avatar_part() -> common::MultipartPart {
+    common::MultipartPart::file(
+        "avatar",
+        "me.png",
+        "image/png",
+        Bytes::from(common::images::png()),
+    )
+}
 
 /// One `PATCH /api/v1/accounts/update_credentials` multipart write with the
 /// given text parts and an optional image file, asserted 200 and answered
@@ -56,7 +66,7 @@ async fn a_profile_update_federates_the_fresh_actor_document() {
             common::MultipartPart::text("note", "bio the peers should read"),
             common::MultipartPart::text("fields_attributes[0][name]", "Site"),
             common::MultipartPart::text("fields_attributes[0][value]", "wired.example"),
-            common::MultipartPart::file("avatar", "me.png", "image/png", Bytes::from_static(PNG)),
+            avatar_part(),
         ],
     )
     .await;

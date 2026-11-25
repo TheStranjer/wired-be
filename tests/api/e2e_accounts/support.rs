@@ -71,9 +71,6 @@ pub(super) const NOT_FOUND: &str = "Record not found";
 pub(super) const INVALID_CODE: &str = "Invalid code";
 /// The multipart boundary the profile-image step frames its body with.
 pub(super) const BOUNDARY: &str = "wired-e2e-accounts-boundary";
-/// A `PNG`: the signature the upload detector names, and nothing more —
-/// a profile image is never decoded.
-pub(super) const PNG: &[u8] = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01";
 /// The seconds the timed mute asks for: one hour, which the listing hands
 /// back as an expiry an hour out.
 pub(super) const MUTE_SECONDS: u32 = 3600;
