@@ -109,6 +109,10 @@ fn update_document(
 
 /// Announce the account whose deletion sweep is running.
 ///
+/// Its one non-test caller is `ActivityPub`'s adapter, which runs it on
+/// [`AccountEvent::Deleted`](crate::protocols::events::AccountEvent::Deleted); the sweep
+/// fires that event instead of calling this.
+///
 /// The `Delete` names the actor as both `actor` and `object` — the peer's
 /// cue to tombstone the account it mirrors — and is addressed to the public
 /// with the followers collection in `cc`. Its id is the deterministic
@@ -211,6 +215,9 @@ fn delete_document(state: &AppState, account: &User, followers: &str) -> Value {
 /// `User.deactivate` federates nothing either. The function exists as the
 /// single place a future ticket changes that answer, and at the call site
 /// that states the intent.
+///
+/// Its one non-test caller is `ActivityPub`'s adapter, which runs it on
+/// [`AccountEvent::Deactivated`](crate::protocols::events::AccountEvent::Deactivated).
 pub const fn after_account_disabled(_state: &AppState, _account: &User) {}
 
 #[cfg(test)]

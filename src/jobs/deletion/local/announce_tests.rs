@@ -6,6 +6,9 @@ use super::super::test_support::{
 };
 use super::*;
 use crate::{
+    config::{
+        BASE_URL_VAR, Config, DATABASE_URL_VAR, PROTOCOLS_VAR, TEST_BASE_URL, TEST_DATABASE_URL,
+    },
     models::{
         activitypub_actor::ActivityPubActorWrite,
         user::{Flag, NewUser, insert},
@@ -100,6 +103,37 @@ async fn a_failed_announcement_retries_and_keeps_every_follow_row() {
     );
 }
 
+/// A protocol that fails to handle the `Deleted` event retries the job, and no follow row is cleared.
+#[tokio::test]
+async fn a_protocol_failing_the_deleted_event_retries_and_keeps_every_follow_row() {
+    let db = crate::test_db::test_db().await.expect("test database slot");
+    let pool = db.pool().clone();
+    let alice = local_user(&pool, "fail-hook-sweep").await;
+    let bob = local_user(&pool, "bob").await;
+    follows(&pool, &alice, &bob).await;
+    let config = Config::from_lookup(|key| match key {
+        DATABASE_URL_VAR => Some(TEST_DATABASE_URL.to_owned()),
+        BASE_URL_VAR => Some(TEST_BASE_URL.to_owned()),
+        PROTOCOLS_VAR => Some("fixture".to_owned()),
+        _ => None,
+    })
+    .expect("the fixed sweep test config is valid");
+    let state = AppState::for_tests(pool.clone(), config);
+
+    match run(&state, alice.id).await {
+        Err(JobError::Retry(detail)) => assert!(
+            detail.starts_with("account delete pass failed"),
+            "the retry states what failed: {detail}"
+        ),
+        other => panic!("a protocol failure must retry, not {other:?}"),
+    }
+
+    assert!(
+        has_follow(&pool, &alice, &bob).await,
+        "the follow alice holds survives the failed attempt"
+    );
+}
+
 /// An instance that does not federate announces nothing, succeeds, and
 /// still runs the sweep.
 #[tokio::test]
@@ -108,7 +142,7 @@ async fn with_federation_disabled_the_sweep_runs_without_a_delete() {
     let pool = db.pool().clone();
     let alice = local_user(&pool, "alice").await;
     let _fan = remote_fan_of(&pool, &alice).await;
-    let mut config = crate::config::Config::for_tests();
+    let mut config = Config::for_tests();
     config.federation_enabled = crate::config::Toggle::new(false);
     let state = AppState::for_tests(pool.clone(), config);
 

@@ -108,11 +108,13 @@
 //! actor (which now carries its `movedTo`) through the hook
 //! `move_account` runs. The move notifications attach to the same hook
 //! later. The federated `Delete` of a deleted account's actor is the
-//! `users.delete` sweep's own: it runs in
-//! [`crate::services::federation_out::after_account_deleted`] while the
-//! sweep still holds the relationship rows the fan-out reads. A disabled
-//! account publishes nothing, the decision
-//! [`crate::services::federation_out::after_account_disabled`] documents.
+//! `users.delete` sweep's own: the sweep fires
+//! [`AccountEvent::Deleted`](crate::protocols::events::AccountEvent::Deleted)
+//! while it still holds the relationship rows the fan-out reads, and
+//! `ActivityPub` answers it with
+//! [`crate::services::federation_out::after_account_deleted`]. A disabled
+//! account fires `AccountEvent::Deactivated` and publishes nothing, the
+//! decision [`crate::services::federation_out::after_account_disabled`] documents.
 //!
 //! [`get_or_fetch_by_acct`]: crate::federation::fetch_actor::get_or_fetch_by_acct
 //! [`get_or_fetch_by_ap_id`]: crate::federation::fetch_actor::get_or_fetch_by_ap_id

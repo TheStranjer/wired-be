@@ -8,6 +8,7 @@ use crate::{
         moderation_log,
         user::{User, admin},
     },
+    protocols::events::{AccountEvent, dispatch},
     state::AppState,
 };
 
@@ -19,8 +20,11 @@ use crate::{
 /// `activate`/`deactivate`, its `toggle_activation`, and the Mastodon admin
 /// `enable` and `action` endpoints. Which accounts may be named at all (the
 /// caller's own, a remote mirror) is each endpoint's own filter, applied
-/// before this; the flag is the whole write, so no token is revoked, no
-/// deletion stamped and nothing federated.
+/// before this; the flag is the whole write, so no token is revoked and no
+/// deletion stamped. Once the writes and the log have committed, each moved
+/// account fires [`AccountEvent::Suspended`] (`active` false) or
+/// [`AccountEvent::Unsuspended`] (`active` true), so the protocols decide
+/// what a moderation change means for them.
 ///
 /// The answer is the updated rows, in the order of `accounts`. An account
 /// whose row went away mid-request matches no write and is simply not among
@@ -54,6 +58,14 @@ pub async fn set_activation(
         active,
         "admin changed account activations"
     );
+    let event = if active {
+        AccountEvent::Unsuspended
+    } else {
+        AccountEvent::Suspended
+    };
+    for account in &moved {
+        dispatch(state, account, event).await;
+    }
     Ok(moved)
 }
 

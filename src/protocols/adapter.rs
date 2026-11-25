@@ -181,7 +181,10 @@ pub trait ProtocolAdapter: Sync {
     ///
     /// Core fires the event through [`crate::protocols::events::dispatch`]; the
     /// account is already in its new state, so an error is logged and changes
-    /// nothing. Network work (federating, announcing) must go into a job
+    /// nothing, except for a caller that fires through
+    /// [`dispatch_checked`](crate::protocols::events::dispatch_checked) and
+    /// retries, as the `users.delete` job does for `Deleted`, so the hook
+    /// must be safe to run twice. Network work (federating, announcing) must go into a job
     /// here, not run inline. The default does nothing.
     ///
     /// # Errors

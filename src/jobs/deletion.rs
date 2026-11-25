@@ -51,12 +51,13 @@
 //! [`JobError::Retry`] and only unusable arguments or a vanished user row
 //! are a discard.
 //!
-//! Federation of the actor's `Delete` is the sweep's own first act:
-//! [`crate::services::federation_out::after_account_deleted`] runs between
-//! loading the account and clearing its rows, because the fan-out to the
-//! remote followers and followees reads the relationships the clear step
-//! deletes. A failure to read the recipients or queue the `Delete` retries
-//! the job before anything is cleared.
+//! The sweep's first act is to fire
+//! [`AccountEvent::Deleted`](crate::protocols::events::AccountEvent::Deleted),
+//! between loading the account and clearing its rows, because `ActivityPub`'s
+//! fan-out of the actor's `Delete` to the remote followers and followees reads
+//! the relationships the clear step deletes. A protocol failing to handle the
+//! event, such as a failure to read those recipients or queue the `Delete`,
+//! retries the job before anything is cleared.
 
 use serde::Deserialize;
 use serde_json::{Value, json};

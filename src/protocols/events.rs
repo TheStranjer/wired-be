@@ -45,17 +45,21 @@ pub enum AccountEvent {
     PasswordChanged,
     /// The display name, bio, avatar, banner, fields or featured tags changed.
     ProfileChanged,
-    /// A moderator deactivated the account.
+    /// A moderator deactivated the account; fired once per account the write moved.
     Suspended,
-    /// A moderator activated the account again.
+    /// A moderator activated the account again; fired once per account the write moved.
     Unsuspended,
-    /// The owner disabled their own account.
+    /// The owner disabled their own account, through `POST /api/pleroma/disable_account`.
     Deactivated,
     /// The owner enabled their account again.
     ///
     /// No endpoint fires it yet, because Pleroma has no self re-enable.
     Reactivated,
-    /// The account was deleted, by its owner or by staff.
+    /// The account is being deleted, by its owner or by staff.
+    ///
+    /// Fired by the `users.delete` job as its first step, while the account's
+    /// relationship rows still exist for a protocol to read. The job retries
+    /// when a protocol fails to handle it, so a protocol's hook must be safe to run twice.
     Deleted,
 }
 
@@ -64,19 +68,35 @@ pub enum AccountEvent {
 /// Call it after the change has committed. An adapter that fails is logged
 /// with `tracing::warn!` and does not stop the others or fail the caller.
 pub async fn dispatch(state: &AppState, user: &User, event: AccountEvent) {
+    drop(dispatch_checked(state, user, event).await);
+}
+
+/// Like [`dispatch`], but hands the first adapter failure back to the caller.
+///
+/// Every enabled protocol is still called, and every failure is still logged.
+/// For a caller that can run again, such as a job that retries: the account
+/// has already changed, but the work a protocol owes for it was not done.
+///
+/// # Errors
+///
+/// The first error an adapter's [`on_account_event`](ProtocolAdapter::on_account_event) returned.
+pub async fn dispatch_checked(state: &AppState, user: &User, event: AccountEvent) -> AppResult<()> {
     let adapters: Vec<&'static dyn ProtocolAdapter> = registry::enabled(&state.config).collect();
-    dispatch_to(&adapters, state, user, event).await;
+    dispatch_to(&adapters, state, user, event).await
 }
 
 /// Calls [`ProtocolAdapter::on_account_event`] on each of `adapters` in turn.
 ///
-/// Split from [`dispatch`] so a test can choose the adapters.
+/// Split from [`dispatch_checked`] so a test can choose the adapters. A
+/// failure is logged and does not stop the next adapter; the first one is
+/// returned once all have run.
 async fn dispatch_to(
     adapters: &[&'static dyn ProtocolAdapter],
     state: &AppState,
     user: &User,
     event: AccountEvent,
-) {
+) -> AppResult<()> {
+    let mut first_failure = Ok(());
     for adapter in adapters {
         if let Err(error) = adapter.on_account_event(state, user, event).await {
             warn!(
@@ -86,8 +106,12 @@ async fn dispatch_to(
                 %error,
                 "protocol failed to handle an account event",
             );
+            if first_failure.is_ok() {
+                first_failure = Err(error);
+            }
         }
     }
+    first_failure
 }
 
 /// Gives every enabled protocol, in registry order, the new plaintext password.
@@ -187,8 +211,9 @@ mod tests {
         let user = local_user(db.pool(), "fail-hook-order").await;
         let adapters: [&'static dyn ProtocolAdapter; 3] = [&Fixture, &ActivityPub, &Fixture];
 
-        dispatch_to(&adapters, &state, &user, AccountEvent::Suspended).await;
+        let outcome = dispatch_to(&adapters, &state, &user, AccountEvent::Suspended).await;
 
+        assert!(outcome.is_err(), "the first failure is handed back");
         assert_eq!(
             events_seen(&user),
             vec![
@@ -212,6 +237,40 @@ mod tests {
             events_seen(&user),
             vec![Recorded::Event(AccountEvent::Deactivated)],
             "the failing hook ran and dispatch returned normally"
+        );
+    }
+
+    /// `dispatch_checked` hands the failure of an adapter back, after every adapter ran.
+    #[tokio::test]
+    async fn dispatch_checked_returns_an_adapters_failure() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let state = state_enabling(db.pool(), "activitypub,fixture");
+        let user = local_user(db.pool(), "fail-hook-checked").await;
+
+        let outcome = dispatch_checked(&state, &user, AccountEvent::Deleted).await;
+
+        assert!(outcome.is_err(), "the fixture's failure comes back");
+        assert_eq!(
+            events_seen(&user),
+            vec![Recorded::Event(AccountEvent::Deleted)],
+            "the fixture ran"
+        );
+    }
+
+    /// `dispatch_checked` answers `Ok` when every adapter handled the event.
+    #[tokio::test]
+    async fn dispatch_checked_is_ok_when_no_adapter_fails() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let state = state_enabling(db.pool(), "fixture");
+        let user = local_user(db.pool(), "checked_ok").await;
+
+        let outcome = dispatch_checked(&state, &user, AccountEvent::Suspended).await;
+
+        assert!(outcome.is_ok(), "nothing failed");
+        assert_eq!(
+            events_seen(&user),
+            vec![Recorded::Event(AccountEvent::Suspended)],
+            "the fixture saw the event"
         );
     }
 
