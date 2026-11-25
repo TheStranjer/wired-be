@@ -120,7 +120,7 @@ pub(super) async fn get_status_history(
             sensitive: revision.sensitive,
             created_at: revision.created_at,
             account: render_author(),
-            media: media_entities(&revision.media_ids, &attachments, &state.config),
+            media: revision_media(revision, &attachments, &state.config),
             emojis: emoji_entities(revision.id, &emojis, &state.config),
         }));
     }
@@ -207,6 +207,30 @@ fn emoji_entities(
             .map(|emoji| CustomEmoji::from_model(emoji, config))
             .collect()
     })
+}
+
+/// The `media_attachments` array of one superseded version: its ids in their
+/// stored order, each answered by its batched row dressed in the alt text and
+/// focal point that version carried ([`status_edit::StatusEdit::dress`]).
+///
+/// The snapshot is aligned with the stored ids, so an attachment whose row
+/// is gone drops out without shifting the others' metadata; a revision
+/// recorded before the snapshot existed renders the rows as stored now.
+fn revision_media(
+    revision: &status_edit::StatusEdit,
+    by_id: &HashMap<Uuid, AttachmentRow>,
+    config: &Config,
+) -> Vec<MediaAttachment> {
+    revision
+        .media_ids
+        .iter()
+        .enumerate()
+        .filter_map(|(index, id)| {
+            let mut row = by_id.get(id)?.clone();
+            revision.dress(index, &mut row);
+            Some(MediaAttachment::from_model(&row, config))
+        })
+        .collect()
 }
 
 /// The `media_attachments` array of one history entry: `ids` in their
