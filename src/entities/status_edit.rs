@@ -8,8 +8,8 @@
 //! [`models::status_edit`](crate::models::status_edit) row through the same
 //! [`MediaAttachment`] entity the status renderer uses, `emojis` renders the
 //! custom emojis that version's text used, as the status renderer does, and
-//! `poll` is still `null` (decision 3: one placeholder per part no ticket
-//! has stored yet).
+//! `poll` is Mastodon's `{"options": [{"title": …}]}` of the options that
+//! version asked, `null` for a version without a poll.
 //!
 //! Pure (decision 3): [`StatusEdit::from_source`] consumes the parts the
 //! endpoint batch-loaded — the revision row's own fields, the author's
@@ -20,7 +20,7 @@
 
 use chrono::{DateTime, Utc};
 use serde::Serialize;
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use crate::{
     entities::{
@@ -54,6 +54,9 @@ pub struct StatusEditSource<'a> {
     /// The custom emojis the version's content and warning used, already
     /// rendered, in the order the texts first use them.
     pub emojis: Vec<CustomEmoji>,
+    /// The option titles of the poll the version asked, in order; `None`
+    /// for a version without a poll.
+    pub poll_options: Option<Vec<String>>,
 }
 
 /// One element of `GET /api/v1/statuses/{id}/history`: one version of the
@@ -79,8 +82,8 @@ pub struct StatusEdit {
     /// same [`CustomEmoji`] entities the
     /// [`Status`](crate::entities::status::Status) entity carries.
     pub emojis: Vec<CustomEmoji>,
-    /// The poll attached to the version; `null` until the polls ticket
-    /// renders it, and `null` for this instance's statuses regardless.
+    /// The poll the version asked, as Mastodon's `{"options": [{"title"}]}`;
+    /// `null` for a version without one.
     pub poll: Option<Value>,
 }
 
@@ -96,6 +99,7 @@ impl StatusEdit {
             account,
             media,
             emojis,
+            poll_options,
         } = source;
         Self {
             content: content.to_owned(),
@@ -105,7 +109,13 @@ impl StatusEdit {
             account,
             media_attachments: media,
             emojis,
-            poll: None,
+            poll: poll_options.map(|titles| {
+                let options: Vec<Value> = titles
+                    .into_iter()
+                    .map(|title| json!({ "title": title }))
+                    .collect();
+                json!({ "options": options })
+            }),
         }
     }
 }
@@ -278,8 +288,31 @@ mod tests {
                 .iter()
                 .map(|found| CustomEmoji::from_model(found, &config))
                 .collect(),
+            poll_options: None,
         }))
         .expect("the entity serializes")
+    }
+
+    #[test]
+    fn a_version_with_a_poll_renders_its_option_titles() {
+        let config = Config::for_tests();
+        let account = Account::from_user_for(None, &author(), &config, None);
+        let value = to_value(StatusEdit::from_source(StatusEditSource {
+            content: "<p>which?</p>",
+            spoiler_text: "",
+            sensitive: false,
+            created_at: stamped(),
+            account,
+            media: Vec::new(),
+            emojis: Vec::new(),
+            poll_options: Some(vec!["a".to_owned(), "b".to_owned()]),
+        }))
+        .expect("the entity serializes");
+        assert_eq!(
+            value["poll"],
+            json!({"options": [{"title": "a"}, {"title": "b"}]}),
+            "Mastodon's StatusEdit poll: the titles that version asked"
+        );
     }
 
     #[test]
@@ -311,7 +344,7 @@ mod tests {
             json!([]),
             "a version using no custom emoji renders the empty array"
         );
-        assert_eq!(value["poll"], Value::Null, "polls are a later ticket");
+        assert_eq!(value["poll"], Value::Null, "a version without a poll");
     }
 
     #[test]

@@ -30,6 +30,9 @@
 //!   `poll` with the author as actor (Pleroma's `create_poll_notifications`
 //!   walks the Question's actor-and-voters list with the self skip waived
 //!   for the poll type).
+//! - [`on_poll_restarted`] — the edit route's telling of a poll whose
+//!   options changed: every local voter whose ballot was deleted is told
+//!   `update` naming the post, the author as actor (Mastodon parity).
 //! - [`on_status_edited`] — the edit route's telling: every local account
 //!   boosting the post is told `update` naming it, the author as actor
 //!   (Pleroma's `Update` arm: the object's local repeaters minus the
@@ -115,7 +118,7 @@ mod subscriptions;
 mod test_support;
 
 pub use edits::on_status_edited;
-pub use polls::on_poll_ended;
+pub use polls::{on_poll_ended, on_poll_restarted};
 pub use quotes::{on_quote, on_quote_linked, on_quoted_update};
 pub use reactions::on_reaction_changed;
 pub use social::{on_follow, on_follow_request_resolved, on_move};

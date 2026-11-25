@@ -51,7 +51,10 @@
 //! `language`, `content_type`, `media_ids`, and Mastodon's
 //! `media_attributes` (`[{id, description, focus}]`, the way clients fix alt
 //! text and focal points of attached media, written in the same
-//! transaction so the federated `Update` carries them) — is merged over the stored row
+//! transaction so the federated `Update` carries them) and Mastodon's `poll`
+//! (`options`, `multiple`, `expires_in`, `hide_totals`, restarting the poll
+//! when its options or choice mode change and keeping it when the body
+//! names none) — is merged over the stored row
 //! by [`crate::services::create_status::edit_status`] and pushed through
 //! the creation's own checks and render (the shared
 //! [`render_status_fields`](crate::services::create_status::render_status_fields)),

@@ -11,8 +11,9 @@
 //! array — the superseded versions oldest-authored-first with the current
 //! one last, each carrying its content, warning, flag, author, media, and
 //! the custom emojis its text used (one batched read per answer) and the
-//! `poll` placeholder the status renderer still answers. A status nobody edited is the one-element array of its current
-//! version.
+//! `poll` — Mastodon's `{"options": [{"title": …}]}`, the options that
+//! version asked, `null` for a version without a poll. A status nobody
+//! edited is the one-element array of its current version.
 //!
 //! `GET /api/v1/statuses/{id}/source` is Pleroma's `show_source` with the
 //! author-only gate this ticket pins: a user token with `read:statuses`,
@@ -47,6 +48,7 @@ use crate::{
     models::{
         custom_emoji::CustomEmoji as EmojiRow,
         media_attachment::{self, MediaAttachment as AttachmentRow},
+        poll,
         status::Status as StatusRow,
         status_edit,
         user::{self, User},
@@ -122,6 +124,7 @@ pub(super) async fn get_status_history(
             account: render_author(),
             media: revision_media(revision, &attachments, &state.config),
             emojis: emoji_entities(revision.id, &emojis, &state.config),
+            poll_options: revision.poll_options.clone(),
         }));
     }
     history.push(StatusEdit::from_source(StatusEditSource {
@@ -132,6 +135,7 @@ pub(super) async fn get_status_history(
         account: render_author(),
         media: media_entities(&current, &attachments, &state.config),
         emojis: emoji_entities(row.id, &emojis, &state.config),
+        poll_options: current_poll_options(&state, row.id).await?,
     }));
     debug!(
         status = %row.id,
@@ -139,6 +143,22 @@ pub(super) async fn get_status_history(
         "status history read"
     );
     Ok(Json(history))
+}
+
+/// The option titles of the poll `status_id` carries now, in order; `None`
+/// for a status without one.
+///
+/// # Errors
+///
+/// Any database failure arrives through `?` as [`AppError::Database`].
+async fn current_poll_options(state: &AppState, status_id: Uuid) -> AppResult<Option<Vec<String>>> {
+    let Some(stored) = poll::get_for_status(&state.db, status_id).await? else {
+        return Ok(None);
+    };
+    let options = poll::options(&state.db, stored.id).await?;
+    Ok(Some(
+        options.into_iter().map(|option| option.title).collect(),
+    ))
 }
 
 /// Every attachment one history answer may render: the ids the revisions

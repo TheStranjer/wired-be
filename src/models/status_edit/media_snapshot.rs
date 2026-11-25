@@ -123,6 +123,7 @@ mod tests {
             media_descriptions: descriptions,
             media_focus_x,
             media_focus_y,
+            poll_options: None,
         }
     }
 
