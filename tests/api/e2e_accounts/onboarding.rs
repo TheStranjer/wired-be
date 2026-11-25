@@ -10,7 +10,7 @@ use serde_json::{Value, json};
 
 use super::support::{
     ACCOUNTS, Account, BASE, BOUNDARY, CREDENTIALS, INVALID_CREDENTIALS, INVALID_TOKEN,
-    NEW_PASSWORD, PASSWORD, PNG, SETTINGS, VERIFY, World, assert_refused, string_field,
+    NEW_PASSWORD, PASSWORD, SETTINGS, VERIFY, World, assert_refused, string_field,
 };
 use crate::common;
 
@@ -104,7 +104,7 @@ async fn finish_profile(world: &World, alice: &Account) -> Value {
                     "avatar",
                     "ada.png",
                     "image/png",
-                    Bytes::from_static(PNG),
+                    Bytes::from(common::images::png()),
                 ),
             ],
         )
@@ -207,7 +207,11 @@ async fn profile_is_public(world: &World, alice: &Account, written: &Value) {
     )
     .await;
     common::assert_answer(&served, StatusCode::OK, "the stored avatar file");
-    assert_eq!(served.body.as_ref(), PNG, "the uploaded bytes");
+    assert_eq!(
+        served.body.as_ref(),
+        common::images::normalized(&common::images::png()),
+        "the uploaded image, encoded again"
+    );
 }
 
 /// The password change and what it costs the account's other credentials:

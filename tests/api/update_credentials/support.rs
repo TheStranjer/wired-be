@@ -38,19 +38,9 @@ pub(super) const INVALID_TOKEN: &str = r#"{"error":"The access token is invalid"
 pub(super) const USER_REQUIRED: &str = r#"{"error":"This API requires an authenticated user"}"#;
 /// The 403 body for a token without the endpoint's scope.
 pub(super) const NO_SCOPE: &str = r#"{"error":"Insufficient permissions: write:accounts."}"#;
-/// A `PNG`: the signature the detector matches on. A profile image is never
-/// decoded, so the header is the whole fixture (20 bytes).
-pub(super) const PNG: &[u8] = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01";
-/// A `JPEG`: the `SOI` and `APP0` markers the detector matches on (16 bytes).
-pub(super) const JPEG: &[u8] = b"\xFF\xD8\xFF\xE0\x00\x10JFIF\x00\x01\x01\x00\x00\x01";
-/// A `GIF`: the versioned header `GIF89a` (14 bytes).
-pub(super) const GIF: &[u8] = b"GIF89a\x01\x00\x01\x00\x80\x00\x00";
-/// The bare 8-byte `PNG` signature: the smallest file the detector still
-/// names a `png`, which the size-cap tests measure against a cap.
-pub(super) const SMALL_PNG: &[u8] = b"\x89PNG\r\n\x1a\n";
-/// A `WebP`: the `RIFF` container, its size and the `WEBP`/`VP8` tags
-/// (16 bytes).
-pub(super) const WEBP: &[u8] = b"RIFF\x24\x00\x00\x00WEBPVP8 ";
+/// The magic bytes of a `PNG` and nothing else: the detector names a `png`,
+/// no decoder reads an image from it.
+pub(super) const TRUNCATED_PNG: &[u8] = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01";
 /// A `BMP`: an image the detector names, and one the endpoint still
 /// refuses.
 pub(super) const BMP: &[u8] = b"BM\x36\x00\x00\x00\x00\x00\x36\x00\x00\x00";

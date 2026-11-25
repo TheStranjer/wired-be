@@ -36,9 +36,6 @@ pub(super) const SCOPES: &str = "read write";
 pub(super) const ACTIVITY_JSON: &str = "application/activity+json";
 /// The percent-encoded `🎉` of the reaction routes' path segment.
 pub(super) const PARTY: &str = "%F0%9F%8E%89";
-/// A `PNG`: the magic bytes the profile-image detector names. A profile
-/// image is never decoded, so the header is the whole fixture.
-pub(super) const PNG: &[u8] = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01";
 /// The status write.
 pub(super) const STATUSES: &str = "/api/v1/statuses";
 /// The account routes the scenarios read and write.

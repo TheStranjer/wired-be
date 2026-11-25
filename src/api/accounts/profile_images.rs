@@ -17,6 +17,7 @@ use crate::{
     error::{AppError, AppResult},
     extract::multipart::{UploadedFile, UploadedFiles as _},
     models::user::User,
+    services::media_processing::normalize_upload,
     state::AppState,
 };
 
@@ -96,26 +97,33 @@ impl ImageWrites {
     /// column held before and no longer holds is the file
     /// [`delete_replaced_files`] removes, once the row stopped naming it.
     ///
+    /// Every uploaded image is normalized first
+    /// ([`normalize_upload`]: decoded, held to
+    /// `MAX_IMAGE_PIXELS` and encoded again without its metadata) and
+    /// nothing is stored until all three passed, so a body with one good
+    /// image and one undecodable one still writes nothing.
+    ///
     /// # Errors
     ///
-    /// Storage failures arrive from [`store_image`] as
-    /// [`AppError::Internal`] / [`AppError::BadRequest`].
+    /// [`AppError::Unprocessable`] with `Invalid image` or `Image too large`
+    /// from the normalization; storage failures arrive from
+    /// [`store_image`] as [`AppError::Internal`] / [`AppError::BadRequest`].
     pub(super) async fn apply(
         self,
         state: &AppState,
         user_id: Uuid,
         current: &User,
     ) -> AppResult<Applied> {
-        let (avatar_url, avatar_replaced) = self
-            .avatar
+        let avatar = self.avatar.normalized(&state.config).await?;
+        let banner = self.banner.normalized(&state.config).await?;
+        let background = self.background.normalized(&state.config).await?;
+        let (avatar_url, avatar_replaced) = avatar
             .merged(state, user_id, current.avatar_url.as_deref())
             .await?;
-        let (banner_url, banner_replaced) = self
-            .banner
+        let (banner_url, banner_replaced) = banner
             .merged(state, user_id, current.banner_url.as_deref())
             .await?;
-        let (background_image_url, background_replaced) = self
-            .background
+        let (background_image_url, background_replaced) = background
             .merged(state, user_id, current.background_image_url.as_deref())
             .await?;
         Ok(Applied {
@@ -146,6 +154,31 @@ pub(super) struct Applied {
 }
 
 impl ImageWrite {
+    /// This write with an uploaded image replaced by its normalized
+    /// re-encoding — the bytes and the media type the encoder produced —
+    /// and any other write unchanged.
+    ///
+    /// # Errors
+    ///
+    /// [`AppError::Unprocessable`] from [`normalize_upload`]: `Invalid
+    /// image` for bytes that name an image type but do not decode, `Image
+    /// too large` for a pixel count over `MAX_IMAGE_PIXELS`.
+    async fn normalized(self, config: &Config) -> AppResult<Self> {
+        match self {
+            Self::Store {
+                bytes, filename, ..
+            } => {
+                let image = normalize_upload(config, bytes).await?;
+                Ok(Self::Store {
+                    bytes: Bytes::from(image.bytes),
+                    filename,
+                    content_type: image.content_type,
+                })
+            }
+            other @ (Self::Unchanged | Self::Clear) => Ok(other),
+        }
+    }
+
     /// The value this write leaves in its column and the URL it replaced:
     /// see [`ImageWrites::apply`] for the three cases. `current` is what the
     /// row holds now, so an untouched slot round-trips it.
