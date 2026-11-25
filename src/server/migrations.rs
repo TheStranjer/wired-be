@@ -18,6 +18,8 @@ mod oauth_token_digests;
 #[cfg(test)]
 mod push;
 #[cfg(test)]
+mod reaction_emoji_origin;
+#[cfg(test)]
 mod status_fk_indexes;
 #[cfg(test)]
 mod sweep_indexes;

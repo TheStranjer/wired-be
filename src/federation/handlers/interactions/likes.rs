@@ -21,6 +21,7 @@ use crate::{
     util::{
         emoji::{Emoji, shortcode as shortcode_of},
         sanitize::strip_html,
+        url::{host_with_port, parse_http_url},
     },
 };
 
@@ -32,6 +33,9 @@ struct Reaction {
     emoji: String,
     /// The `Emoji` tag's icon URL; `None` for a unicode reaction.
     url: Option<String>,
+    /// The instance the emoji belongs to, as the tag says: the host of its
+    /// `id`, else of its icon URL. `None` for a unicode reaction.
+    origin: Option<String>,
 }
 
 /// What a delivered `Like`'s `content` field states, read the way Pleroma
@@ -242,7 +246,7 @@ async fn fold_reaction(
         url: reaction.url.as_deref(),
     };
     let domain = remember_emoji(state, signer, reaction).await?;
-    let row = emoji_reaction::react_in_domain(&state.db, &new, &view.id, domain)
+    let row = emoji_reaction::react_in_domain(&state.db, &new, &view.id, domain.as_deref())
         .await
         .map_err(|err| {
             FederationError::transient("could not fold the remote interaction's reaction", &err)
@@ -257,30 +261,71 @@ async fn fold_reaction(
     Ok(Outcome::Handled)
 }
 
-/// Records the custom emoji a delivered reaction brought and answers its origin
-/// domain, `None` for a unicode reaction.
+/// Records the custom emoji a delivered reaction brought and answers its origin.
 ///
-/// The emoji is filed under the reactor's own domain, as the posts' `Emoji`
+/// The answer is `None` for a unicode reaction and for an emoji of this instance.
+///
+/// The emoji is filed under the instance it comes from, as the posts' `Emoji`
 /// tags are, so a local user can later join the reaction by naming
-/// `shortcode@domain`.
-async fn remember_emoji<'a>(
+/// `shortcode@domain` and every reactor of one emoji lands in one group. A
+/// reactor may name another instance's emoji, or ours, so the signer's domain
+/// is only the fallback for a tag that names no host.
+async fn remember_emoji(
     state: &AppState,
-    signer: &'a User,
+    signer: &User,
     reaction: &Reaction,
-) -> Result<Option<&'a str>, FederationError> {
-    let (Some(url), Some(code), Some(domain)) = (
-        reaction.url.as_deref(),
-        shortcode_of(&reaction.emoji),
-        signer.domain.as_deref(),
-    ) else {
+) -> Result<Option<String>, FederationError> {
+    let (Some(url), Some(code)) = (reaction.url.as_deref(), shortcode_of(&reaction.emoji)) else {
         return Ok(None);
     };
-    custom_emoji::upsert_remote(&state.db, code, Some(domain), url)
+    let local = custom_emoji::get_by_shortcodes(&state.db, &[code.to_owned()], None)
+        .await
+        .map_err(|err| {
+            FederationError::transient("could not look up the local emoji of a reaction", &err)
+        })?
+        .into_iter()
+        .find(|emoji| !emoji.disabled);
+    let ours = reaction
+        .origin
+        .as_deref()
+        .is_some_and(|origin| origin.eq_ignore_ascii_case(state.config.domain()));
+    if local
+        .as_ref()
+        .is_some_and(|emoji| ours || emoji.image_url == url)
+    {
+        return Ok(None);
+    }
+    let tagged = reaction.origin.as_deref().filter(|_| !ours);
+    let Some(origin) = tagged.or(signer.domain.as_deref()) else {
+        return Ok(None);
+    };
+    file_remote_emoji(state, code, origin, url).await?;
+    Ok(Some(origin.to_owned()))
+}
+
+/// Stores the emoji `code` of `origin` unless a row for that pair stands.
+///
+/// A stored row is reused as it is: a reactor naming an instance's emoji does
+/// not get to replace the image that instance's own posts announced.
+async fn file_remote_emoji(
+    state: &AppState,
+    code: &str,
+    origin: &str,
+    url: &str,
+) -> Result<(), FederationError> {
+    let stored = custom_emoji::get_by_shortcodes(&state.db, &[code.to_owned()], Some(origin))
+        .await
+        .map_err(|err| {
+            FederationError::transient("could not look up the remote reaction's emoji", &err)
+        })?;
+    if !stored.is_empty() {
+        return Ok(());
+    }
+    custom_emoji::upsert_remote(&state.db, code, Some(origin), url)
         .await
         .map_err(|err| {
             FederationError::transient("could not record the remote reaction's emoji", &err)
-        })?;
-    Ok(Some(domain))
+        })
 }
 
 /// What a `Like`'s `content` states: absent or blank (of any markup) is the
@@ -310,19 +355,29 @@ fn reaction_of(document: &Value, content: &str) -> Option<Reaction> {
         Some(Emoji::Custom(code)) => Some(code.to_owned()),
         None => return None,
     };
-    let url = match code.as_deref() {
-        None => None,
-        Some(name) => Some(emoji_tag_url(document, name)?),
+    let (url, origin) = match code.as_deref() {
+        None => (None, None),
+        Some(name) => {
+            let (url, origin) = emoji_tag_parts(document, name)?;
+            (Some(url), Some(origin))
+        }
     };
-    Some(Reaction { emoji: text, url })
+    Some(Reaction {
+        emoji: text,
+        url,
+        origin,
+    })
 }
 
-/// The icon URL of the `Emoji` tag naming `shortcode`: a tag entry of type
-/// `Emoji` whose `name` — outer colons dropped, the spellings both Misskey
-/// and Pleroma send — equals the shortcode, carrying an `http(s)` URL under
-/// `icon`. The first match wins; `None` refuses the shortcode.
-fn emoji_tag_url(document: &Value, shortcode: &str) -> Option<String> {
-    document
+/// The icon URL and origin of the `Emoji` tag naming `shortcode`.
+///
+/// The tag is an entry of type `Emoji` whose `name` — outer colons dropped,
+/// the spellings both Misskey and Pleroma send — equals the shortcode,
+/// carrying an `http(s)` URL under `icon`. The first match wins; `None`
+/// refuses the shortcode. The origin is the host of the tag's `id`, or of the
+/// icon URL when the tag has no usable `id`, with a non-default port kept.
+fn emoji_tag_parts(document: &Value, shortcode: &str) -> Option<(String, String)> {
+    let tag = document
         .get("tag")
         .map_or_default(json::as_array)
         .iter()
@@ -332,11 +387,27 @@ fn emoji_tag_url(document: &Value, shortcode: &str) -> Option<String> {
                     .get("name")
                     .and_then(Value::as_str)
                     .is_some_and(|name| name.trim_matches(':') == shortcode)
-        })?
+        })?;
+    let url = tag
         .get("icon")
         .and_then(json::first_string)
-        .filter(|url| json::http_host(url).is_some())
+        .filter(|url| json::http_host(url).is_some())?;
+    let origin = tag
+        .get("id")
+        .and_then(Value::as_str)
+        .and_then(origin_of)
+        .or_else(|| origin_of(&url))?;
+    Some((url, origin))
 }
+
+/// The host of an absolute `http(s)` URL, plus its port when it is not the
+/// scheme's default; `None` for anything else.
+fn origin_of(url: &str) -> Option<String> {
+    parse_http_url(url).map(|parsed| host_with_port(&parsed))
+}
+
+#[cfg(test)]
+mod origin_tests;
 
 #[cfg(test)]
 mod tests {
@@ -417,6 +488,46 @@ mod tests {
                 "{text:?} is not one emoji"
             );
         }
+    }
+
+    #[test]
+    fn a_tags_origin_is_its_id_host_else_its_icon_host() {
+        let with_id = json!({
+            "tag": [{"type": "Emoji", "name": ":cat:", "id": "https://Host-A.example/emoji/cat",
+                     "icon": {"url": "https://cdn.example/cat.png"}}],
+        });
+        let by_id = reaction_of(&with_id, ":cat:").expect("the tag vouches");
+        assert_eq!(
+            by_id.origin.as_deref(),
+            Some("host-a.example"),
+            "the tag id's host wins over the CDN the icon sits on"
+        );
+        assert_eq!(by_id.url.as_deref(), Some("https://cdn.example/cat.png"));
+
+        let no_id = json!({
+            "tag": [{"type": "Emoji", "name": ":cat:",
+                     "icon": {"url": "https://misskey.test:8443/files/cat.png"}}],
+        });
+        let by_icon = reaction_of(&no_id, ":cat:").expect("the tag vouches");
+        assert_eq!(
+            by_icon.origin.as_deref(),
+            Some("misskey.test:8443"),
+            "without an id the icon's host and non-default port name the origin"
+        );
+
+        let bad_id = json!({
+            "tag": [{"type": "Emoji", "name": ":cat:", "id": "not a url",
+                     "icon": {"url": "https://misskey.test/cat.png"}}],
+        });
+        let by_fallback = reaction_of(&bad_id, ":cat:").expect("the tag vouches");
+        assert_eq!(
+            by_fallback.origin.as_deref(),
+            Some("misskey.test"),
+            "an id with no host falls back to the icon's"
+        );
+
+        let unicode = reaction_of(&json!({}), "🍺").expect("a unicode reaction");
+        assert_eq!(unicode.origin, None, "a unicode reaction has no origin");
     }
 
     #[test]
