@@ -509,9 +509,9 @@ pub fn is_true(text: &str) -> bool {
 /// performs: [`mark_deleted`] stamps `deleted_at` and deactivates beside
 /// [`delete_all_for_user`]'s revocation of every token, in one transaction,
 /// and the [`users.delete`](deletion::KIND_DELETE) sweep goes onto
-/// [`QUEUE_BACKGROUND`]. The `Delete` announcement to the peers is the
-/// sweep's own first act, not the endpoint's — a client that gets this 200
-/// must not wait on federation.
+/// [`QUEUE_BACKGROUND`]. Telling the protocols is the sweep's own first act
+/// (it fires `AccountEvent::Deleted`), not the endpoint's — a client that
+/// gets this 200 must not wait on federation.
 ///
 /// # Errors
 ///

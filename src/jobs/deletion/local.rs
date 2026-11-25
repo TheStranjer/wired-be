@@ -15,6 +15,7 @@ use crate::{
         retry, scheduled_statuses,
     },
     models::{backup, job, list, media_attachment, scheduled_status, user, web_push_subscription},
+    protocols::events::{AccountEvent, dispatch_checked},
     state::AppState,
 };
 
@@ -24,16 +25,17 @@ use crate::{
 ///
 /// A vanished user row or an unparsable payload is discarded — no retry
 /// can fix either; everything else that fails is a database failure over
-/// work that is idempotent, and retries. That includes queueing the actor
-/// `Delete`: it happens before the follow rows go, so a failed attempt
-/// leaves the recipients in place for the next one.
+/// work that is idempotent, and retries. That includes a protocol failing to
+/// handle [`AccountEvent::Deleted`], which `ActivityPub` answers by queueing
+/// the actor `Delete`: the event fires before the follow rows go, so a failed
+/// attempt leaves the recipients in place for the next one.
 pub fn handle_delete(state: AppState, _attempt: AttemptInfo, args: Value) -> HandlerFuture {
     Box::pin(async move {
         let user_id = parse_args::<DeleteArgs>(&args, DELETE_JOB)?.user_id;
         let account = load_account(&state, user_id).await?;
-        // A failure here retries before `clear_data` deletes the follow rows
-        // the recipient list is built from.
-        crate::services::federation_out::after_account_deleted(&state, &account)
+        // A protocol failing here retries before `clear_data` deletes the
+        // follow rows it may build its recipient list from.
+        dispatch_checked(&state, &account, AccountEvent::Deleted)
             .await
             .map_err(|err| retry(PASS_JOB, &err))?;
         clear_data(&state, &account).await?;

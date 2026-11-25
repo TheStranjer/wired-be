@@ -18,7 +18,7 @@ use crate::{
         user::{self, User},
     },
     oauth::scopes::WRITE_ACCOUNTS,
-    services::federation_out,
+    protocols::events::{AccountEvent, dispatch},
     state::AppState,
 };
 
@@ -30,12 +30,10 @@ use crate::{
 /// stamped and all its tokens — the presenting one included — revoked in
 /// one transaction, the [`users.delete`](crate::jobs::deletion::KIND_DELETE)
 /// sweep is queued on [`QUEUE_BACKGROUND`](crate::jobs::QUEUE_BACKGROUND).
-/// The `Delete` announcement to the peers is the
-/// sweep's own first act (see
-/// [`federation_out::after_account_deleted`](crate::services::federation_out::after_account_deleted)),
-/// not the endpoint's: the announcement reads the relationship rows the
-/// sweep is about to clear, and a client that gets this 200 must not wait
-/// on either.
+/// The [`AccountEvent::Deleted`] event is the
+/// sweep's own first act, not the endpoint's: a protocol announcing the
+/// deletion reads the relationship rows the sweep is about to clear, and a
+/// client that gets this 200 must not wait on either.
 ///
 /// # Errors
 ///
@@ -65,12 +63,9 @@ pub(super) async fn delete_account(
 /// without the sweep, and its tokens are revoked whole because a
 /// disabled account must not still be acting.
 ///
-/// The account publishes nothing: a deactivation leaves the actor document
-/// resolvable so the posts and follows peers already hold keep rendering,
-/// and that decision lands in
-/// [`federation_out::after_account_disabled`](crate::services::federation_out::after_account_disabled)
-/// — the hook runs after a successful write and sends nothing, in this and
-/// every configuration, until a ticket says otherwise.
+/// After the write it fires [`AccountEvent::Deactivated`]. `ActivityPub`
+/// publishes nothing for it: a deactivation leaves the actor document
+/// resolvable so the posts and follows peers already hold keep rendering.
 ///
 /// # Errors
 ///
@@ -87,7 +82,7 @@ pub(super) async fn disable_account(
         return Ok(error_body(INVALID_PASSWORD));
     }
     let revoked = deactivate_and_revoke_all(&state, &auth.0).await?;
-    federation_out::after_account_disabled(&state, &auth.0);
+    dispatch(&state, &auth.0, AccountEvent::Deactivated).await;
     debug!(account = %auth.0.nickname, revoked, "account disabled");
     Ok(success_body())
 }

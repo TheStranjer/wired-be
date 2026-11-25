@@ -52,15 +52,17 @@
 //!   its author's `featured` collection or withdraws it — Pleroma's
 //!   `Builder.pin` and `Builder.unpin`, `to` the public with the author's
 //!   followers collection in `cc`, delivered to the remote followers;
-//! - [`after_account_deleted`]: a `Delete` of the actor, run as the first
-//!   act of the `users.delete` sweep (before it clears the relationship
+//! - [`after_account_deleted`]: a `Delete` of the actor, run by the
+//!   `ActivityPub` adapter on `AccountEvent::Deleted`, which the `users.delete`
+//!   sweep fires as its first act (before it clears the relationship
 //!   rows the fan-out reads), delivered to the union of the account's
 //!   remote followers' and remote followees' inboxes plus the accepted
 //!   relays' (both sides learned something from the actor, both must learn
 //!   it is gone), then in a second publish to every other known remote
 //!   inbox;
 //! - [`after_account_disabled`]: nothing — deactivation deliberately
-//!   federates no activity, so the hook is the documented landing point for
+//!   federates no activity, so the hook, run by the `ActivityPub` adapter on
+//!   `AccountEvent::Deactivated`, is the documented landing point for
 //!   a ticket that ever changes that answer;
 //! - [`after_report_created`]: the `Flag` a forwarded report owes a REMOTE
 //!   target's instance — the instance actor speaks it, the reported account

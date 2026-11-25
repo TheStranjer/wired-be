@@ -20,6 +20,9 @@ pub mod common;
 /// The directory, suggestions, familiar-followers and birthday listings.
 mod account_lists;
 
+/// The events suspend, unsuspend, deactivate and delete fire.
+mod account_events;
+
 /// The account note endpoints (`/api/v1/accounts/{id}/note`).
 mod account_notes;
 
