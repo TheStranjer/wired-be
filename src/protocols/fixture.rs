@@ -156,6 +156,9 @@ const fn is_identifier_char(c: char) -> bool {
     c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'
 }
 
+/// The fixture's one client API route: `GET` answers 204 No Content.
+pub const CLIENT_API_PING_PATH: &str = "/api/v1/fixture/ping";
+
 /// `GET /fixture/ping`: answers 204 No Content.
 async fn ping() -> StatusCode {
     StatusCode::NO_CONTENT
@@ -175,6 +178,11 @@ impl ProtocolAdapter for Fixture {
     /// One route, `GET /fixture/ping`.
     fn router(&self, _state: &AppState) -> Router<AppState> {
         Router::new().route("/fixture/ping", get(ping))
+    }
+
+    /// One client API route, `GET /api/v1/fixture/ping`.
+    fn client_api_router(&self, _state: &AppState) -> Router<AppState> {
+        Router::new().route(CLIENT_API_PING_PATH, get(ping))
     }
 
     /// One job kind, [`KIND_NOOP`].

@@ -1,6 +1,10 @@
 //! The Mastodon-compatible client API under `/api/v1`
 //! (`docs/ARCHITECTURE.md` decision 1), including Pleroma's extensions at
 //! `/api/v1/pleroma`.
+//!
+//! The area routers are split in two by the rule in [`crate::api`]:
+//! [`core_router`] is always mounted, [`activitypub_router`] only while
+//! `ActivityPub` is enabled. Each returns paths relative to `/api/v1`.
 
 use axum::Router;
 
@@ -17,25 +21,23 @@ use crate::{
     state::AppState,
 };
 
-/// The `/api/v1` router.
+/// The `/api/v1` routes that work for a local account with no `ActivityPub` data.
 ///
-/// Area routers live as `src/api/<area>.rs` and are merged here; future
-/// endpoints join them the same way. One prefix is nested with a merged
-/// pair rather than a single router: [`mastodon_admin::v1_router`] and
+/// Area routers live as `src/api/<area>.rs` and are merged here; the table in
+/// [`crate::api`] says which areas are core. One prefix is nested with a
+/// merged pair rather than a single router: [`mastodon_admin::v1_router`] and
 /// [`mastodon_admin_reports::v1_router`] ride together on `/admin`, the
 /// prefix Mastodon's admin API is routed under (its staff reads are
 /// `GET /api/v1/admin/accounts`, its `{id}` twin and the `reports` queue
-/// with its four moderation writes). Do not call
+/// with its four moderation writes). The reports queue stays with the admin
+/// area it is mounted on, which is core for now. Do not call
 /// [`Router::fallback`] here (or on anything merged here): unmatched paths
 /// must reach the app-wide JSON fallback in [`crate::app`], which answers
 /// them with Pleroma's `api_not_implemented`, and merging two routers that
 /// each set a fallback panics.
 ///
-/// `state` reaches [`accounts::router`], [`apps::router`],
-/// [`polls::router`], [`remote_interaction::pleroma_router`],
-/// [`reports::router`], [`search::router`] and
-/// [`statuses::router`], the merged routers whose routes mount the rate
-/// limiter, and — as
+/// `state` reaches [`accounts::router`] and [`apps::router`], the merged
+/// routers whose routes mount the rate limiter, and — as
 /// [`state.config`] — [`media::router`], [`pleroma_settings::router`],
 /// [`admin::router`] and [`emoji_packs::router`], whose upload/install
 /// routes carry their own body limit (see
@@ -43,61 +45,76 @@ use crate::{
 /// axum's multipart extractor cannot read from the state on its own.
 ///
 /// [`state.config`]: AppState::config
-pub fn router(state: &AppState) -> Router<AppState> {
+pub fn core_router(state: &AppState) -> Router<AppState> {
     Router::new()
-        .merge(account_lists::router())
         .merge(accounts::router(state))
         .merge(announcements::router())
         .merge(apps::router(state))
+        .merge(custom_emojis::router())
+        .merge(instance::router())
+        .merge(markers::router())
+        .merge(media::router(&state.config))
+        .merge(notifications::router())
+        .merge(password_reset::pleroma_router())
+        .merge(pleroma_account_settings::mastodon_router())
+        .merge(pleroma_settings::router(&state.config))
+        .merge(preferences::router())
+        .merge(push::router())
+        .merge(streaming::router())
+        .nest("/pleroma", misc::util_router())
+        .nest("/pleroma/admin", admin::router(&state.config))
+        .nest("/pleroma/apps", oauth_tokens::apps_router())
+        .nest("/pleroma/backups", backups::router())
+        .nest("/pleroma/emoji", emoji_packs::router(&state.config))
+        .nest(
+            "/admin",
+            mastodon_admin::v1_router().merge(mastodon_admin_reports::v1_router()),
+        )
+}
+
+/// The `/api/v1` routes backed by `ActivityPub` data.
+///
+/// They read or write statuses, relationships, remote accounts or federation state.
+///
+/// Mounted by the `ActivityPub` adapter only
+/// ([`crate::protocols::adapter::ProtocolAdapter::client_api_router`]); the
+/// same fallback rule as [`core_router`] applies.
+///
+/// `state` reaches [`polls::router`], [`remote_interaction::pleroma_router`],
+/// [`reports::router`], [`search::router`], [`statuses::router`] and
+/// [`pleroma_accounts::router`], whose routes mount the rate limiter.
+pub fn activitypub_router(state: &AppState) -> Router<AppState> {
+    Router::new()
+        .merge(account_lists::router())
         .merge(blocks::router())
         .merge(conversations::router())
-        .merge(custom_emojis::router())
         .merge(domain_blocks::router())
         .merge(endorsements::router())
         .merge(endorsements::pleroma_router())
         .merge(featured_tags::router())
         .merge(filters::router())
         .merge(follow_requests::router())
-        .merge(instance::router())
         .merge(lists::router())
-        .merge(markers::router())
-        .merge(media::router(&state.config))
         .merge(mutes::router())
-        .merge(notifications::router())
-        .merge(password_reset::pleroma_router())
-        .merge(pleroma_account_settings::mastodon_router())
         .merge(pleroma_accounts::router(state))
-        .merge(pleroma_settings::router(&state.config))
         .merge(polls::router(state))
-        .merge(preferences::router())
-        .merge(push::router())
         .merge(remote_interaction::pleroma_router(state))
         .merge(reports::router(state))
         .merge(scheduled_statuses::router())
         .merge(scrobbles::router())
         .merge(search::router(state))
         .merge(statuses::router(state))
-        .merge(streaming::router())
         .merge(tags::router())
         .merge(timelines::router())
-        .nest("/pleroma", misc::util_router())
-        .nest("/pleroma/admin", admin::router(&state.config))
-        .nest("/pleroma/apps", oauth_tokens::apps_router())
-        .nest("/pleroma/backups", backups::router())
+        .merge(federation_status::router())
         .nest(
             "/pleroma/bookmark_folders",
             pleroma_bookmark_folders::router(),
         )
         .nest("/pleroma/chats", chats::router())
         .nest("/pleroma/conversations", conversations::pleroma_router())
-        .nest("/pleroma/emoji", emoji_packs::router(&state.config))
         .nest(
             "/pleroma/statuses",
             emoji_reactions::router().merge(statuses::pleroma_router()),
-        )
-        .merge(federation_status::router())
-        .nest(
-            "/admin",
-            mastodon_admin::v1_router().merge(mastodon_admin_reports::v1_router()),
         )
 }

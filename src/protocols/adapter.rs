@@ -44,6 +44,21 @@ pub trait ProtocolAdapter: Sync {
     /// they must carry their full paths.
     fn router(&self, state: &AppState) -> Router<AppState>;
 
+    /// The routes this protocol adds to the Mastodon/Pleroma-compatible client API.
+    ///
+    /// Core's client routes (login, credentials, settings, instance info) are
+    /// always mounted by [`crate::api::core_router`]; the routes that only
+    /// make sense for this protocol's data (`ActivityPub` adds its statuses,
+    /// timelines and relationships) come from here. They are kept apart from
+    /// [`Self::router`], the protocol's own server-to-server routes. Like
+    /// those, they must carry their full paths (`/api/v1/...`), and
+    /// [`crate::app`] merges them only while the protocol is enabled, so no
+    /// route may repeat one of core's or another protocol's. The default is
+    /// no routes.
+    fn client_api_router(&self, _state: &AppState) -> Router<AppState> {
+        Router::new()
+    }
+
     /// The background job kinds this protocol handles, each with its handler.
     ///
     /// [`crate::job_registry`] registers them only while the protocol is

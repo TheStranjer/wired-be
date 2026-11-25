@@ -53,11 +53,17 @@ use crate::{
 
 /// Builds the application router, wrapped in the [`middleware`] stack.
 ///
-/// The [`api`] routers are merged under their prefixes; the routers that
-/// serve addresses outside `/api` fixed by their protocols, by stored URLs
-/// or by the clients that call them — `/media` ([`media_files`]), `/proxy`
-/// ([`media_proxy`]), `/emoji` ([`api::emoji_packs`]), `/.well-known`
-/// `/.well-known` ([`discovery`], which serves core's documents and the paths
+/// The core client API ([`api::core_router`]) is always merged. The rest of
+/// the client API arrives with the enabled protocols: each adapter's
+/// [`client_api_router`](protocols::adapter::ProtocolAdapter::client_api_router)
+/// is merged too, so `ActivityPub`'s statuses and timelines are there only
+/// while `activitypub` is enabled.
+///
+/// The routers that serve addresses outside `/api` fixed by their protocols,
+/// by stored URLs or by the clients that call them — `/media`
+/// ([`media_files`]), `/proxy` ([`media_proxy`]), `/emoji`
+/// ([`api::emoji_packs`]), `/.well-known`
+/// ([`discovery`], which serves core's documents and the paths
 /// each enabled protocol owns), `/nodeinfo/{version}` ([`api::nodeinfo`]),
 /// `/oauth` ([`api::oauth`]), the `/oauth` provider-login paths
 /// ([`api::oauth_external`]), `POST /auth/password` ([`api::password_reset`],
@@ -73,7 +79,7 @@ use crate::{
 /// marked with `x-wired-fallback: 1` so a test can tell the fallback's own
 /// 404 from a handler's.
 ///
-/// `state` is handed to [`api::router`] and [`api::oauth::router`] before
+/// `state` is handed to [`api::core_router`] and [`api::oauth::router`] before
 /// it is consumed: the registration routes those build mount the rate
 /// limiter (see [`crate::rate_limit`]), whose middleware layer carries its
 /// own cheap clone of the shared state.
@@ -84,10 +90,15 @@ pub fn app(state: AppState) -> Router {
         .fold(Router::new(), |routes, adapter| {
             routes.merge(adapter.router(&state))
         });
+    let client_api_routes = protocols::registry::enabled(&state.config)
+        .fold(Router::new(), |routes, adapter| {
+            routes.merge(adapter.client_api_router(&state))
+        });
     middleware::apply(
         Router::new()
             .route("/health", get(health))
-            .merge(api::router(&state))
+            .merge(api::core_router(&state))
+            .merge(client_api_routes)
             .merge(protocol_routes)
             .merge(api::oauth::router(&state))
             .merge(api::oauth_external::router())
