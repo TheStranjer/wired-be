@@ -24,14 +24,27 @@
 //! existing code, `protocols::fixture` is the minimal one.
 
 use axum::Router;
+use futures::future::BoxFuture;
+use sqlx::PgConnection;
 
 use crate::{
     api::well_known::{self, FingerLink, WebfingerContribution},
     config::Config,
+    error::AppResult,
     federation,
     jobs::{HandlerFn, QUEUE_FEDERATOR_INCOMING, QUEUE_FEDERATOR_OUTGOING},
-    models::user::User,
-    protocols::{ProtocolId, adapter::ProtocolAdapter},
+    models::{
+        activitypub_actor::{self, ActorStatus},
+        user::{
+            User, local_ap_id, nickname_taken,
+            register::{NICKNAME_FIELD, validated_nickname},
+        },
+    },
+    protocols::{
+        ProtocolId,
+        adapter::ProtocolAdapter,
+        identity::{Identity, IdentityStatus},
+    },
     services,
     state::AppState,
 };
@@ -110,5 +123,214 @@ impl ProtocolAdapter for ActivityPub {
     /// `NodeInfo` names it `activitypub`.
     fn nodeinfo_protocol(&self) -> Option<&'static str> {
         Some("activitypub")
+    }
+
+    /// `nickname`, the key registration errors already use.
+    fn identifier_field(&self) -> &'static str {
+        NICKNAME_FIELD
+    }
+
+    /// Today's registration rules for a nickname.
+    fn validate_identifier(
+        &self,
+        requested: &str,
+        _config: &Config,
+    ) -> Result<String, Vec<String>> {
+        validated_nickname(requested)
+    }
+
+    /// The nickname itself: every valid nickname is a valid `ActivityPub` ID.
+    fn derive_identifier(&self, nickname: &str, _config: &Config) -> String {
+        nickname.to_owned()
+    }
+
+    /// Whether any account already has the nickname, in any case.
+    fn identifier_taken<'a>(
+        &'a self,
+        conn: &'a mut PgConnection,
+        identifier: &'a str,
+    ) -> BoxFuture<'a, AppResult<bool>> {
+        Box::pin(nickname_taken(conn, identifier))
+    }
+
+    /// The actor URL of the local account named `identifier`.
+    fn identifier_uri(&self, identifier: &str, config: &Config) -> String {
+        local_ap_id(&config.base_url, identifier)
+    }
+
+    /// The account's `activitypub_actors` row as an identity, `None` without one.
+    fn identity<'a>(
+        &'a self,
+        state: &'a AppState,
+        user: &'a User,
+    ) -> BoxFuture<'a, AppResult<Option<Identity>>> {
+        Box::pin(async move {
+            let row = activitypub_actor::get(&state.db, user.id).await?;
+            Ok(row.map(|actor| Identity {
+                identifier: user.nickname.clone(),
+                uri: user.ap_id.clone(),
+                status: match actor.status {
+                    ActorStatus::Pending => IdentityStatus::Pending,
+                    ActorStatus::Active => IdentityStatus::Active,
+                },
+            }))
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        test_fixtures::{local_user, remote_user},
+        test_support::app_state,
+    };
+
+    /// Inputs spanning valid, too-long, bad-character, blank and reserved nicknames.
+    const NICKNAMES: [&str; 8] = [
+        "alice",
+        "Alice_Doe-1",
+        "  padded  ",
+        "",
+        "a-nickname-that-is-way-too-long-to-pass",
+        "bad.char",
+        "admin",
+        "Admin",
+    ];
+
+    /// The adapter's validator gives the verdict and messages `validated_nickname` gives.
+    #[test]
+    fn validation_agrees_with_the_nickname_rules() {
+        let config = Config::for_tests();
+        for requested in NICKNAMES {
+            assert_eq!(
+                ActivityPub.validate_identifier(requested, &config),
+                validated_nickname(requested),
+                "for {requested:?}"
+            );
+        }
+    }
+
+    /// Spot checks of the verdicts themselves, so agreement cannot hide a broken rule.
+    #[test]
+    fn validation_verdicts() {
+        let config = Config::for_tests();
+        let verdict = |requested: &str| ActivityPub.validate_identifier(requested, &config);
+        assert_eq!(
+            verdict("  alice "),
+            Ok("alice".to_owned()),
+            "valid, trimmed"
+        );
+        assert!(verdict(&"a".repeat(31)).is_err(), "too long");
+        assert!(verdict("bad.char").is_err(), "bad character");
+        assert!(verdict("admin").is_err(), "reserved");
+        assert!(verdict("").is_err(), "blank");
+    }
+
+    /// The field key and derivation keep today's behaviour.
+    #[test]
+    fn field_and_derivation_keep_the_nickname() {
+        let config = Config::for_tests();
+        assert_eq!(ActivityPub.identifier_field(), "nickname", "field");
+        assert_eq!(
+            ActivityPub.derive_identifier("Cool_Guy", &config),
+            "Cool_Guy",
+            "derived ID"
+        );
+    }
+
+    /// The URI is the actor URL.
+    #[test]
+    fn uri_is_the_actor_url() {
+        let config = Config::for_tests();
+        assert_eq!(
+            ActivityPub.identifier_uri("alice", &config),
+            local_ap_id(&config.base_url, "alice"),
+            "uri"
+        );
+    }
+
+    /// Taken is the case-insensitive nickname check.
+    #[tokio::test]
+    async fn taken_means_a_nickname_in_any_case() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let _user = local_user(db.pool(), "Taken_Name").await;
+        let mut conn = db.pool().acquire().await.expect("a connection");
+
+        let same = ActivityPub.identifier_taken(&mut conn, "Taken_Name").await;
+        let other_case = ActivityPub.identifier_taken(&mut conn, "taken_name").await;
+        let free = ActivityPub.identifier_taken(&mut conn, "free_name").await;
+
+        assert!(same.expect("lookup"), "same spelling");
+        assert!(other_case.expect("lookup"), "other case");
+        assert!(!free.expect("lookup"), "unused nickname");
+    }
+
+    /// A registered local user is an active identity at its actor URL.
+    #[tokio::test]
+    async fn local_user_identity_is_active_at_the_actor_url() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let state = app_state(db.pool());
+        let user = local_user(db.pool(), "identity_user").await;
+
+        let identity = ActivityPub.identity(&state, &user).await;
+
+        assert_eq!(
+            identity.expect("lookup"),
+            Some(Identity {
+                identifier: "identity_user".to_owned(),
+                uri: local_ap_id(&state.config.base_url, "identity_user"),
+                status: IdentityStatus::Active,
+            }),
+            "identity"
+        );
+    }
+
+    /// A pending actor row is a pending identity.
+    #[tokio::test]
+    async fn pending_actor_is_a_pending_identity() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let state = app_state(db.pool());
+        let user = local_user(db.pool(), "pending_user").await;
+        sqlx::query("UPDATE activitypub_actors SET status = 'pending' WHERE user_id = $1")
+            .bind(user.id)
+            .execute(db.pool())
+            .await
+            .expect("the status updates");
+
+        let identity = ActivityPub.identity(&state, &user).await;
+
+        let identity = identity.expect("lookup").expect("enrolled");
+        assert_eq!(identity.status, IdentityStatus::Pending, "status");
+    }
+
+    /// A user without an actor row is not enrolled.
+    #[tokio::test]
+    async fn user_without_an_actor_row_has_no_identity() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let state = app_state(db.pool());
+        let user = local_user(db.pool(), "unenrolled_user").await;
+        sqlx::query("DELETE FROM activitypub_actors WHERE user_id = $1")
+            .bind(user.id)
+            .execute(db.pool())
+            .await
+            .expect("the row is removed");
+
+        let identity = ActivityPub.identity(&state, &user).await;
+
+        assert_eq!(identity.expect("lookup"), None, "not enrolled");
+    }
+
+    /// A remote mirror's identity is its own actor id.
+    #[tokio::test]
+    async fn remote_user_identity_uses_its_actor_id() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let state = app_state(db.pool());
+        let user = remote_user(db.pool(), "far_away").await;
+
+        let identity = ActivityPub.identity(&state, &user).await;
+
+        let identity = identity.expect("lookup").expect("enrolled");
+        assert_eq!(identity.uri, user.ap_id, "uri");
     }
 }

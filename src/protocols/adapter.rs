@@ -1,13 +1,16 @@
 //! The trait every protocol implements to plug into the application.
 
 use axum::{Router, routing::MethodRouter};
+use futures::future::BoxFuture;
+use sqlx::PgConnection;
 
 use crate::{
     api::well_known::{FingerLink, WebfingerContribution},
     config::Config,
+    error::AppResult,
     jobs::HandlerFn,
     models::user::User,
-    protocols::ProtocolId,
+    protocols::{ProtocolId, identity::Identity},
     state::AppState,
 };
 
@@ -94,4 +97,60 @@ pub trait ProtocolAdapter: Sync {
     fn nodeinfo_protocol(&self) -> Option<&'static str> {
         None
     }
+
+    /// The [`FieldErrors`](crate::models::user::register::FieldErrors) key of this protocol's ID.
+    ///
+    /// Errors from [`Self::validate_identifier`] are reported under it.
+    /// `ActivityPub` answers `"nickname"`, which keeps the keys of existing
+    /// registration errors.
+    fn identifier_field(&self) -> &'static str;
+
+    /// Normalises `requested` and accepts it as this protocol's ID, or says why not.
+    ///
+    /// Returns the normalised ID on success and every message the ID earned
+    /// on failure. It judges the shape only; whether the ID is free is
+    /// [`Self::identifier_taken`].
+    ///
+    /// # Errors
+    ///
+    /// The messages, in the order the rules ran.
+    fn validate_identifier(&self, requested: &str, config: &Config) -> Result<String, Vec<String>>;
+
+    /// Converts any `WiredBE` nickname into an ID this protocol accepts.
+    ///
+    /// The result must pass [`Self::validate_identifier`] for every valid
+    /// nickname. It need not be free:
+    /// [`suggest_identifier`](crate::protocols::identity::suggest_identifier)
+    /// makes it unique.
+    fn derive_identifier(&self, nickname: &str, config: &Config) -> String;
+
+    /// Whether `identifier` already belongs to an account of this protocol.
+    ///
+    /// # Errors
+    ///
+    /// Any database failure.
+    fn identifier_taken<'a>(
+        &'a self,
+        conn: &'a mut PgConnection,
+        identifier: &'a str,
+    ) -> BoxFuture<'a, AppResult<bool>>;
+
+    /// `identifier` written as a URI, for linking identities across protocols.
+    ///
+    /// `ActivityPub` gives the actor URL.
+    fn identifier_uri(&self, identifier: &str, config: &Config) -> String;
+
+    /// The identity `user` has on this protocol, or `None` when not enrolled.
+    ///
+    /// The protocol's own main table is the identity record: a row there
+    /// means enrolled, and its status says whether the identity is claimed.
+    ///
+    /// # Errors
+    ///
+    /// Any database failure.
+    fn identity<'a>(
+        &'a self,
+        state: &'a AppState,
+        user: &'a User,
+    ) -> BoxFuture<'a, AppResult<Option<Identity>>>;
 }

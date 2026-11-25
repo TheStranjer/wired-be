@@ -9,14 +9,22 @@
 //! `protocols::activitypub` is the other worked example, a façade over a
 //! large existing implementation.
 
+use std::{
+    collections::HashSet,
+    sync::{LazyLock, Mutex, MutexGuard, PoisonError},
+};
+
 use axum::{Json, Router, http::StatusCode, routing::MethodRouter, routing::get};
+use futures::future::BoxFuture;
+use sqlx::PgConnection;
 
 use crate::{
     api::well_known::{FingerLink, WebfingerContribution},
     config::Config,
+    error::AppResult,
     jobs::{AttemptInfo, HandlerFn, HandlerFuture, JobError},
     models::user::User,
-    protocols::{ProtocolId, adapter::ProtocolAdapter},
+    protocols::{ProtocolId, adapter::ProtocolAdapter, identity::Identity},
     state::AppState,
 };
 
@@ -53,6 +61,32 @@ pub const WELL_KNOWN_PATH: &str = "/.well-known/fixture";
 
 /// The `rel` of the fixture's host-meta link.
 pub const HOST_META_REL: &str = "urn:wired:fixture";
+
+/// The longest fixture ID, in characters.
+const IDENTIFIER_MAX_LEN: usize = 30;
+
+/// The IDs the fixture treats as taken, standing in for a protocol's table.
+static TAKEN_IDENTIFIERS: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(Mutex::default);
+
+/// Locks [`TAKEN_IDENTIFIERS`], ignoring a poisoning left by a panicked test.
+fn taken_identifiers() -> MutexGuard<'static, HashSet<String>> {
+    TAKEN_IDENTIFIERS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Marks `identifier` as taken, as a row in the protocol's table would.
+///
+/// The set is shared by every test in the process, so a test uses IDs no
+/// other test uses.
+pub fn mark_taken(identifier: &str) {
+    taken_identifiers().extend([identifier.to_owned()]);
+}
+
+/// Whether `c` may appear in a fixture ID: `a-z`, `0-9` or `-`.
+const fn is_identifier_char(c: char) -> bool {
+    c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'
+}
 
 /// `GET /fixture/ping`: answers 204 No Content.
 async fn ping() -> StatusCode {
@@ -111,5 +145,145 @@ impl ProtocolAdapter for Fixture {
     /// No name: `NodeInfo` has no protocol called `fixture`.
     fn nodeinfo_protocol(&self) -> Option<&'static str> {
         None
+    }
+
+    /// `fixture_identifier`.
+    fn identifier_field(&self) -> &'static str {
+        "fixture_identifier"
+    }
+
+    /// Trims and lowercases, then requires `^[a-z0-9-]{1,30}$`.
+    fn validate_identifier(
+        &self,
+        requested: &str,
+        _config: &Config,
+    ) -> Result<String, Vec<String>> {
+        let identifier = requested.trim().to_ascii_lowercase();
+        let mut errors = Vec::new();
+        if !(1..=IDENTIFIER_MAX_LEN).contains(&identifier.chars().count()) {
+            errors.push(format!("should be 1 to {IDENTIFIER_MAX_LEN} character(s)"));
+        }
+        if !identifier.chars().all(is_identifier_char) {
+            errors.push("may only contain a-z, 0-9 and -".to_owned());
+        }
+        if errors.is_empty() {
+            Ok(identifier)
+        } else {
+            Err(errors)
+        }
+    }
+
+    /// Lowercases the nickname and maps `_` to `-`.
+    fn derive_identifier(&self, nickname: &str, _config: &Config) -> String {
+        nickname.to_ascii_lowercase().replace('_', "-")
+    }
+
+    /// Whether [`mark_taken`] marked the ID; the connection is not used.
+    fn identifier_taken<'a>(
+        &'a self,
+        _conn: &'a mut PgConnection,
+        identifier: &'a str,
+    ) -> BoxFuture<'a, AppResult<bool>> {
+        let taken = taken_identifiers().contains(identifier);
+        Box::pin(async move { Ok(taken) })
+    }
+
+    /// `fixture:<id>`.
+    fn identifier_uri(&self, identifier: &str, _config: &Config) -> String {
+        format!("fixture:{identifier}")
+    }
+
+    /// Always `None`: the fixture has no table, and nothing claims an identity yet.
+    fn identity<'a>(
+        &'a self,
+        _state: &'a AppState,
+        _user: &'a User,
+    ) -> BoxFuture<'a, AppResult<Option<Identity>>> {
+        Box::pin(async { Ok(None) })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::app_state;
+
+    /// Validates `requested` with the test config.
+    fn validate(requested: &str) -> Result<String, Vec<String>> {
+        Fixture.validate_identifier(requested, &Config::for_tests())
+    }
+
+    /// Derivation lowercases and maps `_` to `-`.
+    #[test]
+    fn derivation_lowercases_and_maps_underscores() {
+        let derived = Fixture.derive_identifier("Cool_Guy", &Config::for_tests());
+        assert_eq!(derived, "cool-guy", "derived ID");
+    }
+
+    /// A derived ID passes the validator, for the longest and the shortest nickname.
+    #[test]
+    fn derived_identifiers_validate() {
+        let config = Config::for_tests();
+        let longest = "Z_".repeat(15);
+        for nickname in ["A", "Under_Score_NAME", longest.as_str()] {
+            let derived = Fixture.derive_identifier(nickname, &config);
+            assert_eq!(validate(&derived), Ok(derived), "derived from {nickname}");
+        }
+    }
+
+    /// Validation trims and lowercases.
+    #[test]
+    fn validation_normalises() {
+        assert_eq!(validate("  Mixed-Case1 "), Ok("mixed-case1".to_owned()));
+    }
+
+    /// Validation rejects blank, long and badly spelled IDs, each with a message.
+    #[test]
+    fn validation_rejects_bad_identifiers() {
+        assert!(rejected_once("   "), "blank");
+        assert!(rejected_once(&"a".repeat(31)), "31 characters");
+        assert!(rejected_once("under_score"), "underscore");
+        assert!(rejected_once("dot.ted"), "dot");
+        assert!(
+            validate(&"a".repeat(30)).is_ok(),
+            "30 characters is allowed"
+        );
+    }
+
+    /// Whether `requested` is refused with exactly one message.
+    fn rejected_once(requested: &str) -> bool {
+        matches!(validate(requested), Err(messages) if messages.len() == 1)
+    }
+
+    /// The error key, the URI scheme and the taken set are the fixture's own.
+    #[tokio::test]
+    async fn field_uri_and_taken_set() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let mut conn = db.pool().acquire().await.expect("a connection");
+        assert_eq!(Fixture.identifier_field(), "fixture_identifier", "field");
+        assert_eq!(
+            Fixture.identifier_uri("cool-guy", &Config::for_tests()),
+            "fixture:cool-guy",
+            "uri"
+        );
+
+        let before = Fixture.identifier_taken(&mut conn, "taken-by-test").await;
+        mark_taken("taken-by-test");
+        let after = Fixture.identifier_taken(&mut conn, "taken-by-test").await;
+
+        assert!(!before.expect("lookup"), "free before it is marked");
+        assert!(after.expect("lookup"), "taken once marked");
+    }
+
+    /// The fixture has no identity for a user until a later ticket lets one be claimed.
+    #[tokio::test]
+    async fn identity_is_none_until_claimed() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let state = app_state(db.pool());
+        let user = crate::test_fixtures::local_user(db.pool(), "fixture_user").await;
+
+        let identity = Fixture.identity(&state, &user).await;
+
+        assert_eq!(identity.expect("lookup"), None, "not enrolled");
     }
 }

@@ -202,6 +202,29 @@ pub async fn create_local_user(
     Ok(user)
 }
 
+/// The nickname a request for `requested` would register, or why it cannot.
+///
+/// It applies the rules [`create_local_user`] applies to a nickname (trim,
+/// then [`validate_nickname`]) and nothing else: availability is a separate
+/// question, answered by [`nickname_taken`](super::nickname_taken). This is
+/// `ActivityPub`'s identifier validator.
+///
+/// # Errors
+///
+/// Every message the nickname earned, in the order the rules ran.
+pub(crate) fn validated_nickname(requested: &str) -> Result<String, Vec<String>> {
+    let nickname = requested.trim();
+    let mut errors = FieldErrors::new();
+    validate_nickname(nickname, &mut errors);
+    match errors.remove(NICKNAME_FIELD) {
+        Some(messages) => Err(messages),
+        None => Ok(nickname.to_owned()),
+    }
+}
+
+/// The [`FieldErrors`] key of the nickname, which `ActivityPub` also uses for its identifier.
+pub(crate) const NICKNAME_FIELD: &str = "nickname";
+
 /// Whether `email` looks like `x@y.z`: a non-empty local part, exactly one
 /// `@`, and a domain of at least two dot-separated hostname labels
 /// (Pleroma's local-part class, and a dotted domain as Mastodon's email

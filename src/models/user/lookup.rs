@@ -3,7 +3,7 @@
 //! candidate search and [`active_local_ids`]. Every read answers `None`
 //! (or skips the id) for a row that is not there.
 
-use sqlx::PgPool;
+use sqlx::{PgExecutor, PgPool};
 use uuid::Uuid;
 
 use super::User;
@@ -43,6 +43,28 @@ pub async fn get_by_nickname(pool: &PgPool, nickname: &str) -> AppResult<Option<
         .fetch_optional(pool)
         .await?;
     Ok(user)
+}
+
+/// Whether any account, local or remote mirror, already has nickname `nickname`.
+///
+/// The comparison is case-insensitive like [`get_by_nickname`]'s. It is the
+/// availability rule of registration and of the `ActivityPub` identifier.
+///
+/// # Errors
+///
+/// Any database failure (connection, encoding) arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn nickname_taken<'e, E>(executor: E, nickname: &str) -> AppResult<bool>
+where
+    E: PgExecutor<'e>,
+{
+    let taken = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS (SELECT 1 FROM users WHERE nickname = $1::citext)",
+    )
+    .bind(nickname)
+    .fetch_one(executor)
+    .await?;
+    Ok(taken)
 }
 
 /// Fetches the local, active user named `nickname` for a route that serves
