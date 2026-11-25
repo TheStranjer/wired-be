@@ -3,19 +3,20 @@
 //! raise `poll` only when a poll ends). The shared creation plumbing this
 //! call lives in the parent module.
 
+use tracing::warn;
 use uuid::Uuid;
 
 use crate::{
     error::AppResult,
     models::{
-        notification::{self, TYPE_POLL, Telling},
+        notification::{self, TYPE_POLL, TYPE_UPDATE, Telling},
         poll::{self, Poll as PollRow},
         status, user,
     },
     state::AppState,
 };
 
-use super::{announce, tell, told_row};
+use super::{announce, tell, tell_local, told_row};
 
 /// The [`polls.end_notify`](crate::jobs::polls::KIND_END_NOTIFY) sweep's
 /// telling: the poll's author and every local voter are told `poll`, with
@@ -94,12 +95,62 @@ async fn poll_end_voter_telling(
     tell(state, &voter, actor_id, TYPE_POLL, Some(poll.status_id)).await
 }
 
+/// Tells the voters of a restarted poll that its author edited the post.
+///
+/// Every account in `voter_ids` (the voters the edit just deleted the
+/// ballots of) is told `update` naming the post, the author as actor —
+/// Mastodon's `UpdateStatusService` notifies the accounts that voted when
+/// an edit changes a poll's options.
+///
+/// A voter who is no local account, or who is the author, is nobody to
+/// tell from here (the remote ones' servers get the federated `Update`).
+/// A failure is logged, never returned: the edit has already been written.
+pub async fn on_poll_restarted(state: &AppState, row: &status::Status, voter_ids: &[Uuid]) {
+    for voter_id in voter_ids {
+        let told = tell_local(state, *voter_id, row.user_id, TYPE_UPDATE, Some(row.id)).await;
+        if let Err(err) = told {
+            warn!(
+                status = %row.id,
+                voter = %voter_id,
+                %err,
+                "could not tell a voter about the edit of a poll"
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::services::notify::test_support::{
         app_state, ballot, facts, local, poll_on, post, remote, rows,
     };
+
+    #[tokio::test]
+    async fn a_restarted_poll_tells_its_local_voters_an_update() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool();
+        let state = app_state(pool);
+        let alice = local(pool, "pu-alice").await;
+        let bob = local(pool, "pu-bob").await;
+        let mallory = remote(pool, "pu-mallory", "remote.example").await;
+        let posted = post(pool, &alice, "which?").await;
+
+        on_poll_restarted(&state, &posted, &[bob.id, mallory.id, alice.id]).await;
+        assert_eq!(
+            facts(pool, bob.id).await,
+            vec![(TYPE_UPDATE.to_owned(), alice.id, Some(posted.id))],
+            "the local voter hears the edit, from the author"
+        );
+        assert!(
+            rows(pool, mallory.id).await.is_empty(),
+            "a remote voter is told by the federated Update"
+        );
+        assert!(
+            rows(pool, alice.id).await.is_empty(),
+            "the author is not told of their own edit"
+        );
+    }
 
     #[tokio::test]
     async fn the_end_of_a_remote_poll_tells_its_local_voter_once() {

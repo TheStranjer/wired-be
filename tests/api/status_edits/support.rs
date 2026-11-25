@@ -8,6 +8,7 @@ mod history_source_gates;
 mod media;
 mod media_attributes;
 mod media_history;
+mod polls;
 
 use axum::{Router, http::StatusCode};
 use serde_json::{Value, json};

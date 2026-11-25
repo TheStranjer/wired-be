@@ -65,6 +65,7 @@ use crate::models::user;
 
 mod cast_vote;
 mod create;
+mod edit;
 mod ending;
 mod reads;
 mod replace;
@@ -75,6 +76,7 @@ mod test_support;
 
 pub use cast_vote::cast_vote;
 pub use create::{RemoteTotals, create, record_remote_totals};
+pub use edit::{PollEdit, Standing, apply_edit, standing};
 pub use ending::{fetch_ended_unnotified, mark_ended_notified, voter_ids};
 pub use reads::{for_statuses, get_by_id, get_for_status, options, options_for_statuses};
 pub use replace::{delete_for_status, replace_remote_poll};

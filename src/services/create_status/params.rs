@@ -178,7 +178,7 @@ pub struct CreateStatusParams {
 ///
 /// [`ApiBody`]: crate::extract::ApiBody
 /// [`flex`]: crate::extract::flex
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct PollRequest {
     /// The options as posted, in order. `#[serde(default)]` lets a poll
     /// that names no options at all reach `checked_poll`'s minimum of

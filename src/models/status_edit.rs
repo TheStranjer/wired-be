@@ -34,12 +34,14 @@ use uuid::Uuid;
 
 use crate::{
     error::AppResult,
-    models::{hashtag, media_attachment::claimable_predicate, mention, status::Status},
+    models::{hashtag, media_attachment::claimable_predicate, mention, poll, status::Status},
     util::id::new_id,
 };
 
 pub mod media_attributes;
 mod media_snapshot;
+#[cfg(test)]
+mod poll_tests;
 
 /// The live row [`update_status`] edits, locked: `FOR UPDATE` serializes two
 /// concurrent edits of one status, so each transaction snapshots exactly
@@ -55,9 +57,9 @@ const LIVE_FOR_UPDATE_SQL: &str = "SELECT * FROM statuses
 const RECORD_SQL: &str = "INSERT INTO status_edits (
      id, status_id, content, raw_text, spoiler_text, sensitive,
      media_ids, created_at, account_id,
-     media_descriptions, media_focus_x, media_focus_y
+     media_descriptions, media_focus_x, media_focus_y, poll_options
 ) VALUES (
-     $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12
+     $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13
 )";
 
 /// The media ids of the live post: the status's attachments in render
@@ -167,6 +169,10 @@ pub struct StatusEdit {
     pub media_focus_x: Option<Vec<Option<f32>>>,
     /// The vertical focal axis each attachment carried, aligned likewise.
     pub media_focus_y: Option<Vec<Option<f32>>>,
+    /// The poll option titles that version asked, in order; `None` for a
+    /// version that carried no poll and for a revision recorded before the
+    /// snapshot existed.
+    pub poll_options: Option<Vec<String>>,
 }
 
 /// The whole new state one edit writes onto a status.
@@ -218,6 +224,13 @@ pub struct EditParams {
     /// version, like [`media_attributes`](Self::media_attributes). Local
     /// edits leave it empty.
     pub media_refresh: Vec<media_attributes::MediaRefresh>,
+    /// The poll the post carries after the edit: `None` leaves the poll (or
+    /// the lack of one) exactly as it is; `Some` creates it, restates it
+    /// with the votes kept, or restarts it with the votes deleted — see
+    /// [`poll::apply_edit`]. A poll whose options or choice mode changed
+    /// counts as a change to the version, whose old options the revision
+    /// snapshots.
+    pub poll: Option<poll::PollEdit>,
 }
 
 /// Snapshots the current state of `status` as a revision row on `conn`.
@@ -237,6 +250,9 @@ pub struct EditParams {
 /// [`AppError::Database`](crate::error::AppError).
 pub async fn record_revision(conn: &mut PgConnection, status: &Status) -> AppResult<()> {
     let media = media_snapshot::load(conn, status.id).await?;
+    let poll_options = poll::standing(conn, status.id)
+        .await?
+        .map(|standing| standing.titles);
     sqlx::query(RECORD_SQL)
         .bind(new_id())
         .bind(status.id)
@@ -250,6 +266,7 @@ pub async fn record_revision(conn: &mut PgConnection, status: &Status) -> AppRes
         .bind(&media.descriptions)
         .bind(&media.focus_x)
         .bind(&media.focus_y)
+        .bind(&poll_options)
         .execute(&mut *conn)
         .await
         .map(drop)?;
@@ -318,12 +335,19 @@ pub async fn update_status(
         &params.media_refresh,
     )
     .await?;
+    let standing = poll::standing(&mut tx, status_id).await?;
+    let poll_changed = params.poll.as_ref().is_some_and(|edit| {
+        standing
+            .as_ref()
+            .is_none_or(|stand| edit.resets_votes(stand))
+    });
     let changed = edit_changes_a_version(
         &row,
         &params,
         new_media.as_ref(),
         &current_media,
-        !attributes.is_empty(),
+        // A restarted question is a new version, as new alt text is.
+        !attributes.is_empty() || poll_changed,
     );
     if changed {
         record_revision(&mut tx, &row).await?;
@@ -337,6 +361,9 @@ pub async fn update_status(
         replace_media(&mut tx, status_id, kept).await?;
     }
     media_attributes::write(&mut tx, &attributes).await?;
+    if let Some(edit) = &params.poll {
+        poll::apply_edit(&mut tx, status_id, edit, standing.as_ref()).await?;
+    }
     tx.commit().await?;
     Ok(Some(updated))
 }
@@ -541,6 +568,7 @@ mod tests {
             edited_at: None,
             media_attributes: Vec::new(),
             media_refresh: Vec::new(),
+            poll: None,
         }
     }
 

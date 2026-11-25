@@ -196,6 +196,7 @@ fn edit_params(
         edited_at,
         media_attributes: Vec::new(),
         media_refresh: media_plan.refreshes().to_vec(),
+        poll: None,
     }
 }
 

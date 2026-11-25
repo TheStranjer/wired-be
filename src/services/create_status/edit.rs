@@ -13,7 +13,7 @@ use tracing::debug;
 use uuid::Uuid;
 
 use super::{
-    CreateStatusParams, POLL_WITH_MEDIA, TOO_MANY_ATTACHMENTS,
+    CheckedPoll, CreateStatusParams, POLL_WITH_MEDIA, PollRequest, TOO_MANY_ATTACHMENTS,
     edit_media::{MediaAttribute, into_changes},
     quote_fallback::edit_fallback,
     render_status_fields,
@@ -22,8 +22,17 @@ use super::{
 use crate::{
     entities::status::Status,
     error::{AppError, AppResult},
-    models::{media_attachment, poll, status, status_edit, user::User},
-    services::render_status::{ViewerMode, render_status},
+    models::{
+        media_attachment,
+        poll::{self, PollEdit},
+        status, status_edit,
+        status_edit::media_attributes::MediaAttributeChange,
+        user::User,
+    },
+    services::{
+        notify,
+        render_status::{ViewerMode, render_status},
+    },
     state::AppState,
     util::id::parse_id,
 };
@@ -66,6 +75,12 @@ pub struct EditStatusParams {
     /// [`edit_media`](super::edit_media).
     #[serde(default, deserialize_with = "super::edit_media::deserialize")]
     media_attributes: Option<Vec<MediaAttribute>>,
+    /// The poll the post is left with, in the create body's own shape
+    /// (`poll[options][]`, `poll[multiple]`, `poll[expires_in]`,
+    /// `poll[hide_totals]`) and under its rules; absent keeps the stored
+    /// poll and its votes, as Mastodon does. See [`edit_status`].
+    #[serde(default)]
+    poll: Option<PollRequest>,
 }
 
 /// The edit body merged over the stored row: every [`CreateStatusParams`]
@@ -88,8 +103,9 @@ fn merged_body(row: &status::Status, params: &EditStatusParams) -> CreateStatusP
         // (Pleroma's `make_update_data` carries it forward the same way)
         // — and never its parent: an edit rewrites what was said in the
         // thread it stands in, and `in_reply_to_id` is not an edit
-        // parameter. Neither is a poll: a post's question is fixed when it
-        // is asked, and neither is a quote: `quote_id` is a creation
+        // parameter. A poll is one: the body's own `poll` rides through the
+        // create path's poll rules, and its absence keeps the stored poll.
+        // A quote is not: `quote_id` is a creation
         // parameter, the stored `quote_of_id` rides along untouched. The
         // edit's own `media_ids` ride [`status_edit::EditParams`] through
         // [`crate::models::status_edit::update_status`]'s replacement arm,
@@ -102,7 +118,7 @@ fn merged_body(row: &status::Status, params: &EditStatusParams) -> CreateStatusP
         expires_in: None,
         in_reply_to_id: None,
         in_reply_to_conversation_id: None,
-        poll: None,
+        poll: params.poll.clone(),
         media_ids: None,
         scheduled_at: None,
     }
@@ -142,6 +158,16 @@ fn kept<T, F: FnOnce() -> T>(submitted: Option<T>, stored: F) -> Option<T> {
 /// `focus` are checked as the media endpoint checks them, and an entry that
 /// alters what is stored counts as a change to the version.
 ///
+/// The body's `poll` goes through the create's own poll rules (option count
+/// and length, the `expires_in` window) and, absent, leaves the stored poll
+/// and its votes alone. A poll whose options or choice mode differ from the
+/// stored one restarts: the votes are deleted, the counters return to zero,
+/// the superseded version snapshots the old options, and every local voter
+/// is told `update` ([`notify::on_poll_restarted`]); the `Update` the route's
+/// hook publishes carries the `Question` with the new options at zero. The
+/// same options with only a new `expires_in` or `hide_totals` keep the votes.
+/// A post with no poll gets one, unless it carries attachments.
+///
 /// An edit that submits more `media_ids` than
 /// [`crate::config::Config::max_media_attachments`] is refused with 422
 /// `Too many attachments`, and one that leaves a polled post with any
@@ -165,32 +191,11 @@ pub async fn edit_status(
     params: EditStatusParams,
 ) -> AppResult<Option<Status>> {
     let merged = merged_body(row, &params);
-    if params
-        .media_ids
-        .as_ref()
-        .is_some_and(|ids| ids.len() > state.config.max_media_attachments)
-    {
-        return Err(AppError::Unprocessable(TOO_MANY_ATTACHMENTS.to_owned()));
-    }
-    let media_attributes = match &params.media_attributes {
-        Some(entries) => into_changes(&state.config, entries)?,
-        None => Vec::new(),
-    };
-    let media_ids: Option<Vec<Uuid>> = params
-        .media_ids
-        .as_ref()
-        .map(|ids| ids.iter().filter_map(|id| parse_id(id)).collect());
+    let media = media_plan(state, row, &params).await?;
     let has_poll = poll::for_statuses(&state.db, &[row.id])
         .await?
         .contains_key(&row.id);
-    let carries_attachment = match &media_ids {
-        Some(ids) => !ids.is_empty(),
-        None => media_attachment::for_statuses(&state.db, &[row.id])
-            .await?
-            .get(&row.id)
-            .is_some_and(|current| !current.is_empty()),
-    };
-    let backing = if carries_attachment || has_poll {
+    let backing = if media.carries_attachment || has_poll {
         Backing::StoredPost
     } else {
         Backing::Body
@@ -202,9 +207,10 @@ pub async fn edit_status(
         &merged,
         backing,
     )?;
-    if has_poll && carries_attachment {
+    if (has_poll || checked.poll.is_some()) && media.carries_attachment {
         return Err(AppError::Unprocessable(POLL_WITH_MEDIA.to_owned()));
     }
+    let poll_plan = plan_poll(state, row, checked.poll.as_ref()).await?;
     let fields = render_status_fields(state, checked.text, checked.content_type).await?;
     let mut content = fields.content;
     if let Some(paragraph) = edit_fallback(state, row, checked.text).await? {
@@ -219,14 +225,16 @@ pub async fn edit_status(
         language: checked.language.map(str::to_owned),
         mentioned_user_ids: fields.mentioned_user_ids,
         hashtags: fields.hashtags,
-        media_ids,
+        media_ids: media.ids,
         edited_at: None,
-        media_attributes,
+        media_attributes: media.attributes,
         media_refresh: Vec::new(),
+        poll: poll_plan.edit,
     };
     let Some(updated) = status_edit::update_status(&state.db, row.id, edit).await? else {
         return Ok(None);
     };
+    notify::on_poll_restarted(state, &updated, &poll_plan.voter_ids).await;
     debug!(
         status = %updated.id,
         user = %user.id,
@@ -235,6 +243,120 @@ pub async fn edit_status(
     );
     render_status(state, ViewerMode::user(user), &updated).await
 }
+
+/// What an edit's media parameters resolve to, before anything is written.
+struct MediaPlan {
+    /// The checked `media_attributes` entries.
+    attributes: Vec<MediaAttributeChange>,
+    /// The submitted attachment set read as ids; `None` when the body says
+    /// nothing about media.
+    ids: Option<Vec<Uuid>>,
+    /// Whether the post wears an attachment once the edit lands.
+    carries_attachment: bool,
+}
+
+/// Resolves the media parameters of `params` for the post `row`.
+///
+/// # Errors
+///
+/// [`AppError::Unprocessable`] with `Too many attachments` for a set over
+/// the instance cap and with the `media_attributes` refusals of
+/// [`into_changes`]; a database failure arrives as [`AppError::Database`].
+async fn media_plan(
+    state: &AppState,
+    row: &status::Status,
+    params: &EditStatusParams,
+) -> AppResult<MediaPlan> {
+    if params
+        .media_ids
+        .as_ref()
+        .is_some_and(|ids| ids.len() > state.config.max_media_attachments)
+    {
+        return Err(AppError::Unprocessable(TOO_MANY_ATTACHMENTS.to_owned()));
+    }
+    let attributes = match &params.media_attributes {
+        Some(entries) => into_changes(&state.config, entries)?,
+        None => Vec::new(),
+    };
+    let ids: Option<Vec<Uuid>> = params
+        .media_ids
+        .as_ref()
+        .map(|submitted| submitted.iter().filter_map(|id| parse_id(id)).collect());
+    let carries_attachment = match &ids {
+        Some(kept) => !kept.is_empty(),
+        None => media_attachment::for_statuses(&state.db, &[row.id])
+            .await?
+            .get(&row.id)
+            .is_some_and(|current| !current.is_empty()),
+    };
+    Ok(MediaPlan {
+        attributes,
+        ids,
+        carries_attachment,
+    })
+}
+
+/// What an edit's poll parameter resolves to, before anything is written.
+struct PollPlan {
+    /// The poll the post is left with; `None` when the body names none and
+    /// the stored poll (if any) stays as it is.
+    edit: Option<PollEdit>,
+    /// The accounts whose ballots the edit deletes, to be told afterwards;
+    /// empty unless the options or the choice mode change.
+    voter_ids: Vec<Uuid>,
+}
+
+/// Resolves the checked poll of an edit against the poll `row` carries.
+///
+/// # Errors
+///
+/// A database failure arrives as [`AppError::Database`].
+async fn plan_poll(
+    state: &AppState,
+    row: &status::Status,
+    checked: Option<&CheckedPoll>,
+) -> AppResult<PollPlan> {
+    let Some(checked) = checked else {
+        return Ok(PollPlan {
+            edit: None,
+            voter_ids: Vec::new(),
+        });
+    };
+    let edit = PollEdit {
+        options: checked.options.clone(),
+        multiple: checked.multiple,
+        hide_totals: checked.hide_totals,
+        expires_at: checked.expires_at,
+    };
+    let Some(stored) = poll::get_for_status(&state.db, row.id).await? else {
+        return Ok(PollPlan {
+            edit: Some(edit),
+            voter_ids: Vec::new(),
+        });
+    };
+    let titles = poll::options(&state.db, stored.id)
+        .await?
+        .into_iter()
+        .map(|option| option.title)
+        .collect();
+    let standing = poll::Standing {
+        poll_id: stored.id,
+        multiple: stored.multiple,
+        titles,
+    };
+    let voter_ids = if edit.resets_votes(&standing) {
+        poll::voter_ids(&state.db, stored.id).await?
+    } else {
+        Vec::new()
+    };
+    Ok(PollPlan {
+        edit: Some(edit),
+        voter_ids,
+    })
+}
+
+#[cfg(test)]
+mod poll_tests;
 
 #[cfg(test)]
 mod tests {
@@ -268,6 +390,7 @@ mod tests {
         assert_eq!(empty.content_type, None, "the type");
         assert_eq!(empty.media_ids, None, "and nothing is said about media");
         assert_eq!(empty.media_attributes, None, "or about its metadata");
+        assert!(empty.poll.is_none(), "or about its poll");
 
         let full = body(json!({
             "status": "new words",
