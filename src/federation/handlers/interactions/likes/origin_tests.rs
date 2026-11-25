@@ -1,15 +1,14 @@
-//! Which instance a delivered reaction's custom emoji is filed under: the
-//! one the `Emoji` tag names, not the reactor's.
+//! Which image and origin a delivered reaction's custom emoji is stored
+//! under: never the reactor's say-so about an emoji that is not its own.
 
 use serde_json::{Value, json};
 use sqlx::PgPool;
 
-use super::super::tests::{app_state, local_post, signer, view};
+use super::super::tests::{app_state, local_post, view};
 use super::*;
 use crate::{
-    config::TEST_BASE_URL,
     models::{
-        custom_emoji::NewCustomEmoji,
+        custom_emoji::{self, NewCustomEmoji},
         emoji_reaction::for_statuses,
         status::Status,
         user::{Flag, NewUser, insert},
@@ -21,6 +20,8 @@ use crate::{
 const WIRED_URL: &str = "https://test.example/emoji/wired/wiredcat.png";
 /// `misskey.test`'s image of `:misskeycat:`.
 const MISSKEY_URL: &str = "https://misskey.test/files/misskeycat.png";
+/// An image an attacker would like shown.
+const EVIL_URL: &str = "https://evil.example/emoji/shock.png";
 
 /// A remote account `nickname` of `domain`.
 async fn reactor(pool: &PgPool, nickname: &str, domain: &str) -> User {
@@ -52,13 +53,13 @@ fn tag(code: &str, id: Option<&str>, url: &str) -> Value {
 }
 
 /// Delivers `who`'s `EmojiReact` `n` of `:code:` with `tag` to `post`.
-async fn deliver_react(
+async fn deliver(
     state: &AppState,
     who: &User,
     post: &Status,
     (n, code): (&str, &str),
     tag: Value,
-) {
+) -> Outcome {
     let react = view(
         "EmojiReact",
         n,
@@ -66,15 +67,26 @@ async fn deliver_react(
         json!(post.uri),
         json!({"content": format!(":{code}:"), "tag": [tag]}),
     );
-    let outcome = apply_emoji_react(state.clone(), react, who.clone())
+    apply_emoji_react(state.clone(), react, who.clone())
         .await
-        .expect("the fold does not fail");
+        .expect("the fold does not fail")
+}
+
+/// Delivers a reaction that must fold.
+async fn deliver_react(
+    state: &AppState,
+    who: &User,
+    post: &Status,
+    which: (&str, &str),
+    tag: Value,
+) {
+    let outcome = deliver(state, who, post, which, tag).await;
     assert_eq!(outcome, Outcome::Handled, "the reaction folds");
 }
 
-/// `who`'s stored reactions as `(emoji, emoji_domain)`.
-async fn stored(pool: &PgPool, who: &User) -> Vec<(String, Option<String>)> {
-    sqlx::query_as("SELECT emoji, emoji_domain FROM emoji_reactions WHERE user_id = $1")
+/// `who`'s stored reactions as `(emoji, emoji_domain, url)`.
+async fn stored(pool: &PgPool, who: &User) -> Vec<(String, Option<String>, Option<String>)> {
+    sqlx::query_as("SELECT emoji, emoji_domain, url FROM emoji_reactions WHERE user_id = $1")
         .bind(who.id)
         .fetch_all(pool)
         .await
@@ -101,10 +113,9 @@ async fn rollup(pool: &PgPool, post: &Status) -> Vec<(String, i64)> {
         .collect()
 }
 
-/// Another instance's reaction with this instance's own emoji is the local
-/// reaction: it counts with a local user's and files no emoji of the reactor's.
+/// A claim of this instance's emoji shows the stored image, never the tag's.
 #[tokio::test]
-async fn a_reaction_with_our_own_emoji_is_the_local_reaction() {
+async fn a_claim_of_our_own_emoji_shows_our_stored_image() {
     let db = crate::test_db::test_db().await.expect("test database slot");
     let pool = db.pool().clone();
     let state = app_state(&pool);
@@ -115,7 +126,7 @@ async fn a_reaction_with_our_own_emoji_is_the_local_reaction() {
     let wanda = local_user(&pool, "wanda2").await;
     let _row = emoji_reaction::react(
         &pool,
-        TEST_BASE_URL,
+        crate::config::TEST_BASE_URL,
         &NewReaction {
             user_id: wanda.id,
             status_id: post.id,
@@ -127,18 +138,22 @@ async fn a_reaction_with_our_own_emoji_is_the_local_reaction() {
     .expect("the local reaction stores");
     let xena = reactor(&pool, "xena", "wired2.test").await;
 
-    let own = tag("wiredcat", None, WIRED_URL);
-    deliver_react(&state, &xena, &post, ("r1", "wiredcat"), own).await;
+    let spoof = tag(
+        "wiredcat",
+        Some("https://test.example/emoji/wiredcat"),
+        EVIL_URL,
+    );
+    deliver_react(&state, &xena, &post, ("r1", "wiredcat"), spoof).await;
 
     assert_eq!(
         stored(&pool, &xena).await,
-        vec![(":wiredcat:".to_owned(), None)],
-        "the reaction names no foreign domain"
+        vec![(":wiredcat:".to_owned(), None, Some(WIRED_URL.to_owned()))],
+        "the local reaction, with the image we hold"
     );
     assert_eq!(
         emojis(&pool).await,
         vec![("wiredcat".to_owned(), None)],
-        "and no `wiredcat` of wired2.test appears"
+        "no emoji row is added"
     );
     assert_eq!(
         rollup(&pool, &post).await,
@@ -147,57 +162,118 @@ async fn a_reaction_with_our_own_emoji_is_the_local_reaction() {
     );
 }
 
-/// The emoji's own image URL marks it ours even when the tag sits on a CDN.
+/// A claim of our domain for a shortcode we do not hold, or hold disabled, is refused.
 #[tokio::test]
-async fn a_tag_carrying_our_emoji_image_is_ours_on_any_host() {
+async fn a_claim_of_an_unknown_or_disabled_local_emoji_is_refused() {
     let db = crate::test_db::test_db().await.expect("test database slot");
     let pool = db.pool().clone();
     let state = app_state(&pool);
     let post = local_post(&pool, "wanda").await;
-    let cdn = "https://cdn.example/wiredcat.png";
-    let _local = custom_emoji::upsert(&pool, &NewCustomEmoji::local("wiredcat", cdn))
+    let off = NewCustomEmoji {
+        disabled: true,
+        ..NewCustomEmoji::local("offcat", WIRED_URL)
+    };
+    let _off = custom_emoji::upsert(&pool, &off)
         .await
-        .expect("the local emoji stores");
+        .expect("the disabled emoji stores");
     let xena = reactor(&pool, "xena", "wired2.test").await;
 
-    deliver_react(
-        &state,
-        &xena,
-        &post,
-        ("r1", "wiredcat"),
-        tag("wiredcat", None, cdn),
-    )
-    .await;
-
+    for (n, code) in [("r1", "ghost"), ("r2", "offcat")] {
+        let claim = tag(code, Some("https://test.example/emoji/x"), EVIL_URL);
+        let outcome = deliver(&state, &xena, &post, (n, code), claim).await;
+        assert!(
+            matches!(outcome, Outcome::Ignored(_)),
+            "{code} is refused, got {outcome:?}"
+        );
+    }
+    assert!(stored(&pool, &xena).await.is_empty(), "nothing is stored");
     assert_eq!(
-        stored(&pool, &xena).await,
-        vec![(":wiredcat:".to_owned(), None)],
-        "the local emoji's image is enough"
+        emojis(&pool).await,
+        vec![("offcat".to_owned(), None)],
+        "and no emoji row is added"
     );
 }
 
-/// A Pleroma user joining a Misskey emoji files it under Misskey and groups
-/// with the Misskey user's own reaction.
+/// An origin that is neither the signer's nor ours is refused and files nothing.
 #[tokio::test]
-async fn a_third_instances_emoji_files_under_its_own_host() {
+async fn a_third_party_origin_is_refused_and_files_nothing() {
+    let db = crate::test_db::test_db().await.expect("test database slot");
+    let pool = db.pool().clone();
+    let state = app_state(&pool);
+    let post = local_post(&pool, "wanda").await;
+    let xena = reactor(&pool, "xena", "wired2.test").await;
+
+    let trap = tag(
+        "trap",
+        Some("https://evil.example/emoji/trap.png"),
+        EVIL_URL,
+    );
+    let outcome = deliver(&state, &xena, &post, ("r1", "trap"), trap).await;
+
+    assert!(matches!(outcome, Outcome::Ignored(_)), "got {outcome:?}");
+    assert!(stored(&pool, &xena).await.is_empty(), "no reaction row");
+    assert!(emojis(&pool).await.is_empty(), "no emoji row");
+}
+
+/// The signer's own emoji is stored under the signer's domain without an emoji row.
+#[tokio::test]
+async fn the_signers_own_emoji_files_no_emoji_row() {
+    let db = crate::test_db::test_db().await.expect("test database slot");
+    let pool = db.pool().clone();
+    let state = app_state(&pool);
+    let post = local_post(&pool, "wanda").await;
+    let carol = reactor(&pool, "carol", "misskey.test").await;
+
+    let own = tag("misskeycat", None, MISSKEY_URL);
+    deliver_react(&state, &carol, &post, ("r1", "misskeycat"), own).await;
+
+    assert_eq!(
+        stored(&pool, &carol).await,
+        vec![(
+            ":misskeycat:".to_owned(),
+            Some("misskey.test".to_owned()),
+            Some(MISSKEY_URL.to_owned())
+        )],
+        "filed under the signer's domain"
+    );
+    assert!(emojis(&pool).await.is_empty(), "no emoji row is created");
+}
+
+/// An emoji of another instance is joined only through the row we already hold.
+#[tokio::test]
+async fn a_third_instances_emoji_joins_only_through_its_stored_row() {
     let db = crate::test_db::test_db().await.expect("test database slot");
     let pool = db.pool().clone();
     let state = app_state(&pool);
     let post = local_post(&pool, "wanda").await;
     let carol = reactor(&pool, "carol", "misskey.test").await;
     let frank = reactor(&pool, "frank", "pleroma.test").await;
+    let id = "https://misskey.test/emoji/misskeycat";
+    let claim = tag("misskeycat", Some(id), EVIL_URL);
 
-    let misskey = tag("misskeycat", None, MISSKEY_URL);
-    deliver_react(&state, &carol, &post, ("r1", "misskeycat"), misskey.clone()).await;
-    deliver_react(&state, &frank, &post, ("r2", "misskeycat"), misskey).await;
+    let unknown = deliver(&state, &frank, &post, ("r0", "misskeycat"), claim.clone()).await;
+    assert!(
+        matches!(unknown, Outcome::Ignored(_)),
+        "no stored row, no join: {unknown:?}"
+    );
 
-    let filed = vec![(":misskeycat:".to_owned(), Some("misskey.test".to_owned()))];
+    custom_emoji::upsert_remote(&pool, "misskeycat", Some("misskey.test"), MISSKEY_URL)
+        .await
+        .expect("the remote emoji stores");
+    deliver_react(&state, &carol, &post, ("r1", "misskeycat"), claim.clone()).await;
+    deliver_react(&state, &frank, &post, ("r2", "misskeycat"), claim).await;
+
+    let filed = vec![(
+        ":misskeycat:".to_owned(),
+        Some("misskey.test".to_owned()),
+        Some(MISSKEY_URL.to_owned()),
+    )];
     assert_eq!(stored(&pool, &carol).await, filed, "the owner's own");
     assert_eq!(stored(&pool, &frank).await, filed, "the joiner's too");
     assert_eq!(
         emojis(&pool).await,
         vec![("misskeycat".to_owned(), Some("misskey.test".to_owned()))],
-        "one emoji row, none under pleroma.test"
+        "still the one emoji row"
     );
     assert_eq!(
         rollup(&pool, &post).await,
@@ -209,82 +285,33 @@ async fn a_third_instances_emoji_files_under_its_own_host() {
 /// The tag's `id` names the origin; the icon may sit on a CDN. A stored row
 /// of that origin keeps its image.
 #[tokio::test]
-async fn a_tag_id_wins_over_the_icons_cdn_and_a_stored_emoji_is_reused() {
+async fn a_stored_row_keeps_its_image_against_a_later_tag() {
     let db = crate::test_db::test_db().await.expect("test database slot");
     let pool = db.pool().clone();
     let state = app_state(&pool);
     let post = local_post(&pool, "wanda").await;
-    let carol = reactor(&pool, "carol", "pleroma.test").await;
-    let frank = reactor(&pool, "frank", "pleroma.test").await;
+    let carol = reactor(&pool, "carol", "host-a.test").await;
     let id = "https://host-a.test/emojis/blob";
+    custom_emoji::upsert_remote(
+        &pool,
+        "blob",
+        Some("host-a.test"),
+        "https://cdn.test/blob.png",
+    )
+    .await
+    .expect("the remote emoji stores");
 
-    deliver_react(
-        &state,
-        &carol,
-        &post,
-        ("r1", "blob"),
-        tag("blob", Some(id), "https://cdn.test/blob.png"),
-    )
-    .await;
-    deliver_react(
-        &state,
-        &frank,
-        &post,
-        ("r2", "blob"),
-        tag("blob", Some(id), "https://cdn.test/other.png"),
-    )
-    .await;
+    let later = tag("blob", Some(id), "https://cdn.test/other.png");
+    deliver_react(&state, &carol, &post, ("r1", "blob"), later).await;
 
     assert_eq!(
         stored(&pool, &carol).await,
-        vec![(":blob:".to_owned(), Some("host-a.test".to_owned()))],
-        "filed under the tag id's host"
-    );
-    let image: String =
-        sqlx::query_scalar("SELECT image_url FROM custom_emojis WHERE domain = 'host-a.test'")
-            .fetch_one(&pool)
-            .await
-            .expect("the emoji row reads");
-    assert_eq!(
-        image, "https://cdn.test/blob.png",
-        "a second reactor does not replace the stored image"
-    );
-}
-
-/// Without a usable origin the signer's domain files the emoji, as it did
-/// before tags were read.
-#[tokio::test]
-async fn an_emoji_without_a_usable_origin_falls_back_to_the_signers_domain() {
-    let db = crate::test_db::test_db().await.expect("test database slot");
-    let pool = db.pool().clone();
-    let state = app_state(&pool);
-    let bob = signer(&pool).await;
-    let anonymous = Reaction {
-        emoji: ":cat:".to_owned(),
-        url: Some("https://cdn.test/cat.png".to_owned()),
-        origin: None,
-    };
-    let anonymous_domain = remember_emoji(&state, &bob, &anonymous)
-        .await
-        .expect("the emoji is recorded");
-    assert_eq!(
-        anonymous_domain.as_deref(),
-        Some("remote.example"),
-        "the signer's"
-    );
-
-    let ours_but_gone = Reaction {
-        emoji: ":gone:".to_owned(),
-        url: Some("https://test.example/gone.png".to_owned()),
-        origin: Some("test.example".to_owned()),
-    };
-    let gone_domain = remember_emoji(&state, &bob, &ours_but_gone)
-        .await
-        .expect("the emoji is recorded");
-    assert_eq!(
-        gone_domain.as_deref(),
-        Some("remote.example"),
-        "our host with no such local emoji is not a local reaction"
+        vec![(
+            ":blob:".to_owned(),
+            Some("host-a.test".to_owned()),
+            Some("https://cdn.test/blob.png".to_owned())
+        )],
+        "the stored image, not the tag's"
     );
 }
 
@@ -297,6 +324,9 @@ async fn an_undo_removes_the_row_filed_under_the_emojis_origin() {
     let post = local_post(&pool, "wanda").await;
     let carol = reactor(&pool, "carol", "misskey.test").await;
     let frank = reactor(&pool, "frank", "pleroma.test").await;
+    custom_emoji::upsert_remote(&pool, "misskeycat", Some("misskey.test"), MISSKEY_URL)
+        .await
+        .expect("the remote emoji stores");
     let misskey = tag("misskeycat", None, MISSKEY_URL);
     deliver_react(&state, &carol, &post, ("r1", "misskeycat"), misskey.clone()).await;
     deliver_react(&state, &frank, &post, ("r2", "misskeycat"), misskey).await;

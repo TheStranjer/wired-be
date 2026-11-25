@@ -47,8 +47,8 @@
 //! on a post — is named Pleroma's way, `shortcode@domain`, with or without the
 //! surrounding colons (`…/reactions/misskeycat@misskey.test` and
 //! `…/reactions/:misskeycat@misskey.test:` are one emoji). It must name an
-//! enabled `custom_emojis` row of that domain, learned from a remote post or
-//! reaction that used it. It is stored as `:shortcode:` with the remote image
+//! enabled `custom_emojis` row of that domain, learned from a remote post
+//! that used it (a reaction never files one). It is stored as `:shortcode:` with the remote image
 //! URL and the domain beside it, federates as the `EmojiReact` Misskey and
 //! Pleroma send for a re-used remote emoji (`content` `:shortcode:` plus an
 //! `Emoji` tag whose icon is the remote image), and is named `shortcode@domain`
@@ -582,9 +582,8 @@ async fn bare_local_emoji(pool: &PgPool, text: &str) -> AppResult<Accepted> {
 /// The remote, enabled custom emoji `shortcode@domain` names, stored as the
 /// `:shortcode:` text with the emoji's image and its origin `domain`.
 ///
-/// The row is one [`custom_emoji`] knows from a remote post or reaction that
-/// used it, so an emoji this instance never saw is refused like any other
-/// unknown name.
+/// The row is one [`custom_emoji`] knows from a remote post that used it, so
+/// an emoji this instance never saw is refused like any other unknown name.
 ///
 /// # Errors
 ///

@@ -12,18 +12,19 @@ use crate::{
         json,
     },
     models::{
-        custom_emoji,
         emoji_reaction::{self, NewReaction},
         favourite,
         user::User,
     },
     state::AppState,
     util::{
-        emoji::{Emoji, shortcode as shortcode_of},
+        emoji::Emoji,
         sanitize::strip_html,
         url::{host_with_port, parse_http_url},
     },
 };
+
+use stored_emoji::resolve_emoji;
 
 /// One delivered reaction, in the parts the fold stores.
 #[derive(Debug)]
@@ -239,14 +240,18 @@ async fn fold_reaction(
     let Some(target) = resolve_target(state, view, signer).await? else {
         return Ok(Outcome::Ignored(NO_TARGET));
     };
+    let Some(stored) = resolve_emoji(state, signer, reaction).await? else {
+        return Ok(Outcome::Ignored(
+            "a reaction whose emoji claims neither the signer's origin nor an emoji this instance holds",
+        ));
+    };
     let new = NewReaction {
         user_id: signer.id,
         status_id: target.id,
         emoji: &reaction.emoji,
-        url: reaction.url.as_deref(),
+        url: stored.url.as_deref(),
     };
-    let domain = remember_emoji(state, signer, reaction).await?;
-    let row = emoji_reaction::react_in_domain(&state.db, &new, &view.id, domain.as_deref())
+    let row = emoji_reaction::react_in_domain(&state.db, &new, &view.id, stored.domain.as_deref())
         .await
         .map_err(|err| {
             FederationError::transient("could not fold the remote interaction's reaction", &err)
@@ -259,73 +264,6 @@ async fn fold_reaction(
         "an inbound reaction landed on a status"
     );
     Ok(Outcome::Handled)
-}
-
-/// Records the custom emoji a delivered reaction brought and answers its origin.
-///
-/// The answer is `None` for a unicode reaction and for an emoji of this instance.
-///
-/// The emoji is filed under the instance it comes from, as the posts' `Emoji`
-/// tags are, so a local user can later join the reaction by naming
-/// `shortcode@domain` and every reactor of one emoji lands in one group. A
-/// reactor may name another instance's emoji, or ours, so the signer's domain
-/// is only the fallback for a tag that names no host.
-async fn remember_emoji(
-    state: &AppState,
-    signer: &User,
-    reaction: &Reaction,
-) -> Result<Option<String>, FederationError> {
-    let (Some(url), Some(code)) = (reaction.url.as_deref(), shortcode_of(&reaction.emoji)) else {
-        return Ok(None);
-    };
-    let local = custom_emoji::get_by_shortcodes(&state.db, &[code.to_owned()], None)
-        .await
-        .map_err(|err| {
-            FederationError::transient("could not look up the local emoji of a reaction", &err)
-        })?
-        .into_iter()
-        .find(|emoji| !emoji.disabled);
-    let ours = reaction
-        .origin
-        .as_deref()
-        .is_some_and(|origin| origin.eq_ignore_ascii_case(state.config.domain()));
-    if local
-        .as_ref()
-        .is_some_and(|emoji| ours || emoji.image_url == url)
-    {
-        return Ok(None);
-    }
-    let tagged = reaction.origin.as_deref().filter(|_| !ours);
-    let Some(origin) = tagged.or(signer.domain.as_deref()) else {
-        return Ok(None);
-    };
-    file_remote_emoji(state, code, origin, url).await?;
-    Ok(Some(origin.to_owned()))
-}
-
-/// Stores the emoji `code` of `origin` unless a row for that pair stands.
-///
-/// A stored row is reused as it is: a reactor naming an instance's emoji does
-/// not get to replace the image that instance's own posts announced.
-async fn file_remote_emoji(
-    state: &AppState,
-    code: &str,
-    origin: &str,
-    url: &str,
-) -> Result<(), FederationError> {
-    let stored = custom_emoji::get_by_shortcodes(&state.db, &[code.to_owned()], Some(origin))
-        .await
-        .map_err(|err| {
-            FederationError::transient("could not look up the remote reaction's emoji", &err)
-        })?;
-    if !stored.is_empty() {
-        return Ok(());
-    }
-    custom_emoji::upsert_remote(&state.db, code, Some(origin), url)
-        .await
-        .map_err(|err| {
-            FederationError::transient("could not record the remote reaction's emoji", &err)
-        })
 }
 
 /// What a `Like`'s `content` states: absent or blank (of any markup) is the
@@ -405,6 +343,8 @@ fn emoji_tag_parts(document: &Value, shortcode: &str) -> Option<(String, String)
 fn origin_of(url: &str) -> Option<String> {
     parse_http_url(url).map(|parsed| host_with_port(&parsed))
 }
+
+mod stored_emoji;
 
 #[cfg(test)]
 mod origin_tests;
