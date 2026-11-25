@@ -15,7 +15,7 @@ use crate::{
     },
     error::{AppError, AppResult},
     models::{
-        follow,
+        activitypub_actor, follow,
         status::Status,
         user::{self, User},
     },
@@ -43,6 +43,8 @@ pub(super) async fn require_consent(
     let Some(author) = user::get_by_id(&state.db, target.user_id).await? else {
         return Ok(());
     };
+    // A remote policy names the author's collections, which the actor row holds.
+    let author = activitypub_actor::with_plumbing(&state.db, author).await?;
     let mut standing = Relationship::unconnected(author.id);
     standing.following.0 = follow::has_accepted_follow(&state.db, poster.id, author.id).await?;
     standing.followed_by.0 = follow::has_accepted_follow(&state.db, author.id, poster.id).await?;

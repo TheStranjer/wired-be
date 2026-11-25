@@ -45,6 +45,7 @@ use crate::{
         publisher::{self, PublishOpts},
     },
     models::{
+        activitypub_actor,
         follow::{self, Follow},
         relay::{self, Relay},
         user::{User, get_by_ap_id},
@@ -93,7 +94,8 @@ pub async fn follow_relay(state: &AppState, relay_url_or_actor: &str) -> AppResu
     let instance = ensure_instance_actor(&state.db, &state.config).await?;
     let relay_user = get_or_fetch_by_ap_id(state, &ap_id).await?;
     ensure_relay_actor_type(&relay_user)?;
-    let inbox = relay_user.inbox.clone().ok_or_else(|| {
+    let relay_actor = activitypub_actor::get(&state.db, relay_user.id).await?;
+    let inbox = relay_actor.and_then(|row| row.inbox).ok_or_else(|| {
         AppError::Unprocessable(format!(
             "the relay actor {} carries no inbox",
             relay_user.ap_id

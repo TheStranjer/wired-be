@@ -66,6 +66,11 @@ const IMAGE_TYPE: &str = "Image";
 /// when the row carries an avatar or a banner and `movedTo` only when the
 /// row records a move.
 ///
+/// `inbox` renders the `user`'s stored `inbox` (the built inbox address
+/// behind a missing one). A caller serving a stored account passes it
+/// through [`with_plumbing`](crate::models::activitypub_actor::with_plumbing),
+/// so the inbox, like the public key, follows the `activitypub_actors` row.
+///
 /// `emojis` is the pool of custom emojis the caller knows; the `tag` array
 /// holds an `Emoji` tag for each local, enabled one whose `:shortcode:` the
 /// profile text uses (see [`profile_emojis`]), once each, in `emojis` order.
@@ -127,7 +132,10 @@ fn actor_fields(
         ("name", json!(user.name)),
         ("summary", json!(user.bio)),
         ("url", json!(ap_id)),
-        ("inbox", json!(inbox(ap_id))),
+        (
+            "inbox",
+            json!(user.inbox.clone().unwrap_or_else(|| inbox(ap_id))),
+        ),
         ("outbox", json!(outbox(ap_id))),
         ("followers", json!(followers(ap_id))),
         ("following", json!(following(ap_id))),

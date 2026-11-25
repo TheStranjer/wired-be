@@ -12,6 +12,11 @@
 //! ([`quote_approval`](crate::federation::quotes::quote_approval)); a
 //! remote one what its note's `interactionPolicy.canQuote` listed, as the
 //! ingest stored it.
+//!
+//! A remote policy names the author's followers and following collections.
+//! The loader of the `author` (the render batch's `load_users`, or the
+//! quote consent check) fills those from `activitypub_actors`, so the
+//! columns this reads off the [`User`] are the actor row's.
 
 use serde::Serialize;
 
