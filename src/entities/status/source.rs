@@ -43,6 +43,8 @@ pub enum QuoteSlot {
     Hidden,
     /// The quoted row is gone.
     Deleted,
+    /// The quote request waits for the quoted author's answer (`pending`).
+    Pending,
     /// The quoted author refused the quote request (`rejected`).
     Rejected,
     /// The quoted author withdrew the grant (`revoked`).
@@ -62,6 +64,7 @@ impl QuoteSlot {
             Self::Visible(rendered) => Some(rendered),
             Self::Hidden
             | Self::Deleted
+            | Self::Pending
             | Self::Rejected
             | Self::Revoked
             | Self::Linked

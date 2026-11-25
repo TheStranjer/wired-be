@@ -251,6 +251,7 @@ pub(super) async fn assert_row_parks_the_request(
             "language": "eo",
             "content_type": "text/plain",
             "quote_id": null,
+            "quote_approval_policy": null,
             "expires_in": 3600,
             "in_reply_to_id": null,
             "in_reply_to_conversation_id": null,

@@ -20,7 +20,7 @@ use crate::{
     federation::vocab::{AS_PUBLIC, AS_VOCABULARY},
     models::{
         quote_authorization::QuoteAuthorization,
-        status::Visibility,
+        status::{QuoteApprovalPolicy, Visibility},
         user::{User, followers_address},
     },
 };
@@ -48,28 +48,73 @@ pub enum QuoteApproval {
     Nobody,
 }
 
-/// The [`QuoteApproval`] a post of `visibility` grants.
-#[must_use]
-pub const fn quote_approval(visibility: Visibility) -> QuoteApproval {
-    match visibility {
-        Visibility::Public | Visibility::Unlisted => QuoteApproval::Everyone,
-        Visibility::Private => QuoteApproval::Followers,
-        Visibility::Direct | Visibility::Local => QuoteApproval::Nobody,
+impl QuoteApproval {
+    /// How open this approval is: nobody, followers, everyone.
+    const fn openness(self) -> u8 {
+        match self {
+            Self::Nobody => 0,
+            Self::Followers => 1,
+            Self::Everyone => 2,
+        }
+    }
+
+    /// The narrower of this approval and `other`.
+    #[must_use]
+    pub const fn capped_by(self, other: Self) -> Self {
+        if self.openness() <= other.openness() {
+            self
+        } else {
+            other
+        }
     }
 }
 
-/// The `interactionPolicy` a note of `visibility` by `author` carries, or
-/// `None` for a post nobody may quote.
+/// The [`QuoteApproval`] a post of `visibility` grants when its author
+/// chose `policy` (`None` is the default, which adds no limit).
+///
+/// The policy only narrows what the visibility allows: a private post never
+/// becomes quotable by everyone, whatever the author asked for.
+#[must_use]
+pub const fn quote_approval(
+    visibility: Visibility,
+    policy: Option<QuoteApprovalPolicy>,
+) -> QuoteApproval {
+    let by_visibility = match visibility {
+        Visibility::Public | Visibility::Unlisted => QuoteApproval::Everyone,
+        Visibility::Private => QuoteApproval::Followers,
+        Visibility::Direct | Visibility::Local => QuoteApproval::Nobody,
+    };
+    let chosen = match policy {
+        None | Some(QuoteApprovalPolicy::Public) => QuoteApproval::Everyone,
+        Some(QuoteApprovalPolicy::Followers) => QuoteApproval::Followers,
+        Some(QuoteApprovalPolicy::Nobody) => QuoteApproval::Nobody,
+    };
+    by_visibility.capped_by(chosen)
+}
+
+/// The `interactionPolicy` a note of `visibility` by `author` carries when
+/// the author chose `policy`, or `None` for a post nobody may quote.
 ///
 /// Mastodon marks a post with no policy as unquotable, which is exactly what
-/// a direct post wants. Manual approval is never offered: the instance
-/// either accepts a request on the spot or refuses it.
+/// a direct post wants. An author who chose `nobody` on a post that could be
+/// quoted gets Mastodon's spelling of it: empty approval lists, but for the
+/// author themself in `automaticApproval`. Manual approval is never offered:
+/// the instance either accepts a request on the spot or refuses it.
 #[must_use]
-pub fn interaction_policy_json(visibility: Visibility, author: &User) -> Option<Value> {
-    let approved = match quote_approval(visibility) {
+pub fn interaction_policy_json(
+    visibility: Visibility,
+    policy: Option<QuoteApprovalPolicy>,
+    author: &User,
+) -> Option<Value> {
+    let approved = match quote_approval(visibility, policy) {
         QuoteApproval::Everyone => json!(AS_PUBLIC),
         QuoteApproval::Followers => json!(followers_address(author)),
-        QuoteApproval::Nobody => return None,
+        QuoteApproval::Nobody => {
+            if quote_approval(visibility, None) == QuoteApproval::Nobody {
+                return None;
+            }
+            json!(author.ap_id)
+        }
     };
     Some(json!({
         "canQuote": {
@@ -149,30 +194,51 @@ mod tests {
     #[test]
     fn visibility_decides_who_may_quote() {
         assert_eq!(
-            quote_approval(Visibility::Public),
+            quote_approval(Visibility::Public, None),
             QuoteApproval::Everyone,
             "public is open to everyone"
         );
         assert_eq!(
-            quote_approval(Visibility::Unlisted),
+            quote_approval(Visibility::Unlisted, None),
             QuoteApproval::Everyone,
             "unlisted is as quotable as public"
         );
         assert_eq!(
-            quote_approval(Visibility::Private),
+            quote_approval(Visibility::Private, None),
             QuoteApproval::Followers,
             "private is for followers"
         );
         assert_eq!(
-            quote_approval(Visibility::Direct),
+            quote_approval(Visibility::Direct, None),
             QuoteApproval::Nobody,
             "direct is nobody's to quote"
         );
         assert_eq!(
-            quote_approval(Visibility::Local),
+            quote_approval(Visibility::Local, None),
             QuoteApproval::Nobody,
             "local never federates"
         );
+    }
+
+    #[test]
+    fn the_authors_policy_only_narrows_the_visibility() {
+        use QuoteApprovalPolicy::{Followers, Nobody, Public};
+        let cases = [
+            (Visibility::Public, Public, QuoteApproval::Everyone),
+            (Visibility::Public, Followers, QuoteApproval::Followers),
+            (Visibility::Unlisted, Nobody, QuoteApproval::Nobody),
+            (Visibility::Private, Public, QuoteApproval::Followers),
+            (Visibility::Private, Followers, QuoteApproval::Followers),
+            (Visibility::Private, Nobody, QuoteApproval::Nobody),
+            (Visibility::Direct, Public, QuoteApproval::Nobody),
+        ];
+        for (visibility, policy, expected) in cases {
+            assert_eq!(
+                quote_approval(visibility, Some(policy)),
+                expected,
+                "{visibility} with {policy}"
+            );
+        }
     }
 
     #[test]

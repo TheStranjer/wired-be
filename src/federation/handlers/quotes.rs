@@ -20,10 +20,11 @@
 //!   ([`fetch_object::resolve_status_as_actor`]). A request whose
 //!   instrument is somebody else's, or cannot be read, is ignored and
 //!   answered with nothing.
-//! * The post's visibility decides, through the same
-//!   [`quote_approval`] rule its `interactionPolicy` advertises: public and
-//!   unlisted posts accept, a private one accepts the author's accepted
-//!   followers, and everything else — a direct post, a quoter the author
+//! * The post's visibility and its author's `quote_approval_policy` decide,
+//!   through the same [`quote_approval`] rule its `interactionPolicy`
+//!   advertises: public and unlisted posts accept (unless the author narrowed
+//!   the policy), a private one or a `followers` policy accepts the author's
+//!   accepted followers, and everything else — a direct post, a quoter the author
 //!   blocks or cannot show the post to — is answered with a `Reject`.
 //! * A grant is stored in [`quote_authorization`], links the stored quoting
 //!   status to the quoted one when the status has not named a quote yet
@@ -251,14 +252,16 @@ async fn quoted_post(
 
 /// Whether the post's policy lets `quoter` quote it right now: public and
 /// unlisted posts to anyone who may see them, a private one to its
-/// author's accepted followers, nothing else.
+/// author's accepted followers, nothing else. The author's own
+/// `quote_approval_policy` narrows that: `followers` admits only accepted
+/// followers and `nobody` admits no remote account.
 async fn may_quote(
     state: &AppState,
     post: &Status,
     author: &User,
     asker: &User,
 ) -> Result<bool, FederationError> {
-    let approval = quote_approval(post.visibility);
+    let approval = quote_approval(post.visibility, post.quote_approval_policy);
     if approval == QuoteApproval::Nobody {
         return Ok(false);
     }

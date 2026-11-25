@@ -64,6 +64,7 @@ mod counters;
 mod delete;
 mod new_status;
 mod pages;
+mod quote_approval_policy;
 mod quote_links;
 mod quote_policy;
 mod quoting;
@@ -86,6 +87,7 @@ pub use new_status::{NewStatus, insert, insert_conn};
 pub use pages::{
     backup_page, outbox_page, public_replies_count, public_replies_page, status_visibility_counts,
 };
+pub use quote_approval_policy::{QuoteApprovalPolicy, set_quote_approval_policy};
 pub use quote_links::{link_backfilled_quote, link_quotes_of, pending_quote_uri};
 pub use quote_policy::{QuotePolicy, set_quote_policy};
 pub use quoting::quoting_page;

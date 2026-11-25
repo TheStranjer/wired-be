@@ -122,7 +122,7 @@ fn keys(audiences: &[Audience]) -> Vec<&'static str> {
 /// advertised nothing.
 fn advertised(row: &StatusRow, author: &User) -> Option<Policy> {
     if row.local {
-        let automatic = match quote_approval(row.visibility) {
+        let automatic = match quote_approval(row.visibility, row.quote_approval_policy) {
             Advertised::Everyone => vec![Audience::Public],
             Advertised::Followers => vec![Audience::Followers],
             Advertised::Nobody => Vec::new(),
@@ -209,7 +209,7 @@ mod tests {
     use super::*;
     use crate::{
         entities::status::test_support::{base_row, base_user, other_user},
-        models::status::{QuotePolicy, Visibility},
+        models::status::{QuoteApprovalPolicy, QuotePolicy, Visibility},
     };
 
     /// The remote author's actor id.
@@ -303,6 +303,27 @@ mod tests {
         assert_eq!(approval.current_user, "denied");
         let own = QuoteApproval::for_row(&row, &author, Some(&author), None);
         assert_eq!(own.current_user, "automatic", "the author may always quote");
+    }
+
+    #[test]
+    fn the_authors_policy_narrows_a_local_status() {
+        let author = base_user("alice");
+        let viewer = a_viewer();
+        let mut row = base_row();
+        row.quote_approval_policy = Some(QuoteApprovalPolicy::Nobody);
+        let nobody = QuoteApproval::for_row(&row, &author, Some(&viewer), None);
+        assert!(nobody.automatic.is_empty() && nobody.manual.is_empty());
+        assert_eq!(nobody.current_user, "denied", "nobody means nobody");
+        let own = QuoteApproval::for_row(&row, &author, Some(&author), None);
+        assert_eq!(own.current_user, "automatic", "except the author");
+
+        row.quote_approval_policy = Some(QuoteApprovalPolicy::Followers);
+        let followers = QuoteApproval::for_row(&row, &author, Some(&viewer), None);
+        assert_eq!(followers.automatic, ["followers"], "a public post narrowed");
+        assert_eq!(followers.current_user, "denied", "a non-follower");
+        let map = follower_of(&author);
+        let follower = QuoteApproval::for_row(&row, &author, Some(&viewer), Some(&map));
+        assert_eq!(follower.current_user, "automatic", "a follower");
     }
 
     #[test]

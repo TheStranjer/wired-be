@@ -11,7 +11,8 @@ use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
 use super::{
-    CONTENT_TYPES, INVALID_CONTENT_TYPE, INVALID_VISIBILITY, MAX_LANGUAGE_CHARS, MAX_SPOILER_CHARS,
+    CONTENT_TYPES, INVALID_CONTENT_TYPE, INVALID_QUOTE_POLICY, INVALID_VISIBILITY,
+    MAX_LANGUAGE_CHARS, MAX_SPOILER_CHARS,
     params::{CheckedPoll, CreateStatusParams},
     validate_media::checked_media,
     validate_poll::checked_poll,
@@ -20,7 +21,7 @@ use super::{
 use crate::{
     config::Config,
     error::{AppError, AppResult},
-    models::status::{DEFAULT_CONTENT_TYPE, Visibility},
+    models::status::{DEFAULT_CONTENT_TYPE, QuoteApprovalPolicy, Visibility},
 };
 
 /// A checked status body: what [`check_body`] resolved, borrowed from the
@@ -60,6 +61,9 @@ pub struct Checked<'a> {
     /// [`crate::models::poll::create`] beside their status row, and the
     /// render batch reads it back into the entity's `poll` key.
     pub poll: Option<CheckedPoll>,
+    /// Who the author lets quote the post, `None` for the default (no limit
+    /// beyond the visibility's own) — see `checked_quote_policy`.
+    pub quote_approval_policy: Option<QuoteApprovalPolicy>,
 }
 
 /// Checks a status body against the instance's limits and the author's two
@@ -154,6 +158,7 @@ pub fn check_body_backed<'a>(
     let visibility = checked_visibility(params.visibility.as_deref(), default_scope)?;
     let content_type = checked_content_type(params.content_type.as_deref())?;
     let expires_at = checked_expiration(config, params.expires_in)?;
+    let quote_approval_policy = checked_quote_policy(params.quote_approval_policy.as_deref())?;
     Ok(Checked {
         text,
         spoiler_text,
@@ -164,7 +169,27 @@ pub fn check_body_backed<'a>(
         expires_at,
         media_ids,
         poll,
+        quote_approval_policy,
     })
+}
+
+/// The author's quote policy: the submitted `public`, `followers` or
+/// `nobody`, or `None` (the default, which adds no limit to what the
+/// visibility allows) when the body names none or names the empty string.
+///
+/// # Errors
+///
+/// [`AppError::Unprocessable`] with [`INVALID_QUOTE_POLICY`] for any other
+/// text.
+fn checked_quote_policy(submitted: Option<&str>) -> AppResult<Option<QuoteApprovalPolicy>> {
+    submitted
+        .filter(|name| !name.is_empty())
+        .map(|name| {
+            name.parse()
+                .ok()
+                .ok_or_else(|| AppError::Unprocessable(INVALID_QUOTE_POLICY.to_owned()))
+        })
+        .transpose()
 }
 
 /// The content warning: [`MAX_SPOILER_CHARS`] characters at most, and the
