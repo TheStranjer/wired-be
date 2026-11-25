@@ -13,6 +13,7 @@ use crate::{
     federation::webfinger_client::{URI_MACRO, URI_MACRO_ENCODED, finger_with_base},
     http_client::HttpClient,
     state::AppState,
+    util::url::parse_http_url,
 };
 
 use super::{
@@ -110,16 +111,26 @@ fn subscribe_template(document: &Value) -> Option<&str> {
 /// encoding is [`url::form_urlencoded`]'s serializer: everything outside
 /// `[A-Za-z0-9*-._]` becomes its `%XX` UTF-8 bytes, so a full `ap_id`
 /// URL survives being quoted into another URL's query value intact.
+///
+/// The template comes from the remote instance, so the expansion is only an
+/// answer when [`parse_http_url`] accepts it: an absolute `http(s)` URL with
+/// a host. A scheme-relative (`//evil.example/..`), non-`http(s)` or
+/// otherwise malformed result is no URL.
 pub(super) fn expand_subscribe_url(document: &Value, target: &str) -> Option<String> {
     let template = subscribe_template(document)?;
     let encoded: String = form_urlencoded::byte_serialize(target.as_bytes()).collect();
-    if template.contains(URI_MACRO) {
-        return Some(template.replace(URI_MACRO, &encoded));
+    let expanded = if template.contains(URI_MACRO) {
+        template.replace(URI_MACRO, &encoded)
+    } else if template.contains(URI_MACRO_ENCODED) {
+        template.replace(URI_MACRO_ENCODED, &encoded)
+    } else {
+        return None;
+    };
+    if parse_http_url(&expanded).is_none() {
+        debug!("the subscribe template expands to no http(s) url; refusing it");
+        return None;
     }
-    if template.contains(URI_MACRO_ENCODED) {
-        return Some(template.replace(URI_MACRO_ENCODED, &encoded));
-    }
-    None
+    Some(expanded)
 }
 
 /// `value` trimmed, or the empty string when the request carried none.
@@ -328,6 +339,60 @@ mod tests {
                 "{why} is no interaction url"
             );
         }
+    }
+
+    #[test]
+    fn http_and_https_expansions_are_accepted() {
+        for template in [
+            "http://r.example/f?u={uri}",
+            "HTTPS://r.example:8443/f?u=%7Buri%7D",
+        ] {
+            let document = json!({"links": [{"rel": SUBSCRIBE_REL, "template": template}]});
+            assert!(
+                expand_subscribe_url(&document, AP_ID).is_some(),
+                "{template} expands to an http(s) url"
+            );
+        }
+    }
+
+    #[test]
+    fn a_non_http_expansion_is_refused() {
+        for (template, why) in [
+            ("//evil.example/phish?u={uri}", "a scheme-relative url"),
+            ("javascript:alert(1)//{uri}", "a javascript url"),
+            ("data:text/html,{uri}", "a data url"),
+            ("ftp://evil.example/?u={uri}", "an ftp url"),
+            ("/relative/path?u={uri}", "a path-only url"),
+            ("{uri}", "a template that is only the macro"),
+            ("https://?u={uri}", "an http url with no host"),
+        ] {
+            let document = json!({"links": [{"rel": SUBSCRIBE_REL, "template": template}]});
+            assert_eq!(
+                expand_subscribe_url(&document, AP_ID),
+                None,
+                "{why} is no interaction url"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_json_endpoint_never_answers_a_non_http_url() {
+        let body = r#"{"links":[{"rel":"http://ostatus.org/schema/1.0/subscribe","template":"//evil.example/phish?u={uri}"}]}"#;
+        let (server, base) = serve(webfinger_route(JRD_JSON, body)).await;
+        let state = client_state();
+        let params = InteractionParams {
+            ap_id: Some(AP_ID.to_owned()),
+            profile: Some(PROFILE.to_owned()),
+        };
+        let err = interaction_answer(&state, params, Some(&base))
+            .await
+            .expect_err("a scheme-relative template must be refused");
+        server.abort();
+        assert_eq!(
+            err.to_string(),
+            COULD_NOT_FIND_USER,
+            "refused like no template"
+        );
     }
 
     #[test]
