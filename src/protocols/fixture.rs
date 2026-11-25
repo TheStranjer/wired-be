@@ -12,7 +12,7 @@
 use axum::{Json, Router, http::StatusCode, routing::MethodRouter, routing::get};
 
 use crate::{
-    api::well_known::WebfingerContribution,
+    api::well_known::{FingerLink, WebfingerContribution},
     config::Config,
     jobs::{AttemptInfo, HandlerFn, HandlerFuture, JobError},
     models::user::User,
@@ -50,6 +50,9 @@ const FIXTURE_JOB_QUEUES: &[&str] = &[QUEUE_FIXTURE];
 
 /// The `/.well-known` path only the fixture serves.
 pub const WELL_KNOWN_PATH: &str = "/.well-known/fixture";
+
+/// The `rel` of the fixture's host-meta link.
+pub const HOST_META_REL: &str = "urn:wired:fixture";
 
 /// `GET /fixture/ping`: answers 204 No Content.
 async fn ping() -> StatusCode {
@@ -93,5 +96,15 @@ impl ProtocolAdapter for Fixture {
             aliases: vec![format!("fixture:{}", user.nickname)],
             links: Vec::new(),
         }
+    }
+
+    /// One link, `rel="urn:wired:fixture"`, pointing at [`WELL_KNOWN_PATH`].
+    fn host_meta_links(&self, config: &Config) -> Vec<FingerLink> {
+        vec![FingerLink {
+            rel: HOST_META_REL,
+            link_type: None,
+            href: Some(format!("{}{WELL_KNOWN_PATH}", config.base_url)),
+            template: None,
+        }]
     }
 }

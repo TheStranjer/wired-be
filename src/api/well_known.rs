@@ -53,6 +53,9 @@ const PROFILE_PAGE_REL: &str = "http://webfinger.net/rel/profile-page";
 /// `rel` of the `ActivityPub` actor link (Mastodon and Pleroma both
 /// advertise the actor id under the plain `self`).
 const SELF_REL: &str = "self";
+/// `rel` of the host-meta link advertising the `WebFinger` template (the
+/// link-based resource descriptor discovery of RFC 6415).
+const LRDD_REL: &str = "lrdd";
 /// `rel` of the `OStatus` follow-intent link, the template remote servers
 /// redirect users to in order to follow this account.
 const SUBSCRIBE_REL: &str = "http://ostatus.org/schema/1.0/subscribe";
@@ -116,18 +119,19 @@ async fn webfinger(
     }
 }
 
-/// `GET /.well-known/host-meta` — the XRD descriptor telling clients that
-/// this host resolves accounts through `/.well-known/webfinger`
-/// (Pleroma's `WebFinger.host_meta/0`). No parameters, no authentication,
-/// no failure: the document only names this instance's own URLs.
+/// `GET /.well-known/host-meta` — the XRD descriptor of this host: the
+/// root element, then the links each enabled protocol adds through
+/// [`ProtocolAdapter::host_meta_links`](crate::protocols::adapter::ProtocolAdapter::host_meta_links),
+/// in registry order. No parameters, no authentication, no failure: the
+/// document only names this instance's own URLs.
 async fn host_meta(State(state): State<AppState>) -> Response {
-    let template = format!(
-        "{}/.well-known/webfinger?resource={{uri}}",
-        state.config.base_url
-    );
+    let links: Vec<String> = registry::enabled(&state.config)
+        .flat_map(|adapter| adapter.host_meta_links(&state.config))
+        .map(|link| xrd_link(&link))
+        .collect();
     xrd_body(format!(
-        r#"<XRD xmlns="{XRD_NAMESPACE}"><Link rel="lrdd" template="{}"/></XRD>"#,
-        escape_html(&template)
+        r#"<XRD xmlns="{XRD_NAMESPACE}">{}</XRD>"#,
+        links.concat()
     ))
 }
 
@@ -233,23 +237,24 @@ pub struct WebfingerContribution {
     pub links: Vec<FingerLink>,
 }
 
-/// One `Link` element or object of a `WebFinger` document.
+/// One `Link` element or object of an XRD or JRD document: a `WebFinger`
+/// answer or host-meta.
 ///
 /// The `type` attribute is omitted for the subscribe link, which is identified by
 /// its `template` instead; Pleroma's map rendering drops the same key.
 #[derive(Debug, Serialize)]
 pub struct FingerLink {
     /// The relation URI (or `self`) this link states.
-    rel: &'static str,
+    pub rel: &'static str,
     /// The media type of the link target, renamed to `type` in JSON.
     #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
-    link_type: Option<&'static str>,
+    pub link_type: Option<&'static str>,
     /// The target URL, for the `href` links.
     #[serde(skip_serializing_if = "Option::is_none")]
-    href: Option<String>,
+    pub href: Option<String>,
     /// The templated follow URL, for the subscribe link.
     #[serde(skip_serializing_if = "Option::is_none")]
-    template: Option<String>,
+    pub template: Option<String>,
 }
 
 impl Finger {
@@ -307,6 +312,22 @@ pub fn activitypub_contribution(user: &User, config: &Config) -> WebfingerContri
             subscribe_link(config),
         ],
     }
+}
+
+/// What `ActivityPub` adds to host-meta: the LRDD link whose template
+/// resolves an account through this instance's `WebFinger` route
+/// (Pleroma's `WebFinger.host_meta/0`).
+#[must_use]
+pub fn activitypub_host_meta_links(config: &Config) -> Vec<FingerLink> {
+    vec![FingerLink {
+        rel: LRDD_REL,
+        link_type: None,
+        href: None,
+        template: Some(format!(
+            "{}{WEBFINGER_PATH}?resource={{uri}}",
+            config.base_url
+        )),
+    }]
 }
 
 /// The `OStatus` subscribe link: the follow-intent template naming the

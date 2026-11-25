@@ -3,8 +3,12 @@
 use axum::{Router, routing::MethodRouter};
 
 use crate::{
-    api::well_known::WebfingerContribution, config::Config, jobs::HandlerFn, models::user::User,
-    protocols::ProtocolId, state::AppState,
+    api::well_known::{FingerLink, WebfingerContribution},
+    config::Config,
+    jobs::HandlerFn,
+    models::user::User,
+    protocols::ProtocolId,
+    state::AppState,
 };
 
 /// One protocol's entry point into the application.
@@ -67,5 +71,16 @@ pub trait ProtocolAdapter: Sync {
     /// contributes nothing.
     fn webfinger(&self, _config: &Config, _user: &User) -> WebfingerContribution {
         WebfingerContribution::default()
+    }
+
+    /// The links this protocol adds to the host-meta document.
+    ///
+    /// host-meta (`/.well-known/host-meta`) is a shared document: core writes
+    /// the XRD root, then appends the links of each enabled protocol in
+    /// registry order. `ActivityPub` adds its `WebFinger` template (the `lrdd`
+    /// link); later, XMPP adds its `WebSocket` and BOSH connection links here
+    /// (XEP-0156). The default contributes nothing.
+    fn host_meta_links(&self, _config: &Config) -> Vec<FingerLink> {
+        Vec::new()
     }
 }
