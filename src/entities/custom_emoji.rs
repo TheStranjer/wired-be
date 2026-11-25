@@ -28,7 +28,7 @@ use crate::{config::Config, models::custom_emoji::CustomEmoji as EmojiRow, servi
 /// Build one with [`CustomEmoji::from_model`]; its [`Serialize`] impl
 /// emits `shortcode`, `url`, `static_url`, `visible_in_picker`,
 /// `category` and the Pleroma extension's `tags`.
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct CustomEmoji {
     /// The shortcode, without surrounding colons.
     pub shortcode: String,

@@ -429,17 +429,23 @@ impl<'a> Batch<'a> {
     /// slice for an anonymous viewer, whose every poll renders `voted:
     /// false` with `own_votes: []`. The render instant decides `expired`
     /// and, through it, whether `hide_totals` still withholds the option
-    /// counts.
+    /// counts. Its `emojis` are the row's emoji list narrowed to those the
+    /// option titles use ([`Poll::with_emojis`]).
     ///
+    /// [`Poll::with_emojis`]: crate::entities::poll::Poll::with_emojis
     /// [`Poll`]: crate::entities::poll::Poll
     /// [`Poll::build`]: crate::entities::poll::Poll::build
     fn render_poll(&self, row: &StatusRow) -> Option<PollEntity> {
         let poll = self.polls.get(&row.id)?;
-        Some(PollEntity::build(
+        let entity = PollEntity::build(
             poll,
             self.poll_options.get(&row.id).map_or(&[], Vec::as_slice),
             self.poll_votes.get(&row.id).map_or(&[], Vec::as_slice),
             Utc::now(),
+        );
+        Some(entity.with_emojis(
+            self.emojis.get(&row.id).map_or(&[], Vec::as_slice),
+            self.config,
         ))
     }
 }
