@@ -26,6 +26,7 @@ async fn a_remote_custom_emoji_reaction_carries_its_image_url() {
     )
     .await;
     let actor = peer.actor(BOB);
+    let ralph = format!("{}/emoji/ralph.png", peer.origin());
 
     let react = {
         let mut react = activity(
@@ -40,7 +41,7 @@ async fn a_remote_custom_emoji_reaction_carries_its_image_url() {
             json!({
                 "content": ":ralph:",
                 "to": [alice.ap_id],
-                "tag": [{"type": "Emoji", "name": ":ralph:", "icon": {"type": "Image", "url": "https://remote.example/emoji/ralph.png"}}],
+                "tag": [{"type": "Emoji", "name": ":ralph:", "icon": {"type": "Image", "url": ralph}}],
             }),
         );
         react
@@ -68,7 +69,7 @@ async fn a_remote_custom_emoji_reaction_carries_its_image_url() {
     );
     assert_eq!(
         reactions[0]["url"],
-        json!("https://remote.example/emoji/ralph.png"),
+        json!(ralph),
         "carrying the delivered emoji's own image"
     );
     let inline = get(&app, Some(&alice_token), &format!("{STATUSES}/{id}"))
@@ -76,7 +77,7 @@ async fn a_remote_custom_emoji_reaction_carries_its_image_url() {
         .json_value();
     assert_eq!(
         inline["pleroma"]["emoji_reactions"][0]["url"],
-        json!("https://remote.example/emoji/ralph.png"),
+        json!(ralph),
         "and rendering it inline on the status"
     );
     assert_eq!(

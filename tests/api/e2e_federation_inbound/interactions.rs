@@ -2,6 +2,7 @@
 
 use axum::http::StatusCode;
 use serde_json::json;
+use wired_be::models::custom_emoji;
 
 use super::support::{
     AS_PUBLIC, BOB, REACTIONS, STATUSES, activity, carries_uri, deliver, get, list, local, merge,
@@ -223,7 +224,7 @@ async fn a_remote_custom_reaction_is_named_for_its_instance_and_can_be_joined() 
     let posted = post_status(&app, &alice_token, json!({"status": "react to me"})).await;
     let id = common::id_of(&posted);
     let actor = peer.actor(BOB);
-    let image = "https://misskey.test/files/misskeycat.png";
+    let image = format!("{}/files/misskeycat.png", peer.origin());
 
     let react = {
         let mut react = activity(
@@ -262,7 +263,10 @@ async fn a_remote_custom_reaction_is_named_for_its_instance_and_can_be_joined() 
     .fetch_one(&pool)
     .await
     .expect("the emoji table reads");
-    assert_eq!(remembered, 1, "the reaction taught this instance the emoji");
+    assert_eq!(remembered, 0, "a reaction never files an emoji row");
+    custom_emoji::upsert_remote(&pool, "misskeycat", Some(domain.as_str()), &image)
+        .await
+        .expect("a remote post would have taught the emoji");
 
     let path = format!("{REACTIONS}/{id}/reactions");
     let reactions = list(&app, Some(&alice_token), &path).await;
