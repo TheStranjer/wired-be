@@ -293,7 +293,10 @@ async fn render_poll(
         None => Vec::new(),
     };
     let emojis = option_emojis(state, posted, &options).await?;
-    Ok(Poll::build(poll, &options, &own_votes, Utc::now()).with_emojis(&emojis, &state.config))
+    let is_author = viewer.is_some_and(|viewer| viewer.id == posted.user_id);
+    Ok(Poll::build(poll, &options, &own_votes, Utc::now())
+        .with_author_view(is_author)
+        .with_emojis(&emojis, &state.config))
 }
 
 /// The custom emojis the titles of `options` use, as the status `posted`'s

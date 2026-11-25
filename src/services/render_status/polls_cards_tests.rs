@@ -343,3 +343,28 @@ async fn the_card_follows_one_batched_read() {
         "the viewer's page renders the same card"
     );
 }
+
+/// The author's own render of the batch reads the poll as voted — the
+/// flag Mastodon and Pleroma give an author — while `own_votes` stays
+/// the empty list of marks she never made.
+#[tokio::test]
+async fn the_author_reads_her_own_poll_as_voted_without_marks() {
+    let db = crate::test_db::test_db().await.expect("test database slot");
+    let pool = db.pool().clone();
+    let state = test_state(&pool);
+    let (alice, _bob, polled, open) = open_poll_fixture(&pool).await;
+
+    let for_alice = render_statuses(
+        &state,
+        ViewerMode::user(&alice),
+        std::slice::from_ref(&polled),
+    )
+    .await
+    .expect("the poll renders for its author");
+    let value = serde_json::to_value(&for_alice[0]).expect("it serializes");
+    assert_eq!(
+        value["poll"],
+        expected_open_poll(&open, true, &[]),
+        "voted for the author, with no marks of hers"
+    );
+}

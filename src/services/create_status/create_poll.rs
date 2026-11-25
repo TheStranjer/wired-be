@@ -146,7 +146,10 @@ mod tests {
             "the roll-ups start at zero"
         );
         assert_eq!(value["poll"]["voters_count"], 0);
-        assert_eq!(value["poll"]["voted"], false, "the author has not voted");
+        assert_eq!(
+            value["poll"]["voted"], true,
+            "the author reads her poll as voted"
+        );
         assert_eq!(value["poll"]["own_votes"], json!([]));
         assert_eq!(
             value["poll"]["options"],

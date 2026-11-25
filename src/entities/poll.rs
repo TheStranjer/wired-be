@@ -20,7 +20,9 @@
 //!   deadline passes the stored counts render like any other poll's.
 //! - `voted` and `own_votes` are the viewer's marks, read by
 //!   [`voted_option_positions`](crate::models::poll::voted_option_positions);
-//!   a viewer who voted nothing gets `false` and `[]`.
+//!   a viewer who voted nothing gets `false` and `[]`. The poll's own
+//!   author gets `voted: true` with `own_votes: []`
+//!   ([`Poll::with_author_view`]).
 //!
 //! The status-wiring ticket connected it: [`crate::services::render_status`]
 //! batch-loads the rows and the viewer's marks and hands the built entity
@@ -130,6 +132,19 @@ impl Poll {
                 .collect(),
             emojis: Vec::new(),
         }
+    }
+
+    /// Marks the poll as seen by its own author when `is_author` holds.
+    ///
+    /// The author's `voted` reads `true` with `own_votes` still `[]`, as
+    /// Mastodon's `Poll#voted?` and Pleroma's `PollView` render it, so
+    /// clients show results rather than a form the vote endpoint refuses.
+    #[must_use]
+    pub const fn with_author_view(mut self, is_author: bool) -> Self {
+        if is_author {
+            self.voted = JsonBool(true);
+        }
+        self
     }
 
     /// Fills [`emojis`](Self::emojis) from `emojis`, keeping only those
@@ -304,6 +319,24 @@ mod tests {
             ]),
             "the stored counts show once the poll is over"
         );
+    }
+
+    #[test]
+    fn the_author_view_reads_voted_while_own_votes_stays_the_viewer_s_marks() {
+        let row = poll_row(None, 0, 0);
+        let author = Poll::build(&row, &options(), &[], now()).with_author_view(true);
+        let author_json = serde_json::to_value(&author).unwrap();
+        assert_eq!(author_json["voted"], true, "the author reads voted");
+        assert_eq!(author_json["own_votes"], json!([]), "with no marks of hers");
+
+        let other = Poll::build(&row, &options(), &[], now()).with_author_view(false);
+        let other_json = serde_json::to_value(&other).unwrap();
+        assert_eq!(other_json["voted"], false, "anyone else who voted nothing");
+
+        let voter = Poll::build(&row, &options(), &[1], now()).with_author_view(false);
+        let voter_json = serde_json::to_value(&voter).unwrap();
+        assert_eq!(voter_json["voted"], true, "a voter reads voted");
+        assert_eq!(voter_json["own_votes"], json!([1]));
     }
 
     #[test]

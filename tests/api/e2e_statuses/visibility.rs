@@ -287,7 +287,7 @@ async fn a_poll_post_carries_its_open_stand_to_the_open_audience() {
         acct: "author",
     };
     let admitted = sweep(&app, &world, &shape, &OPEN).await;
-    for entity in &admitted {
+    for (entity, who) in admitted.iter().zip(OPEN) {
         let stand = &entity["poll"];
         assert_eq!(
             stand["options"],
@@ -298,7 +298,12 @@ async fn a_poll_post_carries_its_open_stand_to_the_open_audience() {
             "the options ride every read"
         );
         assert_eq!(stand["votes_count"], json!(0), "the stand opens at zero");
-        assert_eq!(stand["voted"], json!(false), "and nobody's marked anything");
+        assert_eq!(
+            stand["voted"],
+            json!(who == "author"),
+            "{who}: only the author reads voted, and nobody has marked anything"
+        );
+        assert_eq!(stand["own_votes"], json!([]), "{who}: no marks anywhere");
         assert_eq!(stand["expired"], json!(false), "an hour out is open");
         assert!(
             stand["expires_at"].is_string(),
