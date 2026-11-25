@@ -194,13 +194,24 @@ pub(super) async fn redirect_to(State(location): State<String>) -> Response {
 }
 
 /// Moves a stored mirror's fetch stamp outside the refresh window.
+///
+/// The stamp moves in `users` and in the mirror's `activitypub_actors` row
+/// alike, as the writers keep them.
 pub(super) async fn make_stale(pool: &PgPool, ap_id: &str) {
-    sqlx::query("UPDATE users SET last_fetched_at = now() - interval '25 hours' WHERE ap_id = $1")
-        .bind(ap_id)
-        .execute(pool)
-        .await
-        .map(drop)
-        .unwrap();
+    sqlx::query(
+        "WITH aged AS (
+             UPDATE users SET last_fetched_at = now() - interval '25 hours'
+              WHERE ap_id = $1
+          RETURNING id, last_fetched_at
+         )
+         UPDATE activitypub_actors AS a SET last_fetched_at = aged.last_fetched_at
+           FROM aged WHERE a.user_id = aged.id",
+    )
+    .bind(ap_id)
+    .execute(pool)
+    .await
+    .map(drop)
+    .unwrap();
 }
 
 /// A peer serving an actor document that carries the profile images

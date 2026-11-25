@@ -72,6 +72,17 @@ async fn an_update_folds_the_new_profile_into_the_mirror() {
         Some(NEW_PEM),
         "and so did the signing key"
     );
+
+    let actor = crate::test_fixtures::assert_actor_in_step(&pool, alice_id).await;
+    assert_eq!(
+        actor.inbox, stored.inbox,
+        "the actor row follows the inbox move"
+    );
+    assert_eq!(
+        actor.public_key.as_deref(),
+        Some(NEW_PEM),
+        "and the new signing key"
+    );
 }
 
 /// An `Update` that turns a `Person` into a `Service` flips the bot flag

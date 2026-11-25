@@ -422,6 +422,14 @@ mod tests {
             "the invalid-invite refusal, got {err:?}"
         );
         assert_eq!(user_count(&pool).await, 1, "only one user exists");
+        let actor_rows = sqlx::query_scalar::<_, i64>("SELECT count(*) FROM activitypub_actors")
+            .fetch_one(&pool)
+            .await
+            .expect("the actor rows count");
+        assert_eq!(
+            actor_rows, 1,
+            "the refused registration's actor row rolled back with its user"
+        );
         let spent = stored_invite(&pool, invite.id).await;
         assert_eq!(spent.uses, 1, "the invite was spent exactly once");
     }

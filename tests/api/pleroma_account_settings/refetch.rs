@@ -144,6 +144,12 @@ impl Peer {
             .execute(pool)
             .await
             .expect("the fetch stamp is set");
+        let _mirrored =
+            sqlx::query("UPDATE activitypub_actors SET last_fetched_at = now() WHERE user_id = $1")
+                .bind(row.id)
+                .execute(pool)
+                .await
+                .expect("the actor row's fetch stamp is set alike");
         stored(pool, row.id).await
     }
 }

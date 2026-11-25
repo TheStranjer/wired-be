@@ -365,6 +365,15 @@ mod tests {
 
         assert_actor_endpoints(&user);
         assert_generated_key_pair(&user);
+        let actor = crate::test_fixtures::assert_actor_in_step(&pool, user.id).await;
+        assert_eq!(
+            actor.private_key, user.private_key,
+            "the actor row holds the generated private key"
+        );
+        assert!(
+            actor.public_key.is_some() && actor.inbox.is_some(),
+            "and the key pair's public half and the inbox"
+        );
 
         let fetched = get_by_nickname(&state.db, "aLiCe")
             .await

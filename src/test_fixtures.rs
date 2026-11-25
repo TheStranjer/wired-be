@@ -8,9 +8,14 @@ use serde_json::Value;
 
 #[cfg(test)]
 use sqlx::PgPool;
+#[cfg(test)]
+use uuid::Uuid;
 
 #[cfg(test)]
-use crate::models::user::{User, insert};
+use crate::models::{
+    activitypub_actor::{self, ActivityPubActor},
+    user::{User, get_by_id, insert},
+};
 use crate::{
     config::TEST_BASE_URL,
     models::user::{NewUser, local_ap_id},
@@ -70,6 +75,76 @@ pub async fn remote_user(pool: &PgPool, nickname: &str) -> User {
     insert(pool, &remote_new(nickname))
         .await
         .expect("the remote fixture inserts")
+}
+
+/// Asserts an account's actor row holds the moved columns of its `users` row.
+///
+/// Returns the actor row. The check behind every test of the temporary dual write (see
+/// [`crate::models::activitypub_actor`]): `inbox`, `shared_inbox`, `outbox`,
+/// `followers_url`, `following_url`, `featured_url`, `public_key`,
+/// `private_key`, `public_key_id` and `last_fetched_at` compare equal.
+///
+/// # Panics
+///
+/// Panics when either row is missing or any column differs.
+#[cfg(test)]
+pub async fn assert_actor_in_step(pool: &PgPool, user_id: Uuid) -> ActivityPubActor {
+    let user = get_by_id(pool, user_id)
+        .await
+        .expect("the user reads")
+        .expect("the user exists");
+    let key_id =
+        sqlx::query_scalar::<_, Option<String>>("SELECT public_key_id FROM users WHERE id = $1")
+            .bind(user_id)
+            .fetch_one(pool)
+            .await
+            .expect("the key id reads");
+    let actor = activitypub_actor::get(pool, user_id)
+        .await
+        .expect("the actor row reads")
+        .expect("the account has an actor row");
+    assert_eq!(actor.inbox, user.inbox, "inbox");
+    assert_eq!(actor.shared_inbox, user.shared_inbox, "shared_inbox");
+    assert_eq!(actor.outbox, user.outbox, "outbox");
+    assert_eq!(actor.followers_url, user.followers_url, "followers_url");
+    assert_eq!(actor.following_url, user.following_url, "following_url");
+    assert_eq!(actor.featured_url, user.featured_url, "featured_url");
+    assert_eq!(actor.public_key, user.public_key, "public_key");
+    assert_eq!(actor.private_key, user.private_key, "private_key");
+    assert_eq!(actor.public_key_id, key_id, "public_key_id");
+    assert_eq!(
+        actor.last_fetched_at, user.last_fetched_at,
+        "last_fetched_at"
+    );
+    actor
+}
+
+/// Copies the moved columns of a `users` row onto its `activitypub_actors` row.
+///
+/// For a fixture that sets those columns with a raw `UPDATE users`, so the
+/// two tables stay in step the way the writers keep them.
+///
+/// # Panics
+///
+/// Panics when the account has no actor row to update.
+#[cfg(test)]
+pub async fn resync_actor(pool: &PgPool, user_id: Uuid) {
+    let copied = sqlx::query(
+        "UPDATE activitypub_actors AS a
+            SET inbox = u.inbox, shared_inbox = u.shared_inbox, outbox = u.outbox,
+                followers_url = u.followers_url, following_url = u.following_url,
+                featured_url = u.featured_url, public_key = u.public_key,
+                private_key = u.private_key, public_key_id = u.public_key_id,
+                last_fetched_at = u.last_fetched_at
+           FROM users AS u
+          WHERE u.id = a.user_id AND u.id = $1",
+    )
+    .bind(user_id)
+    .execute(pool)
+    .await
+    .expect("the actor row updates")
+    .rows_affected();
+    assert_eq!(copied, 1, "the account has one actor row to update");
 }
 
 /// The keys of the JSON object `value`, sorted: the exact key-set
