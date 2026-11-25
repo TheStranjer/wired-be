@@ -1,6 +1,10 @@
 //! The admin federation endpoints: the relay ledger, the instance
 //! deletion and the emoji reload under `/api/v1/pleroma/admin` (WBE-203).
 //!
+//! The relay ledger and the instance deletion are `ActivityPub`-backed
+//! ([`router`]); `POST /reload_emoji` is core ([`emoji_router`]), since it
+//! only resyncs the local emoji packs.
+//!
 //! The reference is Pleroma's `AdminAPI.RelayController`
 //! (`lib/pleroma/web/admin_api/controllers/relay_controller.ex`), the
 //! `delete` action of `AdminAPI.InstanceController`
@@ -104,12 +108,21 @@ const NOT_FOUND: &str = "Not found";
 /// domain — Pleroma's `Instance.delete` refusal, verbatim.
 const CANNOT_DELETE_LOCAL: &str = "Can't delete the local instance";
 
-/// The federation routes of the admin API, merged into [`super`].
+/// The relay and remote-instance routes, `ActivityPub`-backed, merged into
+/// [`super::activitypub_router`].
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/relay", get(list).post(follow).delete(unfollow))
         .route("/instances/{instance}", delete(delete_instance))
-        .route("/reload_emoji", post(reload_emoji))
+}
+
+/// The emoji reload route, core, merged into [`super::core_router`].
+///
+/// It lives in this module because Pleroma's controller serves it with the
+/// federation routes, but it only resyncs the local emoji packs and needs no
+/// `ActivityPub` data.
+pub fn emoji_router() -> Router<AppState> {
+    Router::new().route("/reload_emoji", post(reload_emoji))
 }
 
 /// The body of `POST /relay` and `DELETE /relay`: Pleroma's single

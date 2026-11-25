@@ -2,6 +2,28 @@
 //! `/api/v1/pleroma/admin` (`docs/ARCHITECTURE.md` decision 1), starting
 //! with the moderation-log foundation (WBE-194).
 //!
+//! # Core and `ActivityPub`-backed routes
+//!
+//! The rule of [`crate::api`] splits this area in two routers:
+//! [`core_router`] manages local accounts and the instance and is always
+//! mounted; [`activitypub_router`] holds everything about statuses, reports,
+//! relays, remote instances, chats and forced follows, and is mounted only
+//! while `ActivityPub` is enabled. With it off, those paths answer the
+//! app-wide fallback 404.
+//!
+//! | Class | Routes |
+//! |---|---|
+//! | Core | `moderation_log`; [`apps_docs`] (OAuth apps, instance documents); [`config`] (runtime config, `need_reboot`, `restart`); [`content`] (rules, announcements); `POST /reload_emoji` ([`federation::emoji_router`]); [`invites`]; [`ops`] (media-proxy cache ledger, backups); [`users::router`] (list, show, create, delete, credentials, password resets, email confirmation and its resend, MFA, tags, roles, suggestions, activate, deactivate, approve); [`webhooks`] |
+//! | `ActivityPub`-backed | `stats` (it counts statuses); [`chats`]; [`federation::router`] (the `/relay` ledger and `DELETE /instances/{instance}`); [`reports`]; [`statuses`]; [`users::activitypub_router`] (`/users/follow` and `/users/unfollow`, which write follows) |
+//!
+//! `GET /users` and `GET /users/{nickname}` are mixed in themselves: the
+//! listing's `external` filter and the show's `nick@domain` handles reach
+//! remote mirror accounts. They stay core because managing accounts is core,
+//! and they need no `ActivityPub` machinery to answer: they read the
+//! accounts table, so they still answer when `ActivityPub` is off. The webhooks are core too although the
+//! `report.updated` event fires only from the reports routes: the registry
+//! is instance management and may list events that never occur.
+//!
 //! The reference is Pleroma's `AdminAPIController`
 //! (`lib/pleroma/web/admin_api/controllers/admin_api_controller.ex`)
 //! routed in `lib/pleroma/web/router.ex` under `/api/v1/pleroma/admin`.
@@ -132,27 +154,37 @@ const AREA_STATS: &str = "statistics";
 /// The read endpoint class of [`AdminUser::require`].
 const CLASS_READ: &str = "read";
 
-/// The `/api/v1/pleroma/admin` router, nested into [`crate::api::v1`].
-/// Later admin tickets extend it with more `.merge(...)` lines.
+/// The admin routes that manage local accounts and the instance.
+///
+/// Nested at `/pleroma/admin` into [`crate::api::v1::core_router`].
 ///
 /// `config` reaches [`apps_docs::router`], the merged router whose routes
 /// carry a body limit of their own (the instance-document upload; see
 /// [`crate::extract::multipart::upload_body_limit`]).
-pub fn router(config: &Config) -> Router<AppState> {
+pub fn core_router(config: &Config) -> Router<AppState> {
     Router::new()
         .route("/moderation_log", get(list_moderation_log))
-        .route("/stats", get(stats))
         .merge(apps_docs::router(config))
-        .merge(chats::router())
         .merge(config::router())
         .merge(content::router())
-        .merge(federation::router())
+        .merge(federation::emoji_router())
         .merge(invites::router())
         .merge(ops::router())
-        .merge(reports::router())
-        .merge(statuses::router())
         .merge(users::router())
         .merge(webhooks::router())
+}
+
+/// The admin routes about statuses, reports, relays, remote instances and chats.
+///
+/// Nested at `/pleroma/admin` into [`crate::api::v1::activitypub_router`].
+pub fn activitypub_router() -> Router<AppState> {
+    Router::new()
+        .route("/stats", get(stats))
+        .merge(chats::router())
+        .merge(federation::router())
+        .merge(reports::router())
+        .merge(statuses::router())
+        .merge(users::activitypub_router())
 }
 
 /// `GET /api/v1/pleroma/admin/moderation_log` — the log page Pleroma's

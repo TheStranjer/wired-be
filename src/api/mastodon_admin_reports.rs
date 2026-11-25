@@ -7,7 +7,13 @@
 //! (`lib/pleroma/web/mastodon_api/admin/views/report_view.ex`), routed in
 //! `lib/pleroma/web/router.ex` under `/api/v1/admin` beside the account
 //! routes of [`crate::api::mastodon_admin`] — which this file joins as the
-//! sibling [`v1_router`] merged onto the same `/admin` nest.
+//! sibling [`v1_router`] nested on the same `/admin` prefix.
+//!
+//! Every route here is `ActivityPub`-backed: a report references statuses and
+//! remote accounts. [`v1_router`] is therefore mounted by
+//! [`crate::api::v1::activitypub_router`], and with `ActivityPub` off these
+//! paths answer the app-wide fallback 404, while the account routes of
+//! [`crate::api::mastodon_admin`] stay core.
 //!
 //! The controller runs the `admin_api` pipeline, whose gate plug is
 //! `UserIsStaffPlug`, and its `OAuthScopesPlug` pair: `admin:read:reports`
@@ -137,7 +143,7 @@ const MAX_LIMIT: i64 = 200;
 const INVALID_ID: &str = "Invalid id";
 
 /// The `/reports` routes of the Mastodon admin API v1, merged onto the
-/// `/admin` nest of [`crate::api::v1`] beside
+/// `/admin` prefix of [`crate::api::v1::activitypub_router`] beside
 /// [`crate::api::mastodon_admin`]'s account routes.
 ///
 /// The four action suffixes are static segments beside the parameter
