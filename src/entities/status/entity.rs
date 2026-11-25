@@ -17,7 +17,7 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use super::{
-    PlainText, PleromaMetadata, StatusApplication, StatusSource,
+    PlainText, PleromaMetadata, QuoteApproval, StatusApplication, StatusSource,
     pleroma::{BlockViewer, pleroma_block},
     source::QuoteSlot,
 };
@@ -164,6 +164,10 @@ pub struct Status {
     /// quoted status's own `quote` is `{state, quoted_status_id}`. `null`
     /// when this status quotes nothing.
     pub quote: Option<StatusQuote>,
+    /// Who may quote this status and whether the viewer may: Mastodon
+    /// 4.5's `{automatic, manual, current_user}` (see [`QuoteApproval`]).
+    /// Always an object; a reblog row carries its original's.
+    pub quote_approval: QuoteApproval,
     /// The filters that warned over this status, as the v2 `FilterResult`
     /// entities: [`crate::services::filter::apply_filters`] fills it from
     /// the viewer's active filters as a page is post-processed, and an
@@ -216,6 +220,10 @@ impl Status {
             poll,
             parent_visible,
         } = source;
+        let quote_approval = reblog.as_ref().map_or_else(
+            || QuoteApproval::for_row(row, author, viewer, relationships),
+            |original| original.quote_approval.clone(),
+        );
         Self {
             id: row.id.to_string(),
             uri: row.uri.clone(),
@@ -250,6 +258,7 @@ impl Status {
             quote: row
                 .quote_of_id
                 .map(|id| StatusQuote::new(quote.as_ref(), id)),
+            quote_approval,
             filtered: Vec::new(),
             pleroma: pleroma_block(
                 row,

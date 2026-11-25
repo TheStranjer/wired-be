@@ -44,7 +44,7 @@ pub(super) const CAT_IMAGE: &str = "https://test.example/emoji/cats/cat.png";
 /// The URL a link card is cached under, for the card entries.
 pub(super) const CARD_URL: &str = "https://example.test/post";
 /// Every JSON key the entity must emit, sorted.
-pub(super) const EXPECTED_KEYS: [&str; 33] = [
+pub(super) const EXPECTED_KEYS: [&str; 34] = [
     "account",
     "application",
     "bookmarked",
@@ -67,6 +67,7 @@ pub(super) const EXPECTED_KEYS: [&str; 33] = [
     "pleroma",
     "poll",
     "quote",
+    "quote_approval",
     "quote_id",
     "reblog",
     "reblogged",
@@ -214,6 +215,7 @@ pub(super) fn base_row() -> StatusRow {
         direct_conversation_id: None,
         reblog_of_id: None,
         quote_of_id: None,
+        quote_policy: None,
         local: true,
         application_name: None,
         application_website: None,

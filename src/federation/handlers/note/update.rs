@@ -114,6 +114,9 @@ async fn fold_edit(
             ));
         }
     };
+    if recency != Ordering::Less {
+        refresh_quote_policy(state, stored, &parsed).await?;
+    }
     let text_unchanged = restates(&parsed, stored);
     if recency == Ordering::Less && !text_unchanged {
         return Ok(ignore_stale(stored));
@@ -196,6 +199,28 @@ fn edit_params(
     }
 }
 
+/// Stores the quote policy the `Update`'s document advertises when it
+/// differs from the stored one.
+///
+/// The policy is not a versioned field: it is written whether or not the
+/// text changed, with no revision and no `edited_at` stamp, so an author who
+/// only changes who may quote the post still moves what clients see.
+async fn refresh_quote_policy(
+    state: &AppState,
+    stored: &Status,
+    parsed: &ParsedNote,
+) -> Result<(), FederationError> {
+    let incoming = parsed.status.quote_policy.as_ref();
+    if incoming == stored.quote_policy.as_ref().map(|policy| &policy.0) {
+        return Ok(());
+    }
+    status::set_quote_policy(&state.db, stored.id, incoming)
+        .await
+        .map_err(|err| FederationError::transient("the quote policy write failed", &err))?;
+    debug!(status = %stored.id, "an Update changed the advertised quote policy");
+    Ok(())
+}
+
 /// The answer of a [`fold_edit`] whose `Update` restates the stored text
 /// without being newer: a tally refresh.
 ///
@@ -264,6 +289,8 @@ fn update_time(object: &Value, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
 
 #[cfg(test)]
 mod emoji_tests;
+#[cfg(test)]
+mod quote_policy_tests;
 
 #[cfg(test)]
 mod tests {

@@ -46,6 +46,7 @@ pub mod addressing;
 pub mod attachments;
 mod envelope;
 mod polls;
+mod quote_policy;
 mod tags;
 #[cfg(test)]
 mod test_support;
@@ -63,6 +64,7 @@ use addressing::addressed_actor_ids;
 use attachments::parse_attachments;
 use envelope::{check_containment, check_size, object_id, object_kind, resolve_url};
 use polls::parse_poll;
+use quote_policy::parse_quote_policy;
 use tags::parse_tags;
 use text::{field_reference, parse_language, parse_sensitive, parse_text, parse_times};
 
@@ -195,6 +197,7 @@ pub fn parse_note(
         expires_at: poll.as_ref().and_then(|parsed| parsed.expires_at),
         inserted_at: Some(times.inserted_at),
         language: parse_language(json),
+        quote_policy: parse_quote_policy(json),
         ..NewStatus::default()
     };
     Ok(ParsedNote {
@@ -354,6 +357,22 @@ mod tests {
             Some("https://a.example/x"),
             "a bare quote property is the reference"
         );
+    }
+
+    #[test]
+    fn the_can_quote_policy_lands_on_the_status() {
+        let mut note = minimal_note();
+        assert_eq!(parse(&note).status.quote_policy, None, "no policy stated");
+        note["interactionPolicy"] = json!({"canQuote": {
+            "automaticApproval": ["https://remote.example/users/bob/followers"],
+        }});
+        let policy = parse(&note).status.quote_policy.expect("a policy");
+        assert_eq!(
+            policy.automatic,
+            ["https://remote.example/users/bob/followers"],
+            "the automatic approvers"
+        );
+        assert!(policy.manual.is_empty(), "and no manual ones");
     }
 
     #[test]

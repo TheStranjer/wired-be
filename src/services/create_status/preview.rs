@@ -166,6 +166,7 @@ fn preview_row(base_url: &str, new: &NewStatus) -> status::Status {
         direct_conversation_id: new.direct_conversation_id,
         reblog_of_id: None,
         quote_of_id: None,
+        quote_policy: None,
         local: new.local,
         application_name: new.application_name.clone(),
         application_website: new.application_website.clone(),

@@ -39,6 +39,7 @@ pub(super) fn row(id: Uuid) -> status::Status {
         direct_conversation_id: None,
         reblog_of_id: None,
         quote_of_id: None,
+        quote_policy: None,
         local: true,
         application_name: None,
         application_website: None,

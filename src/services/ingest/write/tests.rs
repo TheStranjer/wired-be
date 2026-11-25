@@ -241,3 +241,56 @@ async fn a_direct_note_is_its_own_conversation_root() {
         "and carries no reply reference of either kind"
     );
 }
+
+#[tokio::test]
+async fn the_advertised_quote_policy_lands_with_the_status() {
+    let db = crate::test_db::test_db().await.expect("test database slot");
+    let pool = db.pool().clone();
+    let state = app_state(&pool);
+    let bob = author(&pool).await;
+    let policy = json!({"canQuote": {
+        "automaticApproval": ["https://remote.example/users/bob/followers"],
+        "manualApproval": [],
+    }});
+    let advertising = json!({
+        "id": "https://remote.example/objects/ingest-policy",
+        "type": "Note",
+        "attributedTo": "https://remote.example/users/bob",
+        "to": ["https://www.w3.org/ns/activitystreams#Public"],
+        "content": "<p>with a policy</p>",
+        "interactionPolicy": policy,
+    });
+    let silent = json!({
+        "id": "https://remote.example/objects/ingest-no-policy",
+        "type": "Note",
+        "attributedTo": "https://remote.example/users/bob",
+        "to": ["https://www.w3.org/ns/activitystreams#Public"],
+        "content": "<p>without one</p>",
+    });
+
+    let IngestOutcome::Created(with) = ingest_note(&state, &bob, &advertising)
+        .await
+        .expect("the advertising note ingests")
+    else {
+        panic!("the advertising note writes");
+    };
+    let IngestOutcome::Created(without) = ingest_note(&state, &bob, &silent)
+        .await
+        .expect("the silent note ingests")
+    else {
+        panic!("the silent note writes");
+    };
+
+    assert_eq!(
+        with.quote_policy.map(|stored| stored.0),
+        Some(status::QuotePolicy {
+            automatic: vec!["https://remote.example/users/bob/followers".to_owned()],
+            manual: Vec::new(),
+        }),
+        "the canQuote lists are stored"
+    );
+    assert_eq!(
+        without.quote_policy, None,
+        "a note without interactionPolicy stores none"
+    );
+}
