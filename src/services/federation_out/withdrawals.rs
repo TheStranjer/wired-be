@@ -10,6 +10,7 @@
 use tracing::warn;
 use uuid::Uuid;
 
+use super::audience::{Kind, queue_with_audience};
 use super::boosts::reblog_activity;
 use super::notes::federates_as_note;
 use super::{load_user, queue_activity, status_action};
@@ -109,7 +110,7 @@ async fn note_withdrawal(state: &AppState, deleted: &Status) {
         to: &to,
         cc: &cc,
     });
-    queue_activity(state, &author, &document, "note withdrawal").await;
+    queue_with_audience(state, &author, deleted.id, &document, Kind::Delete).await;
 }
 
 /// The row as the delete left it, for the `Tombstone` to report: the

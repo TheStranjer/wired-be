@@ -60,6 +60,7 @@
 //! steps it back down, so [`bump_counter`] is left to the counters no status
 //! row links to (favourites).
 
+mod audience;
 mod counters;
 mod delete;
 mod new_status;
@@ -78,6 +79,7 @@ mod test_support;
 
 pub mod admin;
 
+pub use audience::{clear_departed_voters, remote_boosters, remote_voters};
 pub use counters::bump_counter;
 pub use delete::{
     fetch_expired, insert_tombstone, soft_delete, soft_delete_all_for_user,

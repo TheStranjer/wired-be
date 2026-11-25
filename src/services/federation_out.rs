@@ -177,6 +177,7 @@ use crate::{
     util::id::new_id,
 };
 
+mod audience;
 mod blocks;
 mod boosts;
 mod chat_admin_deletes;
