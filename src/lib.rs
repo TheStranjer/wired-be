@@ -22,6 +22,7 @@ pub mod middleware;
 pub mod models;
 pub mod oauth;
 pub mod pagination;
+pub mod protocols;
 pub mod rate_limit;
 pub mod server;
 pub mod services;

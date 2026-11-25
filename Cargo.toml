@@ -7,6 +7,10 @@ description = "Wired's API-only fediverse backend in Rust/Axum, compatible with 
 publish = false
 
 [features]
+# One feature per protocol, named by the protocol id (see `src/protocols.rs`).
+# A build needs at least one; `src/protocols.rs` fails the build otherwise.
+default = ["activitypub"]
+activitypub = []
 # Compiles the test-only constructors (`Config::for_tests`) into the library
 # so the integration tests in `tests/` can use them. Enabled by the
 # dev-dependency below; never enabled in a normal build. (Named
