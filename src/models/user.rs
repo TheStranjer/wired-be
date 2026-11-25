@@ -208,6 +208,15 @@ pub fn featured(ap_id: &str) -> String {
     format!("{ap_id}/collections/featured")
 }
 
+/// The featured-hashtags collection of actor `ap_id`: `{ap_id}/collections/tags`.
+///
+/// The single source of truth: the actor document advertises it as
+/// `featuredTags` and the router serves it.
+#[must_use]
+pub fn featured_tags(ap_id: &str) -> String {
+    format!("{ap_id}/collections/tags")
+}
+
 #[cfg(test)]
 mod tests {
     use super::test_support::BASE;
@@ -225,6 +234,14 @@ mod tests {
         assert!(
             NOT_INSTANCE_ACTOR_U.contains(INSTANCE_ACTOR_NICKNAME),
             "so does the `u`-aliased fragment"
+        );
+    }
+
+    #[test]
+    fn the_featured_tags_collection_lives_under_collections_tags() {
+        assert_eq!(
+            featured_tags(&local_ap_id(BASE, "alice")),
+            "https://test.example/users/alice/collections/tags"
         );
     }
 

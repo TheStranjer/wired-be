@@ -21,6 +21,7 @@ use crate::{
     error::{AppError, AppResult},
     federation::{
         collections::{self, FollowSide},
+        featured_tags::featured_tags_document,
         note::litepub_context_json,
     },
     services::instance_actor,
@@ -137,6 +138,27 @@ pub(super) async fn get_featured(
     let response = match outcome {
         Ok(Reader::Account(user)) => {
             document(collections::featured_document(&state.db, &state.config, &user).await)
+        }
+        Ok(Reader::Redirect(redirect)) => Ok(redirect),
+        Err(err) => Err(err),
+    };
+    with_vary(response)
+}
+
+/// `GET /users/{nickname}/collections/tags` — the account's featured
+/// hashtags as one `Collection` of `Hashtag` objects, the document the
+/// actor's `featuredTags` names (Mastodon's `collections#show` for tags);
+/// the list is inline, not paged.
+pub(super) async fn get_featured_tags(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    uri: Uri,
+    Path(nickname): Path<String>,
+) -> Response {
+    let outcome = gate_actor_read(&state, &nickname, &headers, &uri).await;
+    let response = match outcome {
+        Ok(Reader::Account(user)) => {
+            document(featured_tags_document(&state.db, &state.config, &user).await)
         }
         Ok(Reader::Redirect(redirect)) => Ok(redirect),
         Err(err) => Err(err),

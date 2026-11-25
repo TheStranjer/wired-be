@@ -36,6 +36,13 @@
 //!   cursors are [`hashtag_follow::Entry::position`] values — the order the
 //!   tags were followed in, the one order the listing has (Pleroma pages it
 //!   by the same integer ordinal, `id_type: :integer`).
+//! - `POST /api/v1/tags/{name}/feature` and `…/unfeature` need
+//!   `write:accounts` and are newer Mastodon's way to feature a tag on the
+//!   caller's profile (see [`crate::api::featured_tags`]): both answer the
+//!   full Tag with `featuring` set, `feature` creates the tag row on demand
+//!   and is idempotent, a tenth-plus tag is the 422 limit, and an unfeature
+//!   of an unknown tag is the same 404 as `unfollow`. Every full Tag a
+//!   viewer asks for carries `featuring`.
 //! - `GET /api/v1/trends`, `/api/v1/trends/tags`, `/api/v1/trends/statuses`
 //!   and `/api/v1/trends/links` answer the empty array: Pleroma computes no
 //!   trends, and the ticket keeps it that way. The routes exist so clients
@@ -62,9 +69,10 @@ use crate::{
     auth::{AuthUser, MaybeAuthUser},
     entities::tag::{Tag, TagHistory},
     error::{AppError, AppResult},
-    models::{hashtag, hashtag_follow},
-    oauth::scopes::{READ, READ_FOLLOWS, WRITE_FOLLOWS},
+    models::{featured_tag, hashtag, hashtag_follow},
+    oauth::scopes::{READ, READ_FOLLOWS, WRITE_ACCOUNTS, WRITE_FOLLOWS},
     pagination::{MAX_LIMIT, OrdinalPageParams, link_for_page, set_link_header},
+    services::federation_out,
     state::AppState,
 };
 
@@ -76,6 +84,9 @@ const HISTORY_DAYS: u64 = 7;
 const TAG_NOT_FOUND: &str = "Hashtag not found";
 /// 422 body for a path segment that normalizes to no usable tag name.
 const INVALID_HASHTAG: &str = "Invalid hashtag";
+/// 422 body for a `feature` past the per-account limit of featured tags.
+const FEATURE_LIMIT: &str =
+    "Validation failed: You have already featured the maximum number of hashtags";
 
 /// The `/api/v1/tags`, `/api/v1/followed_tags` and `/api/v1/trends` router,
 /// merged into [`crate::api::v1`].
@@ -84,6 +95,8 @@ pub fn router() -> Router<AppState> {
         .route("/tags/{name}", get(show_tag))
         .route("/tags/{name}/follow", post(follow_tag))
         .route("/tags/{name}/unfollow", post(unfollow_tag))
+        .route("/tags/{name}/feature", post(feature_tag))
+        .route("/tags/{name}/unfeature", post(unfeature_tag))
         .route("/followed_tags", get(list_followed_tags))
         .route("/trends", get(empty_array))
         .route("/trends/tags", get(empty_array))
@@ -114,11 +127,14 @@ async fn show_tag(
 ) -> AppResult<Json<Tag>> {
     auth.require_user_scope(READ)?;
     let tag = known_tag(&state, &name).await?;
-    let following = match &auth.0 {
-        Some(user) => Some(hashtag_follow::is_following(&state.db, user.id, tag.id).await?),
-        None => None,
+    let (following, featuring) = match &auth.0 {
+        Some(user) => (
+            Some(hashtag_follow::is_following(&state.db, user.id, tag.id).await?),
+            Some(featured_tag::is_featuring(&state.db, user.id, tag.id).await?),
+        ),
+        None => (None, None),
     };
-    Ok(Json(render_tag(&state, &tag, following).await?))
+    Ok(Json(render_tag(&state, &tag, following, featuring).await?))
 }
 
 /// `POST /api/v1/tags/{name}/follow` — create the tag row when a valid
@@ -148,7 +164,10 @@ async fn follow_tag(
         new,
         "hashtag followed"
     );
-    Ok(Json(render_tag(&state, &tag, Some(true)).await?))
+    let featuring = featured_tag::is_featuring(&state.db, auth.0.id, tag.id).await?;
+    Ok(Json(
+        render_tag(&state, &tag, Some(true), Some(featuring)).await?,
+    ))
 }
 
 /// `POST /api/v1/tags/{name}/unfollow` — drop the follow (idempotent: an
@@ -178,7 +197,78 @@ async fn unfollow_tag(
         removed,
         "hashtag unfollowed"
     );
-    Ok(Json(render_tag(&state, &tag, Some(false)).await?))
+    let featuring = featured_tag::is_featuring(&state.db, auth.0.id, tag.id).await?;
+    Ok(Json(
+        render_tag(&state, &tag, Some(false), Some(featuring)).await?,
+    ))
+}
+
+/// `POST /api/v1/tags/{name}/feature` — feature the tag on the caller's profile.
+///
+/// Idempotent; the tag row is created when a valid name names none, and the
+/// answer is the full Tag with `featuring: true`.
+///
+/// # Errors
+///
+/// [`AppError::Unauthorized`] / [`AppError::Forbidden`] from [`AuthUser`]
+/// and the `write:accounts` check; [`AppError::Unprocessable`] with
+/// [`INVALID_HASHTAG`] for a name normalization rejects, or with
+/// [`FEATURE_LIMIT`] when the caller already features ten other tags. Any
+/// database failure arrives through `?` as [`AppError::Database`].
+async fn feature_tag(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path(name): Path<String>,
+) -> AppResult<Json<Tag>> {
+    auth.require(WRITE_ACCOUNTS)?;
+    let usable = usable_name(&name)?;
+    let tag = hashtag::find_or_create(&state.db, &usable)
+        .await?
+        .ok_or_else(|| AppError::Unprocessable(INVALID_HASHTAG.to_owned()))?;
+    match featured_tag::feature(&state.db, auth.0.id, &tag).await? {
+        featured_tag::Featured::Added(_) => {
+            debug!(hashtag = %tag.id, user = %auth.0.id, "hashtag featured");
+            federation_out::after_profile_updated(&state, &auth.0).await;
+        }
+        featured_tag::Featured::Existing(_) => {}
+        featured_tag::Featured::LimitReached => {
+            return Err(AppError::Unprocessable(FEATURE_LIMIT.to_owned()));
+        }
+    }
+    let following = hashtag_follow::is_following(&state.db, auth.0.id, tag.id).await?;
+    Ok(Json(
+        render_tag(&state, &tag, Some(following), Some(true)).await?,
+    ))
+}
+
+/// `POST /api/v1/tags/{name}/unfeature` — stop featuring the tag.
+///
+/// Idempotent; the answer is the full Tag with `featuring: false`.
+///
+/// # Errors
+///
+/// [`AppError::Unauthorized`] / [`AppError::Forbidden`] from [`AuthUser`]
+/// and the `write:accounts` check; [`AppError::Unprocessable`] with
+/// [`INVALID_HASHTAG`] for a name normalization rejects;
+/// [`AppError::NotFoundMessage`] with [`TAG_NOT_FOUND`] for an
+/// unknown-but-valid tag. Any database failure arrives through `?` as
+/// [`AppError::Database`].
+async fn unfeature_tag(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path(name): Path<String>,
+) -> AppResult<Json<Tag>> {
+    auth.require(WRITE_ACCOUNTS)?;
+    let usable = usable_name(&name)?;
+    let tag = known_tag(&state, &usable).await?;
+    if featured_tag::unfeature_tag(&state.db, auth.0.id, tag.id).await? {
+        debug!(hashtag = %tag.id, user = %auth.0.id, "hashtag unfeatured");
+        federation_out::after_profile_updated(&state, &auth.0).await;
+    }
+    let following = hashtag_follow::is_following(&state.db, auth.0.id, tag.id).await?;
+    Ok(Json(
+        render_tag(&state, &tag, Some(following), Some(false)).await?,
+    ))
 }
 
 /// `GET /api/v1/followed_tags` — the caller's followed tags as full Tags,
@@ -219,7 +309,8 @@ async fn list_followed_tags(
     set_link_header(&mut headers, link.as_deref())?;
     let mut tags = Vec::with_capacity(entries.len());
     for entry in &entries {
-        tags.push(render_tag(&state, &entry.hashtag, Some(true)).await?);
+        let featuring = featured_tag::is_featuring(&state.db, auth.0.id, entry.hashtag.id).await?;
+        tags.push(render_tag(&state, &entry.hashtag, Some(true), Some(featuring)).await?);
     }
     Ok((headers, Json(tags)))
 }
@@ -266,10 +357,11 @@ fn usable_name(name: &str) -> AppResult<String> {
 ///
 /// Any database failure behind [`hashtag::day_counts`] arrives as
 /// [`AppError::Database`].
-async fn render_tag(
+pub(crate) async fn render_tag(
     state: &AppState,
     tag: &hashtag::Hashtag,
     following: Option<bool>,
+    featuring: Option<bool>,
 ) -> AppResult<Tag> {
     let counts = week_counts(&state.db, tag.id).await?;
     Ok(Tag::with_history(
@@ -277,7 +369,8 @@ async fn render_tag(
         &tag.name,
         week(Utc::now().date_naive(), &counts),
         following,
-    ))
+    )
+    .with_featuring(featuring))
 }
 
 /// The tag's live per-UTC-day counts inside the [`HISTORY_DAYS`] window that

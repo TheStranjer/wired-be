@@ -107,6 +107,7 @@ pub fn litepub_context_json() -> Value {
         "canQuote": { "@id": "gts:canQuote", "@type": "@id" },
         "conversation": { "@id": "ostatus:conversation", "@type": "@id" },
         "featured": { "@id": "toot:featured", "@type": "@id" },
+        "featuredTags": { "@id": "toot:featuredTags", "@type": "@id" },
         "focalPoint": { "@container": "@list", "@id": "toot:focalPoint" },
         "interactionPolicy": { "@id": "gts:interactionPolicy", "@type": "@id" },
         "listMessage": { "@id": "litepub:listMessage", "@type": "@id" },

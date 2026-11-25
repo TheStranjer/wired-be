@@ -68,6 +68,7 @@ pub mod chat;
 pub mod conversation;
 pub mod custom_emoji;
 pub mod emoji_reaction;
+pub mod featured_tag;
 pub mod filter;
 pub mod list;
 pub mod marker;

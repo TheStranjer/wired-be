@@ -38,6 +38,7 @@ pub mod domain_block;
 pub mod emoji_reaction;
 pub mod endorsement;
 pub mod favourite;
+pub mod featured_tag;
 pub mod filter;
 pub mod follow;
 pub mod hashtag;

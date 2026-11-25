@@ -55,6 +55,7 @@ pub mod domain_blocks;
 pub mod emoji_packs;
 pub mod emoji_reactions;
 pub mod endorsements;
+pub mod featured_tags;
 pub mod federation_status;
 pub mod filters;
 pub mod follow_requests;

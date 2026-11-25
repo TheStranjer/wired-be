@@ -9,7 +9,7 @@ use uuid::Uuid;
 
 use crate::{
     error::{AppError, AppResult},
-    models::{hashtag, media_attachment, mention, user::User},
+    models::{featured_tag, hashtag, media_attachment, mention, user::User},
     util::{entities::extract_hashtags, format::text_to_html, id::new_id},
 };
 
@@ -297,6 +297,7 @@ pub async fn insert_conn(
     mention::link_conn(conn, status.id, &new_status.mentioned_user_ids).await?;
     mention::link_silent_conn(conn, status.id, &new_status.silent_user_ids).await?;
     hashtag::link_names_conn(conn, status.id, &new_status.hashtags).await?;
+    featured_tag::refresh_conn(conn, status.user_id, Some(status.id)).await?;
     count_new_post(conn, &status).await?;
     Ok(status)
 }

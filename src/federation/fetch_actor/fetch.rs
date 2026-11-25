@@ -11,7 +11,7 @@ use url::Url;
 
 use crate::{
     federation::{
-        mrf,
+        featured_tags, mrf,
         remote_actor::{parse_actor, upsert_remote_user},
         vocab::{ACTIVITY_JSON, LD_JSON},
     },
@@ -274,6 +274,7 @@ pub(super) async fn fetch_and_store(
     let user = upsert_remote_user(&state.db, new_user)
         .await
         .map_err(FetchError::from)?;
+    featured_tags::sync_remote(state, &user, &document, signer.as_ref()).await;
     Ok(user)
 }
 
