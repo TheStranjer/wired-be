@@ -14,10 +14,11 @@ use crate::{
     error::{AppError, AppResult},
     extract::multipart::MultipartForm,
     federation::{
-        actor::{actor_json, profile_emojis, stored_public_key},
+        actor::{actor_json, profile_emojis},
         json as ap_json,
     },
     models::{
+        activitypub_actor::with_plumbing,
         media_attachment,
         status::{self, Status},
         status_visibility,
@@ -42,11 +43,11 @@ use super::negotiation::document_response;
 /// and the `read` check.
 pub(super) async fn whoami(State(state): State<AppState>, auth: AuthUser) -> AppResult<Response> {
     auth.require(READ)?;
-    let emojis = profile_emojis(&state.db, &auth.0).await?;
-    let public_key = stored_public_key(&state.db, &auth.0).await?;
+    let account = with_plumbing(&state.db, auth.0.clone()).await?;
+    let emojis = profile_emojis(&state.db, &account).await?;
     Ok(document_response(&actor_json(
-        &auth.0,
-        public_key.as_deref(),
+        &account,
+        account.public_key.as_deref(),
         &state.config,
         &emojis,
     )))

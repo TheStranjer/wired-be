@@ -7,13 +7,13 @@
 //! the module root; the reaction twin is [`super::reactions`] and the boost
 //! twin [`super::boosts`].
 
-use super::{queue_activity, status_action, withdrawal};
+use super::{load_collections, queue_activity, status_action, withdrawal};
 use crate::{
     federation::{
         activities::{ObjectActivityContext, like_json},
         vocab::AS_PUBLIC,
     },
-    models::{favourite::Favourite, user::followers_address},
+    models::favourite::Favourite,
     state::AppState,
 };
 
@@ -44,7 +44,10 @@ pub async fn after_favourite_changed(state: &AppState, favourite: &Favourite, fa
     let Some(action) = status_action(state, favourite.user_id, favourite.status_id).await else {
         return;
     };
-    let followers = followers_address(&action.actor);
+    let Some(collections) = load_collections(state, &action.actor).await else {
+        return;
+    };
+    let followers = collections.followers;
     let to = [action.author.ap_id.as_str()];
     let cc: Vec<&str> = if action.public {
         vec![followers.as_str(), AS_PUBLIC]
