@@ -11,6 +11,7 @@ use sqlx::PgConnection;
 use uuid::Uuid;
 
 use crate::{
+    error::AppError,
     federation::{
         dispatch::FederationError,
         note_parser::{ParsedAttachment, ParsedNote, ParsedPoll},
@@ -71,21 +72,35 @@ pub(super) fn build_new_status(
 ///
 /// # Errors
 ///
-/// [`FederationError::Transient`] for any database failure; the rollback
-/// takes the half-written status, media and poll with it.
+/// [`FederationError::Transient`] for any database failure other than the
+/// `uri` race below; the rollback takes the half-written status, media and
+/// poll with it.
+///
+/// A concurrent job may store the same object between the caller's dedupe
+/// read and this insert; the loser's insert then fails on `statuses_uri_key`
+/// once the winner commits. That is no failure: the transaction is rolled
+/// back, nothing of this attempt stays, and [`Written::Raced`] tells the
+/// caller to read the winner's row back.
 pub(super) async fn write_ingested(
     state: &AppState,
     new: &NewStatus,
     parsed: &ParsedNote,
-) -> Result<(Status, Vec<Uuid>), FederationError> {
+) -> Result<Written, FederationError> {
     let mut tx = state
         .db
         .begin()
         .await
         .map_err(|err| FederationError::transient("the ingest transaction failed", &err))?;
-    let mut row = status::insert_conn(&mut tx, &state.config.base_url, new)
-        .await
-        .map_err(|err| FederationError::transient("the status insert failed", &err))?;
+    let mut row = match status::insert_conn(&mut tx, &state.config.base_url, new).await {
+        Ok(row) => row,
+        Err(conflict) if is_uri_conflict(&conflict) => {
+            tx.rollback()
+                .await
+                .map_err(|err| FederationError::transient("the ingest rollback failed", &err))?;
+            return Ok(Written::Raced);
+        }
+        Err(err) => return Err(FederationError::transient("the status insert failed", &err)),
+    };
     insert_media(&mut tx, row.id, &parsed.attachments).await?;
     insert_poll(&mut tx, row.id, parsed.poll.as_ref()).await?;
     let waiting = status::link_waiting_quotes(&mut tx, row.id, &row.uri)
@@ -97,7 +112,29 @@ pub(super) async fn write_ingested(
     tx.commit()
         .await
         .map_err(|err| FederationError::transient("the ingest commit failed", &err))?;
-    Ok((row, waiting))
+    Ok(Written::Created(Box::new(row), waiting))
+}
+
+/// What [`write_ingested`] did.
+#[derive(Debug)]
+pub(super) enum Written {
+    /// This call stored the row, and linked the stored quotes that were
+    /// waiting for its `uri`; their ids ride beside it so the caller can
+    /// tell the new row's author once the commit is made.
+    Created(Box<Status>, Vec<Uuid>),
+    /// A concurrent job stored the same `uri` first; nothing was written.
+    Raced,
+}
+
+/// The constraint that keeps one row per remote object id.
+const URI_CONSTRAINT: &str = "statuses_uri_key";
+
+/// Whether `err` is the unique violation (`23505`) on `statuses_uri_key`.
+fn is_uri_conflict(err: &AppError) -> bool {
+    let AppError::Database(sqlx::Error::Database(db_err)) = err else {
+        return false;
+    };
+    db_err.code().as_deref() == Some("23505") && db_err.constraint() == Some(URI_CONSTRAINT)
 }
 
 /// The attachment arm of [`write_ingested`]: one `media_attachments` row
