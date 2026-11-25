@@ -36,7 +36,7 @@ use crate::{
 /// them with Pleroma's `api_not_implemented`, and merging two routers that
 /// each set a fallback panics.
 ///
-/// `state` reaches [`accounts::router`] and [`apps::router`], the merged
+/// `state` reaches [`accounts::core_router`] and [`apps::router`], the merged
 /// routers whose routes mount the rate limiter, and — as
 /// [`state.config`] — [`media::router`], [`pleroma_settings::router`],
 /// [`admin::router`] and [`emoji_packs::router`], whose upload/install
@@ -47,7 +47,7 @@ use crate::{
 /// [`state.config`]: AppState::config
 pub fn core_router(state: &AppState) -> Router<AppState> {
     Router::new()
-        .merge(accounts::router(state))
+        .merge(accounts::core_router(state))
         .merge(announcements::router())
         .merge(apps::router(state))
         .merge(custom_emojis::router())
@@ -80,12 +80,13 @@ pub fn core_router(state: &AppState) -> Router<AppState> {
 /// ([`crate::protocols::adapter::ProtocolAdapter::client_api_router`]); the
 /// same fallback rule as [`core_router`] applies.
 ///
-/// `state` reaches [`polls::router`], [`remote_interaction::pleroma_router`],
+/// `state` reaches [`accounts::activitypub_router`], [`polls::router`], [`remote_interaction::pleroma_router`],
 /// [`reports::router`], [`search::router`], [`statuses::router`] and
 /// [`pleroma_accounts::router`], whose routes mount the rate limiter.
 pub fn activitypub_router(state: &AppState) -> Router<AppState> {
     Router::new()
         .merge(account_lists::router())
+        .merge(accounts::activitypub_router(state))
         .merge(blocks::router())
         .merge(conversations::router())
         .merge(domain_blocks::router())

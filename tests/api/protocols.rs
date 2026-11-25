@@ -14,6 +14,7 @@ use uuid::Uuid;
 use wired_be::{
     config::{
         BASE_URL_VAR, Config, DATABASE_URL_VAR, PROTOCOLS_VAR, TEST_BASE_URL, TEST_DATABASE_URL,
+        Toggle,
     },
     protocols::{
         events::AccountEvent,
@@ -362,4 +363,92 @@ async fn the_fixture_client_api_route_is_mounted_only_when_the_fixture_is_enable
         Some("1"),
         "the fallback answers"
     );
+}
+
+/// The scopes the accounts-split tests mint tokens with.
+const READ_WRITE_ACCOUNTS: &str = "read write";
+
+/// With only `fixture` the core account routes answer and the `ActivityPub`-backed ones do not.
+#[tokio::test]
+async fn a_fixture_only_instance_keeps_registration_and_credentials_and_drops_account_reads() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let alice = common::create_local_user(&pool, "alice").await;
+    let alice_token = common::create_app_and_token(&pool, &alice, READ_WRITE_ACCOUNTS).await;
+    let app_token = common::create_app_only_token(&pool, READ_WRITE_ACCOUNTS).await;
+    let mut config = config_with_protocols("fixture");
+    config.registrations_open = Toggle::new(true);
+    let app = common::test_app_with_config(pool, config);
+
+    let credentials = common::TestRequest::get("/api/v1/accounts/verify_credentials")
+        .bearer(&alice_token)
+        .send(&app)
+        .await;
+    common::assert_answer(&credentials, StatusCode::OK, "verify_credentials is core");
+
+    let registered = common::TestRequest::post("/api/v1/accounts")
+        .bearer(&app_token)
+        .json(&serde_json::json!({
+            "username": "newcomer",
+            "email": "newcomer@example.org",
+            "password": "correct horse battery staple",
+            "agreement": true,
+        }))
+        .send(&app)
+        .await;
+    common::assert_answer(&registered, StatusCode::OK, "registration is core");
+
+    let statuses = common::TestRequest::get(&format!("/api/v1/accounts/{}/statuses", alice.id))
+        .bearer(&alice_token)
+        .send(&app)
+        .await;
+    assert_eq!(
+        statuses.status,
+        StatusCode::NOT_FOUND,
+        "an account's statuses are ActivityPub-backed"
+    );
+    assert_eq!(
+        statuses.header("x-wired-fallback"),
+        Some("1"),
+        "the fallback answers the statuses"
+    );
+}
+
+/// The `ActivityPub`-backed account routes follow the toggle; the default config mounts them.
+#[tokio::test]
+async fn activitypub_backed_account_routes_follow_the_activitypub_toggle() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let alice = common::create_local_user(&pool, "alice").await;
+    let token = common::create_app_and_token(&pool, &alice, READ_WRITE_ACCOUNTS).await;
+    let fixture_app = common::test_app_with_config(pool.clone(), config_with_protocols("fixture"));
+    let default_app = common::test_app(pool);
+    let activitypub_backed = [
+        format!("/api/v1/accounts/{}", alice.id),
+        "/api/v1/accounts/lookup?acct=alice".to_owned(),
+        "/api/v1/accounts/relationships".to_owned(),
+        format!("/api/v1/accounts/{}/followers", alice.id),
+        format!("/api/v1/accounts/{}/following", alice.id),
+    ];
+
+    for path in &activitypub_backed {
+        let without = common::TestRequest::get(path)
+            .bearer(&token)
+            .send(&fixture_app)
+            .await;
+        assert_eq!(
+            without.header("x-wired-fallback"),
+            Some("1"),
+            "{path} is the fallback without ActivityPub"
+        );
+        let with = common::TestRequest::get(path)
+            .bearer(&token)
+            .send(&default_app)
+            .await;
+        assert_eq!(
+            with.header("x-wired-fallback"),
+            None,
+            "{path} is a route with ActivityPub"
+        );
+    }
 }

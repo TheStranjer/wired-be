@@ -1,14 +1,28 @@
 //! The account endpoints: the single-account reads and listings, the
 //! relationship batch, the notes and follow writes, and the profile write.
 //!
-//! `GET /api/v1/accounts/verify_credentials`, `GET /api/v1/accounts/{id}`,
-//! `…/lookup`, `…/relationships` and the relationship listings
-//! `…/{id}/followers` and `…/{id}/following`, with the account's status
-//! listing `…/{id}/statuses`, are the reads;
-//! `PATCH /api/v1/accounts/update_credentials`,
-//! `POST /api/v1/accounts/{id}/note`, `…/{id}/remove_from_followers`,
-//! `…/{id}/follow`, `…/{id}/unfollow` and `POST /api/v1/follows` are the
-//! writes.
+//! The routes are split by the rule in [`crate::api`]. Under `/api/v1`:
+//!
+//! | Route | Class |
+//! |---|---|
+//! | `POST /accounts` | core |
+//! | `GET /accounts/verify_credentials` | core |
+//! | `PATCH`/`POST /accounts/update_credentials` | core |
+//! | `GET /accounts/{id}` | `ActivityPub`-backed |
+//! | `GET /accounts/lookup` | `ActivityPub`-backed |
+//! | `GET /accounts/relationships` | `ActivityPub`-backed |
+//! | `GET /accounts/{id}/followers` | `ActivityPub`-backed |
+//! | `GET /accounts/{id}/following` | `ActivityPub`-backed |
+//! | `GET /accounts/{id}/statuses` | `ActivityPub`-backed |
+//! | `POST /accounts/{id}/note` | `ActivityPub`-backed |
+//! | `POST /accounts/{id}/remove_from_followers` | `ActivityPub`-backed |
+//! | `POST /accounts/{id}/follow` | `ActivityPub`-backed |
+//! | `POST /accounts/{id}/unfollow` | `ActivityPub`-backed |
+//! | `POST /follows` | `ActivityPub`-backed |
+//!
+//! [`core_router`] holds the core routes and [`activitypub_router`] the rest.
+//! `GET /api/account/confirm_email/{user_id}/{token}`
+//! ([`email_confirmation_router`]) is core too.
 //!
 //! Pleroma's `AccountController.verify_credentials`, `.show`, `.lookup`,
 //! `.relationships`, `.followers`, `.following` and `.statuses`
@@ -31,7 +45,7 @@
 //! relationship batch, `notes_followers` and `follow` the relationship
 //! writes, `follow_lists` the relationship listings and their page
 //! render, and `account_statuses` with `pinned_statuses` the status
-//! listing. This root keeps the router, the shared constants and the
+//! listing. This root keeps the routers, the shared constants and the
 //! single-account render `render_account`; `test_support` holds the
 //! unit-test fixtures the children share.
 //!
@@ -117,7 +131,10 @@ pub(crate) const REGISTERED_AWAITING_APPROVAL: &str =
 pub(crate) const REGISTERED_AWAITING_CONFIRMATION: &str =
     "You have been registered. Please check your email for further instructions.";
 
-/// The `/api/v1/accounts` router, merged into [`crate::api::v1`].
+/// The core `/api/v1/accounts` routes, merged into [`crate::api::v1::core_router`].
+///
+/// They work for the signed-in local account with no `ActivityPub` data:
+/// registration, `verify_credentials` and `update_credentials`.
 ///
 /// [`state.config`](AppState::config) is what [`upload_body_limit`] sizes
 /// the routes' body limit from: `update_credentials` takes the three
@@ -128,27 +145,38 @@ pub(crate) const REGISTERED_AWAITING_CONFIRMATION: &str =
 ///
 /// `POST /accounts` runs in the limiter's `app_account_creation` bucket
 /// (Pleroma throttles registration there; see [`crate::rate_limit`]), so
-/// the whole `state` rides along for the middleware layer. The follow
-/// routes (`POST /accounts/{id}/follow`, `…/unfollow` and `POST /follows`)
-/// run in `relations_actions`, the bucket Pleroma throttles every
-/// relationship write through.
+/// the whole `state` rides along for the middleware layer.
 ///
 /// [`DEFAULT_AVATAR_LIMIT_BYTES`]: crate::config::DEFAULT_AVATAR_LIMIT_BYTES
-pub fn router(state: &AppState) -> Router<AppState> {
+pub fn core_router(state: &AppState) -> Router<AppState> {
     Router::new()
         .route(
             "/accounts",
             post(create_account)
                 .layer(crate::rate_limit::rate_limit(state, "app_account_creation")),
         )
-        .route(
-            "/follows",
-            post(follow_by_uri).layer(crate::rate_limit::rate_limit(state, "relations_actions")),
-        )
         .route("/accounts/verify_credentials", get(verify_credentials))
         .route(
             "/accounts/update_credentials",
             patch(update_credentials).post(update_credentials),
+        )
+        .layer(upload_body_limit(&state.config))
+}
+
+/// The `ActivityPub`-backed `/api/v1/accounts` routes, merged into
+/// [`crate::api::v1::activitypub_router`].
+///
+/// They read or write other accounts, relationships, follows and statuses.
+///
+/// The follow routes (`POST /accounts/{id}/follow`, `…/unfollow` and
+/// `POST /follows`) run in `relations_actions`, the bucket Pleroma throttles
+/// every relationship write through, so the whole `state` rides along for
+/// the middleware layer.
+pub fn activitypub_router(state: &AppState) -> Router<AppState> {
+    Router::new()
+        .route(
+            "/follows",
+            post(follow_by_uri).layer(crate::rate_limit::rate_limit(state, "relations_actions")),
         )
         .route("/accounts/relationships", get(relationships))
         .route("/accounts/lookup", get(lookup_account))
@@ -169,7 +197,6 @@ pub fn router(state: &AppState) -> Router<AppState> {
             post(remove_from_followers),
         )
         .route("/accounts/{id}", get(show_account))
-        .layer(upload_body_limit(&state.config))
 }
 
 /// The email-confirmation route, merged by [`crate::api`] at `/api/account`.
