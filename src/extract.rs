@@ -48,7 +48,11 @@ use axum::{
 use serde::de::DeserializeOwned;
 use serde_json::{Map, Value};
 
-use crate::{error::AppError, middleware::MAX_BODY_BYTES, util::media_type::essence};
+use crate::{
+    error::AppError,
+    middleware::MAX_BODY_BYTES,
+    util::{media_type::essence, nul::strip_nul_json},
+};
 use form::parse_form;
 pub use form::{index_map_to_vec, parse_pairs};
 
@@ -172,12 +176,15 @@ fn parse_body(text: &str, content_type: &str) -> Result<Value, AppError> {
     }
 }
 
-/// Deserializes the parameters value into `T`.
+/// Deserializes the parameters value into `T`, after stripping U+0000 from
+/// every string and key (the database cannot store it, and every endpoint
+/// gets the same treatment `update_credentials` gives a display name).
 ///
 /// # Errors
 ///
 /// [`AppError::Unprocessable`] naming what does not fit.
-pub(crate) fn into_params<T: DeserializeOwned>(value: Value) -> Result<T, AppError> {
+pub(crate) fn into_params<T: DeserializeOwned>(mut value: Value) -> Result<T, AppError> {
+    strip_nul_json(&mut value);
     T::deserialize(value).map_err(|err| AppError::Unprocessable(format!("{INVALID_PARAMS}{err}")))
 }
 

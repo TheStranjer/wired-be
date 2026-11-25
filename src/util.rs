@@ -14,7 +14,8 @@
 //! Time-expiring in-memory values go through [`cache`], the batched
 //! group-by-key fold lives in [`collections`], and the `http(s)` URL
 //! checks every origin, signing and delivery guard shares live in [`mod@url`],
-//! and the one `Content-Type` media-type parser in [`media_type`].
+//! the one `Content-Type` media-type parser in [`media_type`], and the
+//! U+0000 strippers (the database cannot store NUL) in [`nul`].
 
 pub mod cache;
 pub mod collections;
@@ -27,6 +28,7 @@ pub mod id;
 pub mod keys;
 pub mod like;
 pub mod media_type;
+pub mod nul;
 pub mod params;
 pub mod password;
 pub mod sanitize;

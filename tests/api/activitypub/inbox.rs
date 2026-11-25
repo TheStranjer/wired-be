@@ -444,3 +444,48 @@ async fn set_mrf(pool: &PgPool, setting: &Value) {
         .await
         .expect("the mrf entry writes");
 }
+
+/// A signed `Create` whose `content` (and a key) carries U+0000 is accepted
+/// with a 202, not a 500: the queued job holds the document with the NUL
+/// removed, since `PostgreSQL` cannot store it.
+#[tokio::test]
+async fn a_nul_in_a_signed_activity_is_stripped_not_a_server_error() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let _alice = common::create_local_user(&pool, "alice").await;
+    let signer = instance_signer(&pool).await;
+    let app = common::test_app(pool.clone());
+    let activity = json!({
+        "@context": "https://www.w3.org/ns/activitystreams",
+        "id": "https://peer.example/activities/nul",
+        "type": "Create",
+        "actor": signer.ap_id,
+        "object": {
+            "id": "https://peer.example/notes/nul",
+            "type": "Note",
+            "content": "nul here \u{0} end",
+            "summary\u{0}": "cw\u{0}",
+        },
+    });
+
+    let response = deliver(&app, &signer, "/inbox", &activity).await;
+
+    assert_eq!(response.status, StatusCode::ACCEPTED, "never a 500");
+    let jobs = incoming_jobs(&pool).await;
+    assert_eq!(jobs.len(), 1, "queued once");
+    assert_eq!(
+        job_object(&jobs[0]),
+        &json!({
+            "id": "https://peer.example/notes/nul",
+            "type": "Note",
+            "content": "nul here  end",
+            "summary": "cw",
+        }),
+        "the stored object has no NUL"
+    );
+}
+
+/// The `object` of the activity a job carries.
+fn job_object(job: &Job) -> &Value {
+    &job.args["activity"]["object"]
+}

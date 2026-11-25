@@ -107,6 +107,7 @@ async fn echo_activity(activity: SignedActivity) -> Response {
             "actor": activity.json.get("actor"),
             "type": activity.json.get("type"),
             "bytes": activity.body.len(),
+            "document": activity.json,
         })),
     )
         .into_response()
