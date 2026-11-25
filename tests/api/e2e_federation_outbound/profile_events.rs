@@ -213,6 +213,7 @@ async fn a_flag_reaches_the_remote_inbox_and_the_admin_queue() {
     let pool = db.pool().clone();
     let (app, state) = remote::app_and_state(pool.clone());
     let peer = remote::MockPeer::start().await;
+    let instance = instance_actor(&state).await;
     let (alice, alice_token) = local(&pool, "eo-flag-alice").await;
     peer_follows(&app, &state, &peer, BOB, &alice).await;
     let bob = lookup(&app, &peer.handle(BOB)).await;
@@ -233,7 +234,6 @@ async fn a_flag_reaches_the_remote_inbox_and_the_admin_queue() {
     );
     let _drained = common::run_all_jobs(&state).await;
 
-    let instance = instance_actor(&state).await;
     let flags = peer.delivered("Flag");
     assert_eq!(flags.len(), 1, "the target's instance is told once");
     assert_delivered(

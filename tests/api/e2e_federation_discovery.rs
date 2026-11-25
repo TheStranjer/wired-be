@@ -47,7 +47,10 @@ use tokio::net::TcpListener;
 use wired_be::{
     config::Toggle,
     federation::fetch_actor::get_or_fetch_by_acct,
-    models::user::{NewUser, User, get_by_ap_id, insert, local_ap_id},
+    models::{
+        activitypub_actor::ActivityPubActorWrite,
+        user::{NewUser, User, get_by_ap_id, insert, local_ap_id},
+    },
     state::AppState,
 };
 
@@ -234,16 +237,15 @@ async fn a_remote_reader_fingers_fetches_and_mirrors_the_local_actor_over_http()
     // The actor the served instance self-identifies as, on its own origin.
     let ap_id = local_ap_id(&served.origin, "efdmirror");
     let keys = remote::local_keys().clone();
-    let alice = insert(
+    let public_pem = keys.public_pem.clone();
+    let alice = insert(&pool, &NewUser::local("efdmirror", &ap_id))
+        .await
+        .expect("the served fixture inserts");
+    let _row = common::write_actor(
         &pool,
-        &NewUser {
-            public_key: Some(keys.public_pem),
-            private_key: Some(keys.private_pem),
-            ..NewUser::local("efdmirror", &ap_id)
-        },
+        &ActivityPubActorWrite::for_local_account(&alice, &served.origin, keys),
     )
-    .await
-    .expect("the served fixture inserts");
+    .await;
 
     // The reader: a second instance, on its own leased slot, that has never
     // heard of alice. Every request it makes rides the socket.
@@ -258,7 +260,7 @@ async fn a_remote_reader_fingers_fetches_and_mirrors_the_local_actor_over_http()
     assert_actor_document(&actor, &ap_id, "efdmirror", &served.origin);
     assert_eq!(
         actor["publicKey"]["publicKeyPem"],
-        json!(alice.public_key.expect("the fixture publishes its key")),
+        json!(public_pem),
         "the served PEM is the one the row carries"
     );
 
@@ -274,13 +276,14 @@ async fn a_remote_reader_fingers_fetches_and_mirrors_the_local_actor_over_http()
     );
     assert_eq!(mirror.ap_id, ap_id, "the mirror is keyed on the fetched id");
     assert!(!mirror.local.get(), "and it is stored as a remote");
+    let mirrored = common::actor_of(reader_db.pool(), &mirror).await;
     assert_eq!(
-        mirror.shared_inbox.as_deref(),
+        mirrored.shared_inbox.as_deref(),
         Some(format!("{}/inbox", served.origin).as_str()),
-        "the endpoints object's sharedInbox landed on the row"
+        "the endpoints object's sharedInbox landed on the actor row"
     );
     assert_eq!(
-        mirror.followers_url.as_deref(),
+        mirrored.followers_url.as_deref(),
         Some(format!("{ap_id}/followers").as_str()),
         "and so did the collections the document named"
     );
@@ -304,13 +307,8 @@ async fn assert_served_actor(app: &axum::Router, alice: &User) {
     assert_actor_document(&document, &alice.ap_id, "e2fd-alice", BASE);
     assert_eq!(
         document["publicKey"]["publicKeyPem"],
-        json!(
-            alice
-                .public_key
-                .clone()
-                .expect("the fixture publishes its key")
-        ),
-        "the served PEM is the one the row carries"
+        json!(remote::local_keys().public_pem),
+        "the served PEM is the one the actor row carries"
     );
 }
 
@@ -698,10 +696,7 @@ fn assert_outbound_follow(delivery: &remote::Delivery, actor: &User, target: &st
         delivery.digest_matches(),
         "the digest describes the delivered bytes"
     );
-    let pem = actor
-        .public_key
-        .as_deref()
-        .expect("the fixture actor publishes its key");
+    let pem = remote::local_keys().public_pem.as_str();
     assert!(
         delivery.signature_verifies(pem),
         "and the signature verifies against that key"

@@ -164,12 +164,16 @@ mod tests {
         );
         assert!(!first.local.get(), "the row is a remote mirror");
         assert_eq!(first.name, "First", "the document landed");
+        let identity = activitypub_actor::get(&state.db, first.id)
+            .await
+            .unwrap()
+            .expect("the fetch wrote the actor row");
         assert_eq!(
-            first.inbox.as_deref(),
+            identity.inbox.as_deref(),
             Some(format!("{ap_id}/inbox").as_str()),
             "the inbox endpoint"
         );
-        assert!(first.last_fetched_at.is_some(), "the fetch is stamped");
+        assert!(identity.last_fetched_at.is_some(), "the fetch is stamped");
         assert_eq!(hits.load(Ordering::SeqCst), 1, "one fetch");
 
         let second = get_or_fetch_by_ap_id(&state, &ap_id).await.unwrap();

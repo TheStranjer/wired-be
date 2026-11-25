@@ -22,7 +22,7 @@ use wired_be::{
     jobs::AttemptInfo,
     models::{
         follow::{self, FollowState},
-        user::{self, User},
+        user::User,
     },
 };
 
@@ -40,19 +40,7 @@ const FIRST_ATTEMPT: AttemptInfo = AttemptInfo {
 
 /// A local account with the endpoints and keys a registered one carries.
 async fn listener(pool: &PgPool, nickname: &str) -> User {
-    let ap_id = format!("{BASE}/users/{nickname}");
-    let stored = ap_id.clone();
-    let inbox = user::inbox(&ap_id);
-    let followers = user::followers(&ap_id);
-    common::create_local_user_with(pool, nickname, move |mut new| {
-        new.ap_id = stored;
-        new.inbox = Some(inbox);
-        new.followers_url = Some(followers);
-        new.private_key = Some("PEM".to_owned());
-        new.public_key = Some("PUB".to_owned());
-        new
-    })
-    .await
+    common::create_federating_user_with(pool, nickname, |new| new).await
 }
 
 /// Records `follower`'s accepted follow of `target`.

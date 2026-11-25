@@ -123,13 +123,5 @@ fn assert_create_delivered(delivery: &ReceivedPost, alice: &User, status: &Value
 /// A local user named `nickname` with a generated RSA key pair — the
 /// signing identity a federating poster needs.
 async fn keyed_user(pool: &PgPool, nickname: &str) -> User {
-    let keys = wired_be::util::keys::generate_keypair_async()
-        .await
-        .expect("the fixture key pair generates");
-    common::create_local_user_with(pool, nickname, |mut new| {
-        new.public_key = Some(keys.public_pem);
-        new.private_key = Some(keys.private_pem);
-        new
-    })
-    .await
+    common::create_signer(pool, nickname).await.user
 }

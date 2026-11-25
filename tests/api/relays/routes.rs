@@ -140,9 +140,9 @@ async fn the_relay_inbox_is_the_shared_inbox() {
     let actor = ensure_instance_actor(&pool, &config)
         .await
         .expect("the instance actor is provisioned");
-    let private_pem = actor
+    let private_pem = common::actor_of(&pool, &actor)
+        .await
         .private_key
-        .clone()
         .expect("the provisioned actor holds its private key");
     let key_id = format!("{}#main-key", actor.ap_id);
     let app = common::test_app(pool.clone());

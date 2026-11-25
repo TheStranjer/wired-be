@@ -10,6 +10,7 @@ use axum::http::StatusCode;
 use serde_json::{Value, json};
 use wired_be::{
     models::{
+        activitypub_actor::ActivityPubActorWrite,
         custom_emoji::{self, NewCustomEmoji},
         user::{Flag, NewUser},
     },
@@ -119,12 +120,19 @@ async fn a_local_user_is_served_as_its_actor_document() {
         bio: "<p>hello</p>".to_owned(),
         raw_bio: "hello".to_owned(),
         discoverable: Flag::new(true),
-        public_key: Some(PUBLIC_PEM.to_owned()),
         fields: json!([
             {"name": "site", "value": "<a href=\"https://alice.example\">alice.example</a>"}
         ]),
         ..new
     })
+    .await;
+    let _row = common::write_actor(
+        &pool,
+        &ActivityPubActorWrite {
+            public_key: Some(PUBLIC_PEM.to_owned()),
+            ..ActivityPubActorWrite::bare(alice.id)
+        },
+    )
     .await;
 
     let document = fetch_actor(&pool, &alice).await;
@@ -639,36 +647,29 @@ async fn profile_custom_emoji_are_tagged_on_the_served_actor() {
 }
 
 /// The served document's `publicKey` and `inbox` are the account's
-/// `activitypub_actors` row's: only that table changes here, and the served
-/// JSON follows it.
+/// `activitypub_actors` row's: the served JSON follows that table alone.
 #[tokio::test]
 async fn the_actor_document_takes_its_key_and_inbox_from_activitypub_actors() {
     let db = common::test_db().await;
     let pool = db.pool().clone();
-    let alice = common::create_local_user_with(&pool, "alice", |new| NewUser {
-        public_key: Some(PUBLIC_PEM.to_owned()),
-        ..new
-    })
-    .await;
+    let alice = common::create_local_user(&pool, "alice").await;
     let row_pem = "-----BEGIN PUBLIC KEY-----\nMIIB-ACTOR-ROW\n-----END PUBLIC KEY-----\n";
     let row_inbox = format!("{BASE}/inboxes/alice");
-
-    let changed =
-        sqlx::query("UPDATE activitypub_actors SET public_key = $2, inbox = $3 WHERE user_id = $1")
-            .bind(alice.id)
-            .bind(row_pem)
-            .bind(&row_inbox)
-            .execute(&pool)
-            .await
-            .expect("the actor row updates")
-            .rows_affected();
-    assert_eq!(changed, 1, "the account has exactly one actor row");
+    let _row = common::write_actor(
+        &pool,
+        &ActivityPubActorWrite {
+            public_key: Some(row_pem.to_owned()),
+            inbox: Some(row_inbox.clone()),
+            ..ActivityPubActorWrite::bare(alice.id)
+        },
+    )
+    .await;
 
     let document = fetch_actor(&pool, &alice).await;
     assert_eq!(
         document["publicKey"]["publicKeyPem"],
         json!(row_pem),
-        "the key is the row's, not the one still in `users`"
+        "the key is the row's"
     );
     assert_eq!(
         document["inbox"],

@@ -139,8 +139,12 @@ mod tests {
             crate::models::activitypub_actor::ActorStatus::Active,
             "the identity is active"
         );
-        assert_eq!(actor.inbox, user.inbox, "inbox is the account's");
-        assert_eq!(actor.private_key, user.private_key, "so are the keys");
+        assert_eq!(
+            actor.inbox,
+            Some(crate::models::user::inbox(&user.ap_id)),
+            "inbox is the account's"
+        );
+        assert!(actor.private_key.is_some(), "and the claim made the keys");
     }
 
     /// With the fixture enabled a registration claims both identities, the fixture's derived.

@@ -14,9 +14,10 @@
 //! ingest stored it.
 //!
 //! A remote policy names the author's followers and following collections.
-//! The loader of the `author` (the render batch's `load_users`, or the
-//! quote consent check) fills those from `activitypub_actors`, so the
-//! columns this reads off the [`User`] are the actor row's.
+//! Those are the ones on the author's `activitypub_actors` row, which the
+//! loader of the author (the render batch, or the quote consent check)
+//! hands in; an author without a row has the collections built from the
+//! actor id.
 
 use serde::Serialize;
 
@@ -30,8 +31,9 @@ use crate::{
         vocab::AS_PUBLIC,
     },
     models::{
+        activitypub_actor::{ActivityPubActor, followers_address},
         status::Status as StatusRow,
-        user::{User, followers_address, following},
+        user::{User, following},
     },
 };
 
@@ -95,16 +97,19 @@ pub struct QuoteApproval {
 impl QuoteApproval {
     /// The approval of `row` by `author`, as `viewer` sees it.
     ///
-    /// `relationships` is the viewer's preloaded relationship to the page's
-    /// authors; without one the viewer counts as unconnected to the author.
+    /// `author_actor` is the author's `activitypub_actors` row, whose
+    /// collections a remote policy names. `relationships` is the viewer's
+    /// preloaded relationship to the page's authors; without one the viewer
+    /// counts as unconnected to the author.
     #[must_use]
     pub fn for_row(
         row: &StatusRow,
         author: &User,
+        author_actor: Option<&ActivityPubActor>,
         viewer: AccountViewer<'_>,
         relationships: Option<&RelationshipMap>,
     ) -> Self {
-        let policy = advertised(row, author);
+        let policy = advertised(row, author, author_actor);
         let standing = relationships.and_then(|map| map.get(&author.id));
         let current_user = current_user(policy.as_ref(), author, viewer, standing);
         let (automatic, manual) = policy.as_ref().map_or((Vec::new(), Vec::new()), |found| {
@@ -125,7 +130,11 @@ fn keys(audiences: &[Audience]) -> Vec<&'static str> {
 
 /// The policy `row` advertises; `None` for a remote status whose note
 /// advertised nothing.
-fn advertised(row: &StatusRow, author: &User) -> Option<Policy> {
+fn advertised(
+    row: &StatusRow,
+    author: &User,
+    author_actor: Option<&ActivityPubActor>,
+) -> Option<Policy> {
     if row.local {
         let automatic = match quote_approval(row.visibility, row.quote_approval_policy) {
             Advertised::Everyone => vec![Audience::Public],
@@ -139,18 +148,21 @@ fn advertised(row: &StatusRow, author: &User) -> Option<Policy> {
     }
     let stored = &row.quote_policy.as_ref()?.0;
     Some(Policy {
-        automatic: classify_all(&stored.automatic, author),
-        manual: classify_all(&stored.manual, author),
+        automatic: classify_all(&stored.automatic, author, author_actor),
+        manual: classify_all(&stored.manual, author, author_actor),
     })
 }
 
 /// The audiences `addresses` name for `author`, each once; the author's own
 /// address is Mastodon's spelling of "only me" and names no audience.
-fn classify_all(addresses: &[String], author: &User) -> Vec<Audience> {
-    let followers = followers_address(author);
-    let following_address = author
-        .following_url
-        .clone()
+fn classify_all(
+    addresses: &[String],
+    author: &User,
+    author_actor: Option<&ActivityPubActor>,
+) -> Vec<Audience> {
+    let followers = followers_address(author_actor, &author.ap_id);
+    let following_address = author_actor
+        .and_then(|row| row.following_url.clone())
         .unwrap_or_else(|| following(&author.ap_id));
     let mut audiences: Vec<Audience> = Vec::new();
     for address in addresses {
@@ -214,7 +226,10 @@ mod tests {
     use super::*;
     use crate::{
         entities::status::test_support::{base_row, base_user, other_user},
-        models::status::{QuoteApprovalPolicy, QuotePolicy, Visibility},
+        models::{
+            activitypub_actor::ActorStatus,
+            status::{QuoteApprovalPolicy, QuotePolicy, Visibility},
+        },
     };
 
     /// The remote author's actor id.
@@ -234,8 +249,28 @@ mod tests {
         let mut author = base_user("wanda");
         author.local = crate::models::user::Flag::new(false);
         author.ap_id = REMOTE_AUTHOR.to_owned();
-        author.followers_url = Some(REMOTE_FOLLOWERS.to_owned());
         author
+    }
+
+    /// The `activitypub_actors` row of [`remote_author`], naming `followers`
+    /// as the followers collection.
+    fn remote_actor(author: &User, followers: &str) -> ActivityPubActor {
+        ActivityPubActor {
+            user_id: author.id,
+            status: ActorStatus::Active,
+            inbox: None,
+            shared_inbox: None,
+            outbox: None,
+            followers_url: Some(followers.to_owned()),
+            following_url: None,
+            featured_url: None,
+            public_key: None,
+            private_key: None,
+            public_key_id: None,
+            last_fetched_at: None,
+            inserted_at: author.inserted_at,
+            updated_at: author.updated_at,
+        }
     }
 
     /// A remote row advertising `policy`.
@@ -272,7 +307,7 @@ mod tests {
     fn a_public_local_status_is_automatic_for_another_account() {
         let author = base_user("alice");
         let viewer = a_viewer();
-        let approval = QuoteApproval::for_row(&base_row(), &author, Some(&viewer), None);
+        let approval = QuoteApproval::for_row(&base_row(), &author, None, Some(&viewer), None);
         assert_eq!(
             serde_json::to_value(&approval).unwrap(),
             serde_json::json!({"automatic": ["public"], "manual": [], "current_user": "automatic"}),
@@ -287,13 +322,13 @@ mod tests {
         let mut row = base_row();
         row.visibility = Visibility::Private;
 
-        let stranger = QuoteApproval::for_row(&row, &author, Some(&viewer), None);
+        let stranger = QuoteApproval::for_row(&row, &author, None, Some(&viewer), None);
         assert_eq!(stranger.automatic, ["followers"]);
         assert_eq!(stranger.manual, Vec::<&str>::new());
         assert_eq!(stranger.current_user, "denied", "a non-follower");
 
         let map = follower_of(&author);
-        let follower = QuoteApproval::for_row(&row, &author, Some(&viewer), Some(&map));
+        let follower = QuoteApproval::for_row(&row, &author, None, Some(&viewer), Some(&map));
         assert_eq!(follower.current_user, "automatic", "a follower");
     }
 
@@ -303,10 +338,10 @@ mod tests {
         let viewer = a_viewer();
         let mut row = base_row();
         row.visibility = Visibility::Direct;
-        let approval = QuoteApproval::for_row(&row, &author, Some(&viewer), None);
+        let approval = QuoteApproval::for_row(&row, &author, None, Some(&viewer), None);
         assert!(approval.automatic.is_empty() && approval.manual.is_empty());
         assert_eq!(approval.current_user, "denied");
-        let own = QuoteApproval::for_row(&row, &author, Some(&author), None);
+        let own = QuoteApproval::for_row(&row, &author, None, Some(&author), None);
         assert_eq!(own.current_user, "automatic", "the author may always quote");
     }
 
@@ -316,25 +351,25 @@ mod tests {
         let viewer = a_viewer();
         let mut row = base_row();
         row.quote_approval_policy = Some(QuoteApprovalPolicy::Nobody);
-        let nobody = QuoteApproval::for_row(&row, &author, Some(&viewer), None);
+        let nobody = QuoteApproval::for_row(&row, &author, None, Some(&viewer), None);
         assert!(nobody.automatic.is_empty() && nobody.manual.is_empty());
         assert_eq!(nobody.current_user, "denied", "nobody means nobody");
-        let own = QuoteApproval::for_row(&row, &author, Some(&author), None);
+        let own = QuoteApproval::for_row(&row, &author, None, Some(&author), None);
         assert_eq!(own.current_user, "automatic", "except the author");
 
         row.quote_approval_policy = Some(QuoteApprovalPolicy::Followers);
-        let followers = QuoteApproval::for_row(&row, &author, Some(&viewer), None);
+        let followers = QuoteApproval::for_row(&row, &author, None, Some(&viewer), None);
         assert_eq!(followers.automatic, ["followers"], "a public post narrowed");
         assert_eq!(followers.current_user, "denied", "a non-follower");
         let map = follower_of(&author);
-        let follower = QuoteApproval::for_row(&row, &author, Some(&viewer), Some(&map));
+        let follower = QuoteApproval::for_row(&row, &author, None, Some(&viewer), Some(&map));
         assert_eq!(follower.current_user, "automatic", "a follower");
     }
 
     #[test]
     fn an_anonymous_viewer_cannot_be_told() {
         let author = base_user("alice");
-        let approval = QuoteApproval::for_row(&base_row(), &author, None, None);
+        let approval = QuoteApproval::for_row(&base_row(), &author, None, None, None);
         assert_eq!(approval.automatic, ["public"], "the policy still shows");
         assert_eq!(approval.current_user, "unknown");
     }
@@ -345,13 +380,34 @@ mod tests {
         let viewer = a_viewer();
         let row = remote_row(Some(policy(&[REMOTE_FOLLOWERS], &[])));
 
-        let outsider = QuoteApproval::for_row(&row, &author, Some(&viewer), None);
+        let outsider = QuoteApproval::for_row(&row, &author, None, Some(&viewer), None);
         assert_eq!(outsider.automatic, ["followers"]);
         assert_eq!(outsider.current_user, "denied", "a non-follower");
 
         let map = follower_of(&author);
-        let follower = QuoteApproval::for_row(&row, &author, Some(&viewer), Some(&map));
+        let follower = QuoteApproval::for_row(&row, &author, None, Some(&viewer), Some(&map));
         assert_eq!(follower.current_user, "automatic", "a follower");
+    }
+
+    #[test]
+    fn the_followers_collection_is_the_one_on_the_actor_row() {
+        let author = remote_author();
+        let viewer = a_viewer();
+        let stored = "https://remote.example/collections/wanda-followers";
+        let row = remote_row(Some(policy(&[stored], &[])));
+        let actor = remote_actor(&author, stored);
+        let map = follower_of(&author);
+
+        let by_row = QuoteApproval::for_row(&row, &author, Some(&actor), Some(&viewer), Some(&map));
+        assert_eq!(by_row.automatic, ["followers"], "the row's own collection");
+        assert_eq!(by_row.current_user, "automatic", "a follower");
+
+        let built = QuoteApproval::for_row(&row, &author, None, Some(&viewer), Some(&map));
+        assert_eq!(
+            built.automatic,
+            ["unsupported_policy"],
+            "without the row the address is not the built followers collection"
+        );
     }
 
     #[test]
@@ -362,7 +418,7 @@ mod tests {
             &[AS_PUBLIC],
             &["https://remote.example/users/wanda/following"],
         )));
-        let approval = QuoteApproval::for_row(&row, &author, Some(&viewer), None);
+        let approval = QuoteApproval::for_row(&row, &author, None, Some(&viewer), None);
         assert_eq!(approval.automatic, ["public"]);
         assert_eq!(approval.manual, ["following"]);
 
@@ -371,7 +427,8 @@ mod tests {
             &["https://remote.example/users/wanda/following"],
         )));
         let followed = followed_by(&author);
-        let asked = QuoteApproval::for_row(&manual_only, &author, Some(&viewer), Some(&followed));
+        let asked =
+            QuoteApproval::for_row(&manual_only, &author, None, Some(&viewer), Some(&followed));
         assert_eq!(asked.current_user, "manual", "someone the author follows");
     }
 
@@ -383,7 +440,7 @@ mod tests {
             &["https://elsewhere.example/lists/1", REMOTE_AUTHOR],
             &[],
         )));
-        let approval = QuoteApproval::for_row(&row, &author, Some(&viewer), None);
+        let approval = QuoteApproval::for_row(&row, &author, None, Some(&viewer), None);
         assert_eq!(
             approval.automatic,
             ["unsupported_policy"],
@@ -397,12 +454,12 @@ mod tests {
         let author = remote_author();
         let viewer = a_viewer();
         let empty = remote_row(Some(QuotePolicy::default()));
-        let denied = QuoteApproval::for_row(&empty, &author, Some(&viewer), None);
+        let denied = QuoteApproval::for_row(&empty, &author, None, Some(&viewer), None);
         assert_eq!(denied.current_user, "denied");
         assert!(denied.automatic.is_empty() && denied.manual.is_empty());
 
         let silent = remote_row(None);
-        let unknown = QuoteApproval::for_row(&silent, &author, Some(&viewer), None);
+        let unknown = QuoteApproval::for_row(&silent, &author, None, Some(&viewer), None);
         assert_eq!(unknown.current_user, "unknown");
         assert!(unknown.automatic.is_empty() && unknown.manual.is_empty());
     }

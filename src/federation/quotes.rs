@@ -21,7 +21,7 @@ use crate::{
     models::{
         quote_authorization::QuoteAuthorization,
         status::{QuoteApprovalPolicy, Visibility},
-        user::{User, followers_address},
+        user::User,
     },
 };
 
@@ -95,6 +95,9 @@ pub const fn quote_approval(
 /// The `interactionPolicy` a note of `visibility` by `author` carries when
 /// the author chose `policy`, or `None` for a post nobody may quote.
 ///
+/// `followers` is the author's followers collection address, the one on their
+/// `activitypub_actors` row, which a followers-only policy names.
+///
 /// Mastodon marks a post with no policy as unquotable, which is exactly what
 /// a direct post wants. An author who chose `nobody` on a post that could be
 /// quoted gets Mastodon's spelling of it: empty approval lists, but for the
@@ -105,10 +108,11 @@ pub fn interaction_policy_json(
     visibility: Visibility,
     policy: Option<QuoteApprovalPolicy>,
     author: &User,
+    followers: &str,
 ) -> Option<Value> {
     let approved = match quote_approval(visibility, policy) {
         QuoteApproval::Everyone => json!(AS_PUBLIC),
-        QuoteApproval::Followers => json!(followers_address(author)),
+        QuoteApproval::Followers => json!(followers),
         QuoteApproval::Nobody => {
             if quote_approval(visibility, None) == QuoteApproval::Nobody {
                 return None;

@@ -129,6 +129,7 @@ mod tests {
     use crate::{
         config::TEST_BASE_URL,
         models::{
+            activitypub_actor::ActivityPubActorWrite,
             poll::{self, PollEdit, PollParams},
             status::{self, Status, Visibility},
             user::{Flag, NewUser, insert},
@@ -141,26 +142,35 @@ mod tests {
                 remote, run_publishes,
             },
         },
+        test_fixtures::write_actor,
     };
 
     /// A remote mirror `nickname@peer.example` with a shared inbox: the
     /// second host the fan-out tests need beside `remote`'s.
     async fn peer(pool: &PgPool, nickname: &str) -> User {
-        insert(
+        let user = insert(
             pool,
             &NewUser {
                 nickname: format!("{nickname}@peer.example"),
                 ap_id: format!("https://peer.example/users/{nickname}"),
                 local: Flag::new(false),
                 domain: Some("peer.example".to_owned()),
-                inbox: Some(format!("https://peer.example/users/{nickname}/inbox")),
-                shared_inbox: Some("https://peer.example/inbox".to_owned()),
-                public_key: Some("PUB".to_owned()),
                 ..NewUser::default()
             },
         )
         .await
-        .expect("the peer fixture inserts")
+        .expect("the peer fixture inserts");
+        let _row = write_actor(
+            pool,
+            &ActivityPubActorWrite {
+                inbox: Some(format!("https://peer.example/users/{nickname}/inbox")),
+                shared_inbox: Some("https://peer.example/inbox".to_owned()),
+                public_key: Some("PUB".to_owned()),
+                ..ActivityPubActorWrite::bare(user.id)
+            },
+        )
+        .await;
+        user
     }
 
     /// A public post of `author` carrying a two-option poll, and the

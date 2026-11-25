@@ -18,6 +18,7 @@ use crate::{
     },
     error::AppResult,
     models::{
+        activitypub_actor::ActivityPubActor,
         custom_emoji::CustomEmoji as EmojiRow,
         emoji_reaction::ReactionSummary,
         hashtag::Hashtag,
@@ -36,7 +37,8 @@ use super::{
     loaders::{
         load_bookmarks, load_direct_participations, load_favourites, load_media, load_mentions,
         load_pins, load_quote_denials, load_quotes, load_reactions, load_reblogs,
-        load_statuses_by_id, load_tags, load_thread_mutes, load_users, load_visible_parents,
+        load_remote_actors, load_statuses_by_id, load_tags, load_thread_mutes, load_users,
+        load_visible_parents,
     },
     loaders_emojis::{load_row_emojis, rendered_rows},
     loaders_polls_cards::{load_cards, load_poll_options, load_poll_votes, load_polls},
@@ -56,6 +58,10 @@ pub(super) struct Batch<'a> {
     viewer: Option<&'a User>,
     /// Every author and replied-to author on the page, keyed by id.
     users: HashMap<Uuid, User>,
+    /// The `activitypub_actors` rows of the remote accounts in
+    /// [`users`](Self::users), keyed by account id: the collections a remote
+    /// quote policy names.
+    actors: HashMap<Uuid, ActivityPubActor>,
     /// The custom emojis each rendered row uses, keyed by status id in the
     /// order the row's texts first use them — one
     /// [`custom_emoji::get_by_shortcodes`] read per distinct author domain,
@@ -211,6 +217,7 @@ impl<'a> Batch<'a> {
             "polls batch-loaded with their options and the viewer's marks"
         );
         let users = load_users(pool, &ids.accounts).await?;
+        let actors = load_remote_actors(pool, &users).await?;
         let shown = rendered_rows(rows, &originals, &quoted, &visible_quotes);
         let emojis = load_row_emojis(pool, &shown, &users, &poll_options).await?;
         let authors: Vec<&User> = users.values().collect();
@@ -224,6 +231,7 @@ impl<'a> Batch<'a> {
             config: state.config.as_ref(),
             viewer,
             users,
+            actors,
             emojis,
             account_emojis,
             originals,
@@ -385,6 +393,7 @@ impl<'a> Batch<'a> {
         let source = StatusSource {
             row,
             author,
+            author_actor: self.actors.get(&author.id),
             reply_author: row
                 .in_reply_to_account_id
                 .and_then(|id| self.users.get(&id)),

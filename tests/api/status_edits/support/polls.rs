@@ -6,7 +6,7 @@ use wired_be::{
     models::{
         follow::{self, FollowState},
         poll,
-        user::{self, User},
+        user::User,
     },
 };
 
@@ -18,19 +18,7 @@ const READ_WRITE: &str = "read write";
 /// A local author with the endpoints and keys a registered one carries, so
 /// the edit's `Update` is published.
 async fn signing_author(pool: &PgPool, nickname: &str) -> (User, String) {
-    let ap_id = format!("{TEST_BASE_URL}/users/{nickname}");
-    let stored = ap_id.clone();
-    let inbox = user::inbox(&ap_id);
-    let followers = user::followers(&ap_id);
-    let author = common::create_local_user_with(pool, nickname, move |mut new| {
-        new.ap_id = stored;
-        new.inbox = Some(inbox);
-        new.followers_url = Some(followers);
-        new.private_key = Some("PEM".to_owned());
-        new.public_key = Some("PUB".to_owned());
-        new
-    })
-    .await;
+    let author = common::create_federating_user_with(pool, nickname, |new| new).await;
     let token = common::create_app_and_token(pool, &author, "write:statuses read:statuses").await;
     (author, token)
 }

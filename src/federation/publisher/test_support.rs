@@ -12,6 +12,7 @@ use crate::{
     config::{Config, TEST_BASE_URL},
     federation::delivery::KIND_DELIVER,
     models::{
+        activitypub_actor::{self, ActivityPubActorWrite},
         follow::{self, FollowState},
         user::{NewUser, User, insert, local_ap_id},
     },
@@ -35,16 +36,25 @@ pub(super) use crate::test_support::app_state;
 /// inbox and followers-collection URL a real actor row carries.
 pub(super) async fn alice(pool: &PgPool) -> User {
     let ap_id = local_ap_id(TEST_BASE_URL, "alice");
-    insert(
+    let user = insert(pool, &NewUser::local("alice", &ap_id))
+        .await
+        .unwrap();
+    let _row = activitypub_actor::upsert(
         pool,
-        &NewUser {
+        &ActivityPubActorWrite {
             inbox: Some(format!("{ap_id}/inbox")),
             followers_url: Some(format!("{ap_id}/followers")),
-            ..NewUser::local("alice", &ap_id)
+            ..ActivityPubActorWrite::bare(user.id)
         },
     )
     .await
-    .unwrap()
+    .unwrap();
+    user
+}
+
+/// The followers collection of `user`, as [`alice`] and the other fixtures store it.
+pub(super) fn followers_of(user: &User) -> String {
+    format!("{}/followers", user.ap_id)
 }
 
 /// Inserts a remote mirror `nickname@host` with the given inbox
@@ -56,19 +66,28 @@ pub(super) async fn mirror(
     inbox: &str,
     shared: Option<&str>,
 ) -> User {
-    insert(
+    let user = insert(
         pool,
         &NewUser {
             nickname: format!("{nickname}@{host}"),
             ap_id: format!("https://{host}/users/{nickname}"),
             domain: Some(host.to_owned()),
-            inbox: Some(inbox.to_owned()),
-            shared_inbox: shared.map(str::to_owned),
             ..NewUser::default()
         },
     )
     .await
-    .unwrap()
+    .unwrap();
+    let _row = activitypub_actor::upsert(
+        pool,
+        &ActivityPubActorWrite {
+            inbox: Some(inbox.to_owned()),
+            shared_inbox: shared.map(str::to_owned),
+            ..ActivityPubActorWrite::bare(user.id)
+        },
+    )
+    .await
+    .unwrap();
+    user
 }
 
 /// Grants `follower` an accepted follow of `target` (a remote follower
@@ -119,7 +138,7 @@ pub(super) fn public_activity(actor: &User) -> Value {
         "type": "Create",
         "actor": actor.ap_id,
         "to": [PUBLIC],
-        "cc": [actor.followers_url],
+        "cc": [followers_of(actor)],
     })
 }
 

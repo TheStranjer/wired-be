@@ -45,10 +45,10 @@ use wired_be::{
     models::{
         block, emoji_reaction, favourite, follow,
         status::{self, NewStatus, Status, Visibility},
-        user::{NewUser, User},
+        user::User,
     },
     services::instance_actor::ensure_instance_actor,
-    util::{keys::generate_keypair_async, time::mastodon_time},
+    util::time::mastodon_time,
 };
 
 use crate::common;
@@ -109,25 +109,17 @@ fn activity_path(id: Uuid) -> String {
     format!("/activities/{id}")
 }
 
-/// Signs a `GET` of `https://test.example{path}` as actor `user`, with
-/// `user`'s stored key pair, the way a peer's authorized fetch would.
-///
-/// # Panics
-///
-/// If `user` holds no private key — the calling fixture forgot to give it
-/// one.
-fn signed_get_as(user: &User, path: &str) -> SignedHeaders {
-    let key_id = format!("{}#main-key", user.ap_id);
+/// Signs a `GET` of `https://test.example{path}` as actor `signer`, with
+/// `signer`'s stored key pair, the way a peer's authorized fetch would.
+fn signed_get_as(signer: &common::Signer, path: &str) -> SignedHeaders {
+    let key_id = format!("{}#main-key", signer.ap_id);
     sign_request(
         "GET",
         &format!("{BASE}{path}"),
         None,
         &SigningKey {
             key_id: &key_id,
-            private_pem: user
-                .private_key
-                .as_deref()
-                .expect("the fixture user holds its private key"),
+            private_pem: &signer.private_pem,
         },
         Utc::now(),
     )
@@ -149,11 +141,13 @@ async fn instance_signer(pool: &PgPool) -> InstanceSigner {
     let actor = ensure_instance_actor(pool, &common::test_config())
         .await
         .expect("the instance actor is provisioned");
+    let private_pem = common::actor_of(pool, &actor)
+        .await
+        .private_key
+        .expect("the provisioned actor holds its private key");
     InstanceSigner {
         ap_id: actor.ap_id,
-        private_pem: actor
-            .private_key
-            .expect("the provisioned actor holds its private key"),
+        private_pem,
     }
 }
 
@@ -171,27 +165,6 @@ fn signed_get_as_instance(signer: &InstanceSigner, path: &str) -> SignedHeaders 
         Utc::now(),
     )
     .expect("signing the test fetch")
-}
-
-/// A local [`User`] named `nickname` with a real RSA key pair stored, so it
-/// can sign an authorized fetch: [`create_local_user_with`] plus the pair
-/// [`generate_keypair_async`] mints.
-///
-/// [`create_local_user_with`]: common::create_local_user_with
-///
-/// # Panics
-///
-/// If key generation or the insert fails.
-async fn signer_user(pool: &PgPool, nickname: &str) -> User {
-    let keys = generate_keypair_async()
-        .await
-        .expect("the fixture key pair generates");
-    common::create_local_user_with(pool, nickname, |new| NewUser {
-        public_key: Some(keys.public_pem.clone()),
-        private_key: Some(keys.private_pem.clone()),
-        ..new
-    })
-    .await
 }
 
 /// `follower` follows `target` through [`wired_be::models::follow`], with
@@ -254,9 +227,9 @@ fn assert_not_found(response: &common::TestResponse, who: &str) {
 async fn a_favourite_is_served_as_its_like_to_its_pair() {
     let db = common::test_db().await;
     let pool = db.pool().clone();
-    let alice = signer_user(&pool, "alice").await;
-    let bob = signer_user(&pool, "bob").await;
-    let mallory = signer_user(&pool, "mallory").await;
+    let alice = common::create_signer(&pool, "alice").await;
+    let bob = common::create_signer(&pool, "bob").await;
+    let mallory = common::create_signer(&pool, "mallory").await;
     let note = common::create_status(&pool, &alice, "like me", Visibility::Public).await;
     let liked = favourite::favourite(&pool, BASE, bob.id, note.id)
         .await
@@ -301,8 +274,8 @@ async fn a_favourite_is_served_as_its_like_to_its_pair() {
 async fn a_reaction_is_served_as_its_emoji_react() {
     let db = common::test_db().await;
     let pool = db.pool().clone();
-    let alice = signer_user(&pool, "alice").await;
-    let bob = signer_user(&pool, "bob").await;
+    let alice = common::create_signer(&pool, "alice").await;
+    let bob = common::create_signer(&pool, "bob").await;
     let note = common::create_status(&pool, &alice, "react to me", Visibility::Public).await;
     let unicode = emoji_reaction::react(
         &pool,
@@ -389,9 +362,9 @@ async fn a_reaction_is_served_as_its_emoji_react() {
 async fn a_follow_is_served_to_follower_and_followee_alone() {
     let db = common::test_db().await;
     let pool = db.pool().clone();
-    let alice = signer_user(&pool, "alice").await;
-    let bob = signer_user(&pool, "bob").await;
-    let mallory = signer_user(&pool, "mallory").await;
+    let alice = common::create_signer(&pool, "alice").await;
+    let bob = common::create_signer(&pool, "bob").await;
+    let mallory = common::create_signer(&pool, "mallory").await;
     let opened = follow::follow(&pool, BASE, &bob, &alice)
         .await
         .expect("the follow write runs");
@@ -432,9 +405,9 @@ async fn a_follow_is_served_to_follower_and_followee_alone() {
 async fn a_block_is_served_to_blocker_and_blocked_alone() {
     let db = common::test_db().await;
     let pool = db.pool().clone();
-    let alice = signer_user(&pool, "alice").await;
-    let carol = signer_user(&pool, "carol").await;
-    let mallory = signer_user(&pool, "mallory").await;
+    let alice = common::create_signer(&pool, "alice").await;
+    let carol = common::create_signer(&pool, "carol").await;
+    let mallory = common::create_signer(&pool, "mallory").await;
     let blocked = block::block(&pool, BASE, &alice, &carol)
         .await
         .expect("the block write runs");
@@ -508,8 +481,8 @@ async fn a_reblogs_announce_is_gated_by_its_visibility() {
     let alice = common::create_local_user(&pool, "alice").await;
     let bob = common::create_local_user(&pool, "bob").await;
     let dave = common::create_local_user(&pool, "dave").await;
-    let carol = signer_user(&pool, "carol").await;
-    let mallory = signer_user(&pool, "mallory").await;
+    let carol = common::create_signer(&pool, "carol").await;
+    let mallory = common::create_signer(&pool, "mallory").await;
     accepted_follow(&pool, &carol, &dave).await;
     let note = common::create_status(&pool, &bob, "boost me", Visibility::Public).await;
     let (reblog, _wrote_public) =
@@ -571,7 +544,7 @@ async fn a_boosts_served_announce_matches_the_delivered_one() {
     let pool = db.pool().clone();
     let alice = common::create_local_user(&pool, "alice").await;
     let bob = common::create_local_user(&pool, "bob").await;
-    let carol = signer_user(&pool, "carol").await;
+    let carol = common::create_signer(&pool, "carol").await;
     let token = common::create_app_and_token(&pool, &alice, "write:statuses").await;
     let app = common::test_app(pool.clone());
 
@@ -743,8 +716,8 @@ async fn the_authorized_fetch_gate_gates_the_activity_reads() {
 async fn the_notice_activity_route_wraps_the_note_in_its_create() {
     let db = common::test_db().await;
     let pool = db.pool().clone();
-    let alice = signer_user(&pool, "alice").await;
-    let carol = signer_user(&pool, "carol").await;
+    let alice = common::create_signer(&pool, "alice").await;
+    let carol = common::create_signer(&pool, "carol").await;
     // A second live local account: the mismatch case must name one that
     // exists, not merely a nickname nobody answers to.
     let bob = common::create_local_user(&pool, "bob").await;

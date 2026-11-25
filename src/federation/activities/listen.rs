@@ -5,14 +5,15 @@
 //! `{BASE_URL}/objects/{id}` that carries the media metadata
 //! (`title`, `artist`, `album`, `length`, `externalLink`). Both are
 //! addressed by the scrobble's own visibility, by the rule statuses use
-//! ([`address_lines`]), and share one `context`.
+//! ([`audience_lines`], over the listener's followers collection), and share
+//! one `context`.
 
 use serde_json::{Value, json};
 
 use super::{TYPE_AUDIO, TYPE_LISTEN};
 use crate::{
     config::Config,
-    federation::note::{address_lines, json_ld_context},
+    federation::note::{audience_lines, json_ld_context},
     models::{scrobble::Scrobble, user::User},
     util::{
         id::{activity_ap_id, object_ap_id},
@@ -29,12 +30,14 @@ fn context_id(scrobble: &Scrobble, config: &Config) -> String {
 /// The `Audio` object behind `scrobble`, listened to by `author`.
 ///
 /// Its `id` is `{BASE_URL}/objects/{id}`, its `to` and `cc` what the
-/// scrobble's visibility addresses, and the optional metadata keys
-/// (`artist`, `album`, `length`, `externalLink`) are left out when the
-/// listener gave none, as Pleroma's object has no key then.
+/// scrobble's visibility addresses (`followers` is the address of the
+/// author's followers collection, the one on their `activitypub_actors`
+/// row), and the optional metadata keys (`artist`, `album`, `length`,
+/// `externalLink`) are left out when the listener gave none, as Pleroma's
+/// object has no key then.
 #[must_use]
-pub fn audio_json(scrobble: &Scrobble, author: &User, config: &Config) -> Value {
-    let (to, cc) = address_lines(scrobble.visibility, author, &[]);
+pub fn audio_json(scrobble: &Scrobble, author: &User, followers: &str, config: &Config) -> Value {
+    let (to, cc) = audience_lines(scrobble.visibility, followers, &[]);
     let fields: [(&str, Option<Value>); 13] = [
         (
             "id",
@@ -72,10 +75,10 @@ pub fn audio_json(scrobble: &Scrobble, author: &User, config: &Config) -> Value 
 ///
 /// The `id` is the row's stored `ap_id` (decision 6), falling back to the
 /// id [`activity_ap_id`] mints for a row that has none, so the document a
-/// peer fetches is the one delivered.
+/// peer fetches is the one delivered. `followers` is as for [`audio_json`].
 #[must_use]
-pub fn listen_json(scrobble: &Scrobble, author: &User, config: &Config) -> Value {
-    let (to, cc) = address_lines(scrobble.visibility, author, &[]);
+pub fn listen_json(scrobble: &Scrobble, author: &User, followers: &str, config: &Config) -> Value {
+    let (to, cc) = audience_lines(scrobble.visibility, followers, &[]);
     let id = scrobble
         .ap_id
         .clone()
@@ -89,7 +92,7 @@ pub fn listen_json(scrobble: &Scrobble, author: &User, config: &Config) -> Value
         "cc": cc,
         "context": context_id(scrobble, config),
         "published": mastodon_time(&scrobble.inserted_at),
-        "object": audio_json(scrobble, author, config),
+        "object": audio_json(scrobble, author, followers, config),
     })
 }
 
@@ -129,7 +132,7 @@ mod tests {
     #[test]
     fn a_public_listen_carries_the_exact_keys_and_addressing() {
         let row = scrobble(Visibility::Public);
-        let listen = listen_json(&row, &author(), &config());
+        let listen = listen_json(&row, &author(), FOLLOWERS, &config());
 
         assert_eq!(
             json_keys(&listen),
@@ -158,7 +161,7 @@ mod tests {
     #[test]
     fn the_embedded_audio_carries_the_media_metadata() {
         let row = scrobble(Visibility::Public);
-        let listen = listen_json(&row, &author(), &config());
+        let listen = listen_json(&row, &author(), FOLLOWERS, &config());
         let audio = &listen["object"];
 
         assert_eq!(
@@ -195,7 +198,7 @@ mod tests {
         assert_eq!(audio["cc"], listen["cc"]);
         assert_eq!(
             audio,
-            &audio_json(&row, &author(), &config()),
+            &audio_json(&row, &author(), FOLLOWERS, &config()),
             "and is the document the object route serves"
         );
     }
@@ -208,7 +211,7 @@ mod tests {
             (Visibility::Private, json!([FOLLOWERS]), json!([])),
             (Visibility::Direct, json!([]), json!([])),
         ] {
-            let listen = listen_json(&scrobble(visibility), &author(), &config());
+            let listen = listen_json(&scrobble(visibility), &author(), FOLLOWERS, &config());
             let name = visibility.as_str();
             assert_eq!(listen["to"], to, "{name} to");
             assert_eq!(listen["cc"], cc, "{name} cc");
@@ -226,7 +229,7 @@ mod tests {
             external_link: None,
             ..scrobble(Visibility::Public)
         };
-        let audio = audio_json(&row, &author(), &config());
+        let audio = audio_json(&row, &author(), FOLLOWERS, &config());
 
         assert_eq!(
             json_keys(&audio),
@@ -251,7 +254,7 @@ mod tests {
             ap_id: None,
             ..scrobble(Visibility::Public)
         };
-        let listen = listen_json(&row, &author(), &config());
+        let listen = listen_json(&row, &author(), FOLLOWERS, &config());
 
         assert_eq!(
             listen["id"],

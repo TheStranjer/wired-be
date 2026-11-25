@@ -3,9 +3,10 @@
 //! [`create_local_user`] is the registration path: it validates the
 //! submitted parameters the way Pleroma's `User.register_changeset`
 //! (`lib/pleroma/user.ex`) does — collecting every failure into one
-//! field-keyed error map — then hashes the password, generates the actor's
-//! RSA key pair, derives the `ActivityPub` endpoint URLs and inserts the
-//! row. A lost race against a concurrent registration on one of `users`'
+//! field-keyed error map — then hashes the password and inserts the row,
+//! claiming one identity per enabled protocol beside it (`ActivityPub`'s
+//! claim generates the actor's RSA key pair and derives its endpoint URLs).
+//! A lost race against a concurrent registration on one of `users`'
 //! unique constraints maps to the same field error as the up-front
 //! availability check. When the request came in on a registration invite,
 //! the caller hands the validated [`InviteToken`] in and its consumption
@@ -144,13 +145,13 @@ impl fmt::Debug for RegisterParams {
 
 /// Creates a new local account from `params` and returns the stored row.
 ///
-/// The password is hashed ([`hash_password`]), a fresh RSA-2048 key pair is
-/// generated ([`generate_keypair_async`]), and the actor URL comes from
-/// [`local_ap_id`] with its `ActivityPub` endpoints beside it; the shared
-/// inbox is the instance-wide `{BASE_URL}/inbox`. Nickname and email
-/// availability are checked up front and the unique constraints are
-/// re-checked through the insert, so a concurrent registration of the same
-/// account loses with the same field error the check would have produced.
+/// The password is hashed ([`hash_password`]) and the actor URL comes from
+/// [`local_ap_id`]; `ActivityPub`'s claim generates the account's RSA-2048 key
+/// pair and derives its endpoints, the shared inbox being the instance-wide
+/// `{BASE_URL}/inbox`. Nickname and email availability are checked up front
+/// and the unique constraints are re-checked through the insert, so a
+/// concurrent registration of the same account loses with the same field error
+/// the check would have produced.
 ///
 /// The insert runs in one transaction with a claim of one identity per
 /// enabled protocol (`ActivityPub`'s is its `activitypub_actors` row; the
@@ -195,7 +196,6 @@ impl fmt::Debug for RegisterParams {
 /// queue or database failures beyond those.
 ///
 /// [`consume`]: crate::models::invite_token::consume
-/// [`generate_keypair_async`]: crate::util::keys::generate_keypair_async
 /// [`hash_password`]: crate::util::password::hash_password
 /// [`local_ap_id`]: crate::models::user::local_ap_id
 pub async fn create_local_user(
@@ -263,9 +263,12 @@ mod tests {
     use super::*;
     use crate::{
         config::TEST_BASE_URL,
-        models::user::{
-            featured, followers, following, get_by_nickname, inbox, outbox,
-            register::test_support::*,
+        models::{
+            activitypub_actor::{self, ActivityPubActor, ActorStatus},
+            user::{
+                featured, followers, following, get_by_nickname, inbox, outbox,
+                register::test_support::*,
+            },
         },
         test_support::app_state,
         util::{
@@ -315,47 +318,47 @@ mod tests {
         );
     }
 
-    /// The five activity endpoints and the shared inbox registration derives
+    /// The five activity endpoints and the shared inbox the claim derives
     /// from the new account's actor id.
-    fn assert_actor_endpoints(user: &User) {
+    fn assert_actor_endpoints(user: &User, actor: &ActivityPubActor) {
         let ap_id = user.ap_id.as_str();
-        assert_eq!(user.inbox.as_deref(), Some(inbox(ap_id).as_str()), "inbox");
+        assert_eq!(actor.inbox.as_deref(), Some(inbox(ap_id).as_str()), "inbox");
         assert_eq!(
-            user.outbox.as_deref(),
+            actor.outbox.as_deref(),
             Some(outbox(ap_id).as_str()),
             "outbox"
         );
         assert_eq!(
-            user.followers_url.as_deref(),
+            actor.followers_url.as_deref(),
             Some(followers(ap_id).as_str()),
             "followers"
         );
         assert_eq!(
-            user.following_url.as_deref(),
+            actor.following_url.as_deref(),
             Some(following(ap_id).as_str()),
             "following"
         );
         assert_eq!(
-            user.featured_url.as_deref(),
+            actor.featured_url.as_deref(),
             Some(featured(ap_id).as_str()),
             "featured"
         );
         assert_eq!(
-            user.shared_inbox.as_deref(),
+            actor.shared_inbox.as_deref(),
             Some(format!("{TEST_BASE_URL}/inbox").as_str()),
             "the shared inbox is the instance-wide one"
         );
     }
 
-    /// The key pair registration generated with the account: two labeled PEMs
+    /// The key pair the claim generated with the account: two labeled PEMs
     /// that are one RSA pair, proven by signing and verifying with them.
     ///
     /// # Panics
     ///
-    /// If the row carries no keys, which registration always stores.
-    fn assert_generated_key_pair(user: &User) {
-        let public_pem = user.public_key.clone().expect("a public key");
-        let private_pem = user.private_key.clone().expect("a private key");
+    /// If the row carries no keys, which the claim always stores.
+    fn assert_generated_key_pair(actor: &ActivityPubActor) {
+        let public_pem = actor.public_key.clone().expect("a public key");
+        let private_pem = actor.private_key.clone().expect("a private key");
         assert!(
             public_pem.starts_with(PUBLIC_PEM_LABEL),
             "SPKI PEM public key"
@@ -405,17 +408,13 @@ mod tests {
             "and it verifies the submitted password"
         );
 
-        assert_actor_endpoints(&user);
-        assert_generated_key_pair(&user);
-        let actor = crate::test_fixtures::assert_actor_in_step(&pool, user.id).await;
-        assert_eq!(
-            actor.private_key, user.private_key,
-            "the actor row holds the generated private key"
-        );
-        assert!(
-            actor.public_key.is_some() && actor.inbox.is_some(),
-            "and the key pair's public half and the inbox"
-        );
+        let actor = activitypub_actor::get(&pool, user.id)
+            .await
+            .unwrap()
+            .expect("the claim wrote the actor row");
+        assert_eq!(actor.status, ActorStatus::Active, "the identity is claimed");
+        assert_actor_endpoints(&user, &actor);
+        assert_generated_key_pair(&actor);
 
         let fetched = get_by_nickname(&state.db, "aLiCe")
             .await

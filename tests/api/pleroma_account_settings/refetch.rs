@@ -14,10 +14,14 @@ use axum::{
     response::{IntoResponse as _, Response},
     routing::get as route_get,
 };
+use chrono::Utc;
 use serde_json::{Value, json};
 use sqlx::PgPool;
 use tokio::{net::TcpListener, task::JoinHandle};
-use wired_be::models::user::{NewUser, User, insert};
+use wired_be::models::{
+    activitypub_actor::ActivityPubActorWrite,
+    user::{NewUser, User, insert},
+};
 
 use super::support::{PASSWORD, fixture, move_account, move_v1, stored};
 use crate::common;
@@ -128,10 +132,6 @@ impl Peer {
             ap_id: ap_id.clone(),
             domain: Some(authority),
             name: "New home".to_owned(),
-            inbox: Some(format!("{ap_id}/inbox")),
-            public_key: Some(
-                "-----BEGIN PUBLIC KEY-----\nPEM\n-----END PUBLIC KEY-----\n".to_owned(),
-            ),
             also_known_as: cached_aliases
                 .iter()
                 .map(|alias| (*alias).to_owned())
@@ -139,17 +139,18 @@ impl Peer {
             ..NewUser::default()
         };
         let row = insert(pool, &new).await.expect("the mirror inserts");
-        let _stamped = sqlx::query("UPDATE users SET last_fetched_at = now() WHERE id = $1")
-            .bind(row.id)
-            .execute(pool)
-            .await
-            .expect("the fetch stamp is set");
-        let _mirrored =
-            sqlx::query("UPDATE activitypub_actors SET last_fetched_at = now() WHERE user_id = $1")
-                .bind(row.id)
-                .execute(pool)
-                .await
-                .expect("the actor row's fetch stamp is set alike");
+        let _actor = common::write_actor(
+            pool,
+            &ActivityPubActorWrite {
+                inbox: Some(format!("{ap_id}/inbox")),
+                public_key: Some(
+                    "-----BEGIN PUBLIC KEY-----\nPEM\n-----END PUBLIC KEY-----\n".to_owned(),
+                ),
+                last_fetched_at: Some(Utc::now()),
+                ..ActivityPubActorWrite::bare(row.id)
+            },
+        )
+        .await;
         stored(pool, row.id).await
     }
 }

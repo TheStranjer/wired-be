@@ -220,7 +220,10 @@ mod tests {
         config::{Config, TEST_BASE_URL},
         federation::signature::{SignedHeaders, SigningKey, sign_request},
         http_client::HttpClient,
-        models::user::{NewUser, get_by_ap_id, insert},
+        models::{
+            activitypub_actor,
+            user::{NewUser, get_by_ap_id, insert},
+        },
         services::instance_actor::{ensure_instance_actor, instance_actor_ap_id},
         test_server::{bind, origin, spawn},
         util::keys::{KeyPair, generate_keypair},
@@ -402,7 +405,7 @@ mod tests {
             .await
             .unwrap();
         let key_id = format!("{}#main-key", actor.ap_id);
-        let signed = sign_as(&key_id, actor.private_key.as_deref().unwrap());
+        let signed = sign_as(&key_id, &private_pem_of(&state, &actor).await);
         let tampered = check_target(&state, &signed, "/users/mallory").await;
         assert!(
             refused(&tampered),
@@ -419,7 +422,7 @@ mod tests {
             .unwrap();
         let get = sign_as(
             &format!("{}#main-key", actor.ap_id),
-            actor.private_key.as_deref().unwrap(),
+            &private_pem_of(&state, &actor).await,
         );
 
         check(&state, &get).await.expect("the instance actor signs");
@@ -626,7 +629,7 @@ mod tests {
             .unwrap();
         let get = sign_as(
             &format!("{}#main-key", actor.ap_id),
-            actor.private_key.as_deref().unwrap(),
+            &private_pem_of(&state, &actor).await,
         );
 
         let signer = ask_signer(&state, &get)
@@ -662,7 +665,13 @@ mod tests {
         let keyless = insert(&state.db, &NewUser::local("keyless", &ap_id))
             .await
             .unwrap();
-        assert!(keyless.public_key.is_none(), "the row carries no key");
+        assert!(
+            activitypub_actor::get(&state.db, keyless.id)
+                .await
+                .unwrap()
+                .is_none_or(|row| row.public_key.is_none()),
+            "the account carries no key"
+        );
         let get = sign_as(&format!("{ap_id}#main-key"), &remote_keys().private_pem);
 
         let gate = check(&state, &get).await.unwrap_err();
@@ -731,7 +740,7 @@ mod tests {
             .unwrap();
         let get = sign_as(
             &format!("{}#main-key", actor.ap_id),
-            actor.private_key.as_deref().unwrap(),
+            &private_pem_of(&state, &actor).await,
         );
 
         let signer = ask_signer(&state, &get)
@@ -754,7 +763,7 @@ mod tests {
             .unwrap();
         let get = sign_as(
             &format!("{}#main-key", actor.ap_id),
-            actor.private_key.as_deref().unwrap(),
+            &private_pem_of(&state, &actor).await,
         );
 
         let outcome = ask_signer_target(&state, &get, "/users/mallory")
@@ -800,41 +809,13 @@ mod tests {
         );
     }
 
-    /// A second key pair, unrelated to [`remote_keys`]: what a signer holds
-    /// when no key this instance can learn of fits its signature.
-    fn other_keys() -> &'static KeyPair {
-        static KEYS: OnceLock<KeyPair> = OnceLock::new();
-        KEYS.get_or_init(|| generate_keypair().expect("test key generation"))
-    }
-
-    /// A counting peer, its origin, and a `GET` of it signed with
-    /// `private_pem` (the key the peer serves, or another).
-    async fn counting_peer_signing_with(
-        private_pem: &str,
-    ) -> (
-        tokio::task::JoinHandle<()>,
-        SignedGet,
-        Arc<AtomicUsize>,
-        String,
-    ) {
-        let (server, base, hits) = counting_server().await;
-        let get = sign_as(&format!("{base}{TARGET_PATH}#main-key"), private_pem);
-        (server, get, hits, base)
-    }
-
-    /// Stores a mirror of the peer's actor holding a key it no longer uses.
-    async fn seed_stale_mirror(pool: &PgPool, base: &str) {
-        let host = base.trim_start_matches("http://");
-        let new = NewUser {
-            nickname: format!("signer@{host}"),
-            ap_id: format!("{base}{TARGET_PATH}"),
-            domain: Some(host.to_owned()),
-            name: "Signer".to_owned(),
-            inbox: Some(format!("{base}{TARGET_PATH}/inbox")),
-            public_key: Some(STALE_KEY_PEM.to_owned()),
-            ..NewUser::default()
-        };
-        let _seeded: User = insert(pool, &new).await.unwrap();
+    /// The private key on `user`'s `activitypub_actors` row, which signs as the account.
+    async fn private_pem_of(state: &AppState, user: &User) -> String {
+        activitypub_actor::get(&state.db, user.id)
+            .await
+            .unwrap()
+            .and_then(|row| row.private_key)
+            .expect("the account has a signing key")
     }
 
     /// The same `GET`, its `Signature` parameters moved under
@@ -850,74 +831,7 @@ mod tests {
         SignedGet { headers }
     }
 
-    #[tokio::test]
-    async fn a_rotated_key_is_refetched_and_the_fetch_passes() {
-        let db = crate::test_db::test_db().await.expect("test database slot");
-        let (server, get, hits, base) =
-            counting_peer_signing_with(&remote_keys().private_pem).await;
-        let state = state_with(db.pool().clone(), gate_on());
-        seed_stale_mirror(&state.db, &base).await;
-
-        check(&state, &get)
-            .await
-            .expect("the refetched key verifies the signature");
-
-        assert_eq!(hits.load(Ordering::SeqCst), 1, "after exactly one refetch");
-        let mirror = get_by_ap_id(&state.db, &format!("{base}{TARGET_PATH}"))
-            .await
-            .unwrap()
-            .expect("the mirror is still stored");
-        assert_eq!(
-            mirror.public_key.expect("a key").trim(),
-            remote_keys().public_pem.trim(),
-            "and now carries the rotated key"
-        );
-        check(&state, &get)
-            .await
-            .expect("the refreshed mirror answers the next read");
-        assert_eq!(hits.load(Ordering::SeqCst), 1, "with no second fetch");
-        server.abort();
-    }
-
-    #[tokio::test]
-    async fn a_refetch_that_still_fails_is_refused() {
-        let db = crate::test_db::test_db().await.expect("test database slot");
-        let (server, get, hits, base) = counting_peer_signing_with(&other_keys().private_pem).await;
-        let state = state_with(db.pool().clone(), gate_on());
-        seed_stale_mirror(&state.db, &base).await;
-
-        let gate = check(&state, &get).await;
-        let signer = ask_signer(&state, &get).await;
-
-        assert!(refused(&gate), "neither the stored nor the fresh key fits");
-        assert!(
-            matches!(signer, Err(AppError::Unauthorized(_))),
-            "the signer read is refused alike"
-        );
-        assert_eq!(hits.load(Ordering::SeqCst), 1, "the one refetch was spent");
-        server.abort();
-    }
-
-    #[tokio::test]
-    async fn a_second_failure_inside_the_window_does_not_refetch_again() {
-        let db = crate::test_db::test_db().await.expect("test database slot");
-        let (server, get, hits, base) = counting_peer_signing_with(&other_keys().private_pem).await;
-        let state = state_with(db.pool().clone(), gate_on());
-        seed_stale_mirror(&state.db, &base).await;
-
-        let first = check(&state, &get).await;
-        assert!(refused(&first), "the first failure is refused");
-        assert_eq!(hits.load(Ordering::SeqCst), 1, "after one refetch");
-
-        let second = check(&state, &get).await;
-        assert!(refused(&second), "the second failure is refused");
-        assert_eq!(
-            hits.load(Ordering::SeqCst),
-            1,
-            "the window is closed: no second fetch"
-        );
-        server.abort();
-    }
+    mod refetch;
 
     #[tokio::test]
     async fn an_authorization_signature_header_authenticates_a_fetch() {
@@ -928,7 +842,7 @@ mod tests {
             .unwrap();
         let bare = sign_as(
             &format!("{}#main-key", actor.ap_id),
-            actor.private_key.as_deref().unwrap(),
+            &private_pem_of(&state, &actor).await,
         );
         let get = as_authorization(&bare);
         assert!(

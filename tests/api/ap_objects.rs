@@ -37,10 +37,10 @@ use wired_be::{
         follow::{self, FollowState},
         poll::{self, PollParams},
         status::{self, NewStatus, Status, Visibility},
-        user::{NewUser, User},
+        user::User,
     },
     services::instance_actor::ensure_instance_actor,
-    util::{keys::generate_keypair_async, time::mastodon_time},
+    util::time::mastodon_time,
 };
 
 use crate::common;
@@ -101,25 +101,17 @@ fn object_path(status: &Status) -> String {
     format!("/objects/{}", status.id)
 }
 
-/// Signs a `GET` of `https://test.example{path}` as actor `user`, with
-/// `user`'s stored key pair, the way a peer's authorized fetch would.
-///
-/// # Panics
-///
-/// If `user` holds no private key — the calling fixture forgot to give it
-/// one.
-fn signed_get_as(user: &User, path: &str) -> SignedHeaders {
-    let key_id = format!("{}#main-key", user.ap_id);
+/// Signs a `GET` of `https://test.example{path}` as actor `signer`, with
+/// `signer`'s stored key pair, the way a peer's authorized fetch would.
+fn signed_get_as(signer: &common::Signer, path: &str) -> SignedHeaders {
+    let key_id = format!("{}#main-key", signer.ap_id);
     sign_request(
         "GET",
         &format!("{BASE}{path}"),
         None,
         &SigningKey {
             key_id: &key_id,
-            private_pem: user
-                .private_key
-                .as_deref()
-                .expect("the fixture user holds its private key"),
+            private_pem: &signer.private_pem,
         },
         Utc::now(),
     )
@@ -143,11 +135,13 @@ async fn instance_signer(pool: &PgPool) -> InstanceSigner {
     let actor = ensure_instance_actor(pool, &common::test_config())
         .await
         .expect("the instance actor is provisioned");
+    let private_pem = common::actor_of(pool, &actor)
+        .await
+        .private_key
+        .expect("the provisioned actor holds its private key");
     InstanceSigner {
         ap_id: actor.ap_id,
-        private_pem: actor
-            .private_key
-            .expect("the provisioned actor holds its private key"),
+        private_pem,
     }
 }
 
@@ -165,27 +159,6 @@ fn signed_get_as_instance(signer: &InstanceSigner, path: &str) -> SignedHeaders 
         Utc::now(),
     )
     .expect("signing the test fetch")
-}
-
-/// A local [`User`] named `nickname` with a real RSA key pair stored, so it
-/// can sign an authorized fetch: [`create_local_user_with`] plus the pair
-/// [`generate_keypair_async`] mints.
-///
-/// [`create_local_user_with`]: common::create_local_user_with
-///
-/// # Panics
-///
-/// If key generation or the insert fails.
-async fn signer_user(pool: &PgPool, nickname: &str) -> User {
-    let keys = generate_keypair_async()
-        .await
-        .expect("the fixture key pair generates");
-    common::create_local_user_with(pool, nickname, |new| NewUser {
-        public_key: Some(keys.public_pem.clone()),
-        private_key: Some(keys.private_pem.clone()),
-        ..new
-    })
-    .await
 }
 
 /// `follower` follows `target` through [`wired_be::models::follow`], with
@@ -398,8 +371,8 @@ async fn a_private_note_reaches_followers_that_sign() {
     let db = common::test_db().await;
     let pool = db.pool().clone();
     let alice = common::create_local_user(&pool, "alice").await;
-    let carol = signer_user(&pool, "carol").await;
-    let mallory = signer_user(&pool, "mallory").await;
+    let carol = common::create_signer(&pool, "carol").await;
+    let mallory = common::create_signer(&pool, "mallory").await;
     accepted_follow(&pool, &carol, &alice).await;
     let note = common::create_status(&pool, &alice, "followers only", Visibility::Private).await;
     let app = common::test_app(pool);
@@ -436,10 +409,17 @@ async fn a_direct_note_reaches_the_mentioned_signer() {
     let db = common::test_db().await;
     let pool = db.pool().clone();
     let alice = common::create_local_user(&pool, "alice").await;
-    let carol = signer_user(&pool, "carol").await;
-    let bob = signer_user(&pool, "bob").await;
+    let carol = common::create_signer(&pool, "carol").await;
+    let bob = common::create_signer(&pool, "bob").await;
     accepted_follow(&pool, &bob, &alice).await;
-    let note = addressed(&pool, &alice, &[&carol], Visibility::Direct, "psst, carol").await;
+    let note = addressed(
+        &pool,
+        &alice,
+        &[&carol.user],
+        Visibility::Direct,
+        "psst, carol",
+    )
+    .await;
     let app = common::test_app(pool);
     let path = object_path(&note);
 
@@ -466,7 +446,7 @@ async fn a_local_status_is_never_a_document() {
     let db = common::test_db().await;
     let pool = db.pool().clone();
     let alice = common::create_local_user(&pool, "alice").await;
-    let carol = signer_user(&pool, "carol").await;
+    let carol = common::create_signer(&pool, "carol").await;
     accepted_follow(&pool, &carol, &alice).await;
     let note = common::create_status(&pool, &alice, "stay at home", Visibility::Local).await;
     let app = common::test_app(pool);

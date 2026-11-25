@@ -54,7 +54,10 @@ use sqlx::PgPool;
 use wired_be::{
     config::TEST_BASE_URL,
     federation::signature::SignedHeaders,
-    models::user::{self, Flag, NewUser, User, get_by_ap_id, get_by_nickname, insert},
+    models::{
+        activitypub_actor::ActivityPubActorWrite,
+        user::{self, Flag, NewUser, User, get_by_ap_id, get_by_nickname, insert},
+    },
 };
 
 use crate::{common, remote};
@@ -695,24 +698,32 @@ async fn the_ssrf_guard_refuses_resolutions_but_not_signed_deliveries() {
 /// [`MockPeer::public_key_pem`]: remote::MockPeer::public_key_pem
 async fn seed_mock_mirror(pool: &PgPool, peer: &remote::MockPeer, nick: &str) -> User {
     let ap_id = peer.actor(nick);
-    insert(
+    let mirror = insert(
         pool,
         &NewUser {
             nickname: peer.handle(nick),
             ap_id: ap_id.clone(),
             domain: Some(LOOPBACK_HOST.to_owned()),
             name: nick.to_owned(),
+            ..NewUser::default()
+        },
+    )
+    .await
+    .expect("the seeded mirror inserts");
+    let _row = common::write_actor(
+        pool,
+        &ActivityPubActorWrite {
             inbox: Some(user::inbox(&ap_id)),
             shared_inbox: Some(peer.shared_inbox()),
             outbox: Some(user::outbox(&ap_id)),
             followers_url: Some(user::followers(&ap_id)),
             following_url: Some(user::following(&ap_id)),
             public_key: Some(remote::MockPeer::public_key_pem().to_owned()),
-            ..NewUser::default()
+            ..ActivityPubActorWrite::bare(mirror.id)
         },
     )
-    .await
-    .expect("the seeded mirror inserts")
+    .await;
+    mirror
 }
 
 // --- the MRF domain block ---------------------------------------------------------------------

@@ -7,7 +7,10 @@ use sqlx::PgPool;
 
 use crate::{
     config::Config,
-    models::user::{self, Flag, NewUser, User},
+    models::{
+        activitypub_actor::{self, ActivityPubActorWrite},
+        user::{self, Flag, NewUser, User},
+    },
     state::AppState,
 };
 
@@ -21,19 +24,28 @@ pub(super) fn state_with_config(pool: &PgPool, config: Config) -> AppState {
 
 /// The fixture author: remote `bob@remote.example`, active by default.
 pub(super) async fn author(pool: &PgPool) -> User {
-    user::insert(
+    let bob = user::insert(
         pool,
         &NewUser {
             nickname: "bob@remote.example".to_owned(),
             ap_id: "https://remote.example/users/bob".to_owned(),
             local: Flag::new(false),
             domain: Some("remote.example".to_owned()),
-            followers_url: Some("https://remote.example/users/bob/followers".to_owned()),
             ..NewUser::default()
         },
     )
     .await
-    .expect("the author fixture inserts")
+    .expect("the author fixture inserts");
+    let _row = activitypub_actor::upsert(
+        pool,
+        &ActivityPubActorWrite {
+            followers_url: Some("https://remote.example/users/bob/followers".to_owned()),
+            ..ActivityPubActorWrite::bare(bob.id)
+        },
+    )
+    .await
+    .expect("the author's actor row writes");
+    bob
 }
 
 /// `bob`'s public note object named `n`, replying to nothing.

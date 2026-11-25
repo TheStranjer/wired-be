@@ -16,10 +16,7 @@ use wired_be::{
         relay::{self, RelayState},
         user::{Flag, NewUser, User, get_by_ap_id},
     },
-    services::{
-        instance_actor::ensure_instance_actor,
-        relay::{follow_relay, unfollow_relay},
-    },
+    services::relay::{follow_relay, unfollow_relay},
     state::AppState,
 };
 
@@ -66,11 +63,10 @@ async fn locked_local(pool: &PgPool, nickname: &str) -> (User, String) {
     (created, token)
 }
 
-/// This instance's own actor: the signer of a relay subscription.
+/// This instance's own actor, signing with [`remote::local_keys`]: the signer
+/// of a relay subscription. Call it before the delivery it signs.
 async fn instance_actor(state: &AppState) -> User {
-    ensure_instance_actor(&state.db, &common::test_config())
-        .await
-        .expect("the instance actor stands")
+    remote::keyed_instance_actor(&state.db).await
 }
 
 /// The stored mirror of the peer's relay actor.
@@ -316,10 +312,7 @@ fn assert_outbound(delivery: &remote::Delivery, actor: &User, path: &str, kind: 
         delivery.digest_matches(),
         "the digest describes the delivered bytes"
     );
-    let pem = actor
-        .public_key
-        .as_deref()
-        .expect("the fixture actor publishes its key");
+    let pem = remote::local_keys().public_pem.as_str();
     assert!(
         delivery.signature_verifies(pem),
         "and the signature verifies against that key"

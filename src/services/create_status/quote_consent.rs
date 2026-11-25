@@ -44,12 +44,18 @@ pub(super) async fn require_consent(
         return Ok(());
     };
     // A remote policy names the author's collections, which the actor row holds.
-    let author = activitypub_actor::with_plumbing(&state.db, author).await?;
+    let author_actor = activitypub_actor::get(&state.db, author.id).await?;
     let mut standing = Relationship::unconnected(author.id);
     standing.following.0 = follow::has_accepted_follow(&state.db, poster.id, author.id).await?;
     standing.followed_by.0 = follow::has_accepted_follow(&state.db, author.id, poster.id).await?;
     let standings = RelationshipMap::from([(author.id, standing)]);
-    let approval = QuoteApproval::for_row(target, &author, Some(poster), Some(&standings));
+    let approval = QuoteApproval::for_row(
+        target,
+        &author,
+        author_actor.as_ref(),
+        Some(poster),
+        Some(&standings),
+    );
     if approval.current_user == "denied" {
         return Err(AppError::Unprocessable(QUOTE_DENIED.to_owned()));
     }

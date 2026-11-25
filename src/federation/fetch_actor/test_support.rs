@@ -193,19 +193,11 @@ pub(super) async fn redirect_to(State(location): State<String>) -> Response {
         .unwrap()
 }
 
-/// Moves a stored mirror's fetch stamp outside the refresh window.
-///
-/// The stamp moves in `users` and in the mirror's `activitypub_actors` row
-/// alike, as the writers keep them.
+/// Moves a stored mirror's fetch stamp, on its `activitypub_actors` row, outside the refresh window.
 pub(super) async fn make_stale(pool: &PgPool, ap_id: &str) {
     sqlx::query(
-        "WITH aged AS (
-             UPDATE users SET last_fetched_at = now() - interval '25 hours'
-              WHERE ap_id = $1
-          RETURNING id, last_fetched_at
-         )
-         UPDATE activitypub_actors AS a SET last_fetched_at = aged.last_fetched_at
-           FROM aged WHERE a.user_id = aged.id",
+        "UPDATE activitypub_actors SET last_fetched_at = now() - interval '25 hours'
+          WHERE user_id = (SELECT id FROM users WHERE ap_id = $1)",
     )
     .bind(ap_id)
     .execute(pool)

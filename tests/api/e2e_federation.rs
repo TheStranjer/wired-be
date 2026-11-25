@@ -212,10 +212,7 @@ async fn a_local_follow_and_post_deliver_one_create_the_mock_can_verify() {
     assert_eq!(creates.len(), 1, "exactly one Create reached the mock");
     let create = creates.first().expect("the capture holds a Create");
     let key_id = format!("{}#main-key", author.ap_id);
-    let public_key = author
-        .public_key
-        .as_deref()
-        .expect("the keyed local fixture stores its public key");
+    let public_key = remote::local_keys().public_pem.as_str();
     assert_eq!(
         create.path(),
         remote::INBOX,

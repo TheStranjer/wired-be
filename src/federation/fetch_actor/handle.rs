@@ -165,6 +165,7 @@ mod tests {
     };
 
     use axum::{Router, extract::State, http::StatusCode, routing::get};
+    use chrono::{Duration, Utc};
     use serde_json::json;
     use tokio::net::TcpListener;
 
@@ -174,7 +175,10 @@ mod tests {
             fetch_actor::{get_or_fetch_by_ap_id, get_or_fetch_by_fingered_ap_id, test_support::*},
             remote_actor::{parse_actor, upsert_remote_user},
         },
-        models::user::{get_by_nickname, set_nickname},
+        models::{
+            activitypub_actor,
+            user::{get_by_nickname, set_nickname},
+        },
     };
 
     /// A JRD whose `subject` is `acct:{handle}` and whose self link is
@@ -462,7 +466,7 @@ mod tests {
         make_stale(&pool, &ap_id).await;
         let lookups = Arc::new(AtomicUsize::new(0));
         let server = serve_counting(listener, &base, &lookups);
-        let state = test_state(pool);
+        let state = test_state(pool.clone());
 
         let refreshed = get_or_fetch_by_fingered_ap_id(&state, &ap_id)
             .await
@@ -470,8 +474,13 @@ mod tests {
 
         server.abort();
         assert_eq!(refreshed.id, mirrored.id, "the same row");
+        let stamp = activitypub_actor::get(&pool, refreshed.id)
+            .await
+            .unwrap()
+            .and_then(|row| row.last_fetched_at)
+            .expect("the refreshed mirror carries a fetch stamp");
         assert!(
-            refreshed.last_fetched_at >= mirrored.last_fetched_at,
+            stamp > Utc::now() - Duration::hours(1),
             "the stale (back-dated) mirror was refetched"
         );
         assert_eq!(

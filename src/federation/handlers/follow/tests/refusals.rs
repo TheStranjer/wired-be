@@ -5,37 +5,33 @@ use super::*;
 
 /// A local target the answer can be published as: keys and an inbox.
 async fn answering_local(pool: &PgPool, nickname: &str) -> User {
-    let ap_id = user::local_ap_id(TEST_BASE_URL, nickname);
-    insert(
-        pool,
-        &NewUser {
-            private_key: Some("PEM".to_owned()),
-            public_key: Some("PUB".to_owned()),
-            inbox: Some(format!("{ap_id}/inbox")),
-            followers_url: Some(format!("{ap_id}/followers")),
-            ..NewUser::local(nickname, &ap_id)
-        },
-    )
-    .await
-    .expect("the answering local fixture inserts")
+    federating_user(pool, nickname).await
 }
 
 /// The `peer.example` mirror `nickname`, with a personal inbox to answer.
 async fn answerable_mirror(pool: &PgPool, nickname: &str) -> User {
     let ap_id = format!("https://peer.example/users/{nickname}");
-    insert(
+    let user = insert(
         pool,
         &NewUser {
             nickname: format!("{nickname}@peer.example"),
-            inbox: Some(format!("{ap_id}/inbox")),
-            public_key: Some("PUB".to_owned()),
-            ap_id,
+            ap_id: ap_id.clone(),
             domain: Some("peer.example".to_owned()),
             ..NewUser::default()
         },
     )
     .await
-    .expect("the answerable remote fixture inserts")
+    .expect("the answerable remote fixture inserts");
+    let _row = write_actor(
+        pool,
+        &ActivityPubActorWrite {
+            inbox: Some(format!("{ap_id}/inbox")),
+            public_key: Some("PUB".to_owned()),
+            ..ActivityPubActorWrite::bare(user.id)
+        },
+    )
+    .await;
+    user
 }
 
 /// The args of every queued delivery job, oldest first.

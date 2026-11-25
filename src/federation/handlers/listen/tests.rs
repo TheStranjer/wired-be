@@ -16,10 +16,12 @@ use super::*;
 use crate::{
     federation::handlers::test_support::{app_state, assert_handled, ignored, local_user},
     models::{
+        activitypub_actor::ActivityPubActorWrite,
         scrobble::Scrobble,
         status::Visibility,
         user::{self, Flag, NewUser},
     },
+    test_fixtures::write_actor,
     test_server::{bind, origin, spawn},
 };
 
@@ -32,19 +34,27 @@ const PAST: &str = "2024-05-01T10:00:00.000Z";
 
 /// A remote account at `ap_id`.
 async fn remote_user(pool: &PgPool, nickname: &str, ap_id: &str) -> User {
-    user::insert(
+    let stored = user::insert(
         pool,
         &NewUser {
             nickname: nickname.to_owned(),
             ap_id: ap_id.to_owned(),
-            followers_url: Some(format!("{ap_id}/followers")),
             local: Flag::new(false),
             domain: Some("remote.example".to_owned()),
             ..NewUser::default()
         },
     )
     .await
-    .expect("the remote fixture inserts")
+    .expect("the remote fixture inserts");
+    let _row = write_actor(
+        pool,
+        &ActivityPubActorWrite {
+            followers_url: Some(format!("{ap_id}/followers")),
+            ..ActivityPubActorWrite::bare(stored.id)
+        },
+    )
+    .await;
+    stored
 }
 
 /// The fixture `Audio` of `actor`, named `n`.

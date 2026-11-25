@@ -52,13 +52,15 @@ async fn instance_signer(pool: &PgPool) -> Signer {
     let actor = ensure_instance_actor(pool, &config)
         .await
         .expect("the instance actor is provisioned");
+    let private_pem = common::actor_of(pool, &actor)
+        .await
+        .private_key
+        .expect("the provisioned actor holds its private key");
     Signer {
         id: actor.id,
         key_id: format!("{}#main-key", actor.ap_id),
         ap_id: actor.ap_id,
-        private_pem: actor
-            .private_key
-            .expect("the provisioned actor holds its private key"),
+        private_pem,
     }
 }
 

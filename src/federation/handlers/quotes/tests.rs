@@ -15,9 +15,8 @@ use crate::{
     models::{
         block,
         status::{NewStatus, QuoteApprovalPolicy, Visibility},
-        user::{NewUser, insert},
     },
-    test_fixtures::remote_new,
+    test_fixtures::federating_remote,
 };
 
 /// The quoting account, on `remote.example`.
@@ -28,17 +27,7 @@ const QUOTING: &str = "https://remote.example/objects/bob-quote";
 /// A remote mirror of `nickname` on `remote.example` that can be delivered
 /// to.
 async fn remote(pool: &PgPool, nickname: &str) -> User {
-    insert(
-        pool,
-        &NewUser {
-            inbox: Some(format!("https://remote.example/users/{nickname}/inbox")),
-            shared_inbox: Some("https://remote.example/inbox".to_owned()),
-            public_key: Some("PUB".to_owned()),
-            ..remote_new(nickname)
-        },
-    )
-    .await
-    .expect("the remote fixture inserts")
+    federating_remote(pool, nickname).await
 }
 
 /// A local post of `author` seen as `visibility`.

@@ -1,10 +1,12 @@
 //! The `Listen` arm of the hooks: the activity a fresh scrobble federates
 //! as, delivered to the listener's remote followers.
 
+use tracing::warn;
+
 use super::{load_user, queue_activity};
 use crate::{
     federation::activities::listen_json,
-    models::{scrobble::Scrobble, status::Visibility},
+    models::{activitypub_actor, scrobble::Scrobble, status::Visibility},
     state::AppState,
 };
 
@@ -32,7 +34,14 @@ pub async fn after_scrobble_created(state: &AppState, scrobble: &Scrobble) {
     if !listener.is_local_active() {
         return;
     }
-    let document = listen_json(scrobble, &listener, &state.config);
+    let followers = match activitypub_actor::account_followers(&state.db, &listener).await {
+        Ok(address) => address,
+        Err(err) => {
+            warn!(%err, listener = %listener.ap_id, "could not read the listener's actor row");
+            return;
+        }
+    };
+    let document = listen_json(scrobble, &listener, &followers, &state.config);
     queue_activity(state, &listener, &document, "scrobble").await;
 }
 

@@ -73,6 +73,7 @@ mod tests {
     use crate::{
         config::TEST_BASE_URL,
         models::{
+            activitypub_actor::{self, ActivityPubActor, ActivityPubActorWrite},
             pinned_status,
             user::{NewUser, User, featured, insert, local_ap_id},
         },
@@ -80,26 +81,35 @@ mod tests {
             accepted_follow, app_state, delivered_inboxes, job_count, local, local_status, remote,
             run_publishes, the_single_activity,
         },
-        util::time::mastodon_time,
+        test_fixtures::{local_user, write_actor},
+        util::{keys::KeyPair, time::mastodon_time},
     };
 
     /// A registered-looking local actor with a featured collection too:
     /// exactly the row `register` writes, the pin hook's publisher.
     async fn pinner(pool: &PgPool, nickname: &str) -> User {
         let ap_id = local_ap_id(TEST_BASE_URL, nickname);
-        insert(
+        let user = insert(pool, &NewUser::local(nickname, &ap_id))
+            .await
+            .expect("the pinning fixture inserts");
+        let keys = KeyPair {
+            private_pem: "PEM".to_owned(),
+            public_pem: "PUB".to_owned(),
+        };
+        let _row = write_actor(
             pool,
-            &NewUser {
-                private_key: Some("PEM".to_owned()),
-                public_key: Some("PUB".to_owned()),
-                inbox: Some(format!("{ap_id}/inbox")),
-                followers_url: Some(format!("{ap_id}/followers")),
-                featured_url: Some(featured(&ap_id)),
-                ..NewUser::local(nickname, &ap_id)
-            },
+            &ActivityPubActorWrite::for_local_account(&user, TEST_BASE_URL, keys),
         )
-        .await
-        .expect("the pinning fixture inserts")
+        .await;
+        user
+    }
+
+    /// The `activitypub_actors` row of `user`, which the fixture wrote.
+    async fn stored_actor(pool: &PgPool, user: &User) -> ActivityPubActor {
+        activitypub_actor::get(pool, user.id)
+            .await
+            .expect("the actor row reads")
+            .expect("the fixture wrote an actor row")
     }
 
     /// Pinning publishes the `Add` that features the status in the
@@ -127,9 +137,10 @@ mod tests {
         assert_eq!(activity["type"], "Add");
         assert_eq!(activity["actor"], alice.ap_id);
         assert_eq!(activity["object"], featured_post.uri);
+        let actor = stored_actor(&pool, &alice).await;
         assert_eq!(
             activity["target"],
-            alice
+            actor
                 .featured_url
                 .clone()
                 .expect("the fixture has a collection"),
@@ -147,7 +158,8 @@ mod tests {
             "a fresh own-instance activity id: {id}"
         );
         assert_eq!(activity["published"], mastodon_time(&row.inserted_at));
-        let document = crate::federation::actor::actor_json(&alice, None, &state.config, &[]);
+        let document =
+            crate::federation::actor::actor_json(&alice, Some(&actor), &state.config, &[]);
         assert_eq!(
             activity["target"], document["featured"],
             "the target is the very collection the actor document advertises"
@@ -188,7 +200,10 @@ mod tests {
         assert_eq!(activity["object"], featured_post.uri);
         assert_eq!(
             activity["target"],
-            alice.featured_url.expect("the fixture has a collection")
+            stored_actor(&pool, &alice)
+                .await
+                .featured_url
+                .expect("the fixture has a collection")
         );
         assert_eq!(activity["to"], json!([AS_PUBLIC]));
         assert_eq!(
@@ -204,13 +219,13 @@ mod tests {
         );
     }
 
-    /// An actor row with no `featured_url` still gets a whole document:
-    /// the built `{ap_id}/collections/featured` address rides the `target`.
+    /// An account with no actor row still gets a whole document: the built
+    /// `{ap_id}/collections/featured` address rides the `target`.
     #[tokio::test]
     async fn a_pin_without_a_stored_featured_url_names_the_built_address() {
         let db = crate::test_db::test_db().await.expect("test database slot");
         let pool = db.pool().clone();
-        let alice = local(&pool, "alice").await;
+        let alice = local_user(&pool, "alice").await;
         let featured_post = local_status(&pool, &alice, "feature me").await;
         let row = pinned_status::pin(&pool, alice.id, featured_post.id)
             .await

@@ -8,7 +8,10 @@ use super::test_support::*;
 use super::*;
 use crate::{
     config::{Config, TEST_BASE_URL},
-    models::user::{NewUser, insert, local_ap_id},
+    models::{
+        activitypub_actor::{self, ActivityPubActorWrite},
+        user::{NewUser, insert, local_ap_id},
+    },
     services::{instance_actor::ensure_instance_actor, runtime_config},
 };
 
@@ -97,7 +100,7 @@ async fn a_mentioned_remote_user_gets_their_shared_inbox() {
         "type": "Create",
         "actor": alice.ap_id,
         "to": [bob.ap_id, PUBLIC],
-        "cc": [alice.followers_url],
+        "cc": [followers_of(&alice)],
     });
 
     let count = publish_ok(&state, &alice, &activity, PublishOpts::default()).await;
@@ -131,7 +134,7 @@ async fn a_mentioned_remote_user_without_a_shared_inbox_gets_their_personal_inbo
         "type": "Create",
         "actor": alice.ap_id,
         "to": [bob.ap_id, PUBLIC],
-        "cc": [alice.followers_url],
+        "cc": [followers_of(&alice)],
     });
 
     let count = publish_ok(&state, &alice, &activity, PublishOpts::default()).await;
@@ -167,7 +170,7 @@ async fn a_boost_of_a_following_remote_author_is_delivered_once() {
         "actor": alice.ap_id,
         "object": "https://peer.example/notes/1",
         "to": [PUBLIC],
-        "cc": [alice.followers_url, carol.ap_id],
+        "cc": [followers_of(&alice), carol.ap_id],
     });
 
     let count = publish_ok(&state, &alice, &activity, PublishOpts::default()).await;
@@ -220,7 +223,7 @@ async fn two_mentions_and_a_follower_on_one_host_share_one_delivery() {
         "type": "Create",
         "actor": alice.ap_id,
         "to": [PUBLIC],
-        "cc": [alice.followers_url, bob.ap_id, carol.ap_id],
+        "cc": [followers_of(&alice), bob.ap_id, carol.ap_id],
     });
 
     let count = publish_ok(&state, &alice, &activity, PublishOpts::default()).await;
@@ -328,10 +331,16 @@ async fn local_followers_never_receive_a_delivery() {
     let alice = alice(&pool).await;
     let local_bob = insert(
         &pool,
-        &NewUser {
+        &NewUser::local("bob", &local_ap_id(TEST_BASE_URL, "bob")),
+    )
+    .await
+    .unwrap();
+    let _bob_row = activitypub_actor::upsert(
+        &pool,
+        &ActivityPubActorWrite {
             inbox: Some(format!("{TEST_BASE_URL}/users/bob/inbox")),
             followers_url: Some(format!("{TEST_BASE_URL}/users/bob/followers")),
-            ..NewUser::local("bob", &local_ap_id(TEST_BASE_URL, "bob"))
+            ..ActivityPubActorWrite::bare(local_bob.id)
         },
     )
     .await
@@ -511,7 +520,7 @@ async fn one_inbox_is_enqueued_once() {
         "type": "Create",
         "actor": alice.ap_id,
         "to": [erin.ap_id, PUBLIC],
-        "cc": [alice.followers_url],
+        "cc": [followers_of(&alice)],
     });
     let opts = PublishOpts {
         extra_inboxes: vec![personal.to_owned(), personal.to_owned()],
@@ -566,7 +575,7 @@ async fn the_instance_actor_the_actor_and_the_suspended_are_excluded() {
             live.ap_id,
             PUBLIC,
         ],
-        "cc": [alice.followers_url],
+        "cc": [followers_of(&alice)],
     });
 
     let count = publish_ok(&state, &alice, &activity, PublishOpts::default()).await;
@@ -592,7 +601,7 @@ async fn unknown_recipients_are_skipped() {
         "type": "Create",
         "actor": alice.ap_id,
         "to": [PUBLIC, "https://ghost.example/users/nobody"],
-        "cc": [alice.followers_url],
+        "cc": [followers_of(&alice)],
     });
 
     let count = publish_ok(&state, &alice, &activity, PublishOpts::default()).await;
@@ -631,8 +640,7 @@ async fn a_repeated_publish_reuses_the_queued_delivery() {
     );
 }
 
-/// Changes the shared inbox on `user_id`'s `activitypub_actors` row alone;
-/// the `users` row keeps the one it was inserted with.
+/// Changes the shared inbox on `user_id`'s `activitypub_actors` row.
 async fn move_actor_shared_inbox(pool: &PgPool, user_id: Uuid, shared_inbox: &str) {
     let updated = sqlx::query("UPDATE activitypub_actors SET shared_inbox = $2 WHERE user_id = $1")
         .bind(user_id)
@@ -644,8 +652,7 @@ async fn move_actor_shared_inbox(pool: &PgPool, user_id: Uuid, shared_inbox: &st
     assert_eq!(updated, 1, "the account has an actor row to move");
 }
 
-/// Changes the followers collection on `user_id`'s `activitypub_actors` row
-/// alone; the `users` row keeps the one it was inserted with.
+/// Changes the followers collection on `user_id`'s `activitypub_actors` row.
 async fn move_actor_followers_url(pool: &PgPool, user_id: Uuid, followers_url: &str) {
     let updated =
         sqlx::query("UPDATE activitypub_actors SET followers_url = $2 WHERE user_id = $1")
@@ -806,7 +813,7 @@ async fn the_publishers_followers_collection_is_read_from_its_actor_row() {
         "id": ACTIVITY_ID,
         "type": "Create",
         "actor": alice.ap_id,
-        "to": [alice.followers_url],
+        "to": [followers_of(&alice)],
     });
 
     let old_count = publish_ok(&state, &alice, &old_address, PublishOpts::default()).await;

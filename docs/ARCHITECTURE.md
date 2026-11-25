@@ -52,7 +52,17 @@ cite these decisions by number.
 
 7. **Users**: a single `users` table for local and remote accounts
    (`local boolean`). Nickname for remote users is stored as `user@host`;
-   local as `user`.
+   local as `user`. `users` holds what every protocol shares, for local and
+   remote accounts alike. Each protocol keeps its own data in
+   `<protocol id>_...` tables keyed by `user_id`, and the main table of a
+   protocol is its identity record, which carries a `status`. ActivityPub's
+   is `activitypub_actors`: the inbox, outbox and collection endpoints, the
+   signing keys (`private_key` for local accounts only), the `publicKey.id`
+   and the last fetch time. `ap_id`, `domain`, `actor_type`,
+   `also_known_as`, `moved_to_ap_id` and `profile_url` stay on `users` for
+   now: `ap_id` is the lookup key across the ActivityPub code and the rest
+   are rendered to clients on every account. Moving `ap_id` is a possible
+   later track.
 
 8. **Errors**: one `AppError` (src/error.rs) implementing `IntoResponse`, JSON
    body `{"error": "message"}`. Handlers return `Result<T, AppError>`.

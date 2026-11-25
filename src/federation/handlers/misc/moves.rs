@@ -223,12 +223,7 @@ mod tests {
         )
         .await
         .expect("the target fixture inserts");
-        let _stamped = sqlx::query("UPDATE users SET last_fetched_at = now() WHERE id = $1")
-            .bind(stored.id)
-            .execute(pool)
-            .await
-            .expect("the fixture stamps the fetch");
-        crate::test_fixtures::resync_actor(pool, stored.id).await;
+        let _stamped = crate::test_fixtures::fetched_just_now(pool, stored.id).await;
         stored
     }
 
@@ -521,17 +516,14 @@ mod tests {
     /// Gives every mirror in the database a personal inbox, so a delivery
     /// to it has somewhere to be addressed.
     async fn give_inboxes(pool: &PgPool) {
-        let _stamped = sqlx::query("UPDATE users SET inbox = ap_id || '/inbox' WHERE NOT local")
-            .execute(pool)
-            .await
-            .expect("the fixture stamps the inboxes");
-        let _mirrored = sqlx::query(
-            "UPDATE activitypub_actors AS a SET inbox = u.inbox FROM users AS u
-              WHERE u.id = a.user_id AND NOT u.local",
+        let _stamped = sqlx::query(
+            "INSERT INTO activitypub_actors (user_id, inbox)
+             SELECT id, ap_id || '/inbox' FROM users WHERE NOT local
+             ON CONFLICT (user_id) DO UPDATE SET inbox = EXCLUDED.inbox",
         )
         .execute(pool)
         .await
-        .expect("the fixture stamps the actor rows alike");
+        .expect("the fixture stamps the inboxes");
     }
 
     /// The args of every queued `federator.deliver` job, oldest first.

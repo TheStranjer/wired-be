@@ -6,7 +6,11 @@ use super::super::test_support::{
 };
 use super::*;
 use crate::{
-    models::user::{Flag, NewUser, insert},
+    models::{
+        activitypub_actor::ActivityPubActorWrite,
+        user::{Flag, NewUser, insert},
+    },
+    test_fixtures::write_actor,
     test_support::{app_state, broken_state},
 };
 
@@ -19,13 +23,20 @@ async fn remote_fan_of(pool: &sqlx::PgPool, alice: &user::User) -> user::User {
             ap_id: "https://peer.example/users/fan".to_owned(),
             local: Flag::new(false),
             domain: Some("peer.example".to_owned()),
-            inbox: Some("https://peer.example/users/fan/inbox".to_owned()),
-            shared_inbox: Some("https://peer.example/inbox".to_owned()),
             ..NewUser::default()
         },
     )
     .await
     .expect("the remote fixture inserts");
+    let _row = write_actor(
+        pool,
+        &ActivityPubActorWrite {
+            inbox: Some("https://peer.example/users/fan/inbox".to_owned()),
+            shared_inbox: Some("https://peer.example/inbox".to_owned()),
+            ..ActivityPubActorWrite::bare(fan.id)
+        },
+    )
+    .await;
     accepted_follow(pool, &fan, alice).await;
     fan
 }

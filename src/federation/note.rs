@@ -58,7 +58,7 @@ pub use fields::note_json;
 pub use load::load_note_context;
 
 pub(crate) use activities::json_ld_context;
-pub(crate) use fields::{address_lines, audience_lines};
+pub(crate) use fields::audience_lines;
 pub(crate) use load::load_mentions;
 pub(crate) use tags::attachment_json;
 

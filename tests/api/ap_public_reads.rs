@@ -8,16 +8,13 @@
 
 use axum::{Router, http::StatusCode};
 use chrono::Utc;
-use sqlx::PgPool;
 use wired_be::{
     config::Toggle,
     federation::signature::{SignedHeaders, SigningKey, sign_request},
     models::{
         block,
         status::{Status, Visibility},
-        user::{NewUser, User},
     },
-    util::keys::generate_keypair_async,
 };
 
 use crate::common;
@@ -33,33 +30,16 @@ fn read_paths(status: &Status) -> [String; 2] {
     ]
 }
 
-/// A local [`User`] named `nickname` with a stored RSA key pair, so it can
-/// sign a fetch.
-async fn signer_user(pool: &PgPool, nickname: &str) -> User {
-    let keys = generate_keypair_async()
-        .await
-        .expect("the fixture key pair generates");
-    common::create_local_user_with(pool, nickname, |new| NewUser {
-        public_key: Some(keys.public_pem.clone()),
-        private_key: Some(keys.private_pem.clone()),
-        ..new
-    })
-    .await
-}
-
-/// Signs a `GET` of `https://test.example{path}` as `user`.
-fn signed_get_as(user: &User, path: &str) -> SignedHeaders {
-    let key_id = format!("{}#main-key", user.ap_id);
+/// Signs a `GET` of `https://test.example{path}` as `signer`.
+fn signed_get_as(signer: &common::Signer, path: &str) -> SignedHeaders {
+    let key_id = format!("{}#main-key", signer.ap_id);
     sign_request(
         "GET",
         &format!("{BASE}{path}"),
         None,
         &SigningKey {
             key_id: &key_id,
-            private_pem: user
-                .private_key
-                .as_deref()
-                .expect("the fixture user holds its private key"),
+            private_pem: &signer.private_pem,
         },
         Utc::now(),
     )
@@ -92,7 +72,7 @@ async fn a_signed_fetch_by_an_actor_the_author_blocked_is_404() {
         let mut config = common::test_config();
         config.fetch.authorized_fetch = Toggle::new(authorized_fetch);
         let alice = common::create_local_user(&pool, "alice").await;
-        let carol = signer_user(&pool, "carol").await;
+        let carol = common::create_signer(&pool, "carol").await;
         let _blocked = block::block(&pool, BASE, &alice, &carol)
             .await
             .expect("the block write runs");
@@ -143,7 +123,7 @@ async fn a_signed_fetch_by_an_unblocked_actor_of_a_public_post_succeeds() {
         let mut config = common::test_config();
         config.fetch.authorized_fetch = Toggle::new(authorized_fetch);
         let alice = common::create_local_user(&pool, "alice").await;
-        let carol = signer_user(&pool, "carol").await;
+        let carol = common::create_signer(&pool, "carol").await;
         let note = common::create_status(&pool, &alice, "public words", Visibility::Public).await;
         let app = common::test_app_with_config(pool, config);
 

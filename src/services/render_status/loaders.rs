@@ -14,7 +14,8 @@ use crate::{
     entities::status::QuoteSlot,
     error::AppResult,
     models::{
-        activitypub_actor, bookmark, conversation, conversation_mute,
+        activitypub_actor::{self, ActivityPubActor},
+        bookmark, conversation, conversation_mute,
         emoji_reaction::{self, ReactionSummary},
         favourite,
         hashtag::{self, Hashtag},
@@ -141,24 +142,38 @@ pub(super) async fn load_visible_parents(
 
 /// [`user::get_many`] keyed by id — one query for every author and
 /// replied-to author on the page.
-///
-/// The remote accounts' `ActivityPub` columns (the followers and following
-/// collections a remote quote policy names) come from
-/// `activitypub_actors`, one more query for all of them; a page of local
-/// accounts skips it.
 pub(super) async fn load_users(pool: &PgPool, ids: &[Uuid]) -> AppResult<HashMap<Uuid, User>> {
     if ids.is_empty() {
         return Ok(HashMap::new());
     }
-    let (remote, local): (Vec<User>, Vec<User>) = user::get_many(pool, ids)
+    Ok(user::get_many(pool, ids)
         .await?
         .into_iter()
-        .partition(|account| !account.local.get());
-    let remote = activitypub_actor::with_plumbing_many(pool, remote).await?;
-    Ok(local
-        .into_iter()
-        .chain(remote)
         .map(|account| (account.id, account))
+        .collect())
+}
+
+/// The `activitypub_actors` rows of the remote accounts among `users`, keyed by account id.
+///
+/// A remote quote policy names the author's followers and following
+/// collections, which the row holds. One query reads them all; a page of
+/// local accounts skips it, since nothing on a page reads a local account's row.
+pub(super) async fn load_remote_actors(
+    pool: &PgPool,
+    users: &HashMap<Uuid, User>,
+) -> AppResult<HashMap<Uuid, ActivityPubActor>> {
+    let remote: Vec<Uuid> = users
+        .values()
+        .filter(|account| !account.local.get())
+        .map(|account| account.id)
+        .collect();
+    if remote.is_empty() {
+        return Ok(HashMap::new());
+    }
+    Ok(activitypub_actor::get_many(pool, &remote)
+        .await?
+        .into_iter()
+        .map(|row| (row.user_id, row))
         .collect())
 }
 
@@ -311,41 +326,40 @@ pub(super) async fn load_direct_participations(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_fixtures::{local_user, remote_user};
+    use crate::{
+        models::activitypub_actor::ActivityPubActorWrite,
+        test_fixtures::{federating_user, remote_user, write_actor},
+    };
 
-    /// Points every actor row's followers collection at `url`.
-    async fn point_followers_at(pool: &PgPool, url: &str) {
-        let changed = sqlx::query("UPDATE activitypub_actors SET followers_url = $1")
-            .bind(url)
-            .execute(pool)
-            .await
-            .expect("the actor rows update")
-            .rows_affected();
-        assert_eq!(changed, 2, "both fixture accounts have a row");
-    }
-
-    /// A remote account's collections are its actor row's; a local one is
-    /// left as `users` has it, since nothing on a page reads its row.
+    /// A remote account's row is loaded; a local one's is not, since
+    /// nothing on a page reads it.
     #[tokio::test]
-    async fn remote_accounts_carry_the_collections_of_their_actor_rows() {
+    async fn only_remote_accounts_load_their_actor_rows() {
         let db = crate::test_db::test_db().await.expect("test database slot");
         let pool = db.pool().clone();
-        let alice = local_user(&pool, "alice").await;
+        let alice = federating_user(&pool, "alice").await;
         let far = remote_user(&pool, "far").await;
-        point_followers_at(&pool, "https://row.example/followers").await;
+        let _row = write_actor(
+            &pool,
+            &ActivityPubActorWrite {
+                followers_url: Some("https://row.example/followers".to_owned()),
+                ..ActivityPubActorWrite::bare(far.id)
+            },
+        )
+        .await;
 
         let users = load_users(&pool, &[alice.id, far.id])
             .await
             .expect("the users load");
+        let actors = load_remote_actors(&pool, &users)
+            .await
+            .expect("the rows load");
 
+        assert_eq!(actors.len(), 1, "one remote account on the page");
         assert_eq!(
-            users[&far.id].followers_url.as_deref(),
+            actors[&far.id].followers_url.as_deref(),
             Some("https://row.example/followers"),
-            "the remote account follows its actor row"
-        );
-        assert_eq!(
-            users[&alice.id].followers_url, alice.followers_url,
-            "the local account is as `users` holds it"
+            "the remote account's collections are its actor row's"
         );
     }
 }

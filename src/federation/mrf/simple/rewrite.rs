@@ -250,10 +250,11 @@ mod tests {
     use crate::{
         federation::{mrf::simple::test_support::*, note_parser},
         models::{
-            activitypub_actor,
+            activitypub_actor::{self, ActivityPubActorWrite},
             status::Visibility,
             user::{self, Flag, NewUser},
         },
+        test_fixtures::write_actor,
     };
 
     /// [`List::FederatedTimelineRemoval`](crate::federation::mrf::simple::List::FederatedTimelineRemoval):
@@ -505,19 +506,27 @@ mod tests {
     /// The stored mirror of the fixture author, with the followers
     /// collection the policy's fallback spells the same way.
     async fn stored_author(pool: &PgPool) -> user::User {
-        user::insert(
+        let author = user::insert(
             pool,
             &NewUser {
                 nickname: "alice@peer.example".to_owned(),
                 ap_id: ALICE.to_owned(),
                 local: Flag::new(false),
                 domain: Some(PEER.to_owned()),
-                followers_url: Some(FOLLOWERS.to_owned()),
                 ..NewUser::default()
             },
         )
         .await
-        .expect("the author fixture inserts")
+        .expect("the author fixture inserts");
+        let _row = write_actor(
+            pool,
+            &ActivityPubActorWrite {
+                followers_url: Some(FOLLOWERS.to_owned()),
+                ..ActivityPubActorWrite::bare(author.id)
+            },
+        )
+        .await;
+        author
     }
 
     /// The embedded note of a `Create` fixture.

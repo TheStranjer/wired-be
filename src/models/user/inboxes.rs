@@ -45,24 +45,37 @@ pub async fn all_remote_inboxes(pool: &PgPool) -> AppResult<Vec<String>> {
 mod tests {
     use super::*;
 
-    use crate::models::user::{Flag, NewUser, insert};
+    use crate::{
+        models::{
+            activitypub_actor::ActivityPubActorWrite,
+            user::{Flag, NewUser, insert},
+        },
+        test_fixtures::write_actor,
+    };
 
-    /// A remote mirror on `host` with the given inbox pair.
+    /// A remote mirror on `host` with the given inbox pair on its actor row.
     async fn mirror(pool: &PgPool, name: &str, inbox: Option<&str>, shared: Option<&str>) {
-        let _row = insert(
+        let user = insert(
             pool,
             &NewUser {
                 nickname: format!("{name}@host.example"),
                 ap_id: format!("https://host.example/users/{name}"),
                 local: Flag::new(false),
                 domain: Some("host.example".to_owned()),
-                inbox: inbox.map(str::to_owned),
-                shared_inbox: shared.map(str::to_owned),
                 ..NewUser::default()
             },
         )
         .await
         .expect("the mirror fixture inserts");
+        let _row = write_actor(
+            pool,
+            &ActivityPubActorWrite {
+                inbox: inbox.map(str::to_owned),
+                shared_inbox: shared.map(str::to_owned),
+                ..ActivityPubActorWrite::bare(user.id)
+            },
+        )
+        .await;
     }
 
     /// Shared inboxes win over personal ones, duplicates collapse, and
@@ -95,16 +108,20 @@ mod tests {
             .execute(&pool)
             .await
             .expect("the deletion mark writes");
-        let local = NewUser::local("alice", "https://wired.test/users/alice");
-        let _alice = insert(
+        let alice = insert(
             &pool,
-            &NewUser {
-                inbox: Some("https://wired.test/users/alice/inbox".to_owned()),
-                ..local
-            },
+            &NewUser::local("alice", "https://wired.test/users/alice"),
         )
         .await
         .expect("the local fixture inserts");
+        let _alice_row = write_actor(
+            &pool,
+            &ActivityPubActorWrite {
+                inbox: Some("https://wired.test/users/alice/inbox".to_owned()),
+                ..ActivityPubActorWrite::bare(alice.id)
+            },
+        )
+        .await;
 
         let inboxes = all_remote_inboxes(&pool).await.expect("the census reads");
 
@@ -120,7 +137,7 @@ mod tests {
     /// The census reads `activitypub_actors`: a change made to that table
     /// alone moves the inbox, and an account without a row adds nothing.
     #[tokio::test]
-    async fn follows_the_actor_rows_not_the_users_columns() {
+    async fn follows_the_actor_rows() {
         let db = crate::test_db::test_db().await.expect("test database slot");
         let pool = db.pool().clone();
         mirror(

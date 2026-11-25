@@ -165,7 +165,11 @@ mod tests {
     use crate::test_support::{app_state, broken_state};
     use crate::{
         config::TEST_BASE_URL,
-        models::user::{Flag, NewUser, insert, local_ap_id},
+        models::{
+            activitypub_actor::ActivityPubActorWrite,
+            user::{Flag, NewUser, insert, local_ap_id},
+        },
+        test_fixtures::{federating_user, write_actor},
     };
 
     /// The sweep's status and media half: past a batch boundary every
@@ -396,16 +400,7 @@ mod tests {
     async fn the_handler_publishes_the_delete_before_clearing_the_graph() {
         let db = crate::test_db::test_db().await.expect("test database slot");
         let pool = db.pool().clone();
-        let alice = insert(
-            &pool,
-            &NewUser {
-                private_key: Some("PEM-PRIV".to_owned()),
-                public_key: Some("PEM-PUB".to_owned()),
-                ..NewUser::local("alice", &local_ap_id(TEST_BASE_URL, "alice"))
-            },
-        )
-        .await
-        .expect("the keyed local fixture inserts");
+        let alice = federating_user(&pool, "alice").await;
         let fan = insert(
             &pool,
             &NewUser {
@@ -413,13 +408,20 @@ mod tests {
                 ap_id: "https://peer.example/users/fan".to_owned(),
                 local: Flag::new(false),
                 domain: Some("peer.example".to_owned()),
-                inbox: Some("https://peer.example/users/fan/inbox".to_owned()),
-                shared_inbox: Some("https://peer.example/inbox".to_owned()),
                 ..NewUser::default()
             },
         )
         .await
         .expect("the remote fixture inserts");
+        let _fan_row = write_actor(
+            &pool,
+            &ActivityPubActorWrite {
+                inbox: Some("https://peer.example/users/fan/inbox".to_owned()),
+                shared_inbox: Some("https://peer.example/inbox".to_owned()),
+                ..ActivityPubActorWrite::bare(fan.id)
+            },
+        )
+        .await;
         accepted_follow(&pool, &fan, &alice).await;
 
         run(&app_state(&pool), alice.id)

@@ -103,7 +103,6 @@ mod tests {
                 ap_id: destination.to_owned(),
                 local: Flag::new(false),
                 domain: Some("other.example".to_owned()),
-                inbox: Some(format!("{destination}/inbox")),
                 ..NewUser::default()
             },
         )

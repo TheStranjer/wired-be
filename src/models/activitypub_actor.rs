@@ -1,10 +1,11 @@
 //! The `activitypub_actors` table: `ActivityPub`'s own data about an account.
 //!
-//! One row per account (local or remote) that exists on `ActivityPub`. This is `ActivityPub`'s own table under the `<protocol id>_...` naming
-//! rule (WBE-832): `users` holds what every protocol shares, and each
-//! protocol keeps the rest in tables named after it. The row holds the
-//! actor's endpoints and collection ids, its signing key pair, the key id
-//! its document names and when it was last fetched. `ap_id`, `domain`,
+//! One row per account (local or remote) that exists on `ActivityPub`. This is
+//! `ActivityPub`'s own table under the `<protocol id>_...` naming rule
+//! (WBE-832): `users` holds what every protocol shares, and each protocol
+//! keeps the rest in tables named after it. The row holds the actor's
+//! endpoints and collection ids, its signing key pair, the key id its
+//! document names and when it was last fetched. `ap_id`, `domain`,
 //! `actor_type` and the other columns client APIs render on every account
 //! stay on `users`.
 //!
@@ -12,37 +13,20 @@
 //! identity is claimed ([`ActorStatus::Active`]) or awaiting setup
 //! ([`ActorStatus::Pending`]).
 //!
-//! The readers are moving here one area at a time: the actor document's
-//! public key, the signature check's key lookup, the instance actor's
-//! signing key, the featured collection id and the remote mirror's fetch
-//! stamp already come from this table, not from `users`. So do the
-//! readers outside `federation`: [`followers_address`] and
-//! [`featured_address`] name a collection, [`with_plumbing`] hands a
-//! [`User`] the row's values for the code that renders it as an actor
-//! document or a quote policy, and `get_by_public_key_id` and
-//! `all_remote_inboxes` join this table. So do delivery and publishing
-//! (inbox choice, the signing key, the followers collection) and the note
-//! and `Announce` documents' addressing. The migration backfilled it from
-//! `users`, and every writer of the moved columns now writes both tables in
-//! one transaction ([`upsert_from_user`] is how): `models::user::insert`
-//! for every account it inserts, and
-//! `federation::remote_actor::upsert_remote_user` for every fetch of a
-//! remote actor. Registration is the exception: it does not dual write but
-//! claims the identity through `ActivityPub`'s adapter, which writes the
-//! local row with [`insert_new`].
-//!
-//! **The dual write is temporary.** It keeps the two tables in step while
-//! the readers move over; the ticket that drops the moved columns from
-//! `users` removes it, and the callers of [`upsert_from_user`] then write
-//! [`ActivityPubActorWrite`] directly. Deleting the user deletes the row
-//! (the foreign key cascades).
+//! This table is the only home of those columns. A local account's row is
+//! written by `ActivityPub`'s claim ([`insert_new`], from
+//! [`ActivityPubActorWrite::for_local_account`]), a remote actor's by
+//! `federation::remote_actor::upsert_remote_user`. A reader of an account
+//! holds the row ([`get`], [`get_many`]) or joins the table;
+//! [`followers_address`] and [`featured_address`] name a collection from it.
+//! Deleting the user deletes the row (the foreign key cascades).
 //!
 //! [`get`] and [`get_many`] read, [`get_many`] taking every id in one
 //! statement so a caller holding a list never queries in a loop, and
 //! [`upsert`] writes the whole row: it inserts, or on a conflict of
 //! `user_id` overwrites every column and moves `updated_at`.
 
-use std::{collections::HashMap, fmt};
+use std::fmt;
 
 use chrono::{DateTime, Utc};
 use sqlx::{Executor, Postgres};
@@ -50,7 +34,8 @@ use uuid::Uuid;
 
 use crate::{
     error::AppResult,
-    models::user::{User, featured, followers},
+    models::user::{User, featured, followers, following, inbox, outbox},
+    util::keys::KeyPair,
 };
 
 /// [`get`]: one account's row, or none without an `ActivityPub` identity.
@@ -224,25 +209,47 @@ impl fmt::Debug for ActivityPubActorWrite {
 }
 
 impl ActivityPubActorWrite {
-    /// The write that mirrors the moved columns of `user`, as an active identity.
+    /// An active identity for `user_id` that holds nothing yet.
     ///
-    /// `public_key_id` is not a field of [`User`], so the writer that sets it
-    /// passes the value it stored.
+    /// Every endpoint, key and stamp is empty, for a caller that sets the few
+    /// columns it knows with struct update syntax.
     #[must_use]
-    pub fn for_user(user: &User, public_key_id: Option<&str>) -> Self {
+    pub const fn bare(user_id: Uuid) -> Self {
         Self {
-            user_id: user.id,
+            user_id,
             status: ActorStatus::Active,
-            inbox: user.inbox.clone(),
-            shared_inbox: user.shared_inbox.clone(),
-            outbox: user.outbox.clone(),
-            followers_url: user.followers_url.clone(),
-            following_url: user.following_url.clone(),
-            featured_url: user.featured_url.clone(),
-            public_key: user.public_key.clone(),
-            private_key: user.private_key.clone(),
-            public_key_id: public_key_id.map(str::to_owned),
-            last_fetched_at: user.last_fetched_at,
+            inbox: None,
+            shared_inbox: None,
+            outbox: None,
+            followers_url: None,
+            following_url: None,
+            featured_url: None,
+            public_key: None,
+            private_key: None,
+            public_key_id: None,
+            last_fetched_at: None,
+        }
+    }
+
+    /// The active identity of the local account `user` on the instance at `base_url`.
+    ///
+    /// The collections derive from the account's actor id, the shared inbox is
+    /// the instance-wide `{base_url}/inbox`, and `keys` is the account's new
+    /// signing key pair. The key id stays empty: a local actor's is its
+    /// actor id plus `#main-key`.
+    #[must_use]
+    pub fn for_local_account(user: &User, base_url: &str, keys: KeyPair) -> Self {
+        let ap_id = user.ap_id.as_str();
+        Self {
+            inbox: Some(inbox(ap_id)),
+            shared_inbox: Some(format!("{base_url}/inbox")),
+            outbox: Some(outbox(ap_id)),
+            followers_url: Some(followers(ap_id)),
+            following_url: Some(following(ap_id)),
+            featured_url: Some(featured(ap_id)),
+            public_key: Some(keys.public_pem),
+            private_key: Some(keys.private_pem),
+            ..Self::bare(user.id)
         }
     }
 }
@@ -373,114 +380,6 @@ where
     Ok(inserted == 1)
 }
 
-/// Mirrors the moved columns of `user` into the account's row.
-///
-/// Returns the row as stored. This is the temporary dual write: a writer of `users` calls it on the same
-/// transaction right after its own statement, passing the row that
-/// statement returned, so both tables hold the same values. `public_key_id`
-/// is not a field of [`User`], so the writer that sets it passes the value
-/// it stored. The status is [`ActorStatus::Active`], the column default,
-/// since `users` has no such notion. The ticket that drops the old `users`
-/// columns removes this function.
-///
-/// # Errors
-///
-/// As [`upsert`].
-pub async fn upsert_from_user<'e, E>(
-    executor: E,
-    user: &User,
-    public_key_id: Option<&str>,
-) -> AppResult<ActivityPubActor>
-where
-    E: Executor<'e, Database = Postgres>,
-{
-    let write = ActivityPubActorWrite::for_user(user, public_key_id);
-    upsert(executor, &write).await
-}
-
-/// `user` with its moved columns replaced by the account's row.
-///
-/// The actor document builder reads `inbox` and the public key off a
-/// [`User`]; this is how the document follows `activitypub_actors` while
-/// `users` still carries the old columns. An account with no row gets
-/// `None` in every moved column, as an unprovisioned `users` row would
-/// have. Temporary like [`upsert_from_user`]: once `users` loses the
-/// columns the builder takes the [`ActivityPubActor`] itself.
-///
-/// # Errors
-///
-/// Any database failure arrives as
-/// [`AppError::Database`](crate::error::AppError).
-pub async fn with_plumbing<'e, E>(executor: E, user: User) -> AppResult<User>
-where
-    E: Executor<'e, Database = Postgres>,
-{
-    let row = get(executor, user.id).await?;
-    Ok(apply_row(user, row))
-}
-
-/// [`with_plumbing`] for many accounts, with one read for all of them.
-///
-/// The accounts come back in the order given, and no query runs for an empty
-/// list.
-///
-/// # Errors
-///
-/// Any database failure arrives as
-/// [`AppError::Database`](crate::error::AppError).
-pub async fn with_plumbing_many<'e, E>(executor: E, users: Vec<User>) -> AppResult<Vec<User>>
-where
-    E: Executor<'e, Database = Postgres>,
-{
-    if users.is_empty() {
-        return Ok(users);
-    }
-    let ids: Vec<Uuid> = users.iter().map(|user| user.id).collect();
-    let mut rows: HashMap<Uuid, ActivityPubActor> = get_many(executor, &ids)
-        .await?
-        .into_iter()
-        .map(|row| (row.user_id, row))
-        .collect();
-    Ok(users
-        .into_iter()
-        .map(|user| {
-            let row = rows.remove(&user.id);
-            apply_row(user, row)
-        })
-        .collect())
-}
-
-/// [`with_plumbing`] without the read, for a caller already holding `row`.
-#[must_use]
-pub fn apply_row(user: User, row: Option<ActivityPubActor>) -> User {
-    let Some(row) = row else {
-        return User {
-            inbox: None,
-            shared_inbox: None,
-            outbox: None,
-            followers_url: None,
-            following_url: None,
-            featured_url: None,
-            public_key: None,
-            private_key: None,
-            last_fetched_at: None,
-            ..user
-        };
-    };
-    User {
-        inbox: row.inbox,
-        shared_inbox: row.shared_inbox,
-        outbox: row.outbox,
-        followers_url: row.followers_url,
-        following_url: row.following_url,
-        featured_url: row.featured_url,
-        public_key: row.public_key,
-        private_key: row.private_key,
-        last_fetched_at: row.last_fetched_at,
-        ..user
-    }
-}
-
 /// The address naming the followers collection of actor `ap_id`.
 ///
 /// It is the row's stored `followers_url` (what the publisher expands, and
@@ -491,6 +390,22 @@ pub fn followers_address(actor: Option<&ActivityPubActor>, ap_id: &str) -> Strin
     actor
         .and_then(|row| row.followers_url.clone())
         .unwrap_or_else(|| followers(ap_id))
+}
+
+/// The address naming the followers collection of `user`, read from their row.
+///
+/// [`followers_address`] for a caller that holds no row yet.
+///
+/// # Errors
+///
+/// Any database failure (connection, encoding) arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn account_followers<'e, E>(executor: E, user: &User) -> AppResult<String>
+where
+    E: Executor<'e, Database = Postgres>,
+{
+    let row = get(executor, user.id).await?;
+    Ok(followers_address(row.as_ref(), &user.ap_id))
 }
 
 /// The address naming the featured (pinned) collection of actor `ap_id`.
@@ -513,35 +428,11 @@ mod tests {
     use super::*;
     use crate::{
         error::AppError,
-        test_fixtures::{local_user, remote_new, remote_user},
+        test_fixtures::{local_user, remote_user},
     };
-
-    /// Removes the row every insert of a fixture user wrote, for a test that
-    /// needs an account with no row (or that writes the row itself).
-    async fn drop_rows(pool: &PgPool) {
-        let removed = sqlx::query("DELETE FROM activitypub_actors")
-            .execute(pool)
-            .await
-            .expect("the rows delete")
-            .rows_affected();
-        assert!(removed > 0, "the fixture users came with rows to remove");
-    }
 
     /// The secret the redaction tests look for.
     const SECRET_KEY: &str = "-----BEGIN PRIVATE KEY-----secret";
-
-    /// The backfill statement of the `activitypub_actors` migration, verbatim.
-    ///
-    /// The migration ran when the database was built, before any test user
-    /// existed, so a test that wants the backfill's effect runs it again.
-    const BACKFILL_SQL: &str = "INSERT INTO activitypub_actors (
-    user_id, inbox, shared_inbox, outbox, followers_url, following_url,
-    featured_url, public_key, private_key, public_key_id, last_fetched_at
-)
-SELECT
-    id, inbox, shared_inbox, outbox, followers_url, following_url,
-    featured_url, public_key, private_key, public_key_id, last_fetched_at
-FROM users";
 
     /// A write for `user_id` with every column set to a distinct value.
     fn full_write(user_id: Uuid) -> ActivityPubActorWrite {
@@ -601,7 +492,6 @@ FROM users";
         let db = crate::test_db::test_db().await.expect("test database slot");
         let pool = db.pool().clone();
         let user = remote_user(&pool, "a").await;
-        drop_rows(&pool).await;
         let write = full_write(user.id);
 
         let stored = upsert(&pool, &write).await.expect("the row writes");
@@ -636,7 +526,6 @@ FROM users";
         let db = crate::test_db::test_db().await.expect("test database slot");
         let pool = db.pool().clone();
         let user = local_user(&pool, "alice").await;
-        drop_rows(&pool).await;
 
         assert!(
             get(&pool, user.id).await.expect("the read works").is_none(),
@@ -680,7 +569,6 @@ FROM users";
         let bob = remote_user(&pool, "bob").await;
         let carol = remote_user(&pool, "carol").await;
         let dave = remote_user(&pool, "dave").await;
-        drop_rows(&pool).await;
         for user in [&alice, &bob, &carol] {
             let _row = upsert(&pool, &bare_write(user.id))
                 .await
@@ -758,7 +646,6 @@ FROM users";
         let db = crate::test_db::test_db().await.expect("test database slot");
         let pool = db.pool().clone();
         let user = local_user(&pool, "alice").await;
-        drop_rows(&pool).await;
 
         let refused =
             sqlx::query("INSERT INTO activitypub_actors (user_id, status) VALUES ($1, $2)")
@@ -808,7 +695,6 @@ FROM users";
         let db = crate::test_db::test_db().await.expect("test database slot");
         let pool = db.pool().clone();
         let alice = local_user(&pool, "alice").await;
-        drop_rows(&pool).await;
         let first = ActivityPubActorWrite {
             inbox: Some("https://test.example/first".to_owned()),
             ..bare_write(alice.id)
@@ -827,73 +713,49 @@ FROM users";
         assert_eq!(stored.inbox, first.inbox, "the first write is kept");
     }
 
+    /// The constructor of a local account's claim: endpoints derived from
+    /// the actor id and the instance, the generated keys, an active status.
     #[tokio::test]
-    async fn the_backfill_copies_every_user_local_and_remote() {
+    async fn a_local_claim_derives_the_endpoints_and_carries_the_keys() {
         let db = crate::test_db::test_db().await.expect("test database slot");
-        let pool = db.pool().clone();
-        let mut remote = remote_new("far");
-        remote.inbox = Some("https://remote.example/users/far/inbox".to_owned());
-        remote.shared_inbox = Some("https://remote.example/inbox".to_owned());
-        remote.outbox = Some("https://remote.example/users/far/outbox".to_owned());
-        remote.followers_url = Some("https://remote.example/users/far/followers".to_owned());
-        remote.following_url = Some("https://remote.example/users/far/following".to_owned());
-        remote.featured_url = Some("https://remote.example/users/far/featured".to_owned());
-        remote.public_key = Some("-----BEGIN PUBLIC KEY-----far".to_owned());
-        remote.last_fetched_at = DateTime::from_timestamp(1_700_000_000, 0);
-        let far = crate::models::user::insert(&pool, &remote)
-            .await
-            .expect("the remote user inserts");
-        let keyed = sqlx::query("UPDATE users SET public_key_id = $2 WHERE id = $1")
-            .bind(far.id)
-            .bind("https://remote.example/users/far#main-key")
-            .execute(&pool)
-            .await
-            .expect("the key id is set")
-            .rows_affected();
-        assert_eq!(keyed, 1, "the key id went onto the one user");
-        let mut local = crate::test_fixtures::local_new("alice");
-        local.private_key = Some(SECRET_KEY.to_owned());
-        local.public_key = Some("-----BEGIN PUBLIC KEY-----alice".to_owned());
-        let alice = crate::models::user::insert(&pool, &local)
-            .await
-            .expect("the local user inserts");
-        drop_rows(&pool).await;
-        assert_eq!(row_count(&pool).await, 0, "the table starts empty");
+        let alice = local_user(db.pool(), "alice").await;
+        let keys = KeyPair {
+            private_pem: SECRET_KEY.to_owned(),
+            public_pem: "-----BEGIN PUBLIC KEY-----alice".to_owned(),
+        };
 
-        let copied = sqlx::query(BACKFILL_SQL)
-            .execute(&pool)
-            .await
-            .expect("the backfill runs")
-            .rows_affected();
+        let write = ActivityPubActorWrite::for_local_account(&alice, "https://test.example", keys);
 
-        assert_eq!(copied, 2, "one row per user");
-        let far_row = get(&pool, far.id).await.unwrap().expect("the remote row");
+        assert_eq!(write.user_id, alice.id, "the account's row");
+        assert_eq!(write.status, ActorStatus::Active, "the identity is claimed");
+        assert_eq!(write.inbox.as_deref(), Some(inbox(&alice.ap_id).as_str()));
         assert_eq!(
-            far_row.status,
-            ActorStatus::Active,
-            "backfilled rows are active"
+            write.shared_inbox.as_deref(),
+            Some("https://test.example/inbox"),
+            "the shared inbox is the instance's own"
         );
-        assert_eq!(far_row.inbox, remote.inbox);
-        assert_eq!(far_row.shared_inbox, remote.shared_inbox);
-        assert_eq!(far_row.outbox, remote.outbox);
-        assert_eq!(far_row.followers_url, remote.followers_url);
-        assert_eq!(far_row.following_url, remote.following_url);
-        assert_eq!(far_row.featured_url, remote.featured_url);
-        assert_eq!(far_row.public_key, remote.public_key);
+        assert_eq!(write.outbox.as_deref(), Some(outbox(&alice.ap_id).as_str()));
         assert_eq!(
-            far_row.public_key_id.as_deref(),
-            Some("https://remote.example/users/far#main-key")
+            write.followers_url.as_deref(),
+            Some(followers(&alice.ap_id).as_str())
         );
-        assert_eq!(far_row.last_fetched_at, remote.last_fetched_at);
-        let alice_row = get(&pool, alice.id).await.unwrap().expect("the local row");
         assert_eq!(
-            alice_row.private_key, local.private_key,
-            "the local key pair came too"
+            write.following_url.as_deref(),
+            Some(following(&alice.ap_id).as_str())
         );
-        assert_eq!(alice_row.public_key, local.public_key);
+        assert_eq!(
+            write.featured_url.as_deref(),
+            Some(featured(&alice.ap_id).as_str())
+        );
+        assert_eq!(write.private_key.as_deref(), Some(SECRET_KEY));
+        assert_eq!(
+            write.public_key.as_deref(),
+            Some("-----BEGIN PUBLIC KEY-----alice")
+        );
+        assert!(write.public_key_id.is_none(), "a local key id is implied");
         assert!(
-            alice_row.last_fetched_at.is_none(),
-            "a local account was never fetched"
+            write.last_fetched_at.is_none(),
+            "a local account is never fetched"
         );
     }
 }

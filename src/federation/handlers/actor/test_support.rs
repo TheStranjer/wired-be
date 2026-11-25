@@ -89,13 +89,16 @@ pub(super) async fn mirror(pool: &PgPool) -> User {
 /// Ages a mirror's fetch stamp and hands back the row as it stands
 /// afterwards: the account an `Update` may fold.
 pub(super) async fn ready_for_update(pool: &PgPool, id: Uuid) -> User {
-    let _aged =
-        sqlx::query("UPDATE users SET last_fetched_at = now() - interval '1 minute' WHERE id = $1")
-            .bind(id)
-            .execute(pool)
-            .await
-            .expect("the fixture ages the fetch");
-    crate::test_fixtures::resync_actor(pool, id).await;
+    let aged = sqlx::query(
+        "UPDATE activitypub_actors SET last_fetched_at = now() - interval '1 minute' \
+         WHERE user_id = $1",
+    )
+    .bind(id)
+    .execute(pool)
+    .await
+    .expect("the fixture ages the fetch")
+    .rows_affected();
+    assert_eq!(aged, 1, "the mirror has an actor row to age");
     fresh_user(pool, id).await
 }
 

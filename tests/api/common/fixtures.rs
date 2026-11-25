@@ -1,9 +1,12 @@
 //! Row fixtures: users, statuses, notifications, reactions and attachments.
 
+use std::ops::Deref;
+
 use sqlx::PgPool;
 use uuid::Uuid;
 use wired_be::{
     models::{
+        activitypub_actor::{self, ActivityPubActor, ActivityPubActorWrite},
         media_attachment::{self, MediaAttachment, NewMediaAttachment},
         notification::{self, NewNotification, Notification},
         status::{self, NewStatus, Status, Visibility},
@@ -11,7 +14,10 @@ use wired_be::{
             NewUser, User, followers, following, get_by_id, inbox, insert, local_ap_id, outbox,
         },
     },
-    util::password::hash_password,
+    util::{
+        keys::{KeyPair, generate_keypair_async},
+        password::hash_password,
+    },
 };
 
 use super::test_config;
@@ -108,11 +114,12 @@ where
 /// [`User`], the shape a fetch of `https://{host}/users/{nickname}` stores.
 ///
 /// The nickname carries `@host` (decision 7) and the actor id, domain and
-/// endpoints are the ones the fetched document would have named.
+/// endpoints are the ones the fetched document would have named: the
+/// endpoints and key are on the account's `activitypub_actors` row.
 ///
 /// # Panics
 ///
-/// If the insert fails, e.g. because the handle is already taken in the
+/// If either insert fails, e.g. because the handle is already taken in the
 /// test database.
 pub async fn create_remote_user(pool: &PgPool, nickname: &str, host: &str) -> User {
     let ap_id = format!("https://{host}/users/{nickname}");
@@ -121,19 +128,131 @@ pub async fn create_remote_user(pool: &PgPool, nickname: &str, host: &str) -> Us
         ap_id: ap_id.clone(),
         domain: Some(host.to_owned()),
         name: nickname.to_owned(),
-        inbox: Some(inbox(&ap_id)),
-        shared_inbox: Some(format!("https://{host}/inbox")),
-        outbox: Some(outbox(&ap_id)),
-        followers_url: Some(followers(&ap_id)),
-        following_url: Some(following(&ap_id)),
-        public_key: Some(
-            "-----BEGIN PUBLIC KEY-----\nREMOTE-DATA\n-----END PUBLIC KEY-----\n".to_owned(),
-        ),
         ..NewUser::default()
     };
-    insert(pool, &new)
+    let user = insert(pool, &new)
         .await
-        .expect("remote user fixture inserts")
+        .expect("remote user fixture inserts");
+    let _row = write_actor(
+        pool,
+        &ActivityPubActorWrite {
+            inbox: Some(inbox(&ap_id)),
+            shared_inbox: Some(format!("https://{host}/inbox")),
+            outbox: Some(outbox(&ap_id)),
+            followers_url: Some(followers(&ap_id)),
+            following_url: Some(following(&ap_id)),
+            public_key: Some(
+                "-----BEGIN PUBLIC KEY-----\nREMOTE-DATA\n-----END PUBLIC KEY-----\n".to_owned(),
+            ),
+            ..ActivityPubActorWrite::bare(user.id)
+        },
+    )
+    .await;
+    user
+}
+
+/// Writes `write` as the `activitypub_actors` row of the account it names,
+/// and returns the stored row.
+///
+/// # Panics
+///
+/// If the write fails, e.g. because the account has no row in the test
+/// database.
+pub async fn write_actor(pool: &PgPool, write: &ActivityPubActorWrite) -> ActivityPubActor {
+    activitypub_actor::upsert(pool, write)
+        .await
+        .expect("the actor row writes")
+}
+
+/// Inserts `new` and gives the account the `activitypub_actors` row of a
+/// federating local account, with the signing keys `PEM` and `PUB`.
+///
+/// The endpoints are the ones registration derives from the actor id (see
+/// [`ActivityPubActorWrite::for_local_account`]).
+///
+/// # Panics
+///
+/// If either insert fails.
+pub async fn insert_federating(pool: &PgPool, new: &NewUser) -> User {
+    let user = insert(pool, new).await.expect("local user fixture inserts");
+    let keys = KeyPair {
+        private_pem: "PEM".to_owned(),
+        public_pem: "PUB".to_owned(),
+    };
+    let _row = write_actor(
+        pool,
+        &ActivityPubActorWrite::for_local_account(&user, &test_config().base_url, keys),
+    )
+    .await;
+    user
+}
+
+/// Inserts a local user named `nickname`, shaped by `customize`, and gives it
+/// the `activitypub_actors` row [`insert_federating`] writes.
+///
+/// # Panics
+///
+/// If either insert fails.
+pub async fn create_federating_user_with<F>(pool: &PgPool, nickname: &str, customize: F) -> User
+where
+    F: FnOnce(NewUser) -> NewUser,
+{
+    let ap_id = local_ap_id(&test_config().base_url, nickname);
+    let new = customize(NewUser::local(nickname, &ap_id));
+    insert_federating(pool, &new).await
+}
+
+/// A local account holding a real RSA key pair on its `activitypub_actors`
+/// row, so it can sign an authorized fetch.
+///
+/// It derefs to its [`User`] row; the private key is kept beside it because
+/// that row no longer carries one.
+#[derive(Debug)]
+pub struct Signer {
+    /// The account's `users` row.
+    pub user: User,
+    /// The private key of the account's actor row.
+    pub private_pem: String,
+}
+
+impl Deref for Signer {
+    type Target = User;
+
+    fn deref(&self) -> &User {
+        &self.user
+    }
+}
+
+/// Inserts a local [`Signer`] named `nickname`, with a freshly generated key
+/// pair on its actor row.
+///
+/// # Panics
+///
+/// If key generation or either insert fails.
+pub async fn create_signer(pool: &PgPool, nickname: &str) -> Signer {
+    let keys = generate_keypair_async()
+        .await
+        .expect("the fixture key pair generates");
+    let user = create_local_user(pool, nickname).await;
+    let private_pem = keys.private_pem.clone();
+    let _row = write_actor(
+        pool,
+        &ActivityPubActorWrite::for_local_account(&user, &test_config().base_url, keys),
+    )
+    .await;
+    Signer { user, private_pem }
+}
+
+/// The `activitypub_actors` row of `user`.
+///
+/// # Panics
+///
+/// If the read fails or the account has no row.
+pub async fn actor_of(pool: &PgPool, user: &User) -> ActivityPubActor {
+    activitypub_actor::get(pool, user.id)
+        .await
+        .expect("the actor row reads")
+        .expect("the account has an actor row")
 }
 
 /// Inserts a local [`Status`] posted by `user` — `text` as a plain-text

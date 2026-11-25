@@ -105,6 +105,7 @@ mod tests {
         federation::note,
         federation::vocab::AS_PUBLIC,
         models::{
+            activitypub_actor::ActivityPubActorWrite,
             status::{self, NewStatus, Visibility},
             user::{Flag, NewUser, User, insert},
         },
@@ -115,6 +116,7 @@ mod tests {
                 publish_jobs, remote, remote_status, run_publishes, the_single_activity,
             },
         },
+        test_fixtures::write_actor,
         util::time::mastodon_time,
     };
 
@@ -124,21 +126,29 @@ mod tests {
     /// second host the fan-out tests need beside [`remote`]'s one, so a
     /// delivery set proves the followers' expansion crosses instances.
     async fn peer(pool: &PgPool, nickname: &str) -> User {
-        insert(
+        let user = insert(
             pool,
             &NewUser {
                 nickname: format!("{nickname}@peer.example"),
                 ap_id: format!("https://peer.example/users/{nickname}"),
                 local: Flag::new(false),
                 domain: Some("peer.example".to_owned()),
-                inbox: Some(format!("https://peer.example/users/{nickname}/inbox")),
-                shared_inbox: Some("https://peer.example/inbox".to_owned()),
-                public_key: Some("PUB".to_owned()),
                 ..NewUser::default()
             },
         )
         .await
-        .expect("the peer fixture inserts")
+        .expect("the peer fixture inserts");
+        let _row = write_actor(
+            pool,
+            &ActivityPubActorWrite {
+                inbox: Some(format!("https://peer.example/users/{nickname}/inbox")),
+                shared_inbox: Some("https://peer.example/inbox".to_owned()),
+                public_key: Some("PUB".to_owned()),
+                ..ActivityPubActorWrite::bare(user.id)
+            },
+        )
+        .await;
+        user
     }
 
     /// The edit the route just wrote, applied straight to `posted`: the new

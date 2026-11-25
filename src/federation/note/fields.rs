@@ -13,7 +13,7 @@ use crate::{
     federation::{quotes::interaction_policy_json, vocab::AS_PUBLIC},
     models::{
         status::{Status, Visibility},
-        user::{User, followers_address, followers_address_of},
+        user::{User, followers_address_of},
     },
     util::time::mastodon_time,
 };
@@ -54,6 +54,7 @@ pub fn note_json(ctx: &NoteContext) -> Option<Value> {
         ctx.status.visibility,
         ctx.status.quote_approval_policy,
         &ctx.author,
+        &author_followers(ctx),
     ) {
         fields.push(("interactionPolicy", policy));
     }
@@ -149,20 +150,13 @@ fn status_url(status: &Status) -> &str {
 /// `activitypub_actors` row, which the loader put in
 /// [`NoteContext::author_followers_url`].
 fn addressing(ctx: &NoteContext) -> (Vec<Value>, Vec<Value>) {
-    let followers = followers_address_of(&ctx.author.ap_id, ctx.author_followers_url.as_deref());
-    audience_lines(ctx.status.visibility, &followers, &ctx.mentions)
+    audience_lines(ctx.status.visibility, &author_followers(ctx), &ctx.mentions)
 }
 
-/// [`audience_lines`] over the followers address on the `users` row.
-///
-/// Only the scrobble documents still use this form; the ticket that moves
-/// them to `activitypub_actors` removes it.
-pub(crate) fn address_lines(
-    visibility: Visibility,
-    author: &User,
-    mentions: &[User],
-) -> (Vec<Value>, Vec<Value>) {
-    audience_lines(visibility, &followers_address(author), mentions)
+/// The address of the followers collection `ctx`'s author owns: the one on
+/// their `activitypub_actors` row, else the one built from the actor id.
+fn author_followers(ctx: &NoteContext) -> String {
+    followers_address_of(&ctx.author.ap_id, ctx.author_followers_url.as_deref())
 }
 
 /// The `to` and `cc` lines one visibility addresses, given the author's
@@ -441,18 +435,6 @@ mod tests {
             to,
             vec![json!(format!("{AUTHOR_AP}/followers"))],
             "the `{{ap_id}}/followers` fallback"
-        );
-    }
-
-    #[test]
-    fn a_note_ignores_the_users_followers_url() {
-        let mut ctx = note_context(Visibility::Unlisted);
-        ctx.author.followers_url = Some("https://test.example/old/followers".to_owned());
-        let (to, _cc) = addressing(&ctx);
-        assert_eq!(
-            to,
-            vec![json!(format!("{AUTHOR_AP}/followers"))],
-            "only the actor row's followers collection counts"
         );
     }
 

@@ -147,6 +147,7 @@ mod tests {
         federation::{dispatch::FederationError, handlers::misc::test_support::*},
         http_client::HttpClient,
         models::{
+            activitypub_actor::ActivityPubActorWrite,
             block, pinned_status, status,
             user::{NewUser, insert},
         },
@@ -255,12 +256,7 @@ mod tests {
         )
         .await
         .expect("the cached target inserts");
-        let _stamped = sqlx::query("UPDATE users SET last_fetched_at = now() WHERE id = $1")
-            .bind(stored.id)
-            .execute(pool)
-            .await
-            .expect("the fixture stamps the fetch");
-        crate::test_fixtures::resync_actor(pool, stored.id).await;
+        let _stamped = crate::test_fixtures::fetched_just_now(pool, stored.id).await;
         stored
     }
 
@@ -461,18 +457,26 @@ mod tests {
         let authority = base
             .strip_prefix("http://")
             .expect("the loopback base is an http url");
-        insert(
+        let alice = insert(
             pool,
             &NewUser {
                 nickname: format!("alice@{authority}"),
                 ap_id: format!("{base}/users/alice"),
                 domain: Some(authority.to_owned()),
-                featured_url: Some(format!("{base}/users/alice/collections/featured")),
                 ..NewUser::default()
             },
         )
         .await
-        .expect("the loopback alice inserts")
+        .expect("the loopback alice inserts");
+        let _row = crate::test_fixtures::write_actor(
+            pool,
+            &ActivityPubActorWrite {
+                featured_url: Some(format!("{base}/users/alice/collections/featured")),
+                ..ActivityPubActorWrite::bare(alice.id)
+            },
+        )
+        .await;
+        alice
     }
 
     /// An `Add`/`Remove` of `object` to alice's featured collection.
@@ -483,7 +487,7 @@ mod tests {
             &alice.ap_id,
             json!({
                 "object": object,
-                "target": alice.featured_url.clone().expect("alice has a featured url"),
+                "target": format!("{}/collections/featured", alice.ap_id),
             }),
         )
     }

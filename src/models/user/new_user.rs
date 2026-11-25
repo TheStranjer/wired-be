@@ -53,23 +53,6 @@ pub struct NewUser {
     /// Profile metadata as its source text; the empty JSON array by
     /// default.
     pub raw_fields: Value,
-    /// `ActivityPub` inbox endpoint.
-    pub inbox: Option<String>,
-    /// Shared inbox endpoint.
-    pub shared_inbox: Option<String>,
-    /// `ActivityPub` outbox collection id.
-    pub outbox: Option<String>,
-    /// Followers collection id.
-    pub followers_url: Option<String>,
-    /// Following collection id.
-    pub following_url: Option<String>,
-    /// Featured (pinned) collection id.
-    pub featured_url: Option<String>,
-    /// Actor public signing key (PEM).
-    pub public_key: Option<String>,
-    /// Actor private signing key, local users only. Never in `Debug`
-    /// output.
-    pub private_key: Option<String>,
     /// Whether the account is an admin; `false` by default.
     pub is_admin: Flag,
     /// Whether the account is a moderator; `false` by default.
@@ -146,8 +129,6 @@ pub struct NewUser {
     pub statuses_count: i32,
     /// Initial newest-status time; `None` by default.
     pub last_status_at: Option<DateTime<Utc>>,
-    /// Initial last-fetch time; `None` by default.
-    pub last_fetched_at: Option<DateTime<Utc>>,
     /// Multi-factor authentication state; the all-off [`mfa::MfaSettings`]
     /// blob by default, matching the column default. Holds the TOTP
     /// secret; never in `Debug` output.
@@ -166,9 +147,9 @@ pub struct NewUser {
     pub email_notifications: Flag,
 }
 
-/// [`password_hash`](Self::password_hash) and [`private_key`](Self::private_key)
-/// are secrets and render as `<redacted>`; [`mfa_settings`](Self::mfa_settings)
-/// holds the TOTP secret and is redacted too; everything else shows.
+/// [`password_hash`](Self::password_hash) is a secret and renders as
+/// `<redacted>`; [`mfa_settings`](Self::mfa_settings) holds the TOTP secret and
+/// is redacted too; everything else shows.
 impl fmt::Debug for NewUser {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("NewUser")
@@ -190,14 +171,6 @@ impl fmt::Debug for NewUser {
             .field("discoverable", &self.discoverable)
             .field("fields", &self.fields)
             .field("raw_fields", &self.raw_fields)
-            .field("inbox", &self.inbox)
-            .field("shared_inbox", &self.shared_inbox)
-            .field("outbox", &self.outbox)
-            .field("followers_url", &self.followers_url)
-            .field("following_url", &self.following_url)
-            .field("featured_url", &self.featured_url)
-            .field("public_key", &self.public_key)
-            .field("private_key", &"<redacted>")
             .field("is_admin", &self.is_admin)
             .field("is_moderator", &self.is_moderator)
             .field("is_active", &self.is_active)
@@ -233,7 +206,6 @@ impl fmt::Debug for NewUser {
             .field("following_count", &self.following_count)
             .field("statuses_count", &self.statuses_count)
             .field("last_status_at", &self.last_status_at)
-            .field("last_fetched_at", &self.last_fetched_at)
             .field("mfa_settings", &"<redacted>")
             .field("is_suggested", &self.is_suggested)
             .field("password_reset_pending", &self.password_reset_pending)
@@ -265,14 +237,6 @@ impl Default for NewUser {
             discoverable: Flag::new(false),
             fields: json!([]),
             raw_fields: json!([]),
-            inbox: None,
-            shared_inbox: None,
-            outbox: None,
-            followers_url: None,
-            following_url: None,
-            featured_url: None,
-            public_key: None,
-            private_key: None,
             is_admin: Flag::new(false),
             is_moderator: Flag::new(false),
             is_active: Flag::new(true),
@@ -308,7 +272,6 @@ impl Default for NewUser {
             following_count: 0,
             statuses_count: 0,
             last_status_at: None,
-            last_fetched_at: None,
             mfa_settings: mfa::MfaSettings::default_value(),
             is_suggested: Flag::new(false),
             password_reset_pending: Flag::new(false),
@@ -363,7 +326,6 @@ mod tests {
             "roles default to false"
         );
         assert!(new.is_active.get(), "a new account is active");
-        assert!(new.private_key.is_none(), "keys are opt-in");
         assert_eq!(
             (new.followers_count, new.following_count, new.statuses_count),
             (0, 0, 0),

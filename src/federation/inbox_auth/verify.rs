@@ -176,7 +176,7 @@ mod tests {
                 send, set_mrf_lists, spawn, test_state,
             },
         },
-        models::user::get_by_ap_id,
+        models::{activitypub_actor, user::get_by_ap_id},
         services::runtime_config,
         util::keys::{FIXTURE_PRIVATE_PKCS1_PEM, FIXTURE_PUBLIC_PKCS1_PEM},
     };
@@ -217,17 +217,22 @@ mod tests {
         );
         assert_eq!(hits.load(Ordering::SeqCst), 1, "and no second fetch");
         let stored = get_by_ap_id(&pool, &ap_id).await.unwrap().unwrap();
+        let stored_key = activitypub_actor::get(&pool, stored.id)
+            .await
+            .unwrap()
+            .and_then(|row| row.public_key)
+            .expect("the mirror's actor row holds a key");
         assert_eq!(
-            stored.public_key.unwrap().trim(),
+            stored_key.trim(),
             ROTATED_PUBLIC_PEM.trim(),
             "the mirror row now carries the rotated key"
         );
         server.abort();
     }
 
-    /// The signer's key comes from `activitypub_actors`: `users` keeps a
-    /// stale key and no fetch stamp, the actor row alone holds the matching key
-    /// and a fresh stamp, and no peer is running to refetch from.
+    /// The signer's key comes from `activitypub_actors`: the seeded row holds
+    /// a stale key, the test swaps in the matching key with a fresh stamp, and
+    /// no peer is running to refetch from.
     #[tokio::test]
     async fn the_signers_key_is_read_from_the_actor_row() {
         let db = crate::test_db::test_db().await.expect("test database slot");

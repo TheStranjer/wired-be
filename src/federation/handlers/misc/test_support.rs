@@ -13,10 +13,12 @@ pub(super) use crate::federation::handlers::test_support::{
 use crate::{
     federation::dispatch::ActivityView,
     models::{
+        activitypub_actor::ActivityPubActorWrite,
         report,
         status::{self, NewStatus, Status},
         user::{NewUser, User, insert},
     },
+    test_fixtures::write_actor,
 };
 
 /// The mirror every fixture here is sent by: alice on `peer.example`.
@@ -86,18 +88,26 @@ pub(super) async fn remote_signer(pool: &PgPool) -> User {
 
 /// The signer mirror with alice's featured url stored.
 pub(super) async fn featured_signer(pool: &PgPool) -> User {
-    insert(
+    let alice = insert(
         pool,
         &NewUser {
             nickname: "alice@peer.example".to_owned(),
             ap_id: ALICE.to_owned(),
             domain: Some("peer.example".to_owned()),
-            featured_url: Some(FEATURED.to_owned()),
             ..NewUser::default()
         },
     )
     .await
-    .expect("the featured fixture inserts")
+    .expect("the featured fixture inserts");
+    let _row = write_actor(
+        pool,
+        &ActivityPubActorWrite {
+            featured_url: Some(FEATURED.to_owned()),
+            ..ActivityPubActorWrite::bare(alice.id)
+        },
+    )
+    .await;
+    alice
 }
 
 /// A post by the remote `author` at a peer-named uri.

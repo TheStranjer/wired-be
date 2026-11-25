@@ -31,36 +31,59 @@ pub fn local_keys() -> &'static KeyPair {
 
 /// A local [`User`] named `nickname` as registration leaves it.
 ///
-/// The account carries [`local_keys`] and the endpoint set a registered
-/// account gets — `followers_url` and friends, which the publisher's follower
-/// expansion reads — plus whatever else `customize` changes on top:
-/// [`keyed_local_user`], or the same account locked, a bot, hidden, and still
-/// able to federate.
+/// The account's `activitypub_actors` row carries [`local_keys`] and the
+/// endpoint set a registered account gets — `followers_url` and friends,
+/// which the publisher's follower expansion reads — and the `users` row
+/// takes whatever `customize` changes: [`keyed_local_user`], or the same
+/// account locked, a bot, hidden, and still able to federate.
 ///
 /// # Panics
 ///
-/// If the insert fails, e.g. because `nickname` is taken in this slot.
+/// If either insert fails, e.g. because `nickname` is taken in this slot.
 pub async fn keyed_local_user_with<F>(pool: &PgPool, nickname: &str, customize: F) -> User
 where
     F: FnOnce(NewUser) -> NewUser,
 {
-    let keys = local_keys().clone();
-    let shared_inbox = format!("{}/inbox", common::test_config().base_url);
-    common::create_local_user_with(pool, nickname, move |user| {
-        let ap_id = user.ap_id.clone();
-        customize(NewUser {
-            inbox: Some(user::inbox(&ap_id)),
-            shared_inbox: Some(shared_inbox),
-            outbox: Some(user::outbox(&ap_id)),
-            followers_url: Some(user::followers(&ap_id)),
-            following_url: Some(user::following(&ap_id)),
-            featured_url: Some(user::featured(&ap_id)),
-            public_key: Some(keys.public_pem),
-            private_key: Some(keys.private_pem),
-            ..user
-        })
-    })
+    let user = common::create_local_user_with(pool, nickname, customize).await;
+    let _row = common::write_actor(
+        pool,
+        &ActivityPubActorWrite::for_local_account(
+            &user,
+            &common::test_config().base_url,
+            local_keys().clone(),
+        ),
+    )
+    .await;
+    user
+}
+
+/// This instance's own actor, its signing keys swapped for [`local_keys`].
+///
+/// A delivery the instance actor signs then verifies against `local_keys()`,
+/// like one signed by a [`keyed_local_user`]. Call it before the delivery is
+/// made, since the signer reads the stored keys at send time.
+///
+/// # Panics
+///
+/// If the instance actor cannot be provisioned or has no `activitypub_actors`
+/// row.
+pub async fn keyed_instance_actor(pool: &PgPool) -> User {
+    let actor =
+        wired_be::services::instance_actor::ensure_instance_actor(pool, &common::test_config())
+            .await
+            .expect("the instance actor stands");
+    let keyed = sqlx::query(
+        "UPDATE activitypub_actors SET public_key = $2, private_key = $3 WHERE user_id = $1",
+    )
+    .bind(actor.id)
+    .bind(&local_keys().public_pem)
+    .bind(&local_keys().private_pem)
+    .execute(pool)
     .await
+    .expect("the instance actor's keys are swapped")
+    .rows_affected();
+    assert_eq!(keyed, 1, "the instance actor has exactly one actor row");
+    actor
 }
 
 /// A local [`User`] named `nickname` that can sign its own deliveries:

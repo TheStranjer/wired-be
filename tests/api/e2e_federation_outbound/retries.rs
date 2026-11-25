@@ -107,11 +107,11 @@ async fn a_failing_inbox_retries_the_same_signed_bytes_until_it_answers() {
 }
 
 /// Asserts the mock recorded `want` deliveries of the one `Create`, each
-/// byte-identical to the first and each freshly signed by `alice`'s key.
+/// byte-identical to the first and each freshly signed by the local fixture key.
 fn assert_signed_resends(peer: &remote::MockPeer, alice: &User, want: usize) {
     let creates = peer.delivered("Create");
     assert_eq!(creates.len(), want, "each try arrived at the mock");
-    let pem = alice.public_key.as_deref().expect("the fixture key");
+    let pem = remote::local_keys().public_pem.as_str();
     for delivery in &creates {
         assert_eq!(delivery.body(), creates[0].body(), "the same body, resent");
         assert!(
@@ -205,7 +205,10 @@ async fn a_refused_signature_retries_once_and_the_capture_keeps_it() {
         .await
         .expect("the mirror reads")
         .expect("the follow mirrored the peer actor");
-    let stored_pem = mirror.public_key.clone().expect("the mirror holds a key");
+    let stored_pem = common::actor_of(&pool, &mirror)
+        .await
+        .public_key
+        .expect("the mirror holds a key");
 
     peer.rotate_keys();
     assert_ne!(
@@ -234,8 +237,8 @@ async fn a_refused_signature_retries_once_and_the_capture_keeps_it() {
         .expect("the mirror reads")
         .expect("the mirror stands");
     assert_eq!(
-        unchanged.public_key.as_deref(),
-        Some(stored_pem.as_str()),
+        common::actor_of(&pool, &unchanged).await.public_key,
+        Some(stored_pem),
         "the delivery path never refetched the follower's document"
     );
     assert_signed_resends(&peer, &alice, 2);

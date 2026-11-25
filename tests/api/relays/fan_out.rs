@@ -276,13 +276,13 @@ async fn a_pending_relay_announce_folds_like_a_strangers() {
     let state = relay_state(&pool);
 
     let relay_user = common::create_remote_user(&pool, "relay", "relay.mock").await;
-    let _subscription = relay::upsert(
-        &pool,
-        &relay_user.ap_id,
-        relay_user.inbox.as_deref().expect("a fixture inbox"),
-    )
-    .await
-    .unwrap();
+    let relay_inbox = common::actor_of(&pool, &relay_user)
+        .await
+        .inbox
+        .expect("a fixture inbox");
+    let _subscription = relay::upsert(&pool, &relay_user.ap_id, &relay_inbox)
+        .await
+        .unwrap();
     let alice = common::create_local_user(&pool, "alice").await;
     let post = common::create_status(&pool, &alice, "pending-target", Visibility::Public).await;
 

@@ -156,7 +156,7 @@ async fn the_unreachable_hook_drops_and_restores_a_marked_host() {
         "type": "Create",
         "actor": alice.ap_id,
         "to": [PUBLIC],
-        "cc": [alice.followers_url],
+        "cc": [followers_of(&alice)],
     });
     instance::set_unreachable(&pool, "other.example", Utc::now() - ONE_MINUTE_AGO)
         .await
@@ -215,7 +215,7 @@ async fn a_followers_only_update_stays_off_the_relay() {
         "type": "Update",
         "actor": alice.ap_id,
         "object": {"type": "Note", "id": "https://test.example/objects/1", "content": "secret"},
-        "to": [alice.followers_url],
+        "to": [followers_of(&alice)],
     });
 
     assert_eq!(
@@ -338,7 +338,7 @@ async fn a_public_delete_still_reaches_the_relay() {
         "actor": alice.ap_id,
         "object": "https://test.example/objects/1",
         "to": [PUBLIC],
-        "cc": [alice.followers_url],
+        "cc": [followers_of(&alice)],
     });
 
     assert_eq!(
@@ -399,7 +399,7 @@ async fn an_unlisted_create_stays_off_the_relay() {
         "type": "Create",
         "actor": alice.ap_id,
         "object": {"type": "Note", "id": "https://test.example/objects/1", "content": "hi"},
-        "to": [alice.followers_url],
+        "to": [followers_of(&alice)],
         "cc": [PUBLIC],
     });
 
@@ -459,7 +459,7 @@ async fn a_public_like_stays_off_the_relay() {
         "actor": alice.ap_id,
         "object": "https://other.example/objects/1",
         "to": [erin.ap_id],
-        "cc": [alice.followers_url, PUBLIC],
+        "cc": [followers_of(&alice), PUBLIC],
     });
 
     assert_eq!(

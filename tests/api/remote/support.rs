@@ -28,7 +28,10 @@ use wired_be::{
         SignedHeaders, SigningKey, sign_request,
         verify::{SignedRequestParts, parse_signature_header, verify, verify_digest},
     },
-    models::user::{self, NewUser, User},
+    models::{
+        activitypub_actor::ActivityPubActorWrite,
+        user::{NewUser, User},
+    },
     state::AppState,
     util::keys::{KeyPair, generate_keypair},
 };
@@ -36,7 +39,7 @@ use wired_be::{
 use self::{keys::peer_keys, routes::router};
 use crate::common;
 
-pub use self::keys::{keyed_local_user, keyed_local_user_with, local_keys};
+pub use self::keys::{keyed_instance_actor, keyed_local_user, keyed_local_user_with, local_keys};
 
 /// The `ActivityStreams` public address, as every mock document names it.
 pub const PUBLIC: &str = "https://www.w3.org/ns/activitystreams#Public";
