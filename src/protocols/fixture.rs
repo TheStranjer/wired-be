@@ -10,7 +10,7 @@
 //! large existing implementation.
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     sync::{LazyLock, Mutex, MutexGuard, PoisonError},
 };
 
@@ -29,7 +29,7 @@ use crate::{
         ProtocolId,
         adapter::ProtocolAdapter,
         events::AccountEvent,
-        identity::{ClaimOutcome, Identity},
+        identity::{ClaimOutcome, Identity, IdentityStatus},
     },
     state::AppState,
 };
@@ -81,12 +81,21 @@ fn taken_identifiers() -> MutexGuard<'static, HashSet<String>> {
         .unwrap_or_else(PoisonError::into_inner)
 }
 
-/// Claims `identifier` in the taken set, or reports that it is already there.
+/// The ID each account claimed, standing in for the rows of a protocol's table.
+static ENROLLED: LazyLock<Mutex<HashMap<Uuid, String>>> = LazyLock::new(Mutex::default);
+
+/// Locks [`ENROLLED`], ignoring a poisoning left by a panicked test.
+fn enrolled() -> MutexGuard<'static, HashMap<Uuid, String>> {
+    ENROLLED.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Claims `identifier` for `user_id` in the taken set, or reports that it is already there.
 ///
-/// The set is not transactional: a claim stays after the caller's transaction
+/// The sets are not transactional: a claim stays after the caller's transaction
 /// rolls back, which a real protocol's table would not do.
-fn claim_identifier(identifier: &str) -> ClaimOutcome {
+fn claim_identifier(user_id: Uuid, identifier: &str) -> ClaimOutcome {
     if taken_identifiers().insert(identifier.to_owned()) {
+        let _previous: Option<String> = enrolled().insert(user_id, identifier.to_owned());
         ClaimOutcome::Claimed
     } else {
         ClaimOutcome::Taken
@@ -269,24 +278,29 @@ impl ProtocolAdapter for Fixture {
         format!("fixture:{identifier}")
     }
 
-    /// Always `None`: the fixture has no table, so no identity is ever stored.
+    /// The active identity the account claimed, or `None` before it claimed one.
     fn identity<'a>(
         &'a self,
-        _state: &'a AppState,
-        _user: &'a User,
+        state: &'a AppState,
+        user: &'a User,
     ) -> BoxFuture<'a, AppResult<Option<Identity>>> {
-        Box::pin(async { Ok(None) })
+        let identity = enrolled().get(&user.id).map(|identifier| Identity {
+            identifier: identifier.clone(),
+            uri: self.identifier_uri(identifier, &state.config),
+            status: IdentityStatus::Active,
+        });
+        Box::pin(async move { Ok(identity) })
     }
 
-    /// Adds the ID to the static set, or `Taken` when it is already there.
+    /// Adds the ID to the static set and remembers it as the account's identity, or `Taken`.
     fn claim<'a>(
         &'a self,
         _conn: &'a mut PgConnection,
-        _user: &'a User,
+        user: &'a User,
         identifier: &'a str,
         _state: &'a AppState,
     ) -> BoxFuture<'a, AppResult<ClaimOutcome>> {
-        let outcome = claim_identifier(identifier);
+        let outcome = claim_identifier(user.id, identifier);
         Box::pin(async move { Ok(outcome) })
     }
 
@@ -406,15 +420,30 @@ mod tests {
         assert!(taken.expect("lookup"), "the set holds the ID");
     }
 
-    /// The fixture stores no identity row, so `identity` is `None` even for a local user.
+    /// `identity` is `None` for a local user until it claims an ID, then the active claim.
     #[tokio::test]
     async fn identity_is_none_until_claimed() {
         let db = crate::test_db::test_db().await.expect("test database slot");
         let state = app_state(db.pool());
         let user = crate::test_fixtures::local_user(db.pool(), "fixture_user").await;
+        let mut conn = db.pool().acquire().await.expect("a connection");
 
-        let identity = Fixture.identity(&state, &user).await;
+        let before = Fixture.identity(&state, &user).await;
+        let claimed = Fixture
+            .claim(&mut conn, &user, "fixture-user-id", &state)
+            .await;
+        let after = Fixture.identity(&state, &user).await;
 
-        assert_eq!(identity.expect("lookup"), None, "not enrolled");
+        assert_eq!(before.expect("lookup"), None, "not enrolled");
+        assert_eq!(claimed.expect("claim"), ClaimOutcome::Claimed, "claimed");
+        assert_eq!(
+            after.expect("lookup"),
+            Some(Identity {
+                identifier: "fixture-user-id".to_owned(),
+                uri: "fixture:fixture-user-id".to_owned(),
+                status: IdentityStatus::Active,
+            }),
+            "enrolled under the claimed ID"
+        );
     }
 }

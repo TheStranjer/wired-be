@@ -155,7 +155,11 @@ cite these decisions by number.
 
     The same flag covers `GET /api/v1/wired/protocols` (`src/api/wired.rs`),
     which says, for each enabled protocol, whether the account is on it and
-    under which ID, or else suggests one.
+    under which ID, or else suggests one. `POST
+    /api/v1/wired/protocols/{protocol}/claim` enrols an existing account on a
+    protocol (its own ID, or the suggestion), and `POST /api/v1/accounts`
+    accepts `wired_identifiers` to claim IDs at sign-up; both use
+    `claim_identity`'s rules.
 
 ## Writing tests
 

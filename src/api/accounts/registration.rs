@@ -11,8 +11,13 @@ use serde::{Deserialize, Serialize};
 use crate::{
     api::oauth::issue::TokenResponse,
     auth::{AWAITING_APPROVAL_ID, EMAIL_UNCONFIRMED_ID},
+    config::Config,
     extract::flex,
-    models::user::{User, register::RegisterParams},
+    models::user::{
+        User,
+        register::{FieldErrors, RegisterError, RegisterParams},
+    },
+    protocols::ProtocolId,
 };
 
 use super::{REGISTERED_AWAITING_APPROVAL, REGISTERED_AWAITING_CONFIRMATION};
@@ -64,13 +69,62 @@ pub(super) struct CreateAccountParams {
     /// `bio`.
     #[serde(default)]
     bio: Option<String>,
+    /// A Wired extension: the ID the registrant wants on each protocol,
+    /// keyed by protocol id (`{"fixture": "custom-name"}`). A protocol
+    /// without an entry gets the ID derived from the username.
+    #[serde(default)]
+    wired_identifiers: Option<BTreeMap<String, String>>,
+}
+
+/// The [`FieldErrors`] key under which `wired_identifiers` failures are reported.
+const WIRED_IDENTIFIERS_FIELD: &str = "wired_identifiers";
+
+/// The protocol named `key` in `wired_identifiers`, when `config` enables it.
+fn enabled_protocol(key: &str, config: &Config) -> Option<ProtocolId> {
+    ProtocolId::parse(key).filter(|id| config.protocols.contains(*id))
 }
 
 impl CreateAccountParams {
+    /// The IDs `wired_identifiers` asks for, keyed by the protocol they are for.
+    ///
+    /// # Errors
+    ///
+    /// [`RegisterError::Invalid`] under `wired_identifiers`, naming every
+    /// key that is not the id of an enabled protocol.
+    pub(super) fn requested_identifiers(
+        &self,
+        config: &Config,
+    ) -> Result<BTreeMap<ProtocolId, String>, RegisterError> {
+        let none_requested = BTreeMap::new();
+        let requested = self.wired_identifiers.as_ref().unwrap_or(&none_requested);
+        let messages: Vec<String> = requested
+            .keys()
+            .filter(|key| enabled_protocol(key, config).is_none())
+            .map(|key| format!("{key} is not an enabled protocol"))
+            .collect();
+        if messages.is_empty() {
+            Ok(requested
+                .iter()
+                .filter_map(|(key, identifier)| {
+                    Some((enabled_protocol(key, config)?, identifier.clone()))
+                })
+                .collect())
+        } else {
+            Err(RegisterError::Invalid(FieldErrors::from([(
+                WIRED_IDENTIFIERS_FIELD,
+                messages,
+            )])))
+        }
+    }
+
     /// The registration [`RegisterParams`] these body parameters claim:
     /// `fullname` is Pleroma's display `name` fallback to the username,
-    /// and `reason` rides along for storage.
-    pub(super) fn into_register_params(self) -> RegisterParams {
+    /// `reason` rides along for storage, and `identifiers` are the IDs
+    /// [`requested_identifiers`](Self::requested_identifiers) accepted.
+    pub(super) fn into_register_params(
+        self,
+        identifiers: BTreeMap<ProtocolId, String>,
+    ) -> RegisterParams {
         RegisterParams {
             nickname: self.username,
             email: self.email,
@@ -81,7 +135,7 @@ impl CreateAccountParams {
             // This endpoint carries no provider: the email is only ever
             // confirmed by the link the confirmation letter sends.
             provider_email_verified: false,
-            identifiers: BTreeMap::new(),
+            identifiers,
         }
     }
 }
@@ -149,6 +203,7 @@ mod tests {
 
     use crate::{
         api::accounts::test_support::stored_user,
+        config::{BASE_URL_VAR, DATABASE_URL_VAR, PROTOCOLS_VAR, TEST_BASE_URL, TEST_DATABASE_URL},
         error::{AppError, AppResult},
         models::{oauth_token::OauthToken, user::Flag},
     };
@@ -275,13 +330,81 @@ mod tests {
             "confirm": "PlzDontHackLain",
         }))
         .expect("a full body");
-        let register = params.into_register_params();
+        let register = params.into_register_params(BTreeMap::new());
         assert_eq!(register.nickname, "lain", "username is the nickname");
         assert_eq!(register.email.as_deref(), Some("lain@example.org"), "email");
         assert_eq!(register.password, "PlzDontHackLain", "password");
         assert_eq!(register.name.as_deref(), Some("Lain Iwakura"), "fullname");
         assert_eq!(register.bio.as_deref(), Some("wired"), "bio");
         assert_eq!(register.reason.as_deref(), Some("let me in"), "reason");
+    }
+
+    /// A config running `ActivityPub` and the fixture protocol.
+    fn config_with_fixture() -> Config {
+        Config::from_lookup(|key| match key {
+            DATABASE_URL_VAR => Some(TEST_DATABASE_URL.to_owned()),
+            BASE_URL_VAR => Some(TEST_BASE_URL.to_owned()),
+            PROTOCOLS_VAR => Some("activitypub,fixture".to_owned()),
+            _ => None,
+        })
+        .expect("the fixed fixture config is valid")
+    }
+
+    /// A registration body with the given `wired_identifiers`.
+    fn asking_for(wired_identifiers: &Value) -> CreateAccountParams {
+        registration_params(json!({
+            "username": "lain",
+            "password": "PlzDontHackLain",
+            "agreement": true,
+            "wired_identifiers": wired_identifiers,
+        }))
+        .expect("a body with wired_identifiers")
+    }
+
+    #[test]
+    fn wired_identifiers_default_to_none_requested() {
+        let params = registration_params(json!({
+            "username": "lain",
+            "password": "PlzDontHackLain",
+            "agreement": true,
+        }))
+        .expect("a body without wired_identifiers");
+        let requested = params.requested_identifiers(&config_with_fixture());
+        assert!(
+            requested.expect("nothing to refuse").is_empty(),
+            "no field, no requests"
+        );
+    }
+
+    #[test]
+    fn wired_identifiers_of_enabled_protocols_are_requested() {
+        let params = asking_for(&json!({"fixture": "custom-name"}));
+        let requested = params
+            .requested_identifiers(&config_with_fixture())
+            .expect("the fixture is enabled");
+        assert_eq!(
+            requested,
+            BTreeMap::from([(ProtocolId::Fixture, "custom-name".to_owned())]),
+            "the ID is requested for the fixture"
+        );
+    }
+
+    #[test]
+    fn wired_identifiers_of_unknown_or_disabled_protocols_are_refused() {
+        let params = asking_for(&json!({"fixture": "custom-name", "nostr": "x"}));
+        let Err(RegisterError::Invalid(errors)) =
+            params.requested_identifiers(&Config::for_tests())
+        else {
+            panic!("the fixture is disabled and nostr is unknown");
+        };
+        assert_eq!(
+            errors.get(WIRED_IDENTIFIERS_FIELD),
+            Some(&vec![
+                "fixture is not an enabled protocol".to_owned(),
+                "nostr is not an enabled protocol".to_owned(),
+            ]),
+            "every refused key is named"
+        );
     }
 
     #[test]

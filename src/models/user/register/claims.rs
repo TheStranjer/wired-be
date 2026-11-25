@@ -1,9 +1,11 @@
-//! The identity claims of a registration: one identity per enabled protocol,
-//! written on the transaction that inserts the user.
+//! The identity claims of an account: one identity per enabled protocol at
+//! registration, written on the transaction that inserts the user, and one
+//! more protocol later through [`claim_identity`].
 //!
 //! The claim rules are in [`crate::protocols::identity`]. This module is the
-//! registration's side of them: it picks each protocol's ID and collects
-//! every failure, so the registrant sees all of them at once.
+//! account side of them: it picks each protocol's ID and collects every
+//! failure, so the caller sees all of them at once. Both paths judge a
+//! requested ID with the same validator and report a taken one the same way.
 
 use std::collections::BTreeMap;
 
@@ -12,10 +14,19 @@ use sqlx::PgConnection;
 use super::{FieldErrors, RegisterError, error::add_error, validate::HAS_ALREADY_BEEN_TAKEN};
 use crate::{
     config::Config,
+    error::AppError,
     models::user::User,
-    protocols::{ProtocolId, adapter::ProtocolAdapter, identity::ClaimOutcome, registry},
+    protocols::{
+        ProtocolId,
+        adapter::ProtocolAdapter,
+        identity::{ClaimOutcome, suggest_identifier},
+        registry,
+    },
     state::AppState,
 };
+
+/// The message of an account that already has an identity on the protocol.
+const ALREADY_ENROLLED: &str = "has already been claimed by this account";
 
 /// Claims `user`'s identity on every enabled protocol, in registry order.
 ///
@@ -58,6 +69,73 @@ pub(super) async fn claim_identities(
     } else {
         Err(RegisterError::Invalid(errors))
     }
+}
+
+/// Claims `user`'s identity on `adapter`'s protocol, for an account that already exists.
+///
+/// A blank or missing `requested` takes the ID
+/// [`suggest_identifier`] finds free; a given one is validated, and may turn out
+/// taken. The claim runs in its own transaction, committed only when it wins.
+///
+/// # Errors
+///
+/// [`RegisterError::Invalid`] under the protocol's
+/// [`identifier_field`](ProtocolAdapter::identifier_field) when the account is already on
+/// the protocol, the ID fails validation, or the ID is taken;
+/// [`RegisterError::Failed`] for a database failure or when no free ID can be suggested.
+pub async fn claim_identity(
+    state: &AppState,
+    adapter: &dyn ProtocolAdapter,
+    user: &User,
+    requested: Option<&str>,
+) -> Result<(), RegisterError> {
+    let field = adapter.identifier_field();
+    if adapter.identity(state, user).await?.is_some() {
+        return Err(single_error(field, ALREADY_ENROLLED));
+    }
+    let identifier =
+        identifier_to_claim(state, adapter, user, requested.unwrap_or_default()).await?;
+    let mut tx = state.db.begin().await.map_err(AppError::from)?;
+    if adapter.claim(&mut tx, user, &identifier, state).await? == ClaimOutcome::Taken {
+        return Err(single_error(field, HAS_ALREADY_BEEN_TAKEN));
+    }
+    tx.commit().await.map_err(AppError::from)?;
+    Ok(())
+}
+
+/// The ID a late claim asks for: `requested` validated, or the suggestion when it is blank.
+///
+/// # Errors
+///
+/// [`RegisterError::Invalid`] with the validation messages of a requested ID;
+/// [`RegisterError::Failed`] for a database failure or when no free ID can be suggested.
+async fn identifier_to_claim(
+    state: &AppState,
+    adapter: &dyn ProtocolAdapter,
+    user: &User,
+    requested: &str,
+) -> Result<String, RegisterError> {
+    let wanted = requested.trim();
+    if wanted.is_empty() {
+        let mut conn = state.db.acquire().await.map_err(AppError::from)?;
+        return Ok(suggest_identifier(adapter, &mut conn, &user.nickname, &state.config).await?);
+    }
+    adapter
+        .validate_identifier(wanted, &state.config)
+        .map_err(|messages| {
+            let mut errors = FieldErrors::new();
+            for message in &messages {
+                add_error(&mut errors, adapter.identifier_field(), message);
+            }
+            RegisterError::Invalid(errors)
+        })
+}
+
+/// A [`RegisterError::Invalid`] with one `message` under `field`.
+fn single_error(field: &'static str, message: &str) -> RegisterError {
+    let mut errors = FieldErrors::new();
+    add_error(&mut errors, field, message);
+    RegisterError::Invalid(errors)
 }
 
 /// The validated ID to claim on `adapter`'s protocol: `requested`, else derived from `nickname`.
@@ -233,6 +311,100 @@ mod tests {
         let user = outcome.expect("a protocol that is not enabled is not claimed");
         assert_eq!(user.nickname, "ignorer", "the registration landed");
         assert!(!fixture_holds(db.pool(), "bad_id").await, "nothing claimed");
+    }
+
+    /// The failures of a late claim that must have been refused as invalid.
+    fn claim_errors(outcome: Result<(), RegisterError>) -> FieldErrors {
+        match outcome {
+            Err(RegisterError::Invalid(errors)) => errors,
+            other => panic!("expected an Invalid claim, got {other:?}"),
+        }
+    }
+
+    /// A late claim without an ID takes the suggestion, derived from the nickname.
+    #[tokio::test]
+    async fn late_claim_without_an_identifier_takes_the_suggestion() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let state = test_state_with(db.pool(), config_with_fixture());
+        let user = crate::test_fixtures::local_user(db.pool(), "Late_Suggested").await;
+
+        let blank = claim_identity(&state, &Fixture, &user, Some("  ")).await;
+
+        blank.expect("a blank ID asks for the suggestion");
+        assert!(fixture_holds(db.pool(), "late-suggested").await, "claimed");
+    }
+
+    /// A late claim uses the requested ID, normalised, instead of the derived one.
+    #[tokio::test]
+    async fn late_claim_uses_the_requested_identifier() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let state = test_state_with(db.pool(), config_with_fixture());
+        let user = crate::test_fixtures::local_user(db.pool(), "late_requester").await;
+
+        let outcome = claim_identity(&state, &Fixture, &user, Some(" Late-Chosen ")).await;
+
+        outcome.expect("the requested ID is free");
+        assert!(fixture_holds(db.pool(), "late-chosen").await, "requested");
+        assert!(
+            !fixture_holds(db.pool(), "late-requester").await,
+            "not derived"
+        );
+    }
+
+    /// A requested ID that fails validation is refused with the protocol's message.
+    #[tokio::test]
+    async fn late_claim_of_an_invalid_identifier_is_refused() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let state = test_state_with(db.pool(), config_with_fixture());
+        let user = crate::test_fixtures::local_user(db.pool(), "late_invalid").await;
+
+        let outcome = claim_identity(&state, &Fixture, &user, Some("bad_id")).await;
+
+        assert_eq!(
+            claim_errors(outcome).get("fixture_identifier"),
+            Some(&vec![FIXTURE_BAD_CHARACTER.to_owned()]),
+            "the fixture's own message"
+        );
+    }
+
+    /// A requested ID another account holds is refused as taken.
+    #[tokio::test]
+    async fn late_claim_of_a_taken_identifier_is_refused() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let state = test_state_with(db.pool(), config_with_fixture());
+        let user = crate::test_fixtures::local_user(db.pool(), "late_taker").await;
+        mark_taken("late-taken");
+
+        let outcome = claim_identity(&state, &Fixture, &user, Some("late-taken")).await;
+
+        assert_eq!(
+            claim_errors(outcome).get("fixture_identifier"),
+            Some(&vec![HAS_ALREADY_BEEN_TAKEN.to_owned()]),
+            "the taken message"
+        );
+    }
+
+    /// An account that already has the identity cannot claim another.
+    #[tokio::test]
+    async fn late_claim_twice_is_refused() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let state = test_state_with(db.pool(), config_with_fixture());
+        let user = crate::test_fixtures::local_user(db.pool(), "late_twice").await;
+        claim_identity(&state, &Fixture, &user, None)
+            .await
+            .expect("the first claim lands");
+
+        let second = claim_identity(&state, &Fixture, &user, Some("late-twice-again")).await;
+
+        assert_eq!(
+            claim_errors(second).get("fixture_identifier"),
+            Some(&vec![ALREADY_ENROLLED.to_owned()]),
+            "the already-claimed message"
+        );
+        assert!(
+            !fixture_holds(db.pool(), "late-twice-again").await,
+            "the second ID was not claimed"
+        );
     }
 
     /// An invited registration that fails on a claim spends no invite.

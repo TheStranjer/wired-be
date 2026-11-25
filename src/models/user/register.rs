@@ -42,7 +42,7 @@
 //! write, `claims` the per-protocol identity claims made in that write's
 //! transaction, and `modes` what the two registration-mode settings decide. Those
 //! children are this module's internals; what the rest of the crate uses is
-//! here — [`create_local_user`], [`RegisterParams`], [`FieldErrors`],
+//! here — [`create_local_user`], [`claim_identity`], [`RegisterParams`], [`FieldErrors`],
 //! [`RegisterError`], [`authenticate`] and [`authenticate_any_status`],
 //! beside the crate-internal `is_plausible_email` — so outside paths stay
 //! `crate::models::user::register::…`.
@@ -59,6 +59,7 @@ mod validate;
 #[cfg(test)]
 mod test_support;
 
+pub use claims::claim_identity;
 pub use error::RegisterError;
 pub use login::{authenticate, authenticate_any_status};
 
