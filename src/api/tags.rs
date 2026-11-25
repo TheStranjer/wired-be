@@ -72,7 +72,7 @@ use crate::{
     models::{featured_tag, hashtag, hashtag_follow},
     oauth::scopes::{READ, READ_FOLLOWS, WRITE_ACCOUNTS, WRITE_FOLLOWS},
     pagination::{MAX_LIMIT, OrdinalPageParams, link_for_page, set_link_header},
-    services::federation_out,
+    protocols::events::{AccountEvent, dispatch},
     state::AppState,
 };
 
@@ -228,7 +228,7 @@ async fn feature_tag(
     match featured_tag::feature(&state.db, auth.0.id, &tag).await? {
         featured_tag::Featured::Added(_) => {
             debug!(hashtag = %tag.id, user = %auth.0.id, "hashtag featured");
-            federation_out::after_profile_updated(&state, &auth.0).await;
+            dispatch(&state, &auth.0, AccountEvent::ProfileChanged).await;
         }
         featured_tag::Featured::Existing(_) => {}
         featured_tag::Featured::LimitReached => {
@@ -263,7 +263,7 @@ async fn unfeature_tag(
     let tag = known_tag(&state, &usable).await?;
     if featured_tag::unfeature_tag(&state.db, auth.0.id, tag.id).await? {
         debug!(hashtag = %tag.id, user = %auth.0.id, "hashtag unfeatured");
-        federation_out::after_profile_updated(&state, &auth.0).await;
+        dispatch(&state, &auth.0, AccountEvent::ProfileChanged).await;
     }
     let following = hashtag_follow::is_following(&state.db, auth.0.id, tag.id).await?;
     Ok(Json(

@@ -44,7 +44,7 @@ use crate::{
         user::User,
     },
     oauth::scopes::{READ_ACCOUNTS, WRITE_ACCOUNTS},
-    services::federation_out,
+    protocols::events::{AccountEvent, dispatch},
     state::AppState,
     util::id::parse_id,
 };
@@ -135,7 +135,7 @@ async fn create(
     match featured_tag::feature(&state.db, auth.0.id, &tag).await? {
         Featured::Added(entry) => {
             debug!(user = %auth.0.id, tag = %tag.name, "tag featured");
-            federation_out::after_profile_updated(&state, &auth.0).await;
+            dispatch(&state, &auth.0, AccountEvent::ProfileChanged).await;
             Ok(Json(FeaturedTag::new(
                 &state.config.base_url,
                 &auth.0.nickname,
@@ -166,7 +166,7 @@ async fn remove(
         return Err(AppError::NotFound);
     }
     debug!(user = %auth.0.id, featured = %row, "tag unfeatured");
-    federation_out::after_profile_updated(&state, &auth.0).await;
+    dispatch(&state, &auth.0, AccountEvent::ProfileChanged).await;
     Ok(Json(json!({})))
 }
 

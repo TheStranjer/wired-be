@@ -9,11 +9,19 @@
 #![cfg(test)]
 
 use axum::{Router, http::StatusCode};
-use wired_be::config::{
-    BASE_URL_VAR, Config, DATABASE_URL_VAR, PROTOCOLS_VAR, TEST_BASE_URL, TEST_DATABASE_URL,
+use sqlx::PgPool;
+use uuid::Uuid;
+use wired_be::{
+    config::{
+        BASE_URL_VAR, Config, DATABASE_URL_VAR, PROTOCOLS_VAR, TEST_BASE_URL, TEST_DATABASE_URL,
+    },
+    protocols::{
+        events::AccountEvent,
+        fixture::{Recorded, recorded_for},
+    },
 };
 
-use crate::common;
+use crate::{common, remote};
 
 /// The `Accept` value of an `ActivityPub` client.
 const ACTIVITY_ACCEPT: &str = "application/activity+json";
@@ -179,4 +187,82 @@ async fn core_documents_are_served_without_activitypub() {
         .send(&app)
         .await;
     assert_eq!(host_meta.status, StatusCode::OK, "host-meta is core's");
+}
+
+/// The `write:accounts` scope `update_credentials` needs.
+const WRITE_ACCOUNTS: &str = "write:accounts";
+
+/// How many `Update` publish jobs the profile debounce key of `user_id` has queued.
+async fn queued_profile_updates(pool: &PgPool, user_id: Uuid) -> i64 {
+    sqlx::query_scalar::<_, i64>(
+        "SELECT count(*) FROM jobs WHERE kind = 'federator.publish' AND unique_key = $1",
+    )
+    .bind(format!("profile-update:{user_id}"))
+    .fetch_one(pool)
+    .await
+    .expect("the publish count reads")
+}
+
+/// Edits the display name of the account behind `token`, asserting a 200.
+async fn rename_through_update_credentials(app: &Router, token: &str) {
+    let response = common::TestRequest::patch("/api/v1/accounts/update_credentials")
+        .bearer(token)
+        .form(&[("display_name", "Renamed")])
+        .send(app)
+        .await;
+    common::assert_answer(&response, StatusCode::OK, "the profile write");
+}
+
+/// With `activitypub,fixture` a profile edit fires `ProfileChanged` and still federates the `Update`.
+#[tokio::test]
+async fn update_credentials_records_the_event_and_federates_the_update() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let alice = remote::keyed_local_user(&pool, "profile-event-both").await;
+    let token = common::create_app_and_token(&pool, &alice, WRITE_ACCOUNTS).await;
+    let app =
+        common::test_app_with_config(pool.clone(), config_with_protocols("activitypub,fixture"));
+
+    rename_through_update_credentials(&app, &token).await;
+
+    assert_eq!(
+        recorded_for(alice.id),
+        vec![Recorded::Event(AccountEvent::ProfileChanged)],
+        "the fixture saw one ProfileChanged"
+    );
+    assert_eq!(
+        queued_profile_updates(&pool, alice.id).await,
+        1,
+        "ActivityPub queued its Update"
+    );
+}
+
+/// With only `fixture` the same edit records the event and enqueues no `ActivityPub` delivery.
+#[tokio::test]
+async fn update_credentials_without_activitypub_records_the_event_only() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let alice = remote::keyed_local_user(&pool, "profile-event-fixture").await;
+    let token = common::create_app_and_token(&pool, &alice, WRITE_ACCOUNTS).await;
+    let app = common::test_app_with_config(pool.clone(), config_with_protocols("fixture"));
+
+    rename_through_update_credentials(&app, &token).await;
+
+    assert_eq!(
+        recorded_for(alice.id),
+        vec![Recorded::Event(AccountEvent::ProfileChanged)],
+        "the fixture saw one ProfileChanged"
+    );
+    assert_eq!(
+        queued_profile_updates(&pool, alice.id).await,
+        0,
+        "no ActivityPub Update was queued"
+    );
+    let deliveries = sqlx::query_scalar::<_, i64>(
+        "SELECT count(*) FROM jobs WHERE kind IN ('federator.publish', 'federator.deliver')",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("the job count reads");
+    assert_eq!(deliveries, 0, "no ActivityPub job of any kind");
 }
