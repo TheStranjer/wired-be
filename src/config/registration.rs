@@ -141,15 +141,26 @@ mod tests {
             ("false", false),
             ("FaLsE", false),
             ("0", false),
-            ("", true),
+            ("", false),
         ] {
             let config = config_with(&[(REGISTRATIONS_OPEN_VAR, value)]);
             assert_eq!(
                 config.registrations_open.get(),
                 want,
-                "REGISTRATIONS_OPEN={value:?} means {want} (unset is open)"
+                "REGISTRATIONS_OPEN={value:?} means {want} (blank is closed)"
             );
         }
+    }
+
+    /// An unset `REGISTRATIONS_OPEN` is closed: opening registration is the
+    /// operator's explicit decision.
+    #[test]
+    fn registrations_are_closed_when_unset() {
+        let config = config_with(&[]);
+        assert!(
+            !config.registrations_open.get(),
+            "unset REGISTRATIONS_OPEN means closed"
+        );
     }
 
     #[test]

@@ -36,6 +36,10 @@ mod account_statuses;
 /// the confirmation link, the resend, and the instance flags they drive.
 mod registration_modes;
 
+/// The out-of-the-box registration state: closed unless
+/// `REGISTRATIONS_OPEN=true`.
+mod registration_default;
+
 /// The core account endpoints: `verify_credentials`, `GET /accounts/{id}` and `lookup`.
 mod accounts;
 

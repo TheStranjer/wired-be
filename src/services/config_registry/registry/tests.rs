@@ -112,7 +112,7 @@ fn subkeys_and_restart_flags_follow_the_ticket() {
 /// the environment-derived config defaults.
 #[test]
 fn instance_defaults_carry_the_whitelisted_subkeys() {
-    let config = Config::for_tests();
+    let config = crate::config::test_support::config_with(&[]);
     let Value::Object(map) = instance_defaults(&config) else {
         panic!("the defaults are a keyword object");
     };
@@ -126,7 +126,11 @@ fn instance_defaults_carry_the_whitelisted_subkeys() {
     }
     assert_eq!(map["name"], json!(config.instance_name), "name from env");
     assert_eq!(map["email"], json!(""), "unset email is empty");
-    assert_eq!(map["registrations_open"], json!(true), "the env default");
+    assert_eq!(
+        map["registrations_open"],
+        json!(false),
+        "the env default is closed"
+    );
     assert_eq!(
         map["limit"],
         json!(config.max_status_chars),

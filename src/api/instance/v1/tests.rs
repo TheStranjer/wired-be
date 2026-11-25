@@ -140,7 +140,7 @@ fn the_empty_document_holds_the_instance_identity() {
         "https://test.example/media/default/thumbnail.jpg"
     );
     assert_eq!(document["languages"], json!(["en"]), "the config languages");
-    assert_eq!(document["registrations"], true, "open by default");
+    assert_eq!(document["registrations"], true, "open in the test config");
     assert_eq!(
         document["approval_required"], false,
         "REGISTRATIONS_APPROVAL_REQUIRED is off by default"

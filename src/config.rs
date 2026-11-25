@@ -247,7 +247,7 @@ impl Config {
         Self::from_lookup(|key| match key {
             DATABASE_URL_VAR => Some(TEST_DATABASE_URL.to_owned()),
             BASE_URL_VAR => Some(TEST_BASE_URL.to_owned()),
-            HTTP_ALLOW_PRIVATE_HOSTS_VAR => Some("true".to_owned()),
+            HTTP_ALLOW_PRIVATE_HOSTS_VAR | REGISTRATIONS_OPEN_VAR => Some("true".to_owned()),
             RATE_LIMITS_ENABLED_VAR => Some("false".to_owned()),
             RICH_MEDIA_IGNORE_HOSTS_VAR => Some(DEFAULT_RICH_MEDIA_IGNORE_HOSTS.to_owned()),
             RICH_MEDIA_REMOTE_VAR => Some(DEFAULT_RICH_MEDIA_REMOTE.to_string()),
@@ -304,7 +304,7 @@ impl Config {
             allow_account_deletion: Toggle::new(DEFAULT_ALLOW_ACCOUNT_DELETION),
             captcha_enabled: Toggle::new(DEFAULT_CAPTCHA_ENABLED),
             healthcheck_enabled: Toggle::new(DEFAULT_HEALTHCHECK_ENABLED),
-            registrations_open: Toggle::new(DEFAULT_REGISTRATIONS_OPEN),
+            registrations_open: Toggle::new(true),
             invites_enabled: Toggle::new(DEFAULT_INVITES_ENABLED),
             registrations_approval_required: Toggle::new(DEFAULT_REGISTRATIONS_APPROVAL_REQUIRED),
             search_statuses_unauthenticated: Toggle::new(DEFAULT_SEARCH_STATUSES_UNAUTHENTICATED),
@@ -425,8 +425,13 @@ mod tests {
             (RATE_LIMITS_ENABLED_VAR, "false"),
             (RICH_MEDIA_IGNORE_HOSTS_VAR, DEFAULT_RICH_MEDIA_IGNORE_HOSTS),
             (RICH_MEDIA_REMOTE_VAR, "false"),
+            (REGISTRATIONS_OPEN_VAR, "true"),
         ]))
         .unwrap();
+        assert!(
+            config.registrations_open.get(),
+            "the test config opts in to open registration"
+        );
         assert_eq!(config, expected, "for_tests equals from_lookup");
     }
 
@@ -441,6 +446,7 @@ mod tests {
             (RATE_LIMITS_ENABLED_VAR, "false"),
             (RICH_MEDIA_IGNORE_HOSTS_VAR, DEFAULT_RICH_MEDIA_IGNORE_HOSTS),
             (RICH_MEDIA_REMOTE_VAR, "false"),
+            (REGISTRATIONS_OPEN_VAR, "true"),
         ]))
         .unwrap();
         assert_eq!(

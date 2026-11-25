@@ -51,7 +51,9 @@ pub fn test_config_with_rate_limits(rate_limits: &str) -> Config {
     Config::from_lookup(|key| match key {
         wired_be::config::DATABASE_URL_VAR => Some(wired_be::config::TEST_DATABASE_URL.to_owned()),
         wired_be::config::BASE_URL_VAR => Some(wired_be::config::TEST_BASE_URL.to_owned()),
-        wired_be::config::RATE_LIMITS_ENABLED_VAR => Some("true".to_owned()),
+        wired_be::config::RATE_LIMITS_ENABLED_VAR | wired_be::config::REGISTRATIONS_OPEN_VAR => {
+            Some("true".to_owned())
+        }
         wired_be::config::RATE_LIMITS_VAR => Some(rate_limits.to_owned()),
         _ => None,
     })

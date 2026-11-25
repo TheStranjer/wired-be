@@ -243,10 +243,12 @@ pub const DEFAULT_CAPTCHA_ENABLED: bool = false;
 /// Healthcheck state used when `HEALTHCHECK_ENABLED` is unset: the
 /// endpoint answers the standard fallback 404 until it is turned on.
 pub const DEFAULT_HEALTHCHECK_ENABLED: bool = false;
-/// Registration state used when `REGISTRATIONS_OPEN` is unset: Pleroma's
-/// `[:instance, :registrations_open]` default is open, so closing
-/// registration is always an explicit operator decision.
-pub const DEFAULT_REGISTRATIONS_OPEN: bool = true;
+/// Registration state used when `REGISTRATIONS_OPEN` is unset: closed, so
+/// opening registration is always an explicit operator decision.
+///
+/// A closed instance bootstraps its first staff account through the CLI
+/// user-create path (`src/cli.rs`), not through sign-up.
+pub const DEFAULT_REGISTRATIONS_OPEN: bool = false;
 /// Invite state used when `INVITES_ENABLED` is unset: invites are off, so
 /// while registrations are closed every registration attempt is refused —
 /// accepting invite tokens is an explicit operator decision.
