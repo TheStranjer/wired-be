@@ -17,6 +17,7 @@ use super::{
     handlers::{streaming_api_url, version_string},
     pleroma::PleromaBlock,
     v1::{MediaAttachmentsConfiguration, PollsConfiguration, Rule, StatusesConfiguration},
+    wired::WiredBlock,
 };
 
 /// The `GET /api/v2/instance` document, in the shape Pleroma's
@@ -55,6 +56,8 @@ pub(super) struct InstanceV2 {
     rules: Vec<Rule>,
     /// Pleroma's extension block, the same [`PleromaBlock`] v1 writes.
     pleroma: PleromaBlock,
+    /// Wired's extension block, the same [`WiredBlock`] v1 writes.
+    wired: WiredBlock,
 }
 
 impl InstanceV2 {
@@ -87,6 +90,7 @@ impl InstanceV2 {
             contact: Contact::build(config, contact),
             rules: rules.iter().map(Rule::from_model).collect(),
             pleroma,
+            wired: WiredBlock::for_config(config),
         }
     }
 }

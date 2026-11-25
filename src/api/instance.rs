@@ -48,7 +48,7 @@
 //!
 //! The module is split by concern: `handlers` holds the endpoint functions,
 //! `v1` the `/api/v1/instance` document, `v2` the `/api/v2/instance`
-//! document, `pleroma` the extension block both documents carry, `stats` the cached
+//! document, `pleroma` and `wired` the extension blocks both documents carry, `stats` the cached
 //! counters (shared with `NodeInfo`), `domain_blocks` the domain-block and
 //! extended-description views and `terms` the terms-of-service view. This
 //! file keeps the shared constants, the remaining SQL and the two routers.
@@ -69,6 +69,7 @@ mod terms;
 mod test_support;
 mod v1;
 mod v2;
+mod wired;
 
 use handlers::{
     show_activity, show_domain_blocks, show_extended_description, show_instance, show_instance_v2,

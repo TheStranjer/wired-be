@@ -74,7 +74,11 @@ pub const POST_FORMATS: [&str; 3] = ["text/plain", "text/html", "text/markdown"]
 /// detection). The list describes the API dialect — which is what clients
 /// sniff — not which endpoint a given build has wired up yet, exactly as
 /// in Pleroma.
-const FEATURES: [&str; 25] = [
+///
+/// Wired's own capabilities follow Pleroma's, each named `wired:<name>`
+/// (`docs/ARCHITECTURE.md` decision 17); clients check the flag before they
+/// rely on the extension.
+const FEATURES: [&str; 26] = [
     "pleroma_api",
     "mastodon_api",
     "mastodon_api_grouped_notifications",
@@ -100,6 +104,7 @@ const FEATURES: [&str; 25] = [
     "pleroma:group_actors",
     "pleroma:bookmark_folders",
     "pleroma:block_expiration",
+    "wired:protocols",
 ];
 
 /// The instance's advertised feature flags, in Pleroma's own order.
@@ -348,6 +353,7 @@ mod tests {
                 "pleroma:group_actors",
                 "pleroma:bookmark_folders",
                 "pleroma:block_expiration",
+                "wired:protocols",
             ][..],
             "every Pleroma-dialect flag stays advertised, in Pleroma's order"
         );

@@ -39,6 +39,7 @@ fn the_v2_document_holds_the_ticket_key_sets() {
             "title",
             "usage",
             "version",
+            "wired",
         ],
         "the ticket's v2 top-level key set"
     );
