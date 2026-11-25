@@ -12,7 +12,10 @@ use super::{
 };
 use crate::{
     error::AppResult,
-    util::{collections::group_pairs, emoji::display_name},
+    util::{
+        collections::group_pairs,
+        emoji::{canonical, display_name},
+    },
 };
 
 /// [`for_statuses`]: one aggregated row per `(status, emoji)` of a batch of
@@ -139,9 +142,10 @@ pub async fn reactors(
     emoji: Option<&str>,
     domain: Option<&str>,
 ) -> AppResult<Vec<ReactorGroup>> {
+    let key = emoji.map(canonical);
     let rows = sqlx::query_as::<_, ReactionRow>(REACTORS_SQL)
         .bind(status_id)
-        .bind(emoji)
+        .bind(key.as_deref())
         .bind(domain)
         .fetch_all(pool)
         .await?;

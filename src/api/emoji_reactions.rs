@@ -142,7 +142,7 @@ use crate::{
     },
     state::AppState,
     util::{
-        emoji::{Emoji, bare_shortcode, remote_shortcode},
+        emoji::{Emoji, bare_shortcode, canonical, remote_shortcode},
         id::new_activity_ap_id,
     },
 };
@@ -189,7 +189,8 @@ impl ReactionParams {
 #[derive(Debug)]
 struct Accepted {
     /// The emoji text as it goes into `emoji_reactions.emoji`: the unicode
-    /// grapheme as sent, or the `:shortcode:` text.
+    /// grapheme in its [`canonical`] spelling (`❤️` and `❤` are one), or the
+    /// `:shortcode:` text.
     text: String,
     /// The custom emoji's image URL, `None` for a unicode emoji.
     url: Option<String>,
@@ -545,7 +546,7 @@ async fn accepted_emoji(state: &AppState, text: &str) -> AppResult<Accepted> {
     };
     match classified {
         Emoji::Unicode(_) => Ok(Accepted {
-            text: text.to_owned(),
+            text: canonical(text).into_owned(),
             url: None,
             domain: None,
         }),

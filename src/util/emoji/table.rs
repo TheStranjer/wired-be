@@ -20,6 +20,9 @@ use std::sync::LazyLock;
 /// The U+FE0F variation selector that makes a sequence's base emoji-presented.
 const VARIATION_SELECTOR: char = '\u{FE0F}';
 
+/// The U+200D joiner that glues the parts of a ZWJ sequence together.
+const ZERO_WIDTH_JOINER: char = '\u{200D}';
+
 /// The files of `emoji-test.txt` lines, in no particular order.
 const SOURCES: [&str; 8] = [
     include_str!("table/a.txt"),
@@ -38,6 +41,10 @@ struct Table {
     qualified: Vec<&'static str>,
     /// The same sequences with every U+FE0F removed, sorted for binary search.
     bare: Vec<String>,
+    /// Every fully-qualified sequence without a zero-width joiner, paired with
+    /// its selector-free form and sorted by that form, so [`qualify`] can find
+    /// the qualified spelling of a stripped one.
+    by_bare: Vec<(String, &'static str)>,
 }
 
 /// The table, parsed on first use.
@@ -73,7 +80,31 @@ fn build() -> Table {
         .collect();
     bare.sort_unstable();
     bare.dedup();
-    Table { qualified, bare }
+    let mut by_bare: Vec<(String, &'static str)> = qualified
+        .iter()
+        .filter(|sequence| !sequence.contains(ZERO_WIDTH_JOINER))
+        .map(|&sequence| (without_selectors(sequence), sequence))
+        .collect();
+    by_bare.sort_unstable();
+    by_bare.dedup_by(|later, earlier| later.0 == earlier.0);
+    Table {
+        qualified,
+        bare,
+        by_bare,
+    }
+}
+
+/// The fully-qualified spelling of `sequence`, which may be given with or
+/// without its U+FE0F selectors; `None` when the table holds no joiner-free
+/// sequence of that shape.
+#[must_use]
+pub(super) fn qualify(sequence: &str) -> Option<&'static str> {
+    let bare = without_selectors(sequence);
+    let by_bare = &TABLE.by_bare;
+    let found = by_bare
+        .binary_search_by(|(key, _)| key.as_str().cmp(bare.as_str()))
+        .ok()?;
+    by_bare.get(found).map(|&(_, qualified)| qualified)
 }
 
 /// Whether `ch` is one of the 26 regional indicators U+1F1E6–U+1F1FF.
@@ -182,6 +213,28 @@ mod tests {
         assert!(is_emoji("\u{2764}"), "❤ without its selector");
         assert!(is_emoji("\u{2764}\u{FE0F}"), "❤ with it");
         assert!(is_emoji("#\u{20E3}"), "a keycap without its selector");
+    }
+
+    #[test]
+    fn a_stripped_spelling_qualifies_back() {
+        assert_eq!(qualify("\u{2764}"), Some("\u{2764}\u{FE0F}"), "the heart");
+        assert_eq!(
+            qualify("\u{2764}\u{FE0F}"),
+            Some("\u{2764}\u{FE0F}"),
+            "already qualified"
+        );
+        assert_eq!(
+            qualify("1\u{20E3}"),
+            Some("1\u{FE0F}\u{20E3}"),
+            "a keycap regains its selector"
+        );
+        assert_eq!(
+            qualify("\u{1F44D}"),
+            Some("\u{1F44D}"),
+            "no selector to add"
+        );
+        assert_eq!(qualify("x"), None, "not an emoji");
+        assert_eq!(qualify("\u{1F1EF}"), None, "a lone regional indicator");
     }
 
     #[test]

@@ -5,7 +5,7 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use super::EmojiReaction;
-use crate::error::AppResult;
+use crate::{error::AppResult, util::emoji::canonical};
 
 /// [`unreact_in_domain`]: one account's one emoji on one status; a pair that
 /// never reacted (or already withdrew) deletes nothing, so withdrawal is
@@ -53,10 +53,11 @@ pub async fn unreact_in_domain(
     emoji: &str,
     domain: Option<&str>,
 ) -> AppResult<Option<EmojiReaction>> {
+    let key = canonical(emoji);
     let removed = sqlx::query_as::<_, EmojiReaction>(UNREACT_SQL)
         .bind(user_id)
         .bind(status_id)
-        .bind(emoji)
+        .bind(&*key)
         .bind(domain)
         .fetch_optional(pool)
         .await?;
