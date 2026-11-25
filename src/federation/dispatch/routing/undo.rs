@@ -9,7 +9,7 @@ use crate::{
         dispatch::{ActivityView, Handlers, ObjectRef},
         json,
     },
-    jobs::JobError,
+    jobs::{JobError, JobErrorExt as _},
     models::{activity, user::User},
     state::AppState,
 };
@@ -58,7 +58,7 @@ async fn undo_inner(
     {
         let stored = activity::find_by_ap_id(&state.db, id)
             .await
-            .map_err(|err| JobError::Retry(format!("the undo lookup failed: {err}")))?;
+            .job_retry("the undo lookup failed")?;
         if let Some((kind, actor)) = stored {
             return Ok(Some((kind.to_owned(), actor)));
         }
@@ -78,7 +78,7 @@ async fn undo_inner(
         ObjectRef::Id(id) => {
             let stored = activity::find_by_ap_id(&state.db, id)
                 .await
-                .map_err(|err| JobError::Retry(format!("the undo lookup failed: {err}")))?;
+                .job_retry("the undo lookup failed")?;
             match stored {
                 None => {
                     debug!(inner = %id, "an Undo of an activity this instance never stored; ignoring");

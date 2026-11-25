@@ -17,7 +17,7 @@ use super::{
 };
 use crate::{
     federation::{json, mrf, policy::host_refused},
-    jobs::JobError,
+    jobs::{JobError, JobErrorExt as _},
     models::{user, user::User},
     state::AppState,
 };
@@ -65,7 +65,7 @@ pub(super) fn extract_incoming(args: &Value) -> Result<Incoming, JobError> {
 pub(super) async fn load_signer(state: &AppState, id: Uuid) -> Result<User, JobError> {
     user::get_by_id(&state.db, id)
         .await
-        .map_err(|err| JobError::Retry(format!("could not read the signer: {err}")))?
+        .job_retry("could not read the signer")?
         .ok_or_else(|| JobError::Discard("the signer account is gone".to_owned()))
 }
 
@@ -134,7 +134,7 @@ async fn policy_rejects(state: &AppState, view: &ActivityView) -> Result<bool, J
     };
     host_refused(state, &host)
         .await
-        .map_err(|err| JobError::Retry(format!("the instance policy read failed: {err}")))
+        .job_retry("the instance policy read failed")
 }
 
 #[cfg(test)]

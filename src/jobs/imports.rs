@@ -43,7 +43,10 @@ use crate::{
     api::{accounts::after_follow_changed, blocks::after_block_changed},
     error::AppError,
     federation::fetch_actor::get_or_fetch_by_acct,
-    jobs::{AttemptInfo, HandlerFuture, JobError, QUEUE_BACKGROUND, load_user, parse_args},
+    jobs::{
+        AttemptInfo, HandlerFuture, JobError, JobErrorExt as _, QUEUE_BACKGROUND, load_user,
+        parse_args,
+    },
     models::{
         block,
         follow::{self, FollowToggles},
@@ -367,7 +370,7 @@ async fn enqueue_next_chunk(
     };
     let _job = enqueue(&state.db, queued)
         .await
-        .map_err(|err| JobError::Retry(format!("{kind} chunk could not be enqueued: {err}")))?;
+        .job_retry(&format!("{kind} chunk could not be enqueued"))?;
     Ok(())
 }
 

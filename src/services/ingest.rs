@@ -111,7 +111,7 @@ use uuid::Uuid;
 
 use crate::{
     federation::{
-        dispatch::FederationError,
+        dispatch::{FederationError, TransientExt as _},
         fetch_object::{
             BACKFILL_MAX_ATTEMPTS, KIND_BACKFILL, KIND_QUOTE_BACKFILL, QUOTE_BACKFILL_MAX_ATTEMPTS,
             backfill_key, quote_backfill_key,
@@ -442,7 +442,7 @@ async fn seen_before(
 ) -> Result<Option<IngestOutcome>, FederationError> {
     let stored = status::get_by_uri(&state.db, uri)
         .await
-        .map_err(|err| FederationError::transient("the status uri read failed", &err))?;
+        .transient("the status uri read failed")?;
     Ok(stored.map(|row| {
         if row.deleted_at.is_some() {
             IngestOutcome::Ignored("tombstoned")
@@ -496,15 +496,8 @@ async fn drops_unsolicited(
     }
     let solicited = follow::has_local_followers(&state.db, author.id)
         .await
-        .map_err(|err| FederationError::transient("the follower gate read failed", &err))?;
+        .transient("the follower gate read failed")?;
     Ok(!solicited)
-}
-
-/// A remote count narrowed to the `integer` column's width: counts beyond
-/// it clamp to the column's maximum rather than refuse the whole post for
-/// a number nobody can vote into being true.
-fn whole(count: i64) -> i32 {
-    i32::try_from(count).unwrap_or(i32::MAX)
 }
 
 #[cfg(test)]

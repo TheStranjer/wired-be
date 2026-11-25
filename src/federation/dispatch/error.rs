@@ -48,6 +48,26 @@ impl FederationError {
     }
 }
 
+/// Lifts a failed [`Result`] into a [`FederationError::Transient`].
+///
+/// The one place a database or network failure gains its context, so how
+/// transient errors read, are logged or are classified changes here only.
+pub trait TransientExt<T> {
+    /// Maps an `Err` to [`FederationError::transient`] reading
+    /// `"{what}: {err}"`; an `Ok` passes through.
+    ///
+    /// # Errors
+    ///
+    /// [`FederationError::Transient`] when `self` is an `Err`.
+    fn transient(self, what: &str) -> Result<T, FederationError>;
+}
+
+impl<T, E: fmt::Display> TransientExt<T> for Result<T, E> {
+    fn transient(self, what: &str) -> Result<T, FederationError> {
+        self.map_err(|source| FederationError::transient(what, &source))
+    }
+}
+
 /// Whether the worker will run the job again, which is exactly when the
 /// ledger row must not stand in its way.
 pub(super) const fn is_retryable(err: &JobError) -> bool {
@@ -91,6 +111,22 @@ mod tests {
         assert_eq!(
             FederationError::permanent("the object", &cause),
             FederationError::Permanent("the object: connection reset".to_owned())
+        );
+    }
+
+    /// An `Ok` passes through; an `Err` becomes the transient variant with
+    /// the message and its source.
+    #[test]
+    fn the_transient_extension_wraps_only_an_error() {
+        let fine: Result<u8, &str> = Ok(7);
+        assert_eq!(fine.transient("the read"), Ok(7));
+
+        let failed: Result<u8, &str> = Err("connection reset");
+        assert_eq!(
+            failed.transient("the status read"),
+            Err(FederationError::Transient(
+                "the status read: connection reset".to_owned()
+            ))
         );
     }
 

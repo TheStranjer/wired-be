@@ -21,7 +21,7 @@ use crate::{
         signature::{SignedHeaders, SigningKey, sign_request},
         vocab::ACTIVITY_JSON,
     },
-    jobs::{AttemptInfo, HandlerFuture, JobError},
+    jobs::{AttemptInfo, HandlerFuture, JobError, JobErrorExt as _},
     models::user::{self, User},
     state::AppState,
     util::url::same_origin,
@@ -56,8 +56,8 @@ pub fn handle(state: AppState, attempt: AttemptInfo, args: Value) -> HandlerFutu
 /// [`JobError::RetryAfter`]. Ledger writes never feed back into any of
 /// that: they only log.
 async fn deliver(state: AppState, attempt: AttemptInfo, args: Value) -> Result<(), JobError> {
-    let args = serde_json::from_value::<DeliveryArgs>(args)
-        .map_err(|err| JobError::Discard(format!("malformed delivery arguments: {err}")))?;
+    let args =
+        serde_json::from_value::<DeliveryArgs>(args).job_discard("malformed delivery arguments")?;
     debug!(
         activity_id = %args.activity_id,
         inbox = %args.inbox,
@@ -72,7 +72,7 @@ async fn deliver(state: AppState, attempt: AttemptInfo, args: Value) -> Result<(
         ))
     })?;
     let body = serde_json::to_vec(&strip_bto_bcc(&args.body))
-        .map_err(|err| JobError::Discard(format!("the activity is not serializable: {err}")))?;
+        .job_discard("the activity is not serializable")?;
     let key_id = format!("{}{MAIN_KEY_FRAGMENT}", actor.ap_id);
     let signed = sign_request(
         "POST",
@@ -134,7 +134,7 @@ pub(super) fn activity_id_of(activity: &Value) -> AppResult<&str> {
 async fn signing_actor(state: &AppState, actor_id: Uuid) -> Result<User, JobError> {
     let found = user::get_by_id(&state.db, actor_id)
         .await
-        .map_err(|err| JobError::Retry(format!("could not read the signing actor: {err}")))?;
+        .job_retry("could not read the signing actor")?;
     found
         .filter(|actor| actor.local.get())
         .ok_or_else(|| JobError::Discard(format!("actor {actor_id} is not a local signer")))

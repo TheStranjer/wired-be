@@ -22,7 +22,7 @@ use tracing::debug;
 
 use crate::{
     federation::{
-        dispatch::{ActivityView, FederationError, Outcome},
+        dispatch::{ActivityView, FederationError, Outcome, TransientExt as _},
         json,
     },
     models::{
@@ -59,7 +59,7 @@ async fn answered_request(
     let found = match view.object.id() {
         Some(id) => quote_request::by_request_ap_id(&state.db, id)
             .await
-            .map_err(|err| FederationError::transient("could not read the quote request", &err))?,
+            .transient("could not read the quote request")?,
         None => None,
     };
     if let Some(row) = found {
@@ -127,7 +127,7 @@ pub(super) async fn fold_accept(
     }
     quote_request::accept(&state.db, row.id, &authorization)
         .await
-        .map_err(|err| FederationError::transient("could not store the quote grant", &err))?;
+        .transient("could not store the quote grant")?;
     debug!(quoting = %row.quoting_status_id, "a quote request was granted");
     republish(state, &row).await?;
     Ok(Some(Outcome::Handled))
@@ -180,7 +180,7 @@ pub(super) async fn fold_revocation(
 ) -> Result<Option<Outcome>, FederationError> {
     let found = quote_request::by_authorization_uri(&state.db, object_id)
         .await
-        .map_err(|err| FederationError::transient("could not read the quote grant", &err))?;
+        .transient("could not read the quote grant")?;
     let Some(row) = found else {
         return Ok(None);
     };
@@ -210,7 +210,7 @@ async fn withdraw(
     }
     quote_request::set_state(&state.db, row.id, next)
         .await
-        .map_err(|err| FederationError::transient("could not store the quote answer", &err))?;
+        .transient("could not store the quote answer")?;
     debug!(quoting = %row.quoting_status_id, state = next.as_str(), "a quote request was answered");
     if row.state() == QuoteRequestState::Accepted {
         republish(state, row).await?;
@@ -224,7 +224,7 @@ async fn withdraw(
 async fn republish(state: &AppState, row: &QuoteRequest) -> Result<(), FederationError> {
     let quoting = status::get_by_id(&state.db, row.quoting_status_id)
         .await
-        .map_err(|err| FederationError::transient("could not read the quoting status", &err))?;
+        .transient("could not read the quoting status")?;
     if let Some(quoting) = quoting {
         federation_out::after_status_edited(state, &quoting).await;
     }

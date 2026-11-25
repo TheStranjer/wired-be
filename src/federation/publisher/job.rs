@@ -8,7 +8,7 @@ use uuid::Uuid;
 
 use super::{PublishArgs, PublishOpts, publish};
 use crate::{
-    jobs::{AttemptInfo, HandlerFuture, JobError},
+    jobs::{AttemptInfo, HandlerFuture, JobError, JobErrorExt as _},
     models::user::{User, get_by_id},
     state::AppState,
 };
@@ -25,8 +25,8 @@ pub fn handle(state: AppState, _attempt: AttemptInfo, args: Value) -> HandlerFut
 /// discards; what may work later (a database hiccup in the fan-out)
 /// retries.
 async fn run_publish(state: AppState, args: Value) -> Result<(), JobError> {
-    let args = serde_json::from_value::<PublishArgs>(args)
-        .map_err(|err| JobError::Discard(format!("malformed publish arguments: {err}")))?;
+    let args =
+        serde_json::from_value::<PublishArgs>(args).job_discard("malformed publish arguments")?;
     if !activity_has_id(&args.activity) {
         return Err(JobError::Discard(
             "the activity carries no string `id`".to_owned(),
@@ -55,7 +55,7 @@ async fn run_publish(state: AppState, args: Value) -> Result<(), JobError> {
 async fn publishing_actor(state: &AppState, actor_id: Uuid) -> Result<User, JobError> {
     let found = get_by_id(&state.db, actor_id)
         .await
-        .map_err(|err| JobError::Retry(format!("could not read the publishing actor: {err}")))?;
+        .job_retry("could not read the publishing actor")?;
     found
         .filter(|candidate| candidate.local.get())
         .ok_or_else(|| JobError::Discard(format!("actor {actor_id} is not a local publisher")))

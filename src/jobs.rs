@@ -112,8 +112,40 @@ impl Error for JobError {}
 /// `job` names the job in the discard text
 /// (`"<job> job arguments are unusable: <cause>"`).
 pub(crate) fn parse_args<T: DeserializeOwned>(args: &Value, job: &str) -> Result<T, JobError> {
-    serde_json::from_value(args.clone())
-        .map_err(|err| JobError::Discard(format!("{job} job arguments are unusable: {err}")))
+    serde_json::from_value(args.clone()).job_discard(&format!("{job} job arguments are unusable"))
+}
+
+/// Lifts a failed [`Result`] into a [`JobError`], naming what failed.
+///
+/// The one place a handler's failure gains its context: the job's treatment
+/// ([`JobError::Retry`] or [`JobError::Discard`]) is the method picked, and
+/// the text reads `"{what}: {err}"`.
+pub trait JobErrorExt<T> {
+    /// Maps an `Err` to [`JobError::Retry`] reading `"{what}: {err}"`; an
+    /// `Ok` passes through.
+    ///
+    /// # Errors
+    ///
+    /// [`JobError::Retry`] when `self` is an `Err`.
+    fn job_retry(self, what: &str) -> Result<T, JobError>;
+
+    /// Maps an `Err` to [`JobError::Discard`] reading `"{what}: {err}"`; an
+    /// `Ok` passes through.
+    ///
+    /// # Errors
+    ///
+    /// [`JobError::Discard`] when `self` is an `Err`.
+    fn job_discard(self, what: &str) -> Result<T, JobError>;
+}
+
+impl<T, E: fmt::Display> JobErrorExt<T> for Result<T, E> {
+    fn job_retry(self, what: &str) -> Result<T, JobError> {
+        self.map_err(|source| JobError::Retry(format!("{what}: {source}")))
+    }
+
+    fn job_discard(self, what: &str) -> Result<T, JobError> {
+        self.map_err(|source| JobError::Discard(format!("{what}: {source}")))
+    }
 }
 
 /// Lifts a transient failure into the queue's retry arm, naming the `job`
@@ -490,6 +522,27 @@ mod tests {
             retry("sample pass", &"disk full"),
             JobError::Retry("sample pass failed: disk full".to_owned()),
             "the retry text is `<job> failed: <err>`"
+        );
+    }
+
+    #[test]
+    fn job_error_ext_passes_ok_and_maps_err_to_the_chosen_arm() {
+        let fine_retry: Result<u8, &str> = Ok(3);
+        assert_eq!(fine_retry.job_retry("the read"), Ok(3));
+        let fine_discard: Result<u8, &str> = Ok(3);
+        assert_eq!(fine_discard.job_discard("the read"), Ok(3));
+
+        let failed_retry: Result<u8, &str> = Err("boom");
+        assert_eq!(
+            failed_retry.job_retry("the read failed"),
+            Err(JobError::Retry("the read failed: boom".to_owned())),
+            "a retry reads `<what>: <err>`"
+        );
+        let failed_discard: Result<u8, &str> = Err("boom");
+        assert_eq!(
+            failed_discard.job_discard("the args are unusable"),
+            Err(JobError::Discard("the args are unusable: boom".to_owned())),
+            "a discard reads `<what>: <err>`"
         );
     }
 

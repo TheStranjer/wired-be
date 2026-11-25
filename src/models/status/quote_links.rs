@@ -7,7 +7,7 @@
 use sqlx::{PgConnection, PgPool};
 use uuid::Uuid;
 
-use crate::error::AppResult;
+use crate::{error::AppResult, util::numbers::saturating_i32_from_usize};
 
 use super::{Counter, Status, counters::step_counter};
 
@@ -113,7 +113,7 @@ pub async fn link_waiting_quotes(
         .fetch_all(&mut *conn)
         .await?;
     if !linked.is_empty() {
-        let delta = i32::try_from(linked.len()).unwrap_or(i32::MAX);
+        let delta = saturating_i32_from_usize(linked.len());
         step_counter(conn, quoted_id, Counter::Quotes, delta).await?;
     }
     Ok(linked)

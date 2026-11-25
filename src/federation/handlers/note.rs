@@ -155,13 +155,6 @@ pub fn delete_note(
     Box::pin(async move { apply_delete(state, view, signer).await })
 }
 
-/// A remote count narrowed to the `integer` column's width — the ingest's
-/// same clamping rule: beyond it the column's maximum, never a refused
-/// update over a number nobody can vote into being true.
-fn whole(count: i64) -> i32 {
-    i32::try_from(count).unwrap_or(i32::MAX)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -16,7 +16,7 @@ use super::update_note;
 use crate::{
     api::statuses::after_status_edited,
     federation::{
-        dispatch::{ActivityView, FederationError, Outcome},
+        dispatch::{ActivityView, FederationError, Outcome, TransientExt as _},
         handlers::create,
         json::clamped_time,
         note_parser::{self, ParsedNote},
@@ -56,7 +56,7 @@ pub(super) async fn apply_update(
     };
     let stored = status::get_by_uri(&state.db, uri)
         .await
-        .map_err(|err| FederationError::transient("the status uri read failed", &err))?;
+        .transient("the status uri read failed")?;
     match stored.filter(|row| row.user_id == signer.id && row.deleted_at.is_none()) {
         Some(row) => fold_edit(&state, object, &signer, &row).await,
         None => ingest_the_rest(&state, &signer, object).await,
@@ -128,7 +128,7 @@ async fn fold_edit(
     let silent = ingest::resolve_local_audience(state, &parsed.audience, &mentioned).await?;
     let media = stored_media(&state.db, stored.id)
         .await
-        .map_err(|err| FederationError::transient("the attachment read failed", &err))?;
+        .transient("the attachment read failed")?;
     let media_plan = plan_media(&media, &parsed.attachments);
     let mut params = edit_params(
         &parsed,
@@ -140,7 +140,7 @@ async fn fold_edit(
     params.silent_user_ids = silent.iter().map(|account| account.id).collect();
     let Some(updated) = status_edit::update_status(&state.db, stored.id, params)
         .await
-        .map_err(|err| FederationError::transient("the status edit failed", &err))?
+        .transient("the status edit failed")?
     else {
         return Ok(Outcome::Ignored("the status was deleted under its edit"));
     };
@@ -216,7 +216,7 @@ async fn refresh_quote_policy(
     }
     status::set_quote_policy(&state.db, stored.id, incoming)
         .await
-        .map_err(|err| FederationError::transient("the quote policy write failed", &err))?;
+        .transient("the quote policy write failed")?;
     debug!(status = %stored.id, "an Update changed the advertised quote policy");
     Ok(())
 }

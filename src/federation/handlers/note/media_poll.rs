@@ -5,13 +5,12 @@ use sqlx::PgPool;
 use tracing::debug;
 use uuid::Uuid;
 
-use super::whole;
 #[cfg(doc)]
 use crate::models::status_edit;
 use crate::{
     error::AppResult,
     federation::{
-        dispatch::FederationError,
+        dispatch::{FederationError, TransientExt as _},
         note_parser::{ParsedAttachment, ParsedPoll},
     },
     models::{
@@ -20,6 +19,7 @@ use crate::{
     },
     services::ingest,
     state::AppState,
+    util::numbers::saturating_i32,
 };
 
 /// One stored attachment of a post: its id (what a replacement deletes after
@@ -166,17 +166,17 @@ pub(super) async fn replace_media(
         .db
         .begin()
         .await
-        .map_err(|err| FederationError::transient("the attachment rewrite failed", &err))?;
+        .transient("the attachment rewrite failed")?;
     sqlx::query("DELETE FROM media_attachments WHERE id = ANY($1)")
         .bind(old_ids)
         .execute(&mut *tx)
         .await
         .map(drop)
-        .map_err(|err| FederationError::transient("the detached attachment delete failed", &err))?;
+        .transient("the detached attachment delete failed")?;
     ingest::insert_media(&mut tx, status_id, attachments).await?;
     tx.commit()
         .await
-        .map_err(|err| FederationError::transient("the attachment rewrite commit failed", &err))?;
+        .transient("the attachment rewrite commit failed")?;
     Ok(())
 }
 
@@ -198,30 +198,26 @@ pub(super) async fn refresh_poll(
     };
     let stored = poll::get_for_status(&state.db, status_id)
         .await
-        .map_err(|err| FederationError::transient("the stored poll read failed", &err))?;
+        .transient("the stored poll read failed")?;
     if let Some(poll) = stored {
         let totals = remote_totals(poll_data);
         let held = poll::options(&state.db, poll.id)
             .await
-            .map_err(|err| FederationError::transient("the stored options read failed", &err))?;
+            .transient("the stored options read failed")?;
         if options_differ(&held, poll.multiple, poll_data) {
             return poll::replace_remote_poll(&state.db, poll.id, poll_data.multiple, &totals)
                 .await
-                .map_err(|err| FederationError::transient("the poll replacement failed", &err));
+                .transient("the poll replacement failed");
         }
         return poll::record_remote_totals(&state.db, poll.id, &totals)
             .await
-            .map_err(|err| FederationError::transient("the remote poll totals failed", &err));
+            .transient("the remote poll totals failed");
     }
-    let mut tx = state
-        .db
-        .begin()
-        .await
-        .map_err(|err| FederationError::transient("the poll insert failed", &err))?;
+    let mut tx = state.db.begin().await.transient("the poll insert failed")?;
     ingest::insert_poll(&mut tx, status_id, Some(poll_data)).await?;
     tx.commit()
         .await
-        .map_err(|err| FederationError::transient("the poll insert commit failed", &err))?;
+        .transient("the poll insert commit failed")?;
     Ok(())
 }
 
@@ -237,7 +233,7 @@ pub(super) async fn remove_poll(
     }
     let removed = poll::delete_for_status(&state.db, status_id)
         .await
-        .map_err(|err| FederationError::transient("the poll removal failed", &err))?;
+        .transient("the poll removal failed")?;
     if removed {
         debug!(status = %status_id, "an Update dropped the poll; deleted it");
     }
@@ -263,15 +259,15 @@ fn remote_totals(poll_data: &ParsedPoll) -> RemoteTotals {
     let option_counts: Vec<(String, i32)> = poll_data
         .options
         .iter()
-        .map(|option| (option.title.clone(), whole(option.votes_count)))
+        .map(|option| (option.title.clone(), saturating_i32(option.votes_count)))
         .collect();
     let votes_count = option_counts.iter().fold(0_i64, |sum, (_title, votes)| {
         sum.saturating_add(i64::from(*votes))
     });
     RemoteTotals {
         options: option_counts,
-        voters_count: poll_data.voters_count.map_or(0, whole),
-        votes_count: whole(votes_count),
+        voters_count: poll_data.voters_count.map_or(0, saturating_i32),
+        votes_count: saturating_i32(votes_count),
         expires_at: poll_data.expires_at,
     }
 }

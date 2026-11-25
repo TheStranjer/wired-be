@@ -6,7 +6,10 @@ use chrono::TimeDelta;
 use sqlx::PgPool;
 use tracing::{debug, warn};
 
-use crate::{jobs::JobError, state::AppState};
+use crate::{
+    jobs::{JobError, JobErrorExt as _},
+    state::AppState,
+};
 
 /// How long a `received_activities` row lives: 14 days. A peer that
 /// redelivers the same activity after that horizon gets it processed
@@ -34,7 +37,7 @@ pub(super) async fn claim_ledger_row(state: &AppState, key: &str) -> Result<bool
         .bind(key)
         .execute(&state.db)
         .await
-        .map_err(|err| JobError::Retry(format!("the received-activity claim failed: {err}")))?;
+        .job_retry("the received-activity claim failed")?;
     Ok(written.rows_affected() > 0)
 }
 

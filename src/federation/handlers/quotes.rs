@@ -52,7 +52,7 @@ use tracing::debug;
 use super::create::names_actor;
 use crate::{
     federation::{
-        dispatch::{ActivityView, FederationError, Handlers, Outcome},
+        dispatch::{ActivityView, FederationError, Handlers, Outcome, TransientExt as _},
         fetch_object, json,
         quotes::{QuoteApproval, quote_approval, quote_authorization_uri},
     },
@@ -185,7 +185,7 @@ impl Request<'_> {
     async fn send(&self, answer: &QuoteRequestAnswer<'_>) -> Result<Outcome, FederationError> {
         let queued = federation_out::answer_quote_request(self.state, self.author, answer)
             .await
-            .map_err(|err| FederationError::transient("could not queue the quote answer", &err))?;
+            .transient("could not queue the quote answer")?;
         debug!(queued, "the quote answer is queued");
         Ok(Outcome::Handled)
     }
@@ -217,7 +217,7 @@ impl Request<'_> {
         if let Some(quoting) = &self.instrument.status {
             let linked = status::link_backfilled_quote(&self.state.db, quoting.id, self.quoted)
                 .await
-                .map_err(|err| FederationError::transient("could not link the quote", &err))?;
+                .transient("could not link the quote")?;
             if linked {
                 notify::on_quote_linked(self.state, quoting.id).await;
             }
@@ -243,7 +243,7 @@ async fn quoted_post(
     };
     let found = status::get_by_uri(&state.db, uri)
         .await
-        .map_err(|err| FederationError::transient("could not read the quoted status", &err))?;
+        .transient("could not read the quoted status")?;
     let Some(quoted) =
         found.filter(|row| row.local && row.deleted_at.is_none() && row.reblog_of_id.is_none())
     else {
@@ -251,7 +251,7 @@ async fn quoted_post(
     };
     let author = user::get_by_id(&state.db, quoted.user_id)
         .await
-        .map_err(|err| FederationError::transient("could not read the quoted author", &err))?;
+        .transient("could not read the quoted author")?;
     Ok(author
         .filter(User::is_local_active)
         .map(|owner| (quoted, owner)))
@@ -274,13 +274,13 @@ async fn may_quote(
     }
     let visible = status_visibility::can_view(&state.db, post, Some(asker))
         .await
-        .map_err(|err| FederationError::transient("could not read the quoter's standing", &err))?;
+        .transient("could not read the quoter's standing")?;
     if !visible || approval == QuoteApproval::Everyone {
         return Ok(visible);
     }
     follow::has_accepted_follow(&state.db, asker.id, author.id)
         .await
-        .map_err(|err| FederationError::transient("could not read the quoter's follow", &err))
+        .transient("could not read the quoter's follow")
 }
 
 /// The quoting post the request names in `instrument`, `None` unless it is

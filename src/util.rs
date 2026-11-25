@@ -15,7 +15,8 @@
 //! group-by-key fold lives in [`collections`], and the `http(s)` URL
 //! checks every origin, signing and delivery guard shares live in [`mod@url`],
 //! the one `Content-Type` media-type parser in [`media_type`], and the
-//! U+0000 strippers (the database cannot store NUL) in [`nul`].
+//! U+0000 strippers (the database cannot store NUL) in [`nul`], and the
+//! saturating narrowing of counts to `i32` in [`numbers`].
 
 pub mod cache;
 pub mod collections;
@@ -29,6 +30,7 @@ pub mod keys;
 pub mod like;
 pub mod media_type;
 pub mod nul;
+pub mod numbers;
 pub mod params;
 pub mod password;
 pub mod sanitize;
