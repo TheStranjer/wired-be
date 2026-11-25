@@ -117,6 +117,47 @@ mod tests {
         );
     }
 
+    /// The same activity under two id spellings claims one ledger row and
+    /// the second delivery is skipped entirely.
+    #[tokio::test]
+    async fn id_spellings_of_one_activity_claim_one_row() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let state = app_state(&pool);
+        let alice = signer(&pool).await;
+        let handlers = test_handlers();
+        let original = follow_activity("spelling-1");
+        let mut variant = original.clone();
+        variant["id"] = json!("https://PEER.example/activities/SPELLING-1?");
+
+        for activity in [&original, &variant] {
+            let outcome = dispatch_activity(
+                &state,
+                incoming_args(activity, &alice),
+                &handlers,
+                mrf::filter_incoming_boxed,
+            )
+            .await;
+            assert_eq!(outcome, Ok(()), "the delivery completes");
+        }
+
+        assert_eq!(
+            seen("ok", "https://peer.example/activities/spelling-1"),
+            1,
+            "the handler ran for the first spelling only"
+        );
+        assert_eq!(
+            seen("ok", "https://PEER.example/activities/SPELLING-1?"),
+            0,
+            "the second spelling never reached the handler"
+        );
+        let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM received_activities")
+            .fetch_one(&pool)
+            .await
+            .expect("the ledger reads");
+        assert_eq!(rows, 1, "exactly one ledger row");
+    }
+
     /// A same-second `Update` under a reused activity id claims its own
     /// row when its object differs; an exact redelivery is still deduplicated.
     #[tokio::test]
