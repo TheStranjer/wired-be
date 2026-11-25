@@ -14,12 +14,20 @@
 //!   [`webfinger`](ProtocolAdapter::webfinger) adds aliases and links to a
 //!   user's `WebFinger` document, and
 //!   [`host_meta_links`](ProtocolAdapter::host_meta_links) adds links to
-//!   host-meta. A `NodeInfo` hook comes in a follow-up ticket.
+//!   host-meta, and
+//!   [`nodeinfo_protocol`](ProtocolAdapter::nodeinfo_protocol) names the
+//!   protocol in `NodeInfo`'s `protocols` list. A protocol's `WebFinger`
+//!   aliases are where its identity URI for cross-protocol linking goes.
 //!
 //! `/.well-known/oauth-authorization-server` is a future shared document:
 //! more than one protocol may want to describe its authorization server
-//! there, and the `ATProto` work must settle who serves it before it is
-//! added.
+//! there. It is not served yet. The planned answer for `ATProto` is an
+//! authorization server on its own host (such as `auth.<domain>`), which
+//! leaves the document on the main host to the Mastodon-style OAuth; see the
+//! open questions in `docs/ADDING_A_PROTOCOL.md`.
+//!
+//! The playbook for adding a protocol, `docs/ADDING_A_PROTOCOL.md`, lists
+//! where a new protocol contributes here.
 //!
 //! No path may be claimed twice. Axum panics at startup when two routes
 //! overlap, and the tests in this file check every adapter in

@@ -13,13 +13,15 @@
 //!
 //! # Adding a protocol
 //!
-//! 1. Add a variant to [`ProtocolId`]. The compiler then points at every
-//!    `match` on it (they have no wildcard arm) and at [`ProtocolId::ALL`].
-//! 2. Add a Cargo feature named by the id to `Cargo.toml`, and add it to the
-//!    `any(...)` list of the `compile_error!` below.
-//! 3. Put the protocol's code in `src/protocols/<id>.rs`.
+//! The ordered playbook is `docs/ADDING_A_PROTOCOL.md`; the design behind it
+//! is decision 18 of `docs/ARCHITECTURE.md`. Read both before adding or
+//! changing a protocol. The first step is here: add a variant to
+//! [`ProtocolId`] (the compiler then points at every `match` on it, none of
+//! which has a wildcard arm, and at [`ProtocolId::ALL`]), a Cargo feature
+//! named by the id, and that feature in the `any(...)` list of the
+//! `compile_error!` below.
 //!
-//! # Where later pieces live
+//! # Where the pieces live
 //!
 //! Under `src/protocols/`:
 //!
@@ -34,14 +36,15 @@
 //! - `fixture` (test builds only) is the minimal adapter, the template to copy
 //!   for a new protocol.
 //!
-//! Owned `/.well-known` paths come from
-//! [`ProtocolAdapter::well_known_routes`](adapter::ProtocolAdapter::well_known_routes)
-//! and are mounted by [`crate::discovery`].
+//! Discovery is [`crate::discovery`]: owned `/.well-known` paths come from
+//! [`ProtocolAdapter::well_known_routes`](adapter::ProtocolAdapter::well_known_routes),
+//! and the shared documents (`WebFinger`, host-meta, `NodeInfo`) are served by
+//! core with each protocol's contribution.
 //!
-//! [`identity`] holds the identifier schemes: how an account gets its ID on
-//! each protocol (see its docs). [`events`] holds the account lifecycle
-//! events every enabled protocol reacts to. This file only names the protocols
-//! and declares the submodules.
+//! [`identity`] holds the identifier schemes and the claim rules: how an
+//! account gets its ID on each protocol (see its docs). [`events`] holds the
+//! account lifecycle events every enabled protocol reacts to. This file only
+//! names the protocols and declares the submodules.
 
 pub mod activitypub;
 pub mod adapter;
