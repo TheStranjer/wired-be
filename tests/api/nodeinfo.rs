@@ -82,7 +82,7 @@ const METADATA_KEYS: [&str; 17] = [
 
 /// The feature list Pleroma 2.10.2 advertises with its shipped defaults,
 /// spelled out here so the shared builder is checked, not echoed.
-const EXPECTED_FEATURES: [&str; 25] = [
+const EXPECTED_FEATURES: [&str; 26] = [
     "pleroma_api",
     "mastodon_api",
     "mastodon_api_grouped_notifications",
@@ -108,6 +108,7 @@ const EXPECTED_FEATURES: [&str; 25] = [
     "pleroma:group_actors",
     "pleroma:bookmark_folders",
     "pleroma:block_expiration",
+    "wired:protocols",
 ];
 
 /// The sorted object keys of `value`, for key-set assertions.

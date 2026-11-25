@@ -20,6 +20,7 @@ use super::{
     VIDEO_MATRIX_LIMIT,
     handlers::{streaming_api_url, version_string},
     pleroma::PleromaBlock,
+    wired::WiredBlock,
 };
 
 /// The whole instance document, in the key order Pleroma renders it.
@@ -83,6 +84,8 @@ pub(super) struct Instance {
     configuration: Configuration,
     /// Pleroma's extension block.
     pleroma: PleromaBlock,
+    /// Wired's extension block ([`WiredBlock`]).
+    wired: WiredBlock,
 }
 
 impl Instance {
@@ -128,6 +131,7 @@ impl Instance {
             description_limit: DESCRIPTION_LIMIT,
             configuration: Configuration::for_config(config),
             pleroma,
+            wired: WiredBlock::for_config(config),
         }
     }
 }

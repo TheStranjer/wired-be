@@ -15,7 +15,7 @@ use super::support::{
 use crate::common;
 
 /// The sorted top-level keys of the v2 document — the ticket's key set.
-const V2_TOP_KEYS: [&str; 13] = [
+const V2_TOP_KEYS: [&str; 14] = [
     "configuration",
     "contact",
     "description",
@@ -29,6 +29,7 @@ const V2_TOP_KEYS: [&str; 13] = [
     "title",
     "usage",
     "version",
+    "wired",
 ];
 
 /// The `configuration` block of the empty [`common::test_config`] v2
@@ -71,6 +72,7 @@ fn expected_v2_document(vapid_key: &str) -> Value {
         "contact": { "email": "", "account": null },
         "rules": [],
         "pleroma": expected_pleroma(vapid_key),
+        "wired": { "protocols": ["activitypub"] },
     })
 }
 

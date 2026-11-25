@@ -23,3 +23,4 @@ mod sub_resources;
 mod support;
 mod v1;
 mod v2_peers;
+mod wired;

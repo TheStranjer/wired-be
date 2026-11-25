@@ -14,7 +14,7 @@ pub(super) const BASE: &str = "https://test.example";
 /// The feature list Pleroma 2.10.2 advertises with its shipped defaults,
 /// spelled out here (as in `tests/nodeinfo.rs`) so the shared builder is
 /// checked against the ticket, not echoed by it.
-pub(super) const EXPECTED_FEATURES: [&str; 25] = [
+pub(super) const EXPECTED_FEATURES: [&str; 26] = [
     "pleroma_api",
     "mastodon_api",
     "mastodon_api_grouped_notifications",
@@ -40,11 +40,12 @@ pub(super) const EXPECTED_FEATURES: [&str; 25] = [
     "pleroma:group_actors",
     "pleroma:bookmark_folders",
     "pleroma:block_expiration",
+    "wired:protocols",
 ];
 
 /// The sorted top-level keys of the instance document — the ticket's key
 /// set.
-pub(super) const TOP_KEYS: [&str; 25] = [
+pub(super) const TOP_KEYS: [&str; 26] = [
     "approval_required",
     "avatar_upload_limit",
     "background_upload_limit",
@@ -70,6 +71,7 @@ pub(super) const TOP_KEYS: [&str; 25] = [
     "uri",
     "urls",
     "version",
+    "wired",
 ];
 
 /// The `version` string the endpoint claims: the Mastodon API level,
@@ -196,6 +198,7 @@ pub(super) fn expected_document(vapid_key: &str) -> Value {
         "description_limit": 5000,
         "configuration": expected_configuration(),
         "pleroma": expected_pleroma(vapid_key),
+        "wired": { "protocols": ["activitypub"] },
     })
 }
 

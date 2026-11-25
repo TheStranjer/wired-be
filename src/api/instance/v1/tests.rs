@@ -53,6 +53,7 @@ fn the_document_holds_the_ticket_top_level_key_set() {
             "uri",
             "urls",
             "version",
+            "wired",
         ],
         "the ticket's top-level key set"
     );
