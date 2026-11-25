@@ -1,8 +1,7 @@
 //! Inbound poll votes over federation (WBE-174): the dispatcher's own entry
 //! point [`handle_incoming`] folding a `Create` of a bodyless `Note` that
-//! names one option of this instance's own poll, and the counts and the
-//! author's telling the delivery leaves behind
-//! (`src/federation/handlers/vote.rs`).
+//! names one option of this instance's own poll, and the counts the
+//! delivery leaves behind (`src/federation/handlers/vote.rs`).
 //!
 //! Every test delivers the fixture activity through the real dispatcher —
 //! the same job the inbox routes enqueue, run in-process with the signer's
@@ -10,10 +9,10 @@
 //! What this pins, per the ticket:
 //!
 //! - a delivered ballot moves the option's count, the poll's totals, and
-//!   raises exactly one `poll` notification for the author;
+//!   raises no notification for the author (`poll` is the end-of-poll one);
 //! - a [`multiple`](wired_be::models::poll::Poll::multiple) poll takes one
 //!   `Create` per chosen option as one voter's ballot: every named option
-//!   moves, the voter counts once, and the author is still told once;
+//!   moves, the voter counts once, and the author is told nothing;
 //! - refused ballots mark nothing — the second ballot on a one-option poll,
 //!   a vote past the deadline, an option the poll does not carry, the poll's
 //!   own author, and a question the voter may not see;
@@ -29,7 +28,6 @@ use sqlx::PgPool;
 use uuid::Uuid;
 use wired_be::{
     models::{
-        notification::TYPE_POLL,
         poll::{self, Poll, PollOption},
         status::{self, Status, Visibility},
         user::User,
@@ -174,10 +172,10 @@ async fn rows_for_uri(pool: &PgPool, uri: &str) -> i64 {
 }
 
 /// A delivered ballot moves its option's count, the poll's totals once
-/// each, and tells the author — and stores no status, because a claimed
-/// answer is a mark, never a post.
+/// each, and tells the author nothing — and stores no status, because a
+/// claimed answer is a mark, never a post.
 #[tokio::test]
-async fn a_delivered_ballot_moves_the_counts_and_tells_the_author() {
+async fn a_delivered_ballot_moves_the_counts_and_tells_nobody() {
     let db = common::test_db().await;
     let pool = db.pool().clone();
     let state = delivering_state(&pool);
@@ -201,13 +199,11 @@ async fn a_delivered_ballot_moves_the_counts_and_tells_the_author() {
         "the claimed answer is no post"
     );
 
-    // The author's telling, exactly one, naming the voter and the poll's
-    // question.
-    let notes = note_rows(&pool, alice.id).await;
-    assert_eq!(notes.len(), 1, "the author is told once");
-    assert_eq!(notes[0].0, TYPE_POLL, "as a poll notification");
-    assert_eq!(notes[0].1, bob.id, "by the voter");
-    assert_eq!(notes[0].2, Some(posted.id), "about the question");
+    // A ballot notifies nobody: `poll` is raised when the poll ends.
+    assert!(
+        note_rows(&pool, alice.id).await.is_empty(),
+        "the author is not told of the ballot"
+    );
     assert!(
         note_rows(&pool, bob.id).await.is_empty(),
         "and the voter hears nothing of their own ballot"
@@ -243,13 +239,10 @@ async fn a_multiple_choice_ballot_arrives_as_one_create_per_option() {
         "two marks, one ballot-set"
     );
 
-    let notes = note_rows(&pool, alice.id).await;
-    assert_eq!(
-        notes.len(),
-        1,
-        "the author is still told once for the voter"
+    assert!(
+        note_rows(&pool, alice.id).await.is_empty(),
+        "no create of the multiple-choice ballot told the author anything"
     );
-    assert_eq!(notes[0].0, TYPE_POLL);
 }
 
 /// The same option delivered twice is one mark; and on a poll that takes
@@ -278,8 +271,10 @@ async fn a_second_ballot_on_a_single_choice_poll_counts_nothing() {
     );
     assert_eq!(mark_rows(&pool, stand.id).await, 1, "one mark row");
 
-    let notes = note_rows(&pool, alice.id).await;
-    assert_eq!(notes.len(), 1, "the refusals told the author nothing new");
+    assert!(
+        note_rows(&pool, alice.id).await.is_empty(),
+        "neither the ballot nor the refusals told the author anything"
+    );
 }
 
 /// A ballot that arrives after the deadline marks nothing — the expiry is

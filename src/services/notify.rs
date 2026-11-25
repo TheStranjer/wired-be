@@ -26,10 +26,6 @@
 //!   status (the group key Pleroma groups boosts and likes on is the
 //!   object id, and the entity renders the post that was acted on). The
 //!   withdrawal of either takes that one telling back.
-//! - [`on_poll_vote`] — the vote endpoint's telling: the poll's author is
-//!   told `poll` of every ballot, `from` the voter and about the poll's
-//!   status, deduplicated per voter and poll so a re-fired hook cannot
-//!   stack tellings.
 //! - [`on_poll_ended`] — the [`polls.end_notify`](crate::jobs::polls::KIND_END_NOTIFY)
 //!   sweep's telling: the poll's author *and* every local voter are told
 //!   `poll` with the author as actor (Pleroma's `create_poll_notifications`
@@ -114,7 +110,7 @@ mod subscriptions;
 mod test_support;
 
 pub use edits::on_status_edited;
-pub use polls::{on_poll_ended, on_poll_vote};
+pub use polls::on_poll_ended;
 pub use reactions::on_reaction_changed;
 pub use social::{on_follow, on_follow_request_resolved, on_move};
 pub use statuses::{on_favourite, on_mention, on_reblog};
@@ -270,8 +266,8 @@ mod tests {
     use crate::{
         models::user::{self, NewUser},
         services::notify::test_support::{
-            BASE, app_state, ballot, followed, local, poll_on, post, push_jobs, push_token,
-            reacted, register_push, remote, rows,
+            BASE, app_state, followed, local, poll_on, post, push_jobs, push_token, reacted,
+            register_push, remote, rows,
         },
     };
 
@@ -370,14 +366,6 @@ mod tests {
         .expect("the gated fixture inserts");
 
         let posted = post(pool, &gated, "gate me").await;
-        let stand = poll_on(pool, &posted, 30).await;
-        ballot(pool, &stand, &bob).await;
-        on_poll_vote(&state, &stand, &bob).await;
-        assert!(
-            rows(pool, gated.id).await.is_empty(),
-            "the stranger's ballot is withheld by the setting"
-        );
-
         reacted(&state, pool, &bob, &posted, "👍").await;
         assert!(
             rows(pool, gated.id).await.is_empty(),
