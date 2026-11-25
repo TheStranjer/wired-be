@@ -18,7 +18,12 @@ use axum::http::StatusCode;
 use quick_xml::{XmlVersion, events::Event, reader::Reader};
 use serde_json::{Value, json};
 use sqlx::PgPool;
-use wired_be::models::user::{Flag, NewUser};
+use wired_be::{
+    config::{
+        BASE_URL_VAR, Config, DATABASE_URL_VAR, PROTOCOLS_VAR, TEST_BASE_URL, TEST_DATABASE_URL,
+    },
+    models::user::{Flag, NewUser},
+};
 
 use crate::common;
 
@@ -501,5 +506,98 @@ async fn stored_urls_are_escaped_in_xml_and_raw_in_json() {
     assert_eq!(
         document["links"][0]["href"], evil,
         "the profile link carries it verbatim too"
+    );
+}
+
+/// The test configuration with `PROTOCOLS` set to `protocols`.
+///
+/// # Panics
+///
+/// If `protocols` is not a valid `PROTOCOLS` value; the tests pass fixed ones.
+fn config_with_protocols(protocols: &str) -> Config {
+    Config::from_lookup(|key| match key {
+        DATABASE_URL_VAR => Some(TEST_DATABASE_URL.to_owned()),
+        BASE_URL_VAR => Some(TEST_BASE_URL.to_owned()),
+        PROTOCOLS_VAR => Some(protocols.to_owned()),
+        _ => None,
+    })
+    .expect("the fixed protocols test config is valid")
+}
+
+/// With `activitypub,fixture` the fixture's alias follows `ActivityPub`'s
+/// aliases, in the JSON and in the XML, and `ActivityPub`'s links are unchanged.
+#[tokio::test]
+async fn the_fixture_alias_follows_the_activitypub_aliases() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let _alice = common::create_local_user_with(&pool, "alice", |new| NewUser {
+        profile_url: Some(format!("{BASE}/@alice")),
+        ..new
+    })
+    .await;
+    let app = common::test_app_with_config(pool, config_with_protocols("activitypub,fixture"));
+
+    let jrd = common::TestRequest::get(&webfinger_path(ALICE_ACCT))
+        .send(&app)
+        .await
+        .json_value();
+    assert_eq!(
+        jrd["aliases"],
+        json!([ALICE_AP_ID, format!("{BASE}/@alice"), "fixture:alice"]),
+        "the fixture alias comes last in the JSON"
+    );
+    assert_eq!(
+        jrd["links"].as_array().map(Vec::len),
+        Some(3),
+        "the fixture adds no links"
+    );
+
+    let xrd = common::TestRequest::get(&webfinger_path(ALICE_ACCT))
+        .header("accept", XRD_XML)
+        .send(&app)
+        .await
+        .text();
+    let want_aliases = format!(
+        "<Alias>{ALICE_AP_ID}</Alias><Alias>{BASE}/@alice</Alias><Alias>fixture:alice</Alias><Link"
+    );
+    assert!(
+        xrd.contains(&want_aliases),
+        "the fixture alias comes last in the XML: {xrd}"
+    );
+}
+
+/// With only `fixture` enabled the subject is still answered, with the
+/// fixture's alias alone and none of `ActivityPub`'s links.
+#[tokio::test]
+async fn a_fixture_only_instance_answers_without_activitypub_links() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let _alice = common::create_local_user(&pool, "alice").await;
+    let app = common::test_app_with_config(pool, config_with_protocols("fixture"));
+
+    let jrd = common::TestRequest::get(&webfinger_path(ALICE_ACCT))
+        .send(&app)
+        .await;
+    assert_eq!(jrd.status, StatusCode::OK, "the lookup still answers");
+    assert_eq!(
+        jrd.json_value(),
+        json!({
+            "subject": "acct:alice@test.example",
+            "aliases": ["fixture:alice"],
+            "links": [],
+        }),
+        "the subject and the fixture alias, nothing of ActivityPub"
+    );
+
+    let xrd = common::TestRequest::get(&webfinger_path(ALICE_ACCT))
+        .header("accept", XRD_XML)
+        .send(&app)
+        .await;
+    assert_eq!(
+        xrd.text(),
+        format!(
+            r#"<XRD xmlns="{XRD_NS}"><Subject>acct:alice@test.example</Subject><Alias>fixture:alice</Alias></XRD>"#
+        ),
+        "the XML carries the same subject and alias"
     );
 }

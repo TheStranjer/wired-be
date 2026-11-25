@@ -2,7 +2,10 @@
 
 use axum::{Router, routing::MethodRouter};
 
-use crate::{jobs::HandlerFn, protocols::ProtocolId, state::AppState};
+use crate::{
+    api::well_known::WebfingerContribution, config::Config, jobs::HandlerFn, models::user::User,
+    protocols::ProtocolId, state::AppState,
+};
 
 /// One protocol's entry point into the application.
 ///
@@ -55,5 +58,14 @@ pub trait ProtocolAdapter: Sync {
     /// contribute to is core's, not an owned path. The default is no paths.
     fn well_known_routes(&self) -> Vec<(&'static str, MethodRouter<AppState>)> {
         Vec::new()
+    }
+
+    /// The aliases and links this protocol adds to a local user's `WebFinger` document.
+    ///
+    /// Core answers the lookup and writes the subject; then, for each enabled
+    /// protocol in registry order, it appends this contribution. The default
+    /// contributes nothing.
+    fn webfinger(&self, _config: &Config, _user: &User) -> WebfingerContribution {
+        WebfingerContribution::default()
     }
 }

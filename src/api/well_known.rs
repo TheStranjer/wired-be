@@ -32,6 +32,7 @@ use crate::{
     error::{AppError, AppResult},
     federation::vocab::ACTIVITY_JSON,
     models::user::{User, get_by_ap_id, get_by_nickname},
+    protocols::registry,
     state::AppState,
     util::sanitize::escape_html,
 };
@@ -200,25 +201,44 @@ fn is_xml_format(value: &str) -> bool {
 }
 
 /// The `WebFinger` answer about one actor, the document both
-/// representations render: subject, aliases and links exactly as Pleroma's
-/// `represent_user/2` builds them.
+/// representations render.
+///
+/// Core owns the subject; the aliases and links are what each enabled
+/// protocol contributes, in registry order (see [`WebfingerContribution`]).
 #[derive(Debug, Serialize)]
 struct Finger {
     /// `acct:nickname@domain` on this instance, the nickname stored case.
     subject: String,
-    /// The actor id, plus the profile URL when the row carries a distinct
-    /// one (Pleroma's aliases start from the `ap_id`; its `also_known_as`
-    /// moves here when the migration ticket adds the column).
+    /// Every enabled protocol's aliases, in registry order.
     aliases: Vec<String>,
-    /// The profile-page, self and subscribe links, in that order.
+    /// Every enabled protocol's links, in registry order.
     links: Vec<FingerLink>,
 }
 
-/// One `Link` element or object of a [`Finger`] document. The `type`
-/// attribute is omitted for the subscribe link, which is identified by
+/// The aliases and links one protocol adds to an account's `WebFinger` document.
+///
+/// Returned by
+/// [`ProtocolAdapter::webfinger`](crate::protocols::adapter::ProtocolAdapter::webfinger).
+/// Core appends it to the document after the subject and after the
+/// contributions of the protocols before it.
+///
+/// Later, an account's identities on other protocols (`matrix:u/bob:example.com`,
+/// `xmpp:bob@example.com`, `at://did:...`) are listed here as alias URIs for
+/// cross-protocol account linking. Nothing links accounts yet.
+#[derive(Debug, Default)]
+pub struct WebfingerContribution {
+    /// URIs that also name the account.
+    pub aliases: Vec<String>,
+    /// Links the document states about the account.
+    pub links: Vec<FingerLink>,
+}
+
+/// One `Link` element or object of a `WebFinger` document.
+///
+/// The `type` attribute is omitted for the subscribe link, which is identified by
 /// its `template` instead; Pleroma's map rendering drops the same key.
 #[derive(Debug, Serialize)]
-struct FingerLink {
+pub struct FingerLink {
     /// The relation URI (or `self`) this link states.
     rel: &'static str,
     /// The media type of the link target, renamed to `type` in JSON.
@@ -234,37 +254,58 @@ struct FingerLink {
 
 impl Finger {
     /// The document describing the local user `user` on the instance
-    /// `config` serves: the `profile_url` column is the human-facing URL
-    /// where a row carries one, and the actor id stands in for it in the
-    /// profile link and the alias list otherwise.
+    /// `config` serves: the subject, then the contribution of each protocol
+    /// `config` enables, in registry order.
     fn for_user(user: &User, config: &Config) -> Self {
-        let profile_url = user.profile_url.clone();
-        let mut aliases = vec![user.ap_id.clone()];
-        if let Some(url) = profile_url
-            .as_ref()
-            .filter(|url| url.as_str() != user.ap_id)
-        {
-            aliases.push(url.clone());
-        }
-        Self {
+        let mut finger = Self {
             subject: format!("acct:{}@{}", user.nickname, config.domain()),
-            aliases,
-            links: vec![
-                FingerLink {
-                    rel: PROFILE_PAGE_REL,
-                    link_type: Some(TEXT_HTML),
-                    href: Some(profile_url.unwrap_or_else(|| user.ap_id.clone())),
-                    template: None,
-                },
-                FingerLink {
-                    rel: SELF_REL,
-                    link_type: Some(ACTIVITY_JSON),
-                    href: Some(user.ap_id.clone()),
-                    template: None,
-                },
-                subscribe_link(config),
-            ],
+            aliases: Vec::new(),
+            links: Vec::new(),
+        };
+        for adapter in registry::enabled(config) {
+            let contribution = adapter.webfinger(config, user);
+            finger.aliases.extend(contribution.aliases);
+            finger.links.extend(contribution.links);
         }
+        finger
+    }
+}
+
+/// What `ActivityPub` adds to the `WebFinger` document of the local user `user`.
+///
+/// As Pleroma's `represent_user/2` builds it: the actor id as an alias, plus
+/// the profile URL when the row carries a distinct one; then the
+/// profile-page, self and subscribe links, in that order.
+///
+/// The `profile_url` column is the human-facing URL where a row carries one,
+/// and the actor id stands in for it in the profile link otherwise.
+#[must_use]
+pub fn activitypub_contribution(user: &User, config: &Config) -> WebfingerContribution {
+    let profile_url = user.profile_url.clone();
+    let mut aliases = vec![user.ap_id.clone()];
+    if let Some(url) = profile_url
+        .as_ref()
+        .filter(|url| url.as_str() != user.ap_id)
+    {
+        aliases.push(url.clone());
+    }
+    WebfingerContribution {
+        aliases,
+        links: vec![
+            FingerLink {
+                rel: PROFILE_PAGE_REL,
+                link_type: Some(TEXT_HTML),
+                href: Some(profile_url.unwrap_or_else(|| user.ap_id.clone())),
+                template: None,
+            },
+            FingerLink {
+                rel: SELF_REL,
+                link_type: Some(ACTIVITY_JSON),
+                href: Some(user.ap_id.clone()),
+                template: None,
+            },
+            subscribe_link(config),
+        ],
     }
 }
 
