@@ -235,12 +235,12 @@ mod tests {
     pub(super) const BOB: &str = "https://remote.example/users/bob";
 
     /// Test state: `pool` and the fixed test config, collaborators inert.
-    fn app_state(pool: &PgPool) -> AppState {
+    pub(super) fn app_state(pool: &PgPool) -> AppState {
         AppState::for_tests(pool.clone(), crate::config::Config::for_tests())
     }
 
     /// The stored mirror of the fixture signer.
-    async fn signer(pool: &PgPool) -> User {
+    pub(super) async fn signer(pool: &PgPool) -> User {
         insert(
             pool,
             &NewUser {
@@ -256,7 +256,7 @@ mod tests {
     }
 
     /// A local author named `nickname` and one public post of theirs.
-    async fn local_post(pool: &PgPool, nickname: &str) -> Status {
+    pub(super) async fn local_post(pool: &PgPool, nickname: &str) -> Status {
         let author = local_user(pool, nickname).await;
         status::insert(
             pool,
