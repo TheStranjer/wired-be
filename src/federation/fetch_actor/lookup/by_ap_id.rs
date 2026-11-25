@@ -2,13 +2,17 @@
 //! consults the local mirror first, and [`serve_or_refresh`], the
 //! freshness policy it runs a stored row through.
 
+use chrono::{DateTime, Utc};
 use tracing::debug;
 
 use crate::{
     federation::fetch_actor::{
         FetchError, error::server_error, fetch::fetch_and_store, handle::Naming,
     },
-    models::user::{User, get_by_ap_id},
+    models::{
+        activitypub_actor,
+        user::{User, get_by_ap_id},
+    },
     state::AppState,
 };
 
@@ -74,6 +78,21 @@ async fn get_or_fetch(state: &AppState, ap_id: &str, naming: Naming) -> Result<U
     fetch_and_store(state, ap_id, naming).await
 }
 
+/// When the mirror `stored` was last fetched, from its `activitypub_actors`
+/// row.
+///
+/// A mirror with no row, like one never stamped, has no fetch to date, so
+/// it counts as stale and is refetched.
+async fn last_fetched_at(
+    state: &AppState,
+    stored: &User,
+) -> Result<Option<DateTime<Utc>>, FetchError> {
+    let actor = activitypub_actor::get(&state.db, stored.id)
+        .await
+        .map_err(|err| server_error(&err))?;
+    Ok(actor.and_then(|row| row.last_fetched_at))
+}
+
 /// Answers from the stored mirror when it can (a local row, or a remote
 /// one inside the refresh window), refetches otherwise — and on a failed
 /// refetch keeps serving the stale mirror, `Gone` excepted.
@@ -83,7 +102,7 @@ async fn serve_or_refresh(
     ap_id: &str,
     naming: Naming,
 ) -> Result<User, FetchError> {
-    if stored.local.get() || fresh_since(stored.last_fetched_at) {
+    if stored.local.get() || fresh_since(last_fetched_at(state, &stored).await?) {
         return Ok(stored);
     }
     match fetch_and_store(state, ap_id, naming).await {
@@ -196,6 +215,48 @@ mod tests {
         let again = get_or_fetch_by_ap_id(&state, &ap_id).await.unwrap();
         assert_eq!(again.name, "Second", "the refreshed stamp is fresh again");
         assert_eq!(hits.load(Ordering::SeqCst), 2, "no third fetch");
+        server.abort();
+    }
+
+    /// Only the `activitypub_actors` stamp ages: `users` still says the
+    /// mirror is fresh, so a refetch proves the stamp is read from the actor row.
+    #[tokio::test]
+    async fn the_fetch_stamp_is_read_from_the_actor_row() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let listener = bind().await;
+        let base = origin(&listener);
+        let ap_id = format!("{base}/users/alice");
+        let peer = peer_at(&base);
+        let hits = Arc::clone(&peer.hits);
+        let server = spawn(
+            listener,
+            Router::new()
+                .route("/users/alice", get(versioned_actor))
+                .with_state(peer),
+        );
+        let state = test_state(pool);
+        let first = get_or_fetch_by_ap_id(&state, &ap_id).await.unwrap();
+        assert_eq!(hits.load(Ordering::SeqCst), 1, "the first lookup fetched");
+
+        let aged = sqlx::query(
+            "UPDATE activitypub_actors SET last_fetched_at = now() - interval '25 hours'
+              WHERE user_id = $1",
+        )
+        .bind(first.id)
+        .execute(&state.db)
+        .await
+        .unwrap()
+        .rows_affected();
+        assert_eq!(aged, 1, "the mirror has one actor row to age");
+
+        let refreshed = get_or_fetch_by_ap_id(&state, &ap_id).await.unwrap();
+        assert_eq!(refreshed.id, first.id, "the same mirror row");
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            2,
+            "the aged actor row alone made the mirror stale"
+        );
         server.abort();
     }
 

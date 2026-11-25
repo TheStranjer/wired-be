@@ -146,9 +146,12 @@ async fn the_archive_holds_the_four_entries_and_owns_its_temp_file() {
             "{name} parses as a JSON object"
         );
     }
+    let public_key = stored_public_key(&pool, &alice)
+        .await
+        .expect("the key reads");
     assert_eq!(
         entry_json(&archive, ACTOR_ENTRY),
-        actor_json(&alice, &state.config, &[]),
+        actor_json(&alice, public_key.as_deref(), &state.config, &[]),
         "actor.json is the federation actor verbatim"
     );
 
@@ -164,6 +167,31 @@ async fn the_archive_holds_the_four_entries_and_owns_its_temp_file() {
     // ...and the temp file cannot outlive the value.
     drop(archive);
     assert!(!path.exists(), "dropping the archive deleted its file");
+}
+
+#[tokio::test]
+async fn the_actor_entry_carries_the_key_of_the_actor_row() {
+    let db = crate::test_db::test_db().await.expect("test database slot");
+    let pool = db.pool().clone();
+    let state = app_state(&pool);
+    let alice = user(&pool, "alice").await;
+    let changed = sqlx::query(
+        "UPDATE activitypub_actors SET public_key = 'actor-row-key' WHERE user_id = $1",
+    )
+    .bind(alice.id)
+    .execute(&pool)
+    .await
+    .expect("the actor row updates")
+    .rows_affected();
+    assert_eq!(changed, 1, "the account has one actor row");
+
+    let archive = build_for(&state, &alice).await;
+
+    assert_eq!(
+        entry_json(&archive, ACTOR_ENTRY)["publicKey"]["publicKeyPem"],
+        "actor-row-key",
+        "actor.json names the key `activitypub_actors` stores"
+    );
 }
 
 #[tokio::test]

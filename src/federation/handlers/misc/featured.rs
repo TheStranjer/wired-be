@@ -14,7 +14,7 @@ use crate::{
         fetch_object, json,
     },
     models::{
-        pinned_status,
+        activitypub_actor, pinned_status,
         status::{self, Status},
         user::User,
     },
@@ -88,6 +88,27 @@ async fn fetch_unstored(
     Ok(resolved)
 }
 
+/// The featured collection id stored for `signer`, from its
+/// `activitypub_actors` row.
+///
+/// A signer with no row, like one whose document named no featured
+/// collection, has none (`None`), so no target matches it.
+///
+/// # Errors
+///
+/// [`FederationError::Transient`] for a database failure.
+async fn stored_featured_url(
+    state: &AppState,
+    signer: &User,
+) -> Result<Option<String>, FederationError> {
+    let actor = activitypub_actor::get(&state.db, signer.id)
+        .await
+        .map_err(|err| {
+            FederationError::transient("could not read the signer's featured collection", &err)
+        })?;
+    Ok(actor.and_then(|row| row.featured_url))
+}
+
 /// The shared body of [`handle_add`] and [`handle_remove`]: the featured
 /// collection's pins, folded for the signer alone.
 async fn apply_featured_change(
@@ -101,10 +122,11 @@ async fn apply_featured_change(
             "an Add or Remove signed by an account this instance owns",
         ));
     }
+    let featured_url = stored_featured_url(&state, &signer).await?;
     let featured = view
         .target
         .as_deref()
-        .is_some_and(|target| signer.featured_url.as_deref() == Some(target));
+        .is_some_and(|target| featured_url.as_deref() == Some(target));
     if !featured {
         debug!(
             target = view.target.as_deref().unwrap_or_default(),
@@ -246,6 +268,67 @@ mod tests {
                 "{n} leaves nothing pinned"
             );
         }
+    }
+
+    /// The featured collection is the one `activitypub_actors` names: after
+    /// only that row changes, its new id pins and `users`' old one no longer does.
+    #[tokio::test]
+    async fn the_featured_collection_is_read_from_the_actor_row() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let state = app_state(&pool);
+        let alice = featured_signer(&pool).await;
+        let alice_id = alice.id;
+        let posted = remote_post(&pool, &alice, "moved-collection").await;
+        let moved = "https://peer.example/users/alice/collections/pinned";
+        let changed =
+            sqlx::query("UPDATE activitypub_actors SET featured_url = $2 WHERE user_id = $1")
+                .bind(alice_id)
+                .bind(moved)
+                .execute(&pool)
+                .await
+                .unwrap()
+                .rows_affected();
+        assert_eq!(changed, 1, "the signer has one actor row");
+
+        let old_target = handle_add(
+            state.clone(),
+            view(
+                "Add",
+                "add-old",
+                ALICE,
+                json!({"object": posted.uri.clone(), "target": FEATURED}),
+            ),
+            alice,
+        )
+        .await;
+        assert!(
+            ignored(old_target).contains("featured collection"),
+            "the id still in users is no longer the featured collection"
+        );
+        assert_eq!(
+            pinned_status::count(&pool, alice_id).await.unwrap(),
+            0,
+            "nothing was pinned"
+        );
+
+        let new_target = handle_add(
+            state,
+            view(
+                "Add",
+                "add-new",
+                ALICE,
+                json!({"object": posted.uri.clone(), "target": moved}),
+            ),
+            fresh_user(&pool, alice_id).await,
+        )
+        .await;
+        assert_handled(&new_target);
+        assert_eq!(
+            pinned_status::count(&pool, alice_id).await.unwrap(),
+            1,
+            "the id in the actor row pins"
+        );
     }
 
     /// The `Add`/`Remove` target arm: a `target` that is not the actor's

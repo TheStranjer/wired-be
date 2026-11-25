@@ -12,6 +12,7 @@ use crate::{
         actor::MAIN_KEY_FRAGMENT,
         signature::{SignedHeaders, SigningKey, sign_request},
     },
+    models::activitypub_actor,
     services::instance_actor::ensure_instance_actor,
     state::AppState,
 };
@@ -53,13 +54,16 @@ impl Signer {
     ///
     /// Whatever instance-actor provisioning reports (database or
     /// key-generation failures), plus
-    /// [`AppError::Internal`] if the
-    /// stored row carries no private key.
+    /// [`AppError::Internal`] if the instance actor has no
+    /// `activitypub_actors` row or its row carries no private key.
     pub async fn instance(state: &AppState) -> AppResult<Self> {
         let actor = ensure_instance_actor(&state.db, &state.config).await?;
-        let private_pem = actor.private_key.clone().ok_or_else(|| {
-            AppError::Internal("the instance actor carries no private key".to_owned())
-        })?;
+        let private_pem = activitypub_actor::get(&state.db, actor.id)
+            .await?
+            .and_then(|row| row.private_key)
+            .ok_or_else(|| {
+                AppError::Internal("the instance actor carries no private key".to_owned())
+            })?;
         Ok(Self {
             key_id: format!("{}{MAIN_KEY_FRAGMENT}", actor.ap_id),
             private_pem,
@@ -361,6 +365,46 @@ mod tests {
         assert!(
             !debug.contains("BEGIN") && debug.contains("<redacted>"),
             "Debug never prints the private key material: {debug}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_instance_signer_reads_its_key_from_the_actor_row() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let state = test_state(db.pool().clone());
+        let instance = Signer::instance(&state).await.unwrap();
+        let actor = get_by_nickname(&state.db, INSTANCE_ACTOR_NICKNAME)
+            .await
+            .unwrap()
+            .expect("asking for the signer provisions the actor");
+
+        let changed = sqlx::query(
+            "UPDATE activitypub_actors SET private_key = 'only-in-actor-row' WHERE user_id = $1",
+        )
+        .bind(actor.id)
+        .execute(&state.db)
+        .await
+        .unwrap()
+        .rows_affected();
+        assert_eq!(changed, 1, "the instance actor has one actor row");
+        let signer = Signer::instance(&state).await.unwrap();
+        assert_eq!(
+            signer.private_pem, "only-in-actor-row",
+            "the key comes from activitypub_actors, not users"
+        );
+        assert_ne!(signer.private_pem, instance.private_pem, "it did change");
+
+        let removed = sqlx::query("DELETE FROM activitypub_actors WHERE user_id = $1")
+            .bind(actor.id)
+            .execute(&state.db)
+            .await
+            .unwrap()
+            .rows_affected();
+        assert_eq!(removed, 1, "the actor row goes");
+        let error = Signer::instance(&state).await.unwrap_err();
+        assert!(
+            matches!(&error, AppError::Internal(message) if message.contains("no private key")),
+            "no row is the same error as no key: {error:?}"
         );
     }
 }

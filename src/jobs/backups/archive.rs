@@ -19,7 +19,7 @@ use crate::{
     config::Config,
     error::{AppError, AppResult},
     federation::{
-        actor::{actor_json, profile_emojis},
+        actor::{actor_json, profile_emojis, stored_public_key},
         note::{create_activity_json, load_note_context, note_json},
         vocab::AS_VOCABULARY,
     },
@@ -113,7 +113,14 @@ pub async fn build(state: &AppState, user: &User, file_name: &str) -> AppResult<
             .map_err(|err| archive_error("open temp file", &err))?,
     );
     let emojis = profile_emojis(&state.db, user).await?;
-    write_actor(&mut zip, user, &state.config, &emojis)?;
+    let public_key = stored_public_key(&state.db, user).await?;
+    write_actor(
+        &mut zip,
+        user,
+        public_key.as_deref(),
+        &state.config,
+        &emojis,
+    )?;
     let outbox_items = write_outbox(&mut zip, state, user).await?;
     let like_items = write_uris(&mut zip, state, user.id, LIKES_ENTRY, UriTable::Likes).await?;
     let bookmark_items = write_uris(
@@ -179,14 +186,16 @@ fn start_entry(zip: &mut ZipWriter<File>, name: &str) -> AppResult<()> {
 
 /// Writes `actor.json`: this instance's actor document for `user`,
 /// verbatim — no relative-path key merge, the archive carries the same
-/// absolute document the fediverse already sees.
+/// absolute document the fediverse already sees. `public_key` is the PEM
+/// stored for `user` in `activitypub_actors`.
 fn write_actor(
     zip: &mut ZipWriter<File>,
     user: &User,
+    public_key: Option<&str>,
     config: &Config,
     emojis: &[CustomEmoji],
 ) -> AppResult<()> {
-    let bytes = encode(&actor_json(user, config, emojis))?;
+    let bytes = encode(&actor_json(user, public_key, config, emojis))?;
     start_entry(zip, ACTOR_ENTRY)?;
     zip.write_all(&bytes)
         .map_err(|err| archive_error("write actor", &err))?;

@@ -15,7 +15,7 @@ use crate::{
     config::Config,
     error::{AppError, AppResult},
     federation::{
-        actor::{actor_json, instance_actor_json, profile_emojis},
+        actor::{actor_json, instance_actor_json, profile_emojis, stored_public_key},
         vocab::{ACTIVITY_JSON, AP_MEDIA_TYPES},
     },
     models::user::User,
@@ -75,10 +75,16 @@ pub(super) fn frontend_redirect(config: &Config, path: &str) -> AppResult<Respon
 ///
 /// # Errors
 ///
-/// Any database failure of the emoji lookup.
+/// Any database failure of the emoji or public key lookup.
 pub(super) async fn actor_response(state: &AppState, user: &User) -> AppResult<Response> {
     let emojis = profile_emojis(&state.db, user).await?;
-    Ok(document_response(&actor_json(user, &state.config, &emojis)))
+    let public_key = stored_public_key(&state.db, user).await?;
+    Ok(document_response(&actor_json(
+        user,
+        public_key.as_deref(),
+        &state.config,
+        &emojis,
+    )))
 }
 
 /// The instance actor document for `user` as an `ActivityPub` response,
@@ -86,11 +92,13 @@ pub(super) async fn actor_response(state: &AppState, user: &User) -> AppResult<R
 ///
 /// # Errors
 ///
-/// Any database failure of the emoji lookup.
+/// Any database failure of the emoji or public key lookup.
 pub(super) async fn instance_actor_response(state: &AppState, user: &User) -> AppResult<Response> {
     let emojis = profile_emojis(&state.db, user).await?;
+    let public_key = stored_public_key(&state.db, user).await?;
     Ok(document_response(&instance_actor_json(
         user,
+        public_key.as_deref(),
         &state.config,
         &emojis,
     )))
