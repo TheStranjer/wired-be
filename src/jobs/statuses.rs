@@ -21,7 +21,8 @@
 //! [`KIND_SWEEP`] is the safety net: Pleroma has no twin for it (its purge
 //! jobs can simply be missed), but here a lost or failed per-status job must
 //! not leave an expiring post alive forever, so every five minutes the sweep
-//! tombstones every live status whose `expires_at` has run out, in batches of
+//! tombstones every live **local** status whose `expires_at` has run out (a
+//! remote status is only ever removed by its origin's `Delete`), in batches of
 //! [`SWEEP_BATCH`] — the same loop
 //! [`soft_delete_all_for_user`](crate::models::status::soft_delete_all_for_user)
 //! runs for the account purge.
@@ -154,6 +155,10 @@ pub fn handle_expire(state: AppState, _attempt: AttemptInfo, args: Value) -> Han
 /// failures.
 async fn expire_one(state: &AppState, status_id: Uuid) -> Result<(), JobError> {
     match status::get_by_id(&state.db, status_id).await {
+        Ok(Some(row)) if !row.local => {
+            debug!(status = %status_id, "a remote status never expires");
+            Ok(())
+        }
         Ok(Some(row)) => delete(state, &row).await,
         Ok(None) => {
             debug!(status = %status_id, "expiring status is already gone");
@@ -243,7 +248,7 @@ mod tests {
             status::NewStatus,
             user::User,
         },
-        test_fixtures::local_user as user,
+        test_fixtures::{local_user as user, remote_user},
     };
 
     /// Test state over `pool` with the fixed test config.
@@ -494,6 +499,59 @@ mod tests {
                 "a future expiry or no expiry is left alone"
             );
         }
+    }
+
+    /// A remote public post whose `expires_at` ran out a minute ago, the row
+    /// the old parser wrote for every closed remote poll.
+    async fn lapsed_remote_post(pool: &PgPool) -> Status {
+        let bob = remote_user(pool, "bob").await;
+        let new = NewStatus {
+            user_id: bob.id,
+            uri: Some("https://remote.example/objects/lapsed".to_owned()),
+            content: "<p>which?</p>".to_owned(),
+            expires_at: Some(Utc::now() - TimeDelta::seconds(60)),
+            ..NewStatus::default()
+        };
+        status::insert(pool, TEST_BASE_URL, &new)
+            .await
+            .expect("the remote fixture inserts")
+    }
+
+    #[tokio::test]
+    async fn the_sweep_never_tombstones_a_remote_status() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let remote = lapsed_remote_post(&pool).await;
+        assert!(!remote.local, "the fixture is a remote status");
+
+        let outcome = handle_sweep(app_state(&pool), FIRST_ATTEMPT, json!({})).await;
+
+        assert_eq!(outcome, Ok(()), "a sweep with nothing local succeeds");
+        assert!(
+            status::get_by_id(&pool, remote.id)
+                .await
+                .expect("the read runs")
+                .is_some(),
+            "a remote status with a past expiry stays live"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_expire_job_never_tombstones_a_remote_status() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let remote = lapsed_remote_post(&pool).await;
+
+        let outcome = handle_expire(app_state(&pool), FIRST_ATTEMPT, job_args(remote.id)).await;
+
+        assert_eq!(outcome, Ok(()), "the job completes");
+        assert!(
+            status::get_by_id(&pool, remote.id)
+                .await
+                .expect("the read runs")
+                .is_some(),
+            "and leaves the remote status live"
+        );
     }
 
     /// More expired rows than one batch holds: the sweep must walk every

@@ -194,7 +194,6 @@ pub fn parse_note(
         sensitive: parse_sensitive(json, !summary.trim().is_empty()),
         visibility: parse_visibility(json, author),
         edited_at: times.edited_at,
-        expires_at: poll.as_ref().and_then(|parsed| parsed.expires_at),
         inserted_at: Some(times.inserted_at),
         language: parse_language(json),
         quote_policy: parse_quote_policy(json),
