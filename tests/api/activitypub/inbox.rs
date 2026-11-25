@@ -204,6 +204,51 @@ async fn a_redelivered_activity_is_queued_once() {
     );
 }
 
+/// An `Update` whose id is reused by a second edit (Mastodon stamps the id
+/// with whole seconds) is queued again when its object differs, and once
+/// when the same object is redelivered.
+#[tokio::test]
+async fn updates_sharing_an_id_are_queued_per_object() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let _alice = common::create_local_user(&pool, "alice").await;
+    let signer = instance_signer(&pool).await;
+    let app = common::test_app(pool.clone());
+    let update = |content: &str| {
+        json!({
+            "@context": "https://www.w3.org/ns/activitystreams",
+            "id": "https://peer.example/statuses/1#updates/1795571820",
+            "type": "Update",
+            "actor": signer.ap_id,
+            "object": {"id": "https://peer.example/statuses/1", "content": content},
+        })
+    };
+
+    for content in ["second", "third", "third"] {
+        let response = deliver(&app, &signer, "/inbox", &update(content)).await;
+        assert_eq!(response.status, StatusCode::ACCEPTED, "{content} accepted");
+    }
+
+    let jobs = incoming_jobs(&pool).await;
+    assert_eq!(
+        jobs.len(),
+        2,
+        "two objects, two jobs; the redelivery is dropped"
+    );
+    let keys: Vec<_> = jobs
+        .iter()
+        .filter_map(|job| job.unique_key.as_deref())
+        .collect();
+    assert_eq!(keys.len(), 2, "both jobs carry a key");
+    assert_ne!(keys[0], keys[1], "the keys differ by object digest");
+    for key in keys {
+        assert!(
+            key.starts_with("incoming:https://peer.example/statuses/1#updates/1795571820#sha256:"),
+            "the key is the id plus a digest: {key}"
+        );
+    }
+}
+
 /// A personal inbox exists only for a live local account: an unknown
 /// nickname, a remote mirror's handle and a deactivated account's name all
 /// answer the plain 404, and queue nothing.

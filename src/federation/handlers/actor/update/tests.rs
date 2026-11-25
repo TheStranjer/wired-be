@@ -502,3 +502,37 @@ async fn an_update_against_a_dead_database_is_transient() {
         "the mirror write failing asks for another attempt: {outcome:?}"
     );
 }
+
+/// Mastodon's second profile save in one second reuses the first's activity
+/// id: both land, and the second display name wins.
+#[tokio::test]
+async fn two_updates_under_one_activity_id_both_apply() {
+    let db = crate::test_db::test_db().await.expect("test database slot");
+    let pool = db.pool().clone();
+    let state = app_state(&pool);
+    let alice = mirror(&pool).await;
+    let alice_id = alice.id;
+
+    let mut first = person();
+    first["name"] = json!("Alice one");
+    let mut second = person();
+    second["name"] = json!("Alice two");
+
+    let folded = update_actor(
+        state.clone(),
+        view("Update", "same-second", ALICE, first),
+        alice,
+    )
+    .await;
+    assert_handled(&folded);
+    let again = update_actor(
+        state,
+        view("Update", "same-second", ALICE, second),
+        fresh_user(&pool, alice_id).await,
+    )
+    .await;
+    assert_handled(&again);
+
+    let stored = fresh_user(&pool, alice_id).await;
+    assert_eq!(stored.name, "Alice two", "the second display name wins");
+}
