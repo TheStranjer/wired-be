@@ -40,6 +40,8 @@ pub(super) const THUMB: &str = "👍";
 pub(super) const PARTY: &str = "🎉";
 /// A custom emoji's shortcode, in its stored `:shortcode:` spelling.
 pub(super) const CAT: &str = ":cat:";
+/// What the API names [`CAT`]: its bare shortcode, as Pleroma lists a local one.
+pub(super) const CAT_NAME: &str = "cat";
 /// Where [`CAT`]'s image lives.
 pub(super) const CAT_URL: &str = "https://test.example/emoji/cats/cat.png";
 /// An id that names no stored status.

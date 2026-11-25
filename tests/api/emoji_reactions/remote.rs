@@ -150,7 +150,7 @@ async fn a_local_and_a_remote_emoji_of_one_shortcode_are_two_reactions() {
     withdraw_ok(&app, &token, &status_id.to_string(), NAME).await;
     let left = listed(&app, Some(&token), &status_id, None).await;
     assert_eq!(
-        left[0]["name"], ":misskeycat:",
+        left[0]["name"], "misskeycat",
         "the local emoji is still reacted with"
     );
     assert_eq!(left.as_array().map(Vec::len), Some(1), "and it is alone");
@@ -202,4 +202,6 @@ async fn a_remote_and_a_local_reactor_of_one_remote_emoji_share_an_entry() {
     assert_eq!(colons, one, "with or without colons");
     let local = listed(&app, Some(&token), &status_id, Some(":misskeycat:")).await;
     assert_eq!(local, json!([]), "the plain shortcode is the local emoji");
+    let bare = listed(&app, Some(&token), &status_id, Some("misskeycat")).await;
+    assert_eq!(bare, json!([]), "and so is the bare one");
 }

@@ -13,8 +13,8 @@ use super::read::{REACTORS_SQL, reactors};
 /// instead of summarising.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReactorGroup {
-    /// The emoji's API name: the stored text, or `shortcode@domain` for a
-    /// custom emoji of another instance.
+    /// The emoji's API name: the stored text, the bare `shortcode` of a local
+    /// custom emoji, or `shortcode@domain` for one of another instance.
     pub name: String,
     /// The custom emoji's image URL, `None` for a unicode emoji: the image of
     /// this emoji's earliest reaction.
@@ -85,8 +85,8 @@ mod tests {
     use super::super::{
         read::{for_statuses, reactors},
         test_support::{
-            CAT, CAT_URL, REMOTE_CAT, REMOTE_CAT_URL, REMOTE_DOMAIN, THUMBS, instant, names,
-            post_by, react_remote, react_with, stamp, user,
+            CAT, CAT_NAME, CAT_URL, REMOTE_CAT, REMOTE_CAT_URL, REMOTE_DOMAIN, THUMBS, instant,
+            names, post_by, react_remote, react_with, stamp, user,
         },
     };
     use super::*;
@@ -144,7 +144,7 @@ mod tests {
             .expect("the roll-up reads");
         assert_eq!(
             names(&rollups[&status_id]),
-            vec![":zebra:", THUMBS, ":apple:"],
+            vec!["zebra", THUMBS, "apple"],
             "january's zebra leads, then february's thumb, then march's \
              apple, which nothing later moved"
         );
@@ -167,7 +167,7 @@ mod tests {
             .expect("the second roll-up reads");
         assert_eq!(
             names(&twins[&twin]),
-            vec![":a:", ":b:"],
+            vec!["a", "b"],
             "one first-reaction time leaves the emoji text to order"
         );
     }
@@ -221,7 +221,7 @@ mod tests {
         assert_eq!(
             groups[1],
             ReactorGroup {
-                name: CAT.to_owned(),
+                name: CAT_NAME.to_owned(),
                 url: Some(CAT_URL.to_owned()),
                 reactor_ids: vec![bob.id],
             },
@@ -233,7 +233,7 @@ mod tests {
                 .await
                 .expect("the filtered read runs"),
             vec![ReactorGroup {
-                name: CAT.to_owned(),
+                name: CAT_NAME.to_owned(),
                 url: Some(CAT_URL.to_owned()),
                 reactor_ids: vec![bob.id],
             }],
@@ -272,8 +272,8 @@ mod tests {
         let entries = &rollup[&status_id];
         assert_eq!(
             names(entries),
-            vec!["misskeycat@misskey.test", REMOTE_CAT],
-            "the remote emoji is named shortcode@domain, the local one keeps its text"
+            vec!["misskeycat@misskey.test", "misskeycat"],
+            "the remote emoji is named shortcode@domain, the local one by its bare shortcode"
         );
         assert_eq!(entries[0].count, 2, "both remote reactors share one entry");
         assert!(entries[0].me, "and alice is one of them");
@@ -304,7 +304,7 @@ mod tests {
                 .iter()
                 .map(|group| group.name.as_str())
                 .collect::<Vec<_>>(),
-            vec![REMOTE_CAT],
+            vec!["misskeycat"],
             "without a domain the same text is the local emoji"
         );
         assert_eq!(local[0].reactor_ids, vec![bob.id], "and only bob's");
@@ -339,7 +339,7 @@ mod tests {
         );
         assert_eq!(
             (grouped[1].0, grouped[1].1.name.clone()),
-            (status, CAT.to_owned()),
+            (status, CAT_NAME.to_owned()),
             "the cat group is its own entry of the same status"
         );
         assert_eq!(

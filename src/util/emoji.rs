@@ -103,8 +103,20 @@ fn is_domain(domain: &str) -> bool {
         })
 }
 
+/// The shortcode of a bare `shortcode` spelling of a local custom emoji, the
+/// way Pleroma names its own; `None` for anything else.
+///
+/// Bare means no colons and no `@domain`: non-empty, only `[A-Za-z0-9_+-]`,
+/// and not itself one unicode emoji. Whether this instance has such an emoji is
+/// the caller's database question.
+#[must_use]
+pub fn bare_shortcode(text: &str) -> Option<&str> {
+    (is_shortcode_body(text) && !is_single_emoji(text)).then_some(text)
+}
+
 /// The name a reaction goes by on the API: `shortcode@domain` for a custom
-/// emoji of another instance (Pleroma's spelling), the stored text otherwise.
+/// emoji of another instance and the bare `shortcode` for a local one (Pleroma's
+/// spellings), the stored text otherwise.
 ///
 /// `emoji` is the stored spelling and `domain` the emoji's origin, `None` for
 /// a unicode or local emoji. Text that is not a `:shortcode:` keeps its own
@@ -113,6 +125,7 @@ fn is_domain(domain: &str) -> bool {
 pub fn display_name(emoji: &str, domain: Option<&str>) -> String {
     match (domain, shortcode(emoji)) {
         (Some(domain), Some(code)) => format!("{code}@{domain}"),
+        (None, Some(code)) => code.to_owned(),
         _ => emoji.to_owned(),
     }
 }
@@ -391,8 +404,8 @@ mod tests {
         );
         assert_eq!(
             display_name(":cat:", None),
-            ":cat:",
-            "a local one keeps its stored name"
+            "cat",
+            "a local one is named by its bare shortcode, as Pleroma does"
         );
         assert_eq!(display_name("👍", None), "👍", "so does a unicode one");
         assert_eq!(
@@ -400,6 +413,27 @@ mod tests {
             "👍",
             "a domain cannot rename text that is no shortcode"
         );
+    }
+
+    #[test]
+    fn a_bare_shortcode_is_a_word_of_shortcode_characters() {
+        for text in ["cat", "blob-cat", "blobfox+1", "a_b", "Cat99", "2hu"] {
+            assert_eq!(bare_shortcode(text), Some(text), "{text}");
+        }
+        for text in [
+            "",
+            ":cat:",
+            ":cat",
+            "cat:",
+            "a b",
+            "a.b",
+            "cat@x.test",
+            "🐱",
+            "é",
+            "::",
+        ] {
+            assert_eq!(bare_shortcode(text), None, "{text:?} is not a bare code");
+        }
     }
 
     #[test]

@@ -5,8 +5,8 @@ use serde_json::{Value, json};
 use wired_be::{config::TEST_BASE_URL, models::block};
 
 use super::support::{
-    CAT, CAT_URL, PARTY, THUMB, emoji, entry_keys, field, known, listed, names, public_post,
-    react_ok, reader_and_writer, shown, stamp, summary,
+    CAT, CAT_NAME, CAT_URL, PARTY, THUMB, emoji, entry_keys, field, known, listed, names,
+    public_post, react_ok, reader_and_writer, shown, stamp, summary,
 };
 use crate::common;
 
@@ -37,7 +37,7 @@ async fn the_reactions_read_lists_every_account_behind_each_emoji() {
             shown(&anonymous, 1)
         ),
         (
-            vec![THUMB.to_owned(), CAT.to_owned()],
+            vec![THUMB.to_owned(), CAT_NAME.to_owned()],
             vec![known(&alice), known(&bob)],
             vec![known(&bob)],
         ),
@@ -72,7 +72,7 @@ async fn the_reactions_read_lists_every_account_behind_each_emoji() {
         field(&app, Some(&alice_token), &status_id).await,
         json!([
             summary(THUMB, 2, true, &Value::Null, &[&alice.id, &bob.id]),
-            summary(CAT, 1, false, &json!(CAT_URL), &[&bob.id]),
+            summary(CAT_NAME, 1, false, &json!(CAT_URL), &[&bob.id]),
         ]),
         "and the status field of the same viewer says the same thing, by id"
     );

@@ -36,6 +36,13 @@
 //! activity's `tag` list and runs it through its media proxy; this instance
 //! serves the URL as stored).
 //!
+//! A local custom emoji is also accepted by its bare shortcode
+//! (`…/reactions/cat`, Pleroma's `plerofox` spelling) when the segment is
+//! neither unicode, `:code:` nor `code@domain` and names a local, enabled
+//! emoji. It is stored as `:cat:` either way, so federation is unchanged, and
+//! reads name it `cat`; `GET …/reactions/{emoji}` takes `cat` and `:cat:`
+//! alike.
+//!
 //! A custom emoji of another instance — the `:misskeycat:` a Misskey user left
 //! on a post — is named Pleroma's way, `shortcode@domain`, with or without the
 //! surrounding colons (`…/reactions/misskeycat@misskey.test` and
@@ -135,7 +142,7 @@ use crate::{
     },
     state::AppState,
     util::{
-        emoji::{Emoji, remote_shortcode},
+        emoji::{Emoji, bare_shortcode, remote_shortcode},
         id::new_activity_ap_id,
     },
 };
@@ -324,8 +331,9 @@ async fn list_reactions(
 /// `GET /api/v1/pleroma/statuses/{id}/reactions/{emoji}` — the same array
 /// narrowed to the one emoji the path names.
 ///
-/// The filter is on the emoji text as sent (Pleroma's `filter/2` compares the
-/// decoded parameter with the stored name), so an emoji nobody reacted with —
+/// The filter is on the emoji text as sent, read through [`named_emoji`] so the
+/// bare, colon and `shortcode@domain` spellings of one reaction all match it
+/// (Pleroma's `filter/2` compares the decoded parameter with the stored name), so an emoji nobody reacted with —
 /// usable shape or not — answers `[]`; nothing has to validate the segment to
 /// say that, and nothing does.
 ///
@@ -361,13 +369,17 @@ struct Wanted<'a> {
 /// The stored spelling and origin of the emoji an `{emoji}` segment names,
 /// without asking whether this instance has it.
 ///
-/// `shortcode@domain` (colons or not) names `:shortcode:` of `domain`; any
-/// other text is its own stored spelling.
+/// `shortcode@domain` (colons or not) names `:shortcode:` of `domain`, a bare
+/// `shortcode` names the local `:shortcode:`, and any other text is its own
+/// stored spelling.
 fn named_emoji(text: &str) -> (String, Option<String>) {
-    match remote_shortcode(text) {
-        Some((code, domain)) => (format!(":{code}:"), Some(domain)),
-        None => (text.to_owned(), None),
+    if let Some((code, domain)) = remote_shortcode(text) {
+        return (format!(":{code}:"), Some(domain));
     }
+    bare_shortcode(text).map_or_else(
+        || (text.to_owned(), None),
+        |code| (format!(":{code}:"), None),
+    )
 }
 
 /// The body of both reads: the reactions of the status `id` as `viewer` may see
@@ -529,7 +541,7 @@ async fn accepted_emoji(state: &AppState, text: &str) -> AppResult<Accepted> {
         return remote_emoji(&state.db, code, domain).await;
     }
     let Some(classified) = Emoji::classify(text) else {
-        return Err(invalid_emoji());
+        return bare_local_emoji(&state.db, text).await;
     };
     match classified {
         Emoji::Unicode(_) => Ok(Accepted {
@@ -546,6 +558,24 @@ async fn accepted_emoji(state: &AppState, text: &str) -> AppResult<Accepted> {
             })
             .ok_or_else(invalid_emoji),
     }
+}
+
+/// The local, enabled custom emoji a bare `shortcode` segment names, stored as
+/// `:shortcode:` like the colon spelling (Pleroma accepts both).
+///
+/// # Errors
+///
+/// [`AppError::BadRequest`] with `"Invalid emoji"` when `text` is not a bare
+/// shortcode or names no local, enabled emoji; any database failure arrives
+/// through `?` as [`AppError::Database`].
+async fn bare_local_emoji(pool: &PgPool, text: &str) -> AppResult<Accepted> {
+    let code = bare_shortcode(text).ok_or_else(invalid_emoji)?;
+    let emoji = local_emoji(pool, code).await?.ok_or_else(invalid_emoji)?;
+    Ok(Accepted {
+        text: format!(":{code}:"),
+        url: Some(emoji.image_url),
+        domain: None,
+    })
 }
 
 /// The remote, enabled custom emoji `shortcode@domain` names, stored as the
@@ -773,6 +803,11 @@ mod tests {
             named_emoji(":cat:"),
             (":cat:".to_owned(), None),
             "a plain shortcode is the local emoji"
+        );
+        assert_eq!(
+            named_emoji("cat"),
+            (":cat:".to_owned(), None),
+            "and so is the bare spelling Pleroma names it by"
         );
         assert_eq!(
             named_emoji("👍"),

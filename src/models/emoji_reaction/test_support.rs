@@ -30,6 +30,8 @@ pub(super) const THUMBS: &str = "👍";
 pub(super) const HEART: &str = "❤️";
 /// A custom emoji's stored spelling.
 pub(super) const CAT: &str = ":cat:";
+/// The name the API gives [`CAT`]: its bare shortcode.
+pub(super) const CAT_NAME: &str = "cat";
 /// The image URL stored beside [`CAT`].
 pub(super) const CAT_URL: &str = "https://test.example/emoji/cats/cat.png";
 

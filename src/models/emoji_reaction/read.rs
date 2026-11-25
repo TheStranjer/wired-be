@@ -156,7 +156,7 @@ mod tests {
     use super::super::{
         MAX_SUMMARY_REACTORS,
         test_support::{
-            CAT, CAT_URL, HEART, THUMBS, post, post_by, react_with, rollup, summary, user,
+            CAT, CAT_NAME, CAT_URL, HEART, THUMBS, post, post_by, react_with, rollup, summary, user,
         },
     };
     use super::*;
@@ -252,7 +252,7 @@ mod tests {
         );
         assert_eq!(
             rollups[&second],
-            vec![summary(CAT, 1, true, Some(CAT_URL), &[alice.id])],
+            vec![summary(CAT_NAME, 1, true, Some(CAT_URL), &[alice.id])],
             "the second status carries its custom reaction with its image"
         );
         assert_eq!(

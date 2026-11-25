@@ -135,7 +135,7 @@ async fn the_reactions_roll_up_in_the_render_batch() {
                 "account_ids": [alice.id.to_string()],
             },
             {
-                "name": CAT,
+                "name": "cat",
                 "count": 1,
                 "me": true,
                 "url": CAT_URL,
