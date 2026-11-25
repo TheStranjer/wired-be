@@ -137,6 +137,8 @@ mod tests {
             "update",
             "poll",
             "status",
+            "quote",
+            "quoted_update",
         ] {
             assert!(!is_groupable(name), "{name} is not groupable");
             assert_eq!(

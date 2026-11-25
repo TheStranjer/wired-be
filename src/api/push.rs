@@ -312,6 +312,12 @@ struct AlertsParams {
     /// A followed status was edited.
     #[serde(default, deserialize_with = "flex::opt_bool")]
     update: Option<bool>,
+    /// Someone quoted a status of the account.
+    #[serde(default, deserialize_with = "flex::opt_bool")]
+    quote: Option<bool>,
+    /// A status quoting one of the account's was edited.
+    #[serde(default, deserialize_with = "flex::opt_bool")]
+    quoted_update: Option<bool>,
     /// Someone requested to follow a locked account (`follow` also wakes
     /// for it, Pleroma's `enabled?/2` alias).
     #[serde(
@@ -498,7 +504,8 @@ mod tests {
             parsed.given_alerts(),
             json!({
                 "follow": true, "favourite": null, "reblog": null, "mention": null,
-                "poll": null, "status": null, "update": null, "follow_request": null,
+                "poll": null, "status": null, "update": null, "quote": null,
+                "quoted_update": null, "follow_request": null,
                 "pleroma:chat_mention": null, "pleroma:emoji_reaction": null,
                 "admin.sign_up": null, "admin.report": true,
             }),

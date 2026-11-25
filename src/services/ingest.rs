@@ -125,7 +125,7 @@ use crate::{
         status::{self, Status, Visibility},
         user::User,
     },
-    services::create_status::after_status_created,
+    services::{create_status::after_status_created, notify},
     state::AppState,
 };
 
@@ -339,8 +339,11 @@ async fn ingest_note_inner(
     }
     upsert_emojis(state, &parsed.emojis).await?;
     let new = build_new_status(&parsed, &reply, quote_of_id, &mentioned);
-    let row = write_ingested(state, &new, &parsed).await?;
+    let (row, late_quotes) = write_ingested(state, &new, &parsed).await?;
     after_status_created(state, &row).await;
+    for quoting_id in late_quotes {
+        notify::on_quote_linked(state, quoting_id).await;
+    }
     enqueue_backfill(state, &row, depth.backfill).await;
     if depth.follow_quotes {
         enqueue_quote_backfill(state, &row, parsed.quote_uri.as_deref()).await;

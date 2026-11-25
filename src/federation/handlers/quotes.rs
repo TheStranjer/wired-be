@@ -31,9 +31,12 @@
 //!   [`federation_out::answer_quote_request`]. A redelivered request
 //!   restates the standing grant; one whose grant was revoked is rejected.
 //!
+//! A grant that links the quote also tells the quoted author, through
+//! [`notify::on_quote_linked`].
+//!
 //! Withdrawing a grant (the `Delete` of the authorization when the quoted
-//! post goes away) and telling the author about the quote are follow-ups:
-//! until they land a revoked grant only makes its document answer 410.
+//! post goes away) is a follow-up: until it lands a revoked grant only
+//! makes its document answer 410.
 //!
 //! The dispatcher's containment has already proved the activity's `actor`
 //! to be the signer, so the local-signer guard here is the belt to that
@@ -62,6 +65,7 @@ use crate::{
     services::{
         federation_out::{self, QuoteRequestAnswer},
         ingest::{self, IngestOutcome},
+        notify,
     },
     state::AppState,
 };
@@ -210,9 +214,12 @@ impl Request<'_> {
             return self.refuse().await;
         };
         if let Some(quoting) = &self.instrument.status {
-            let _linked = status::link_backfilled_quote(&self.state.db, quoting.id, self.quoted)
+            let linked = status::link_backfilled_quote(&self.state.db, quoting.id, self.quoted)
                 .await
                 .map_err(|err| FederationError::transient("could not link the quote", &err))?;
+            if linked {
+                notify::on_quote_linked(self.state, quoting.id).await;
+            }
         }
         let authorization_uri = quote_authorization_uri(&self.state.config.base_url, grant.id);
         let answer = QuoteRequestAnswer {

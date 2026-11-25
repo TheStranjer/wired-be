@@ -138,6 +138,13 @@ pub const TYPE_POLL: &str = "poll";
 pub const TYPE_STATUS: &str = "status";
 /// The update type: a post the recipient boosted was edited. Ungrouped.
 pub const TYPE_UPDATE: &str = "update";
+/// The quote type: a status quoting a post the recipient wrote (Mastodon
+/// 4.5's `quote`). Ungrouped; the status is the quoting one.
+pub const TYPE_QUOTE: &str = "quote";
+/// The quoted-update type: a status that quotes the recipient's post was
+/// edited (Mastodon 4.5's `quoted_update`). Ungrouped; the status is the
+/// quoting one.
+pub const TYPE_QUOTED_UPDATE: &str = "quoted_update";
 /// The Pleroma chat-mention type: a chat message delivered to its recipient.
 ///
 /// Ungrouped, and it names no status — its subject is the

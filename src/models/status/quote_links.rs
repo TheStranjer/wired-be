@@ -89,6 +89,24 @@ pub async fn link_quotes_of(
     quoted_id: Uuid,
     uri: &str,
 ) -> AppResult<usize> {
+    Ok(link_waiting_quotes(conn, quoted_id, uri).await?.len())
+}
+
+/// [`link_quotes_of`], answering the ids of the quoting statuses it linked
+/// instead of their number.
+///
+/// The ids let the caller tell the original's author about each quote once
+/// the transaction has committed.
+///
+/// # Errors
+///
+/// Any database failure arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn link_waiting_quotes(
+    conn: &mut PgConnection,
+    quoted_id: Uuid,
+    uri: &str,
+) -> AppResult<Vec<Uuid>> {
     let linked = sqlx::query_scalar::<_, Uuid>(LINK_WAITING_SQL)
         .bind(quoted_id)
         .bind(uri)
@@ -98,7 +116,7 @@ pub async fn link_quotes_of(
         let delta = i32::try_from(linked.len()).unwrap_or(i32::MAX);
         step_counter(conn, quoted_id, Counter::Quotes, delta).await?;
     }
-    Ok(linked.len())
+    Ok(linked)
 }
 
 #[cfg(test)]
