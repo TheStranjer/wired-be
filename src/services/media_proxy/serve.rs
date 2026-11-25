@@ -17,7 +17,10 @@ use crate::{
     http_client::{HttpError, HttpResponse},
     models::media_proxy_cache,
     state::AppState,
-    util::{headers::NOSNIFF, media_type::top_level},
+    util::{
+        headers::NOSNIFF,
+        media_type::{essence, top_level},
+    },
 };
 
 /// `cache-control` for proxied media: a day, per the ticket (Pleroma's
@@ -33,6 +36,26 @@ const INLINE: &str = "inline";
 /// policy (`lib/pleroma/web/plugs/http_security_plug.ex`).
 const CSP: &str =
     "default-src 'none'; style-src 'unsafe-inline'; media-src 'self' data:; img-src 'self' data:";
+/// The raster image types served inline. Everything else under `image/`
+/// (notably `image/svg+xml`, which can run script) is refused.
+const RASTER_IMAGE_TYPES: [&str; 16] = [
+    "image/png",
+    "image/apng",
+    "image/jpeg",
+    "image/jpg",
+    "image/pjpeg",
+    "image/gif",
+    "image/webp",
+    "image/avif",
+    "image/bmp",
+    "image/heic",
+    "image/heif",
+    "image/tiff",
+    "image/jxl",
+    "image/x-icon",
+    "image/vnd.microsoft.icon",
+    "image/x-ms-bmp",
+];
 /// The request headers forwarded upstream: range requests and
 /// conditional revalidation, Pleroma's `@range_headers` plus the
 /// conditional half of its `@keep_req_headers`
@@ -217,11 +240,26 @@ fn copy_validator_headers(
     })
 }
 
-/// Whether a `Content-Type` names media this route may serve inline: the
-/// top-level type is `image/…`, `video/…` or `audio/…` (case-insensitive,
-/// parameters stripped).
+/// Whether a `Content-Type` names media this route may serve inline.
+///
+/// Images must be one of [`RASTER_IMAGE_TYPES`], so `image/svg+xml` (which
+/// can carry script and would run on the instance origin) and any XML,
+/// JSON or HTML type under an `image/` prefix are refused. Video and audio
+/// pass unless the subtype is a structured-syntax (`+xml`, `+json`, …) or
+/// markup type. Case-insensitive, parameters stripped.
 fn is_media_type(content_type: &str) -> bool {
-    top_level(content_type).is_some()
+    let media_type = essence(content_type);
+    match top_level(&media_type) {
+        Some("image") => RASTER_IMAGE_TYPES.contains(&media_type.as_str()),
+        Some(_) => media_type.split_once('/').is_some_and(|(_, subtype)| {
+            !subtype.is_empty()
+                && !subtype.contains('+')
+                && !subtype.contains("html")
+                && !subtype.contains("xml")
+                && !subtype.contains("svg")
+        }),
+        None => false,
+    }
 }
 
 /// The visible text of header `name`, empty when absent or not text.
