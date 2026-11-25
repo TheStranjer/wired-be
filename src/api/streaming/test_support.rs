@@ -25,6 +25,7 @@ use crate::{
     },
     state::AppState,
     streaming::hub::{Audience, RenderSpec, StreamEvent},
+    test_support::app_state,
 };
 
 /// An event on `streams` carrying the entity `payload`.
@@ -64,14 +65,8 @@ pub(super) fn query(pairs: &[(&str, &str)]) -> HashMap<String, String> {
         .collect()
 }
 
-/// The [`AppState`] a connection test runs on: `pool` and the fixed test
-/// config, with a hub of its own.
-fn app_state(pool: &PgPool) -> AppState {
-    app_state_with(pool, Config::for_tests())
-}
-
-/// [`app_state`] over `config`, for the tests that read a setting.
-pub(super) fn app_state_with(pool: &PgPool, config: Config) -> AppState {
+/// The [`AppState`] over `config`, for the tests that read a setting.
+pub(super) fn state_with_config(pool: &PgPool, config: Config) -> AppState {
     AppState::for_tests(pool.clone(), config)
 }
 

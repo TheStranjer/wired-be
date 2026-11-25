@@ -140,7 +140,6 @@ mod tests {
         routing::get,
     };
     use serde_json::{Value, json};
-    use sqlx::postgres::PgPoolOptions;
     use tokio::{net::TcpListener, task::JoinHandle};
 
     use super::*;
@@ -152,6 +151,7 @@ mod tests {
             user::{NewUser, insert},
         },
         state::AppState,
+        test_support::broken_state,
     };
 
     /// What the loopback peer answers a request for the move target with.
@@ -581,16 +581,6 @@ mod tests {
             "and nothing was stored"
         );
         peer.server.abort();
-    }
-
-    /// Test state over a pool that cannot answer: the database having gone
-    /// away, as the handlers see it.
-    async fn broken_state() -> AppState {
-        let pool = PgPoolOptions::new()
-            .connect_lazy("postgres://localhost/unused")
-            .expect("a lazy pool needs no database");
-        pool.close().await;
-        app_state(&pool)
     }
 
     /// The local-signer guard on every route: an account this instance owns

@@ -165,6 +165,7 @@ mod tests {
             test_support::*,
             validate::{CANNOT_BE_BLANK, HAS_INVALID_FORMAT, at_least},
         },
+        test_support::app_state,
     };
 
     /// Reads the invite `id` back, panicking if it is gone.
@@ -233,7 +234,7 @@ mod tests {
     async fn register_collects_every_failure_and_inserts_nothing() {
         let db = crate::test_db::test_db().await.expect("test database slot");
         let pool = db.pool().clone();
-        let state = test_state(&pool);
+        let state = app_state(&pool);
 
         let bad_shape = RegisterParams {
             nickname: "bad nickname!".to_owned(),
@@ -296,7 +297,7 @@ mod tests {
         let pool = db.pool().clone();
         let alice = insert_login(&pool, "Alice", "Alice@Example.ORG", None).await;
         let bob = insert_login(&pool, "bob", "bob@example.org", None).await;
-        let state = test_state(&pool);
+        let state = app_state(&pool);
         let dup_params = RegisterParams {
             nickname: "aLiCe".to_owned(),
             email: Some("alice@example.org".to_owned()),
@@ -364,7 +365,7 @@ mod tests {
         .await
         .expect("the squatter inserts");
         assert_eq!(squatter.nickname, "mallory", "the squatter owns ap_id");
-        let state = test_state(&pool);
+        let state = app_state(&pool);
         let race_err = create_local_user(&state, params_for("alice"), None)
             .await
             .unwrap_err();
@@ -383,7 +384,7 @@ mod tests {
     async fn an_invited_registration_consumes_the_invite_in_its_transaction() {
         let db = crate::test_db::test_db().await.expect("test database slot");
         let pool = db.pool().clone();
-        let state = test_state(&pool);
+        let state = app_state(&pool);
         let invite = invite_token::create(&pool, &invite_token::InviteParams::one_time())
             .await
             .expect("the invite mints");
@@ -431,7 +432,7 @@ mod tests {
         let pool = db.pool().clone();
         let squatter = insert_login(&pool, "taken", "taken@example.org", None).await;
         assert_eq!(squatter.nickname, "taken", "the collision fixture exists");
-        let state = test_state(&pool);
+        let state = app_state(&pool);
         let invite = invite_token::create(
             &pool,
             &invite_token::InviteParams {

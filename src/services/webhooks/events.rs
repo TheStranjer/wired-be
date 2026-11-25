@@ -96,11 +96,12 @@ fn account_payload(state: &AppState, account: &User) -> AppResult<Value> {
 mod tests {
     use chrono::Utc;
 
-    use super::super::test_support::{
-        app_state, dead_state, deliveries, filed, fresh_id, hook, local,
-    };
+    use super::super::test_support::{deliveries, filed, fresh_id, hook, local};
     use super::*;
-    use crate::models::report::Category;
+    use crate::{
+        models::report::Category,
+        test_support::{app_state, lazy_state},
+    };
 
     #[tokio::test]
     async fn the_report_hooks_announce_the_filed_report() {
@@ -171,7 +172,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_unreadable_database_queues_nothing_and_never_panics() {
-        let state = dead_state();
+        let state = lazy_state();
         let row = ReportRow {
             id: fresh_id(),
             reporter_id: fresh_id(),

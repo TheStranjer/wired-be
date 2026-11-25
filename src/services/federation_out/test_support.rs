@@ -25,10 +25,8 @@ use crate::{
 };
 use serde_json::Value;
 
-/// The test state over `pool` with the default (federating) config.
-pub(super) fn app_state(pool: &PgPool) -> AppState {
-    state_with(pool, Config::for_tests())
-}
+// The test state over a slot's pool with the default (federating) config.
+pub(super) use crate::test_support::app_state;
 
 /// The test state over `pool` with an injected config.
 pub(super) fn state_with(pool: &PgPool, config: Config) -> AppState {

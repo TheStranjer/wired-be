@@ -38,11 +38,6 @@ pub(super) fn state_with_config(pool: &PgPool, config: Config) -> AppState {
     AppState::for_tests(pool.clone(), config)
 }
 
-/// Test state over `pool` with the fixed test config.
-pub(super) fn app_state(pool: &PgPool) -> AppState {
-    state_with_config(pool, Config::for_tests())
-}
-
 /// Test state over `pool` whose uploads live in a fresh temporary
 /// directory, together with that directory's guard: the handler stores
 /// into and deletes from that same directory, so the guard must

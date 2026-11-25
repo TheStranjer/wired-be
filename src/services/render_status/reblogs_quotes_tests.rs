@@ -7,7 +7,7 @@ use sqlx::PgPool;
 
 use super::{
     ViewerMode, render_status,
-    test_support::{BASE, post, test_state, user},
+    test_support::{BASE, app_state, post, user},
 };
 use crate::models::{
     quote_request::{self, NewQuoteRequest, QuoteRequestState},
@@ -60,7 +60,7 @@ async fn private_post(pool: &PgPool, author: &User) -> StatusRow {
 async fn the_quote_nests_from_the_batch_with_its_visibility_read() {
     let db = crate::test_db::test_db().await.expect("test database slot");
     let pool = db.pool().clone();
-    let state = test_state(&pool);
+    let state = app_state(&pool);
     let alice = user(&pool, "alice").await;
     let bob = user(&pool, "bob").await;
     let carol = user(&pool, "carol").await;
@@ -147,7 +147,7 @@ async fn the_quote_nests_from_the_batch_with_its_visibility_read() {
 async fn the_admin_view_nests_a_quote_its_viewer_cannot_reach() {
     let db = crate::test_db::test_db().await.expect("test database slot");
     let pool = db.pool().clone();
-    let state = test_state(&pool);
+    let state = app_state(&pool);
     let alice = user(&pool, "alice").await;
     let root = user(&pool, "root").await;
     let secret = private_post(&pool, &alice).await;
@@ -186,7 +186,7 @@ async fn the_admin_view_nests_a_quote_its_viewer_cannot_reach() {
 async fn a_reblog_nests_the_original_and_keeps_its_own_identity() {
     let db = crate::test_db::test_db().await.expect("test database slot");
     let pool = db.pool().clone();
-    let state = test_state(&pool);
+    let state = app_state(&pool);
     let alice = user(&pool, "alice").await;
     let bob = user(&pool, "bob").await;
     let original = insert(
@@ -261,7 +261,7 @@ async fn a_reblog_nests_the_original_and_keeps_its_own_identity() {
 async fn the_quoted_authors_answer_is_the_quotes_state() {
     let db = crate::test_db::test_db().await.expect("test database slot");
     let pool = db.pool().clone();
-    let state = test_state(&pool);
+    let state = app_state(&pool);
     let alice = user(&pool, "alice").await;
     let bob = user(&pool, "bob").await;
     let source = post(&pool, &bob, "the source").await;

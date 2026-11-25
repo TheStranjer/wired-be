@@ -8,7 +8,7 @@ use sqlx::PgPool;
 
 use super::{
     ViewerMode, render_status, render_statuses,
-    test_support::{BASE, post, test_state, user},
+    test_support::{BASE, app_state, post, user},
 };
 use crate::{
     entities::status::Status,
@@ -63,7 +63,7 @@ async fn render_first(state: &AppState, statuses: &[StatusRow]) -> Value {
 async fn a_plain_status_renders_its_stored_facts() {
     let db = crate::test_db::test_db().await.expect("test database slot");
     let pool = db.pool().clone();
-    let state = test_state(&pool);
+    let state = app_state(&pool);
     let alice = user(&pool, "alice").await;
     let status = insert(
         &pool,
@@ -130,7 +130,7 @@ async fn a_plain_status_renders_its_stored_facts() {
 async fn replies_mentions_and_media_render_their_links() {
     let db = crate::test_db::test_db().await.expect("test database slot");
     let pool = db.pool().clone();
-    let state = test_state(&pool);
+    let state = app_state(&pool);
     let alice = user(&pool, "alice").await;
     let bob = user(&pool, "bob").await;
     let root = insert(
@@ -216,7 +216,7 @@ async fn replies_mentions_and_media_render_their_links() {
 async fn twenty_statuses_by_five_authors_render_in_one_batch() {
     let db = crate::test_db::test_db().await.expect("test database slot");
     let pool = db.pool().clone();
-    let state = test_state(&pool);
+    let state = app_state(&pool);
     let mut authors = Vec::new();
     for n in 0..5 {
         authors.push(author_with_posts(&pool, &format!("user{n}"), 4).await);
@@ -255,7 +255,7 @@ async fn twenty_statuses_by_five_authors_render_in_one_batch() {
 async fn tombstones_and_reblogs_of_gone_originals_are_skipped() {
     let db = crate::test_db::test_db().await.expect("test database slot");
     let pool = db.pool().clone();
-    let state = test_state(&pool);
+    let state = app_state(&pool);
     let alice = user(&pool, "alice").await;
     let bob = user(&pool, "bob").await;
     let keep = post(&pool, &alice, "kept").await;
@@ -303,7 +303,7 @@ async fn tombstones_and_reblogs_of_gone_originals_are_skipped() {
 async fn the_viewers_relationship_lands_in_the_account_entity() {
     let db = crate::test_db::test_db().await.expect("test database slot");
     let pool = db.pool().clone();
-    let state = test_state(&pool);
+    let state = app_state(&pool);
     let alice = user(&pool, "alice").await;
     let bob = user(&pool, "bob").await;
     let following = follow::follow(&pool, BASE, &bob, &alice)
@@ -349,7 +349,7 @@ async fn the_viewers_relationship_lands_in_the_account_entity() {
 async fn remote_mirrors_render_their_stored_urls_and_text() {
     let db = crate::test_db::test_db().await.expect("test database slot");
     let pool = db.pool().clone();
-    let state = test_state(&pool);
+    let state = app_state(&pool);
     let mallory = user(&pool, "mallory").await;
     let published = Utc
         .with_ymd_and_hms(2024, 2, 1, 8, 0, 0)
@@ -401,7 +401,7 @@ async fn remote_mirrors_render_their_stored_urls_and_text() {
 async fn empty_and_tombstone_pages_render_empty() {
     let db = crate::test_db::test_db().await.expect("test database slot");
     let pool = db.pool().clone();
-    let state = test_state(&pool);
+    let state = app_state(&pool);
     let alice = user(&pool, "alice").await;
     let status = post(&pool, &alice, "gone").await;
     let tombstone = soft_delete(&pool, status.id)

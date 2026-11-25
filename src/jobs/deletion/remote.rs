@@ -69,12 +69,13 @@ mod tests {
     use uuid::Uuid;
 
     use super::super::test_support::{
-        Departed, app_state, broken_state, count_where, departed_mirror, fresh_user, has_follow,
-        is_blank_tombstone, likes, listed_messages, live_statuses, local_user, post, remote_post,
-        remote_user, run_remote, send_chat, send_chat_own, status_deleted_at,
+        Departed, count_where, departed_mirror, fresh_user, has_follow, is_blank_tombstone, likes,
+        listed_messages, live_statuses, local_user, post, remote_post, remote_user, run_remote,
+        send_chat, send_chat_own, status_deleted_at,
     };
     use super::super::{KIND_DELETE_REMOTE, job_args};
     use super::*;
+    use crate::test_support::{app_state, broken_state};
 
     /// The remote sweep, past a batch boundary: every post the mirror made is
     /// a tombstone while the rows stay, and the row itself survives as the

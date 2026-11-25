@@ -1,18 +1,20 @@
 //! Test fixtures shared by the chat unit tests: the local and remote
-//! users the gating and hook tests pair up, the test [`AppState`] the
-//! hooks publish through, and the message write both create paths stand
-//! on.
+//! users the gating and hook tests pair up, the test state the hooks
+//! publish through, and the message write both create paths stand on.
 
 use crate::{
-    config::{Config, TEST_BASE_URL},
+    config::TEST_BASE_URL,
     models::{
         chat,
         chat::{ChatMessageReference, NewChatMessage},
         user::{self, User},
     },
-    state::AppState,
     test_fixtures::{local_new, remote_new},
 };
+
+// Test state over a slot's pool with the fixed test config: the hooks under
+// test publish through the hub it owns, which the tests subscribe to.
+pub(super) use crate::test_support::app_state;
 
 // A local user named `nickname` that accepts chats, and its remote
 // counterpart on `remote.example`: the pair a delivered or addressed
@@ -44,12 +46,6 @@ pub(super) async fn quiet_remote(pool: &sqlx::PgPool, nickname: &str) -> User {
     )
     .await
     .expect("fixture remote user inserts")
-}
-
-/// Test state over `pool` with the fixed test config: the hooks under
-/// test publish through the hub it owns, which the tests subscribe to.
-pub(super) fn app_state(pool: &sqlx::PgPool) -> AppState {
-    AppState::for_tests(pool.clone(), Config::for_tests())
 }
 
 /// Writes `sender`'s message to `recipient` the way both create paths

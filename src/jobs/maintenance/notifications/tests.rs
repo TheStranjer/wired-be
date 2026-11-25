@@ -11,10 +11,11 @@ use super::*;
 use crate::{
     jobs::{
         JobError, QUEUE_BACKGROUND,
-        maintenance::test_support::{DAY, EVERY, FIRST_ATTEMPT, app_state, broken_state, user},
+        maintenance::test_support::{DAY, EVERY, FIRST_ATTEMPT, user},
         scheduler::periodic_jobs,
     },
     models::user::User,
+    test_support::{app_state, broken_state},
 };
 
 /// Inserts a notification for `recipient` caused by `actor` whose

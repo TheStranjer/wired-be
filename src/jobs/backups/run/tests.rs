@@ -7,7 +7,6 @@
 use std::{fs::File, time::Duration};
 
 use serde_json::json;
-use sqlx::postgres::PgPoolOptions;
 use uuid::Uuid;
 use zip::ZipArchive;
 
@@ -17,25 +16,14 @@ use crate::{
         QUEUE_BACKGROUND,
         backups::{
             archive::{ACTOR_ENTRY, BOOKMARKS_ENTRY, LIKES_ENTRY, OUTBOX_ENTRY},
-            test_support::{
-                FIRST_ATTEMPT, app_state, like, mark, post, purge, run, uploads_state, user,
-            },
+            test_support::{FIRST_ATTEMPT, like, mark, post, purge, run, uploads_state, user},
         },
         scheduler::periodic_jobs,
     },
     models::status::{Status, Visibility},
+    test_support::{app_state, broken_state},
     uploads,
 };
-
-/// Test state over a pool that cannot answer: closed before it ever
-/// connected, which is how a handler sees a database that went away.
-async fn broken_state() -> AppState {
-    let pool = PgPoolOptions::new()
-        .connect_lazy("postgres://localhost/unused")
-        .expect("a lazy pool needs no database");
-    pool.close().await;
-    app_state(&pool)
-}
 
 /// The entry names of the zip file standing at `path`, in archive
 /// order — the read-back of a stored archive, opened by path because

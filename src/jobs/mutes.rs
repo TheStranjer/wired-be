@@ -50,34 +50,19 @@ mod tests {
     use std::time::Duration;
 
     use serde_json::json;
-    use sqlx::{PgPool, postgres::PgPoolOptions};
+    use sqlx::PgPool;
     use uuid::Uuid;
 
     use super::*;
     use crate::{
-        config::Config,
         jobs::{JobError, QUEUE_BACKGROUND, scheduler::periodic_jobs},
         models::user::User,
         test_fixtures::local_user as user,
+        test_support::{app_state, broken_state},
     };
 
     /// The period the sweep is scheduled on: ten minutes.
     const EVERY: Duration = Duration::from_secs(600);
-
-    /// Test state over `pool` with the fixed test config.
-    fn app_state(pool: &PgPool) -> AppState {
-        AppState::for_tests(pool.clone(), Config::for_tests())
-    }
-
-    /// Test state over a pool that cannot answer: closed before it ever
-    /// connected, which is how a handler sees a database that went away.
-    async fn broken_state() -> AppState {
-        let pool = PgPoolOptions::new()
-            .connect_lazy("postgres://localhost/unused")
-            .expect("a lazy pool needs no database");
-        pool.close().await;
-        app_state(&pool)
-    }
 
     /// Writes `target` into `muter`'s mute list with `expires_at` set to
     /// `seconds` from now (negative for the past), so a test can put the table

@@ -7,7 +7,7 @@ use sqlx::PgPool;
 
 use super::{
     ViewerMode, render_statuses,
-    test_support::{BASE, post, test_state, user},
+    test_support::{BASE, app_state, post, user},
 };
 use crate::models::{
     follow,
@@ -76,7 +76,7 @@ async fn parent_visible(
 async fn a_reply_to_a_private_post_is_visible_only_to_those_who_see_the_parent() {
     let db = crate::test_db::test_db().await.expect("test database slot");
     let pool = db.pool().clone();
-    let state = test_state(&pool);
+    let state = app_state(&pool);
     let alice = user(&pool, "alice").await;
     let bob = user(&pool, "bob").await;
     let carol = user(&pool, "carol").await;
@@ -122,7 +122,7 @@ async fn a_reply_to_a_private_post_is_visible_only_to_those_who_see_the_parent()
 async fn public_and_root_parents_are_visible_and_a_gone_parent_is_not() {
     let db = crate::test_db::test_db().await.expect("test database slot");
     let pool = db.pool().clone();
-    let state = test_state(&pool);
+    let state = app_state(&pool);
     let alice = user(&pool, "alice").await;
     let bob = user(&pool, "bob").await;
     let open = post(&pool, &alice, "open").await;
@@ -148,7 +148,7 @@ async fn public_and_root_parents_are_visible_and_a_gone_parent_is_not() {
 async fn the_flag_is_keyed_to_each_rows_own_parent() {
     let db = crate::test_db::test_db().await.expect("test database slot");
     let pool = db.pool().clone();
-    let state = test_state(&pool);
+    let state = app_state(&pool);
     let alice = user(&pool, "alice").await;
     let bob = user(&pool, "bob").await;
     let secret = private_post(&pool, &alice).await;

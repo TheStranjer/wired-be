@@ -4,7 +4,6 @@
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use sqlx::PgPool;
-use sqlx::postgres::PgPoolOptions;
 use uuid::Uuid;
 
 use super::{handle_delete, handle_delete_remote, job_args};
@@ -29,27 +28,13 @@ use crate::{
     pagination::{MAX_LIMIT, PageParams},
     state::AppState,
     test_fixtures::local_new,
+    test_support::app_state,
     uploads::UploaderBackend,
 };
 
 /// How many statuses the batch test inserts: one full 100-row pass and
 /// a remainder, so the loop must run at least twice.
 pub(super) const BATCH_OVERSHOOT: i64 = 120;
-
-/// Test state over `pool` with the fixed test config.
-pub(super) fn app_state(pool: &PgPool) -> AppState {
-    AppState::for_tests(pool.clone(), Config::for_tests())
-}
-
-/// Test state over a pool that cannot answer: closed before it ever
-/// connected, which is how a handler sees a database that went away.
-pub(super) async fn broken_state() -> AppState {
-    let pool = PgPoolOptions::new()
-        .connect_lazy("postgres://localhost/unused")
-        .expect("a lazy pool needs no database");
-    pool.close().await;
-    app_state(&pool)
-}
 
 /// Inserts a locked local user named `nickname`, so a follow of it waits
 /// in `pending` until the user answers.

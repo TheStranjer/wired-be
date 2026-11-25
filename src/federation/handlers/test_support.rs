@@ -7,29 +7,18 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::{
-    config::{Config, TEST_BASE_URL},
+    config::TEST_BASE_URL,
     federation::dispatch::{FederationError, Outcome},
     models::{
         follow,
-        user::{self, NewUser, User, insert},
+        user::{self, User},
     },
-    state::AppState,
 };
 
-/// Test state over `pool` with the fixed test config.
-pub(super) fn app_state(pool: &PgPool) -> AppState {
-    AppState::for_tests(pool.clone(), Config::for_tests())
-}
-
-/// A local account named `nickname` at `{TEST_BASE_URL}/users/{nickname}`.
-pub(super) async fn local_user(pool: &PgPool, nickname: &str) -> User {
-    insert(
-        pool,
-        &NewUser::local(nickname, &user::local_ap_id(TEST_BASE_URL, nickname)),
-    )
-    .await
-    .expect("the local fixture inserts")
-}
+// Test state over a slot's pool with the fixed test config.
+pub(super) use crate::test_support::app_state;
+// A local account named `nickname` at `{TEST_BASE_URL}/users/{nickname}`.
+pub(super) use crate::test_fixtures::local_user;
 
 /// User `id` as it stands now.
 pub(super) async fn fresh_user(pool: &PgPool, id: Uuid) -> User {

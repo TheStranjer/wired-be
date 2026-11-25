@@ -126,15 +126,11 @@ mod tests {
 
     use super::*;
     use crate::{
-        config::{Config, TEST_BASE_URL},
+        config::TEST_BASE_URL,
         models::{notification::NewNotification, status::NewStatus, user::User},
         test_fixtures::local_user as user,
+        test_support::app_state,
     };
-
-    /// Test state over `pool` with the fixed test config.
-    fn app_state(pool: &PgPool) -> AppState {
-        AppState::for_tests(pool.clone(), Config::for_tests())
-    }
 
     /// A public post by `author`.
     async fn post(pool: &PgPool, author: &User, text: &str) -> status::Status {

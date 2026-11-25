@@ -327,7 +327,7 @@ mod tests {
 
     /// Test state over `pool` with the fixed test config: rich media
     /// fetching for remote posts off, nothing on the ignore list.
-    fn app_state(pool: &PgPool) -> AppState {
+    fn mock_state(pool: &PgPool) -> AppState {
         state_with(pool, Config::for_tests())
     }
 
@@ -528,7 +528,7 @@ mod tests {
         let alice = user(&pool, "alice").await;
         let (url, hits) = mock_page().await;
         let row = linking(&pool, &alice, Visibility::Public, &url).await;
-        let state = app_state(&pool);
+        let state = mock_state(&pool);
 
         let first = handle_fetch(state.clone(), FIRST_ATTEMPT, job_args(row.id)).await;
         assert_eq!(first, Ok(()), "the fetching pass completes");
@@ -561,7 +561,7 @@ mod tests {
         let (url, _hits) = mock_page().await;
         let row = linking(&pool, &alice, Visibility::Unlisted, &url).await;
 
-        let outcome = handle_fetch(app_state(&pool), FIRST_ATTEMPT, job_args(row.id)).await;
+        let outcome = handle_fetch(mock_state(&pool), FIRST_ATTEMPT, job_args(row.id)).await;
 
         assert_eq!(outcome, Ok(()), "unlisted passes the gate");
         assert_eq!(
@@ -582,7 +582,7 @@ mod tests {
             .await
             .expect("the fixture seeds the cache");
 
-        let outcome = handle_fetch(app_state(&pool), FIRST_ATTEMPT, job_args(row.id)).await;
+        let outcome = handle_fetch(mock_state(&pool), FIRST_ATTEMPT, job_args(row.id)).await;
 
         assert_eq!(outcome, Ok(()), "a cache hit is a completed job");
         assert_eq!(
@@ -611,7 +611,7 @@ mod tests {
         let pool = db.pool().clone();
         let alice = user(&pool, "alice").await;
         let (url, hits) = mock_page().await;
-        let state = app_state(&pool);
+        let state = mock_state(&pool);
 
         for visibility in [Visibility::Private, Visibility::Direct, Visibility::Local] {
             let row = linking(&pool, &alice, visibility, &url).await;
@@ -631,7 +631,7 @@ mod tests {
         let (url, hits) = mock_page().await;
         let row = mirrored_linking(&pool, &bob, &url).await;
 
-        let gated = handle_fetch(app_state(&pool), FIRST_ATTEMPT, job_args(row.id)).await;
+        let gated = handle_fetch(mock_state(&pool), FIRST_ATTEMPT, job_args(row.id)).await;
         assert_eq!(gated, Ok(()), "the closed gate completes silently");
         assert_eq!(cache_count(&pool).await, 0, "and stores nothing");
         assert_eq!(hits.load(Ordering::SeqCst), 0, "without fetching");
@@ -661,7 +661,7 @@ mod tests {
             .await
             .expect("the status fixture inserts");
 
-        let outcome = handle_fetch(app_state(&pool), FIRST_ATTEMPT, job_args(row.id)).await;
+        let outcome = handle_fetch(mock_state(&pool), FIRST_ATTEMPT, job_args(row.id)).await;
 
         assert_eq!(
             outcome,
@@ -697,7 +697,7 @@ mod tests {
         let url = mock_missing_page().await;
         let row = linking(&pool, &alice, Visibility::Public, &url).await;
 
-        let outcome = handle_fetch(app_state(&pool), FIRST_ATTEMPT, job_args(row.id)).await;
+        let outcome = handle_fetch(mock_state(&pool), FIRST_ATTEMPT, job_args(row.id)).await;
 
         assert_eq!(outcome, Ok(()), "a dead URL is cached, not a queue retry");
         let entry = cached(&pool, &url)
@@ -717,7 +717,8 @@ mod tests {
         let db = crate::test_db::test_db().await.expect("test database slot");
         let pool = db.pool().clone();
 
-        let outcome = handle_fetch(app_state(&pool), FIRST_ATTEMPT, job_args(Uuid::now_v7())).await;
+        let outcome =
+            handle_fetch(mock_state(&pool), FIRST_ATTEMPT, job_args(Uuid::now_v7())).await;
 
         match outcome {
             Err(JobError::Discard(detail)) => assert!(
@@ -734,7 +735,7 @@ mod tests {
         let db = crate::test_db::test_db().await.expect("test database slot");
         let pool = db.pool().clone();
 
-        let outcome = handle_fetch(app_state(&pool), FIRST_ATTEMPT, json!({})).await;
+        let outcome = handle_fetch(mock_state(&pool), FIRST_ATTEMPT, json!({})).await;
 
         match outcome {
             Err(JobError::Discard(detail)) => assert!(
@@ -754,7 +755,7 @@ mod tests {
         unusable.close().await;
 
         let outcome = handle_fetch(
-            app_state(&unusable),
+            mock_state(&unusable),
             FIRST_ATTEMPT,
             job_args(Uuid::now_v7()),
         )
@@ -775,7 +776,7 @@ mod tests {
         let pool = db.pool().clone();
         let alice = user(&pool, "alice").await;
         let row = linking(&pool, &alice, Visibility::Public, "https://example.test").await;
-        let state = app_state(&pool);
+        let state = mock_state(&pool);
 
         schedule_fetch(&state, &row).await;
         // The dedupe key swallows the second claim.

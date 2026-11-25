@@ -230,11 +230,11 @@ mod tests {
     use tokio::task::JoinHandle;
 
     use super::super::test_support::{
-        Pref, Seen, account, app_state, client_keys, local, mock_push_service, note_about,
-        open_pref, run, served, setup, subscribe,
+        Pref, Seen, account, client_keys, local, mock_push_service, note_about, open_pref, run,
+        served, setup, subscribe,
     };
     use super::*;
-    use crate::config::TEST_BASE_URL;
+    use crate::{config::TEST_BASE_URL, test_support::app_state};
 
     #[tokio::test]
     async fn a_missing_subscription_or_notification_completes_quietly() {

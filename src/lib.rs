@@ -33,6 +33,8 @@ pub mod test_db;
 pub mod test_fixtures;
 #[cfg(test)]
 pub mod test_server;
+#[cfg(test)]
+pub mod test_support;
 pub mod uploads;
 pub mod util;
 

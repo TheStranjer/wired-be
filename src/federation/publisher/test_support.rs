@@ -28,10 +28,8 @@ pub(super) fn state_with(pool: &PgPool, config: Config) -> AppState {
     AppState::for_tests(pool.clone(), config)
 }
 
-/// The default test state: federation on, the standard test config.
-pub(super) fn test_state(pool: &PgPool) -> AppState {
-    state_with(pool, Config::for_tests())
-}
+// The default test state: federation on, the standard test config.
+pub(super) use crate::test_support::app_state;
 
 /// The publishing actor: local `alice` on the test origin, with the
 /// inbox and followers-collection URL a real actor row carries.

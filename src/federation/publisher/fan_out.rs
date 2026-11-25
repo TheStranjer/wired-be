@@ -52,7 +52,7 @@ async fn a_public_note_fans_out_to_the_remote_followers() {
     for follower in [&carol, &dave, &erin, &frank] {
         followed(&pool, follower, &alice).await;
     }
-    let state = test_state(&pool);
+    let state = app_state(&pool);
 
     let count = publish_ok(
         &state,
@@ -89,7 +89,7 @@ async fn a_mentioned_remote_user_gets_their_shared_inbox() {
         Some("https://peer.example/inbox"),
     )
     .await;
-    let state = test_state(&pool);
+    let state = app_state(&pool);
     let activity = json!({
         "id": ACTIVITY_ID,
         "type": "Create",
@@ -123,7 +123,7 @@ async fn a_mentioned_remote_user_without_a_shared_inbox_gets_their_personal_inbo
         None,
     )
     .await;
-    let state = test_state(&pool);
+    let state = app_state(&pool);
     let activity = json!({
         "id": ACTIVITY_ID,
         "type": "Create",
@@ -158,7 +158,7 @@ async fn a_boost_of_a_following_remote_author_is_delivered_once() {
     )
     .await;
     followed(&pool, &carol, &alice).await;
-    let state = test_state(&pool);
+    let state = app_state(&pool);
     let activity = json!({
         "id": ACTIVITY_ID,
         "type": "Announce",
@@ -212,7 +212,7 @@ async fn two_mentions_and_a_follower_on_one_host_share_one_delivery() {
     )
     .await;
     followed(&pool, &dave, &alice).await;
-    let state = test_state(&pool);
+    let state = app_state(&pool);
     let activity = json!({
         "id": ACTIVITY_ID,
         "type": "Create",
@@ -255,7 +255,7 @@ async fn a_direct_message_to_two_users_on_one_host_goes_to_both_personal_inboxes
         shared,
     )
     .await;
-    let state = test_state(&pool);
+    let state = app_state(&pool);
     let activity = json!({
         "id": ACTIVITY_ID,
         "type": "Create",
@@ -301,7 +301,7 @@ async fn a_direct_message_goes_only_to_the_mentioned() {
         None,
     )
     .await;
-    let state = test_state(&pool);
+    let state = app_state(&pool);
     let opts = PublishOpts {
         extra_inboxes: Vec::new(),
         only_to: Some(vec![bob.ap_id.clone()]),
@@ -344,7 +344,7 @@ async fn local_followers_never_receive_a_delivery() {
     )
     .await;
     followed(&pool, &remote, &alice).await;
-    let state = test_state(&pool);
+    let state = app_state(&pool);
 
     let count = publish_ok(
         &state,
@@ -387,7 +387,7 @@ async fn a_rejected_domain_is_excluded() {
     )
     .await;
     followed(&pool, &clean, &alice).await;
-    let state = test_state(&pool);
+    let state = app_state(&pool);
 
     let count = publish_ok(
         &state,
@@ -414,7 +414,7 @@ async fn a_rejected_extra_inbox_is_never_enqueued() {
     let pool = db.pool().clone();
     let alice = alice(&pool).await;
     policy_reject(&pool, "spam.example").await;
-    let state = test_state(&pool);
+    let state = app_state(&pool);
 
     let count = publish_ok(
         &state,
@@ -475,7 +475,7 @@ async fn a_domain_the_mrf_lists_reject_is_excluded() {
     )
     .await;
     followed(&pool, &erin, &alice).await;
-    let state = test_state(&pool);
+    let state = app_state(&pool);
 
     let count = publish_ok(
         &state,
@@ -503,7 +503,7 @@ async fn one_inbox_is_enqueued_once() {
     let personal = "https://peer.example/users/erin/inbox";
     let erin = mirror(&pool, "erin", "peer.example", personal, None).await;
     followed(&pool, &erin, &alice).await;
-    let state = test_state(&pool);
+    let state = app_state(&pool);
     let activity = json!({
         "id": ACTIVITY_ID,
         "type": "Create",
@@ -553,7 +553,7 @@ async fn the_instance_actor_the_actor_and_the_suspended_are_excluded() {
         None,
     )
     .await;
-    let state = test_state(&pool);
+    let state = app_state(&pool);
     let activity = json!({
         "id": ACTIVITY_ID,
         "type": "Create",
@@ -584,7 +584,7 @@ async fn unknown_recipients_are_skipped() {
     let db = crate::test_db::test_db().await.expect("test database slot");
     let pool = db.pool().clone();
     let alice = alice(&pool).await;
-    let state = test_state(&pool);
+    let state = app_state(&pool);
     let activity = json!({
         "id": ACTIVITY_ID,
         "type": "Create",
@@ -615,7 +615,7 @@ async fn a_repeated_publish_reuses_the_queued_delivery() {
     )
     .await;
     followed(&pool, &erin, &alice).await;
-    let state = test_state(&pool);
+    let state = app_state(&pool);
     let activity = public_activity(&alice);
 
     let first = publish_ok(&state, &alice, &activity, PublishOpts::default()).await;

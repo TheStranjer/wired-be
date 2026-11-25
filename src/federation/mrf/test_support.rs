@@ -6,7 +6,7 @@ use std::sync::Mutex;
 
 use chrono::{DateTime, TimeDelta, TimeZone as _, Utc};
 use serde_json::{Map, Value, json};
-use sqlx::{PgPool, postgres::PgPoolOptions};
+use sqlx::PgPool;
 
 use super::{
     MrfContext, MrfPolicy, MrfResult,
@@ -55,20 +55,6 @@ pub(super) fn after(secs: i64) -> DateTime<Utc> {
 /// Test state over `pool` and `config`.
 pub(super) fn state_with(pool: &PgPool, config: Config) -> AppState {
     AppState::for_tests(pool.clone(), config)
-}
-
-/// Test state on the default test config over `pool`.
-pub(super) fn test_state(pool: &PgPool) -> AppState {
-    state_with(pool, Config::for_tests())
-}
-
-/// State whose database cannot answer: the failed-read path.
-pub(super) async fn broken_state() -> AppState {
-    let pool = PgPoolOptions::new()
-        .connect_lazy("postgres://localhost/unused")
-        .expect("a lazy pool needs no database");
-    pool.close().await;
-    test_state(&pool)
 }
 
 /// The follow fixture the filters read.

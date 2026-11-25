@@ -193,21 +193,16 @@ mod tests {
 
     use super::*;
     use crate::{
-        config::Config,
         models::{
             status,
             user::{self, Flag, NewUser, User},
         },
         test_server::{bind, origin, spawn},
+        test_support::app_state,
     };
 
     /// The actor every fixture here is delivered by.
     const BOB: &str = "https://remote.example/users/bob";
-
-    /// Test state: `pool` and the fixed test config, collaborators inert.
-    fn app_state(pool: &PgPool) -> AppState {
-        AppState::for_tests(pool.clone(), Config::for_tests())
-    }
 
     /// The stored mirror of the fixture author.
     async fn signer(pool: &PgPool) -> User {

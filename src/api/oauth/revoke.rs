@@ -176,11 +176,9 @@ mod tests {
 
     use super::*;
     use crate::{
-        api::oauth::{
-            INVALID_CREDENTIALS,
-            test_support::{message_of, test_state},
-        },
+        api::oauth::{INVALID_CREDENTIALS, test_support::message_of},
         error::AppError,
+        test_support::lazy_state,
     };
 
     /// [`RevokeParams`] with the three fields as given.
@@ -288,9 +286,9 @@ mod tests {
     async fn a_revoke_without_the_token_parameter_is_refused_by_name() {
         // The parameter gate runs before the credential check, and the
         // credential check before any database access, so the lazy pool
-        // of `test_state` is never consulted.
+        // of `lazy_state` is never consulted.
         let err = revoke_token(
-            &test_state(),
+            &lazy_state(),
             &HeaderMap::new(),
             &revoke_params(None, None, None),
         )

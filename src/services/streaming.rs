@@ -234,7 +234,8 @@ async fn visibility_targets(
 mod tests {
     use crate::{
         models::status,
-        services::streaming::test_support::{app_state, boost, inactive_user, local_user, post},
+        services::streaming::test_support::{boost, inactive_user, local_user, post},
+        test_support::app_state,
     };
 
     use super::*;

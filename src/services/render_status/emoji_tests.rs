@@ -7,7 +7,7 @@ use sqlx::PgPool;
 
 use super::{
     ViewerMode, render_statuses,
-    test_support::{BASE, post, test_state, user},
+    test_support::{BASE, app_state, post, user},
 };
 use crate::{
     models::{
@@ -72,7 +72,7 @@ async fn remote_status(pool: &PgPool, author: &User, content: &str) -> StatusRow
 
 /// Renders `rows` anonymously and returns every entity's JSON, in order.
 async fn render_all(pool: &PgPool, rows: &[StatusRow]) -> Vec<Value> {
-    let state = test_state(pool);
+    let state = app_state(pool);
     render_statuses(&state, ViewerMode::ANONYMOUS, rows)
         .await
         .expect("the page renders")

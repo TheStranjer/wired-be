@@ -1,18 +1,15 @@
 //! Fixtures shared by the `oauth` children's unit tests: the parameter
 //! builder and message reader the grant-gate and refusal tests use, the
-//! stored-looking token row the response shapes render, and the
-//! config-only [`AppState`] the endpoint tests build on — its lazy pool
-//! is never consulted, because every case fails at a gate before any
-//! database access.
+//! stored-looking token row the response shapes render. The endpoint tests
+//! build their state on [`lazy_state`](crate::test_support::lazy_state):
+//! its lazy pool is never consulted, because every case fails at a gate
+//! before any database access.
 
 use chrono::{Duration, Utc};
 use uuid::Uuid;
 
 use super::params::{ClientCredentials, TokenParams};
-use crate::{
-    config::Config, error::AppError, models::oauth_token::OauthToken, state::AppState,
-    util::id::new_id,
-};
+use crate::{error::AppError, models::oauth_token::OauthToken, util::id::new_id};
 
 /// A [`TokenParams`] with everything absent but `grant_type`, which
 /// `grant` sets.
@@ -49,11 +46,4 @@ pub(super) fn token_row(app_id: Uuid, scopes: &str) -> OauthToken {
         inserted_at: now,
         updated_at: now,
     }
-}
-
-/// The state the router-shaped tests below need: config only, the
-/// lazy pool is never consulted (the grant-type and token gates
-/// fail first).
-pub(super) fn test_state() -> AppState {
-    AppState::lazy_for_tests(Config::for_tests())
 }

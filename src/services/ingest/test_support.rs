@@ -11,10 +11,8 @@ use crate::{
     state::AppState,
 };
 
-/// The test state: `pool` and the test config, collaborators inert.
-pub(super) fn app_state(pool: &PgPool) -> AppState {
-    state_with_config(pool, Config::for_tests())
-}
+// The test state: a slot's pool and the test config, collaborators inert.
+pub(super) use crate::test_support::app_state;
 
 /// The test state on `config` instead of the stock test one.
 pub(super) fn state_with_config(pool: &PgPool, config: Config) -> AppState {

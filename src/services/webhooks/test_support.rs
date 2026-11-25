@@ -16,7 +16,7 @@ use uuid::Uuid;
 
 use super::{KIND_DELIVER, MAX_ATTEMPTS, signing::SIGNATURE_PREFIX};
 use crate::{
-    config::{Config, TEST_BASE_URL},
+    config::TEST_BASE_URL,
     jobs::{AttemptInfo, JobError},
     models::{
         job::Job,
@@ -24,21 +24,8 @@ use crate::{
         user::{self, NewUser, User, insert},
         webhook::{self, Webhook},
     },
-    state::AppState,
     util::{hmac::hmac_sha256, id::new_id, token::to_hex},
 };
-
-/// Test state over `pool` on the fixed test config, whose HTTP client
-/// reaches the loopback mocks these tests bind.
-pub(super) fn app_state(pool: &PgPool) -> AppState {
-    AppState::for_tests(pool.clone(), Config::for_tests())
-}
-
-/// The lazy pool the payload tests build state on: nothing they call
-/// reaches a database, and a state that does must fail.
-pub(super) fn dead_state() -> AppState {
-    AppState::lazy_for_tests(Config::for_tests())
-}
 
 /// The first of the [`MAX_ATTEMPTS`] tries the queue hands a delivery.
 pub(super) const FIRST_ATTEMPT: AttemptInfo = AttemptInfo {

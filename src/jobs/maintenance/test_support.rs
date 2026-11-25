@@ -6,7 +6,7 @@
 
 use std::time::Duration;
 
-use sqlx::{PgPool, postgres::PgPoolOptions, query_scalar};
+use sqlx::{PgPool, query_scalar};
 use uuid::Uuid;
 
 use crate::{config::Config, jobs::AttemptInfo, state::AppState};
@@ -26,25 +26,10 @@ pub(super) const SIX_HOURS: Duration = Duration::from_secs(21_600);
 /// One day in the seconds the fixture helpers count ages in.
 pub(super) const DAY: i64 = 86_400;
 
-/// Test state over `pool` with the fixed test config.
-pub(super) fn app_state(pool: &PgPool) -> AppState {
-    state_with_config(pool, Config::for_tests())
-}
-
 /// Test state over `pool` with an explicit `config`, for handlers whose
 /// work reads the configuration — the token sweep's reset window.
 pub(super) fn state_with_config(pool: &PgPool, config: Config) -> AppState {
     AppState::for_tests(pool.clone(), config)
-}
-
-/// Test state over a pool that cannot answer: closed before it ever
-/// connected, which is how a handler sees a database that went away.
-pub(super) async fn broken_state() -> AppState {
-    let pool = PgPoolOptions::new()
-        .connect_lazy("postgres://localhost/unused")
-        .expect("a lazy pool needs no database");
-    pool.close().await;
-    app_state(&pool)
 }
 
 /// Whether `table` — one of the swept tables, named by the test — still

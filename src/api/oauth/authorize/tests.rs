@@ -10,8 +10,9 @@ use uuid::Uuid;
 
 use super::*;
 use crate::{
-    config::{Config, FRONTEND_BASE_URL_VAR, test_support::config_with},
+    config::{FRONTEND_BASE_URL_VAR, test_support::config_with},
     extract::into_params,
+    test_support::lazy_state,
 };
 
 /// The redirect URI the [`app_row`] fixture registers.
@@ -261,16 +262,9 @@ fn no_store_sets_and_replaces_the_cache_control() {
     );
 }
 
-/// The state the route-shaped tests below need: config only, the
-/// lazy pool is never consulted (the validation gates that fail here
-/// run before any query).
-fn test_state() -> AppState {
-    AppState::lazy_for_tests(Config::for_tests())
-}
-
 #[tokio::test]
 async fn get_answers_at_oauth_authorize_and_refuses_other_flows() {
-    let state = test_state();
+    let state = lazy_state();
     let app = router(&state).with_state(state);
     let request = Request::get("/oauth/authorize?response_type=token&client_id=whatever")
         .body(axum::body::Body::empty())
@@ -294,7 +288,7 @@ async fn get_answers_at_oauth_authorize_and_refuses_other_flows() {
 
 #[tokio::test]
 async fn a_form_post_is_refused_with_a_400() {
-    let state = test_state();
+    let state = lazy_state();
     let app = router(&state).with_state(state);
     let request = Request::post(AUTHORIZE_PATH)
         .header(CONTENT_TYPE, "application/x-www-form-urlencoded")

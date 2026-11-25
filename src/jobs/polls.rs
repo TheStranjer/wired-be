@@ -116,7 +116,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        config::{Config, TEST_BASE_URL},
+        config::TEST_BASE_URL,
         jobs::{JobError, QUEUE_BACKGROUND},
         models::{
             notification::TYPE_POLL,
@@ -125,12 +125,8 @@ mod tests {
             user::User,
         },
         test_fixtures::local_user as user,
+        test_support::app_state,
     };
-
-    /// Test state over `pool` with the fixed test config.
-    fn app_state(pool: &PgPool) -> AppState {
-        AppState::for_tests(pool.clone(), Config::for_tests())
-    }
 
     /// A poll by `author` closing `mins` minutes from now (negative: one
     /// whose deadline ran out), with each of `voters` marking one option.

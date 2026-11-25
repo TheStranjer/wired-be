@@ -11,7 +11,6 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::{
-    config::Config,
     models::{
         emoji_reaction::{self, NewReaction},
         follow::{self, Follow},
@@ -27,23 +26,13 @@ use crate::{
     state::AppState,
 };
 
+// The state the job handlers are tested with, over a slot's pool.
+pub(super) use crate::test_support::app_state;
+// A local user named `nickname`.
+pub(super) use crate::test_fixtures::local_user as local;
+
 /// The fixed test config's instance origin.
 pub(super) const BASE: &str = crate::config::TEST_BASE_URL;
-
-/// An [`AppState`] over `pool`: the one the job handlers are tested with.
-pub(super) fn app_state(pool: &PgPool) -> AppState {
-    AppState::for_tests(pool.clone(), Config::for_tests())
-}
-
-/// A local user named `nickname`.
-pub(super) async fn local(pool: &PgPool, nickname: &str) -> User {
-    user::insert(
-        pool,
-        &NewUser::local(nickname, &user::local_ap_id(BASE, nickname)),
-    )
-    .await
-    .expect("local user fixture")
-}
 
 /// A local user named `nickname` who answers follows with requests.
 pub(super) async fn locked(pool: &PgPool, nickname: &str) -> User {

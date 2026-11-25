@@ -215,15 +215,15 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::federation::{
-        dispatch::ActivityView,
-        mrf::{
-            MrfDecision, filter_incoming,
-            test_support::{
-                after, broken_state, config_with, fixed_now, follow_activity, set_mrf_entry,
-                test_state,
+    use crate::{
+        federation::{
+            dispatch::ActivityView,
+            mrf::{
+                MrfDecision, filter_incoming,
+                test_support::{after, config_with, fixed_now, follow_activity, set_mrf_entry},
             },
         },
+        test_support::{app_state, broken_state},
     };
 
     /// [`MrfConfig::rejected`] is the allowlist and the reject list read as
@@ -386,7 +386,7 @@ mod tests {
         set_mrf_entry(&pool, ":mrf", &json!({"policies": ["noop"]}))
             .await
             .expect("the setting writes");
-        let state = test_state(&pool);
+        let state = app_state(&pool);
 
         let first = load_config_at(&state, fixed_now()).await;
         assert_eq!(

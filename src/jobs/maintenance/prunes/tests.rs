@@ -11,10 +11,11 @@ use super::*;
 use crate::{
     jobs::{
         JobError, QUEUE_BACKGROUND,
-        maintenance::test_support::{EVERY, FIRST_ATTEMPT, app_state, broken_state, row_exists},
+        maintenance::test_support::{EVERY, FIRST_ATTEMPT, row_exists},
         scheduler::periodic_jobs,
     },
     models::job::{NewJob, enqueue},
+    test_support::{app_state, broken_state},
 };
 
 /// The `kind` the multi-batch fixture stamps its rows, so the test can

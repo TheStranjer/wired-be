@@ -342,7 +342,7 @@ mod tests {
     use tower::ServiceExt as _;
 
     use super::*;
-    use crate::{api::oauth::NO_STORE, config::Config};
+    use crate::{api::oauth::NO_STORE, test_support::lazy_state};
 
     /// A minimal stored-looking local user row.
     fn user_row() -> User {
@@ -541,16 +541,11 @@ mod tests {
         assert_eq!(from_form.code.as_deref(), Some("1"), "the siblings fill");
     }
 
-    /// The state the route-shaped tests below need: config only, the
-    /// lazy pool is never consulted (every refusal these tests send
-    /// fails before the first query).
-    fn test_state() -> AppState {
-        AppState::lazy_for_tests(Config::for_tests())
-    }
-
-    /// The MFA router over [`test_state`].
+    /// The MFA router over [`lazy_state`]: config only, the lazy pool is
+    /// never consulted (every refusal these tests send fails before the
+    /// first query).
     fn test_router() -> Router {
-        let state = test_state();
+        let state = lazy_state();
         router(&state).with_state(state)
     }
 

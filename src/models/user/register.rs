@@ -226,6 +226,7 @@ mod tests {
             featured, followers, following, get_by_nickname, inbox, outbox,
             register::test_support::*,
         },
+        test_support::app_state,
         util::{
             format::text_to_html,
             keys::{parse_private_key, parse_public_key, sign_sha256, verify_sha256},
@@ -340,7 +341,7 @@ mod tests {
     async fn register_stores_a_complete_local_account() {
         let db = crate::test_db::test_db().await.expect("test database slot");
         let pool = db.pool().clone();
-        let state = test_state(&pool);
+        let state = app_state(&pool);
         let raw_bio = "Hello <script>evil()</script> visit https://example.org";
         let params = RegisterParams {
             nickname: "  Alice  ".to_owned(),

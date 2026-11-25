@@ -113,7 +113,7 @@ mod tests {
         )
         .await;
         followed(&pool, &erin, &alice).await;
-        let state = test_state(&pool);
+        let state = app_state(&pool);
         let activity = public_activity(&alice);
 
         publish_in_background(&state, alice.id, &activity, &[], None)
@@ -150,7 +150,7 @@ mod tests {
         let db = crate::test_db::test_db().await.expect("test database slot");
         let pool = db.pool().clone();
         let alice = alice(&pool).await;
-        let state = test_state(&pool);
+        let state = app_state(&pool);
         let activity = json!({
             "id": ACTIVITY_ID,
             "type": "Update",
@@ -200,7 +200,7 @@ mod tests {
             None,
         )
         .await;
-        let state = test_state(&pool);
+        let state = app_state(&pool);
         let activity = public_activity(&alice);
 
         let cases = [

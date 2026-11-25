@@ -12,7 +12,6 @@ use wired_be::{
     auth::admin::{AdminUser, StaffUser},
     error::AppError,
     models::user::{Flag, NewUser, User},
-    state::AppState,
 };
 
 use crate::common;
@@ -85,12 +84,7 @@ pub(super) fn extractor_app(pool: PgPool) -> Router {
     Router::new()
         .route("/admin", get(admin_view))
         .route("/staff", get(staff_view))
-        .with_state(app_state(pool))
-}
-
-/// The shared [`AppState`] every test router runs on.
-fn app_state(pool: PgPool) -> AppState {
-    common::test_app_state(pool, common::test_config())
+        .with_state(common::test_app_state(pool, common::test_config()))
 }
 
 /// Reports the resolved admin and the token's scopes.

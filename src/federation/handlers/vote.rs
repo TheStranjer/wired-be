@@ -395,15 +395,13 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::models::user::{self, Flag, NewUser};
+    use crate::{
+        models::user::{self, Flag, NewUser},
+        test_support::app_state,
+    };
 
     /// The actor every fixture here is delivered by.
     const BOB: &str = "https://remote.example/users/bob";
-
-    /// Test state: `pool` and the fixed test config, collaborators inert.
-    fn app_state(pool: &sqlx::PgPool) -> AppState {
-        AppState::for_tests(pool.clone(), crate::config::Config::for_tests())
-    }
 
     /// The stored mirror of the fixture voter.
     async fn voter(pool: &sqlx::PgPool) -> User {

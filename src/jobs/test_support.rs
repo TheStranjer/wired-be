@@ -17,9 +17,9 @@ use uuid::Uuid;
 
 use super::{AttemptInfo, HandlerFuture, JobError, JobRegistry, Worker};
 use crate::{
-    config::Config,
     models::job::{Job, NewJob},
     state::AppState,
+    test_support::app_state,
 };
 
 /// Set once by [`marking_handler`] when its body runs.
@@ -28,11 +28,6 @@ pub(super) static HANDLER_RAN: AtomicBool = AtomicBool::new(false);
 pub(super) static HANDLER_STARTED: AtomicBool = AtomicBool::new(false);
 /// What [`reporting_handler`] was told about its attempt.
 pub(super) static LAST_ATTEMPT: Mutex<Option<AttemptInfo>> = Mutex::new(None);
-
-/// Test state over `pool` with the fixed test config.
-pub(super) fn app_state(pool: &PgPool) -> AppState {
-    AppState::for_tests(pool.clone(), Config::for_tests())
-}
 
 /// Idle-poll interval for worker tests: short enough that a claim round
 /// after an empty one costs milliseconds, so tests never sit through the

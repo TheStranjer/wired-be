@@ -2,12 +2,15 @@
 //! mirror rows.
 
 use serde_json::{Value, json};
-use sqlx::{PgPool, postgres::PgPoolOptions};
+use sqlx::PgPool;
 use uuid::Uuid;
 
 pub(super) use crate::federation::handlers::test_support::{
     accepted_follow, app_state, assert_handled, fresh_user, ignored, local_user,
 };
+// Test state over a pool that cannot answer: the database having gone
+// away, as the handlers see it.
+pub(super) use crate::test_support::broken_state;
 use crate::{
     federation::{
         dispatch::ActivityView,
@@ -18,7 +21,6 @@ use crate::{
         status::{self, NewStatus, Status},
         user::{Flag, NewUser, User, insert},
     },
-    state::AppState,
 };
 
 /// The mirror every fixture here speaks about: alice on `peer.example`,
@@ -34,16 +36,6 @@ pub(super) const PEM: &str =
 /// The replacement key one update brings.
 pub(super) const NEW_PEM: &str =
     "-----BEGIN PUBLIC KEY-----\nNEWKEYMATERIAL\n-----END PUBLIC KEY-----\n";
-
-/// Test state over a pool that cannot answer: the database having gone
-/// away, as the handlers see it.
-pub(super) async fn broken_state() -> AppState {
-    let pool = PgPoolOptions::new()
-        .connect_lazy("postgres://localhost/unused")
-        .expect("a lazy pool needs no database");
-    pool.close().await;
-    app_state(&pool)
-}
 
 /// alice's `Person` document as a fetch last saw it: what `parse_actor`
 /// requires, plus the profile the assertions watch change.

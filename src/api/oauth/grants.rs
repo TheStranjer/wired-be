@@ -261,9 +261,12 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::api::oauth::{
-        GRANT_TYPE_AUTHORIZATION_CODE, GRANT_TYPE_REFRESH_TOKEN,
-        test_support::{message_of, params_with_grant, test_state},
+    use crate::{
+        api::oauth::{
+            GRANT_TYPE_AUTHORIZATION_CODE, GRANT_TYPE_REFRESH_TOKEN,
+            test_support::{message_of, params_with_grant},
+        },
+        test_support::lazy_state,
     };
 
     #[test]
@@ -294,9 +297,9 @@ mod tests {
     async fn a_refresh_without_the_refresh_token_parameter_is_refused_by_name() {
         // The parameter gate runs before the credential check, and the
         // credential check before any database access, so the lazy pool
-        // of `test_state` is never consulted.
+        // of `lazy_state` is never consulted.
         let err = refresh_token_grant(
-            &test_state(),
+            &lazy_state(),
             &HeaderMap::new(),
             &params_with_grant(Some(GRANT_TYPE_REFRESH_TOKEN)),
         )
@@ -312,9 +315,9 @@ mod tests {
     #[tokio::test]
     async fn a_code_grant_without_the_code_parameter_is_refused_by_name() {
         // Same order as the refresh grant: the parameter gate first, so
-        // the lazy pool of `test_state` is never consulted.
+        // the lazy pool of `lazy_state` is never consulted.
         let err = authorization_code_grant(
-            &test_state(),
+            &lazy_state(),
             &HeaderMap::new(),
             &params_with_grant(Some(GRANT_TYPE_AUTHORIZATION_CODE)),
         )

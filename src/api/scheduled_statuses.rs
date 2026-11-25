@@ -371,6 +371,7 @@ mod tests {
         config::TEST_BASE_URL,
         models::{media_attachment::NewMediaAttachment, user::User},
         test_fixtures::local_user,
+        test_support::app_state,
         util::time::mastodon_time,
     };
 
@@ -412,11 +413,6 @@ mod tests {
                 idempotency_key: None,
             })
             .collect()
-    }
-
-    /// Test state over `pool` with the fixed test config.
-    fn app_state(pool: &PgPool) -> AppState {
-        AppState::for_tests(pool.clone(), Config::for_tests())
     }
 
     /// An unposted `image/png` upload of `owner`, named for its url.

@@ -224,7 +224,7 @@ mod tests {
     };
     use chrono::{DateTime, Utc};
     use serde_json::json;
-    use sqlx::{PgPool, postgres::PgPoolOptions};
+    use sqlx::PgPool;
     use tokio::{net::TcpListener, sync::Mutex, task::JoinHandle};
 
     use super::*;
@@ -233,6 +233,7 @@ mod tests {
         http_client::HttpClient,
         jobs::{QUEUE_BACKGROUND, scheduler::periodic_jobs},
         test_fixtures::local_user,
+        test_support::broken_state,
     };
 
     /// `User-Agent` of the probe client the tests run.
@@ -261,21 +262,11 @@ mod tests {
     /// Test state over `pool`: the loopback-tolerant client the mocks answer
     /// (guard disabled), so the probe's requests reach `http://127.0.0.1`
     /// targets.
-    fn app_state(pool: &PgPool) -> AppState {
+    fn probing_state(pool: &PgPool) -> AppState {
         AppState {
             http_client: HttpClient::new_for_tests(TEST_UA),
             ..AppState::for_tests(pool.clone(), Config::for_tests())
         }
-    }
-
-    /// Test state over a pool that cannot answer: closed before it ever
-    /// connected, which is how the sweep sees a database that went away.
-    async fn broken_state() -> AppState {
-        let pool = PgPoolOptions::new()
-            .connect_lazy("postgres://localhost/unused")
-            .expect("a lazy pool needs no database");
-        pool.close().await;
-        app_state(&pool)
     }
 
     /// Marks `host` unreachable `secs` seconds in the past — the shape a real
@@ -500,7 +491,7 @@ mod tests {
         let clean_before = row(&pool, "clean.example").await;
         let users_before = user_count(&pool).await;
 
-        let outcome = probe_unreachable(&app_state(&pool), Some(&origin), PROBE_TIMEOUT).await;
+        let outcome = probe_unreachable(&probing_state(&pool), Some(&origin), PROBE_TIMEOUT).await;
 
         assert_eq!(outcome, Ok(()), "a sweep that recovers one host succeeds");
         assert_eq!(seen.count(), 1, "the eligible host was probed once");
@@ -544,7 +535,7 @@ mod tests {
         marked_ago(&pool, "grumpy.example", 2 * DAY).await;
         let before = mark_of(&pool, "grumpy.example").await;
 
-        let outcome = probe_unreachable(&app_state(&pool), Some(&origin), PROBE_TIMEOUT).await;
+        let outcome = probe_unreachable(&probing_state(&pool), Some(&origin), PROBE_TIMEOUT).await;
 
         assert_eq!(outcome, Ok(()), "a non-2xx answer is absorbed, not fatal");
         assert_eq!(seen.count(), 1, "the host was probed once");
@@ -567,7 +558,7 @@ mod tests {
         marked_ago(&pool, "stalled.example", 2 * DAY).await;
         let before = mark_of(&pool, "stalled.example").await;
 
-        let outcome = probe_unreachable(&app_state(&pool), Some(&origin), TINY_TIMEOUT).await;
+        let outcome = probe_unreachable(&probing_state(&pool), Some(&origin), TINY_TIMEOUT).await;
 
         assert_eq!(outcome, Ok(()), "a stalled peer cannot hang the sweep");
         assert_eq!(seen.count(), 1, "the request reached the mock");
@@ -589,7 +580,7 @@ mod tests {
         marked_ago(&pool, "gone.example", 2 * DAY).await;
         let before = mark_of(&pool, "gone.example").await;
 
-        let outcome = probe_unreachable(&app_state(&pool), Some(&origin), PROBE_TIMEOUT).await;
+        let outcome = probe_unreachable(&probing_state(&pool), Some(&origin), PROBE_TIMEOUT).await;
 
         assert_eq!(outcome, Ok(()), "a refused connection is absorbed");
         assert_eq!(
@@ -609,7 +600,7 @@ mod tests {
         marked_ago(&pool, "recent.example", YOUNGER).await;
         let before = mark_of(&pool, "recent.example").await;
 
-        let outcome = probe_unreachable(&app_state(&pool), Some(&origin), PROBE_TIMEOUT).await;
+        let outcome = probe_unreachable(&probing_state(&pool), Some(&origin), PROBE_TIMEOUT).await;
 
         assert_eq!(outcome, Ok(()), "nothing to probe is a clean pass");
         assert_eq!(seen.count(), 0, "the fresh mark was never probed");
@@ -632,7 +623,7 @@ mod tests {
         marked_ago(&pool, "dead.example", 40 * DAY).await;
         let before = row(&pool, "dead.example").await;
 
-        let outcome = probe_unreachable(&app_state(&pool), Some(&origin), PROBE_TIMEOUT).await;
+        let outcome = probe_unreachable(&probing_state(&pool), Some(&origin), PROBE_TIMEOUT).await;
 
         assert_eq!(
             outcome,
@@ -662,7 +653,7 @@ mod tests {
         marked_ago(&pool, "recent.example", YOUNGER).await;
         let fresh = mark_of(&pool, "recent.example").await;
 
-        let outcome = probe_unreachable(&app_state(&pool), Some(&origin), PROBE_TIMEOUT).await;
+        let outcome = probe_unreachable(&probing_state(&pool), Some(&origin), PROBE_TIMEOUT).await;
 
         assert_eq!(outcome, Ok(()), "the mixed sweep completes");
         assert_eq!(
@@ -714,7 +705,7 @@ mod tests {
             waiting.push(mark_of(&pool, &batch_host(i)).await);
         }
 
-        let outcome = probe_unreachable(&app_state(&pool), Some(&origin), PROBE_TIMEOUT).await;
+        let outcome = probe_unreachable(&probing_state(&pool), Some(&origin), PROBE_TIMEOUT).await;
 
         assert_eq!(outcome, Ok(()), "a capped sweep succeeds");
         assert_eq!(seen.count(), PROBE_BATCH, "exactly one batch was probed");
@@ -747,7 +738,7 @@ mod tests {
         let (origin, seen, server) = mock_nodeinfo(StatusCode::SERVICE_UNAVAILABLE).await;
         mark_overflow_hosts(&pool).await;
 
-        let outcome = probe_unreachable(&app_state(&pool), Some(&origin), PROBE_TIMEOUT).await;
+        let outcome = probe_unreachable(&probing_state(&pool), Some(&origin), PROBE_TIMEOUT).await;
 
         assert_eq!(outcome, Ok(()), "dead hosts are absorbed");
         assert_eq!(
@@ -772,7 +763,7 @@ mod tests {
         let pool = db.pool().clone();
         let (origin, seen, server) = mock_nodeinfo(StatusCode::OK).await;
 
-        let outcome = probe_unreachable(&app_state(&pool), Some(&origin), PROBE_TIMEOUT).await;
+        let outcome = probe_unreachable(&probing_state(&pool), Some(&origin), PROBE_TIMEOUT).await;
 
         assert_eq!(outcome, Ok(()), "an empty ledger is a clean pass");
         assert_eq!(seen.count(), 0, "nothing was probed");
@@ -828,7 +819,7 @@ mod tests {
             .get(KIND_PROBE)
             .expect("the probe's kind is registered");
 
-        let outcome = handler(app_state(&pool), FIRST_ATTEMPT, json!({})).await;
+        let outcome = handler(probing_state(&pool), FIRST_ATTEMPT, json!({})).await;
 
         assert_eq!(
             outcome,
