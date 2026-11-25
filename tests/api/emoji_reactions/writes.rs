@@ -12,9 +12,9 @@ use wired_be::{
 };
 
 use super::support::{
-    BAD_TOKEN, CAT, CAT_URL, INVALID, NO_TOKEN, NO_WRITE, NOT_FOUND, PARTY, THUMB, UNKNOWN_ID,
-    USER_REQUIRED, disabled_emoji, emoji, entry_keys, field, fixture, get, public_post, put,
-    react_ok, reacted, reader_and_writer, refused, remove, route, segment, stored, summary,
+    BAD_TOKEN, CAT, CAT_NAME, CAT_URL, INVALID, NO_TOKEN, NO_WRITE, NOT_FOUND, PARTY, THUMB,
+    UNKNOWN_ID, USER_REQUIRED, disabled_emoji, emoji, entry_keys, field, fixture, get, public_post,
+    put, react_ok, reacted, reader_and_writer, refused, remove, route, segment, stored, summary,
     withdraw_ok,
 };
 use crate::common;
@@ -117,8 +117,8 @@ async fn a_custom_reaction_carries_its_shortcode_and_image() {
     let body = reacted(&app, &token, &status_id, CAT).await;
     assert_eq!(
         body["pleroma"]["emoji_reactions"],
-        json!([summary(CAT, 1, true, &json!(CAT_URL), &[&alice.id])]),
-        "the shortcode is the name and the emoji's image is the url"
+        json!([summary(CAT_NAME, 1, true, &json!(CAT_URL), &[&alice.id])]),
+        "the bare shortcode is the name and the emoji's image is the url"
     );
 
     // An unknown shortcode, another instance's emoji, and a retired one are all

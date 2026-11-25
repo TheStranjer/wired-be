@@ -134,8 +134,9 @@ pub async fn get_by_ap_id(
 #[cfg(test)]
 mod tests {
     use super::super::test_support::{
-        ACTIVITY_PREFIX, BASE, CAT, CAT_URL, HEART, REMOTE_CAT, REMOTE_DOMAIN, THUMBS, instant,
-        names, post, post_by, react_remote, react_with, rollup, stamp, stored, summary, user,
+        ACTIVITY_PREFIX, BASE, CAT, CAT_NAME, CAT_URL, HEART, REMOTE_CAT, REMOTE_DOMAIN, THUMBS,
+        instant, names, post, post_by, react_remote, react_with, rollup, stamp, stored, summary,
+        user,
     };
     use super::*;
 
@@ -237,7 +238,7 @@ mod tests {
         let both = rollup(&pool, status_id, Some(&alice)).await;
         assert_eq!(
             names(&both),
-            vec![CAT, THUMBS],
+            vec![CAT_NAME, THUMBS],
             "a second emoji is a second row, ordered by its own first reaction"
         );
         assert_eq!(

@@ -215,7 +215,7 @@ async fn a_pack_is_created_filled_shared_archived_and_reacted_with() {
     assert_eq!(
         reacted.json()["pleroma"]["emoji_reactions"],
         json!([{
-            "name": ":woof:",
+            "name": "woof",
             "count": 1,
             "me": true,
             "url": format!("{BASE}/emoji/dogs/woof.png"),

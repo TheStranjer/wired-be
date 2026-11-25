@@ -25,6 +25,7 @@
 
 #![cfg(test)]
 
+mod bare;
 mod reads;
 mod reads_visibility;
 mod remote;

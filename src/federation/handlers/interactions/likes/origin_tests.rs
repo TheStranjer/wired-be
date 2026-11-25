@@ -142,7 +142,7 @@ async fn a_reaction_with_our_own_emoji_is_the_local_reaction() {
     );
     assert_eq!(
         rollup(&pool, &post).await,
-        vec![(":wiredcat:".to_owned(), 2)],
+        vec![("wiredcat".to_owned(), 2)],
         "it is one group with the local user's"
     );
 }

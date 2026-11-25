@@ -108,8 +108,9 @@ pub struct NewReaction<'a> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReactionSummary {
     /// The emoji's API name, which is the text a client sends back to react:
-    /// the stored text, except that a remote custom emoji is
-    /// `shortcode@domain` (see [`crate::util::emoji::display_name`]).
+    /// the stored text, except that a local custom emoji is its bare
+    /// `shortcode` and a remote one `shortcode@domain` (see
+    /// [`crate::util::emoji::display_name`]).
     pub name: String,
     /// How many accounts reacted with this emoji — all of them, not only the
     /// ones [`account_ids`](Self::account_ids) names.

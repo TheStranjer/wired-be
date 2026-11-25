@@ -25,8 +25,9 @@ use crate::{entities::account::Account, models::emoji_reaction::ReactionSummary 
 /// array renders it: the roll-up with the first few reactors' ids.
 #[derive(Clone, Debug, Serialize)]
 pub struct ReactionSummary {
-    /// `name`: the emoji as stored, one unicode grapheme or `:shortcode:` —
-    /// the text a client sends back in the `PUT` path to react again.
+    /// `name`: one unicode grapheme, a local custom emoji's bare `shortcode`
+    /// or a remote one's `shortcode@domain` — the text a client sends back in
+    /// the `PUT` path to react again.
     pub name: String,
     /// `count`: every account that reacted with this emoji, not only the
     /// [`account_ids`](Self::account_ids) listed here.
@@ -68,7 +69,7 @@ impl ReactionSummary {
 /// roll-up, with the reactor accounts themselves instead of their ids.
 #[derive(Debug, Serialize)]
 pub struct EmojiReaction {
-    /// `name`: the emoji as stored.
+    /// `name`: the emoji's API name (see [`ReactionSummary::name`]).
     pub name: String,
     /// `count`: the reactors this entry lists.
     pub count: i64,
