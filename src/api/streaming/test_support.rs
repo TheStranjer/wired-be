@@ -206,14 +206,14 @@ pub(super) async fn seed_word_filter(
     context: &str,
     irreversible: bool,
 ) {
-    let _created = filter::create(
+    let _created = filter::phrase::create_phrase(
         &state.db,
         reader.id,
-        &filter::NewFilter {
+        &filter::phrase::NewPhrase {
             phrase: phrase.to_owned(),
             context: vec![context.to_owned()],
             irreversible,
-            ..filter::NewFilter::default()
+            ..filter::phrase::NewPhrase::default()
         },
     )
     .await

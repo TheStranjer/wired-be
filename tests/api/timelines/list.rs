@@ -13,7 +13,7 @@ use sqlx::PgPool;
 use uuid::Uuid;
 use wired_be::models::{
     block,
-    filter::{self, NewFilter},
+    filter::{self, phrase::NewPhrase},
     list::{self, NewList},
     media_attachment::{self, NewMediaAttachment},
     mute::{self, MuteOptions},
@@ -409,32 +409,25 @@ async fn list_timeline_applies_the_home_context_filters() {
     let token = common::create_app_and_token(&pool, &alice, "read:lists").await;
     let app = common::test_app(pool.clone());
     let path = format!("{LIST}/{}", circle.id);
-    let filter_for = |contexts: &[&str], irreversible: bool| NewFilter {
+    let filter_for = |contexts: &[&str], irreversible: bool| NewPhrase {
         phrase: "spoiler".to_owned(),
         context: contexts.iter().map(|name| (*name).to_owned()).collect(),
         irreversible,
-        ..NewFilter::default()
+        ..NewPhrase::default()
     };
 
-    let public_only = filter::create(&pool, alice.id, &filter_for(&["public"], true))
-        .await
-        .expect("the public-only filter creates");
-    let untouched = get(&app, Some(&token), &path).await;
+    let public_only =
+        filter::phrase::create_phrase(&pool, alice.id, &filter_for(&["public"], true))
+            .await
+            .expect("the public-only filter creates");
+    let untouched = get(&app, Some(&token), &path).await.json_value();
     assert_eq!(
-        ids(&untouched.json_value()),
+        ids(&untouched),
         newest_first(&[&spoiler, &clean]),
         "a `public`-only filter does not reach the list timeline"
     );
-    for entry in untouched
-        .json_value()
-        .as_array()
-        .expect("a page is an array")
-    {
-        assert_eq!(
-            entry["filtered"],
-            serde_json::json!([]),
-            "and flags nothing"
-        );
+    for entry in untouched.as_array().expect("a page is an array") {
+        assert_eq!(entry["filtered"], serde_json::json!([]), "flags nothing");
     }
     assert!(
         filter::delete(&pool, public_only.id, alice.id)
@@ -443,7 +436,7 @@ async fn list_timeline_applies_the_home_context_filters() {
         "the public-only filter was live"
     );
 
-    let warn = filter::create(&pool, alice.id, &filter_for(&["home"], false))
+    let warn = filter::phrase::create_phrase(&pool, alice.id, &filter_for(&["home"], false))
         .await
         .expect("the warn filter creates");
     let warned = get(&app, Some(&token), &path).await;
@@ -472,7 +465,7 @@ async fn list_timeline_applies_the_home_context_filters() {
         "the warn filter was live"
     );
 
-    let _hider = filter::create(&pool, alice.id, &filter_for(&["home"], true))
+    let _hider = filter::phrase::create_phrase(&pool, alice.id, &filter_for(&["home"], true))
         .await
         .expect("the irreversible filter creates");
     let hidden = get(&app, Some(&token), &path).await;

@@ -1,16 +1,16 @@
-//! Applying a user's v1 phrase filters to already-rendered status pages.
+//! Applying a user's filters to already-rendered status pages.
 //!
 //! [`apply_filters`] is the one post-processing step every filtered
 //! listing shares (`docs/ARCHITECTURE.md` decision 3: this is more than
 //! any single table owns and less than an endpoint). It takes rendered
 //! [`Status`] entities and the viewer's active [`Filter`] rows, and for
 //! every status tests each filter that names the listing's
-//! [`FilterContext`] against the status's plain text — [`strip_html`] of
-//! the content, the spoiler text and every media description, of the
-//! status *and* of its reblogged original. A matching `irreversible`
-//! filter removes the status from the page; any other match keeps it and
-//! sets its `filtered` array to one [`FilterResult`] per matched filter
-//! ([`FilterResult::warn`]'s v2 shape). Statuses authored by the viewer
+//! [`FilterContext`] (a match is a keyword in the status's plain text, or
+//! the status itself being on the filter). A
+//! matching `hide` filter removes the status from the page; any other match
+//! keeps it and sets its `filtered` array to one
+//! [`FilterResult`](crate::entities::filter::FilterResult) per matched
+//! filter. Statuses authored by the viewer
 //! are never filtered, and with them their nested originals, which is
 //! also what leaves an account owner's own profile listing in the
 //! `account` context untouched.
@@ -32,21 +32,22 @@
 //! [`Status`]: crate::entities::status::Status
 //! [`Filter`]: crate::models::filter::Filter
 //! [`models::filter::list_active`]: crate::models::filter::list_active
-//! [`FilterResult::warn`]: crate::entities::filter::FilterResult::warn
 
 use chrono::Utc;
 use uuid::Uuid;
 
+use self::matching::apply_to_status;
 use crate::{
-    entities::{filter::FilterResult, status::Status as StatusEntity},
+    entities::status::Status as StatusEntity,
     error::AppResult,
     models::{
         filter::{self, Filter},
         user::User,
     },
     state::AppState,
-    util::sanitize::strip_html,
 };
+
+mod matching;
 
 /// The five Mastodon v1 filter contexts: where a filter applies. Every
 /// filtered listing names one; the spellings are exactly the ones
@@ -123,10 +124,12 @@ pub async fn apply_active(
 ///   the account owner's own profile listing unfiltered, because every
 ///   status on it is theirs;
 /// - a status whose text — or whose reblogged original's text — matches
-///   an `irreversible` filter leaves the page entirely;
+///   a keyword of a `hide` filter, or that is (or boosts) a status the
+///   filter holds, leaves the page entirely;
 /// - every other match keeps the status and sets its `filtered` array to
-///   one [`FilterResult::warn`] per matching filter, in the order the
-///   filters came in; nothing matched keeps the empty array.
+///   one [`FilterResult`](crate::entities::filter::FilterResult) per
+///   matching filter, in the order the filters came in; nothing matched
+///   keeps the empty array.
 ///
 /// With nothing to apply — no filters, or none active in this context —
 /// the page is returned untouched, so an unauthenticated (or unfiltered)
@@ -155,7 +158,7 @@ pub fn apply_filters(
 /// This is [`apply_filters`]' per-status step for a caller that renders one
 /// entity at a time (the streaming delivery): the same context scoping,
 /// expiry test, own-status exemption and text, over the unscoped `filters`
-/// list. `false` means an `irreversible` filter matched; `true` keeps the
+/// list. `false` means a `hide` filter matched; `true` keeps the
 /// status, with its `filtered` array set to the warning filters that matched.
 #[must_use]
 pub fn apply_to_entity(
@@ -181,56 +184,6 @@ fn applies_in(filter: &Filter, context: FilterContext) -> bool {
     live && filter.context.iter().any(|name| name == context.as_str())
 }
 
-/// Applies the scoped `filters` to the one rendered `status`, reporting
-/// whether it survives the page. See [`apply_filters`] for the rules.
-fn apply_to_status(status: &mut StatusEntity, scoped: &[&Filter], viewer_id: Option<Uuid>) -> bool {
-    if viewer_id.is_some_and(|id| status.account.id == id.to_string()) {
-        return true;
-    }
-    let text = filter_text(status);
-    let mut results: Vec<FilterResult> = Vec::new();
-    for filter in scoped {
-        if !filter::matches(filter, &text) {
-            continue;
-        }
-        if filter.irreversible {
-            return false;
-        }
-        results.push(FilterResult::warn(filter));
-    }
-    status.filtered = results;
-    true
-}
-
-/// The plain text a phrase is tested against: [`strip_html`] of the
-/// content, the spoiler text and every media description, and — for a
-/// reblog, whose own content is empty — the same again for the nested
-/// original. The parts are newline-joined, so no phrase can read across
-/// one of the boundaries between them.
-fn filter_text(status: &StatusEntity) -> String {
-    let mut text = own_text(status);
-    if let Some(original) = status.reblog.as_deref() {
-        text.push('\n');
-        text.push_str(&own_text(original));
-    }
-    text
-}
-
-/// The entity's own plain text: stripped content, spoiler and media
-/// descriptions, newline-joined.
-fn own_text(status: &StatusEntity) -> String {
-    let mut text = strip_html(&status.content);
-    text.push('\n');
-    text.push_str(&status.spoiler_text);
-    for attachment in &status.media_attachments {
-        if let Some(description) = &attachment.description {
-            text.push('\n');
-            text.push_str(description);
-        }
-    }
-    text
-}
-
 #[cfg(test)]
 mod tests {
     use chrono::{DateTime, Duration};
@@ -241,7 +194,7 @@ mod tests {
     use crate::{
         config::{Config, TEST_BASE_URL},
         models::{
-            filter::NewFilter,
+            filter::{FilterAction, keyword::Keyword, phrase::NewPhrase},
             media_attachment::{self, NewMediaAttachment},
             status::{self, NewStatus, Status as StatusRow, Visibility},
         },
@@ -339,34 +292,45 @@ mod tests {
     }
 
     /// A stored whole-word warning filter: `phrase` applying in `context`.
+    /// Its keyword carries the filter's own id, as a v1 phrase filter's does.
     fn warn(phrase: &str, context: &[&str]) -> Filter {
+        let id = Uuid::now_v7();
         Filter {
-            id: Uuid::now_v7(),
+            id,
             user_id: Uuid::now_v7(),
-            phrase: phrase.to_owned(),
+            title: phrase.to_owned(),
             context: context.iter().map(|name| (*name).to_owned()).collect(),
-            whole_word: true,
-            irreversible: false,
+            action: FilterAction::Warn,
             expires_at: None,
             inserted_at: Utc::now(),
             updated_at: Utc::now(),
+            keywords: vec![Keyword {
+                id,
+                filter_id: id,
+                phrase: phrase.to_owned(),
+                whole_word: true,
+                inserted_at: Utc::now(),
+                updated_at: Utc::now(),
+            }],
+            statuses: Vec::new(),
         }
     }
 
-    /// The same filter as an `irreversible` one, hiding its matches.
+    /// The same filter as a `hide` one, removing its matches.
     fn hidden(phrase: &str, context: &[&str]) -> Filter {
         Filter {
-            irreversible: true,
+            action: FilterAction::Hide,
             ..warn(phrase, context)
         }
     }
 
     /// The same filter with whole-word off: a plain substring search.
     fn loose(phrase: &str, context: &[&str]) -> Filter {
-        Filter {
-            whole_word: false,
-            ..warn(phrase, context)
+        let mut filter = warn(phrase, context);
+        for found in &mut filter.keywords {
+            found.whole_word = false;
         }
+        filter
     }
 
     /// The same filter expiring at `at`.
@@ -930,15 +894,14 @@ mod tests {
         let alice = person(&pool, "alice").await;
         let bob = person(&pool, "bob").await;
         let doomed = post(&pool, &bob, "the spam word").await;
-        let _seeded: Filter = filter::create(
+        let _seeded: Filter = filter::phrase::create_phrase(
             &pool,
             alice.id,
-            &NewFilter {
+            &NewPhrase {
                 phrase: "spam".to_owned(),
                 context: vec!["home".to_owned()],
-                whole_word: true,
                 irreversible: true,
-                expires_at: None,
+                ..NewPhrase::default()
             },
         )
         .await

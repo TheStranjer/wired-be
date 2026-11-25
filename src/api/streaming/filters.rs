@@ -196,15 +196,15 @@ mod tests {
         seed_word_filter(&state, &reader, "spoilers", "home", true).await;
         seed_word_filter(&state, &reader, "maybe", "public", false).await;
         seed_word_filter(&state, &reader, "profile-only", "account", true).await;
-        let _expired = filter::create(
+        let _expired = filter::phrase::create_phrase(
             &state.db,
             reader.id,
-            &filter::NewFilter {
+            &filter::phrase::NewPhrase {
                 phrase: "past-due".to_owned(),
                 context: vec!["home".to_owned()],
                 irreversible: true,
                 expires_at: Some(chrono::Utc::now() - chrono::Duration::days(1)),
-                ..filter::NewFilter::default()
+                ..filter::phrase::NewPhrase::default()
             },
         )
         .await
@@ -217,7 +217,7 @@ mod tests {
         let mut phrases = filters
             .words
             .iter()
-            .map(|row| row.phrase.as_str())
+            .map(|row| row.title.as_str())
             .collect::<Vec<&str>>();
         phrases.sort_unstable();
         assert_eq!(

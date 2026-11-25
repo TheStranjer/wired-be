@@ -43,3 +43,10 @@ mod gates;
 /// Shared consts, fixtures, HTTP wrappers and seeds every submodule draws
 /// on; everything here is `pub(super)`.
 mod support;
+/// v2 filters applied to rendered listings: annotation, hiding, contexts,
+/// whole-word matching, expiry, status entries and the v1 view of the same
+/// storage.
+mod v2_apply;
+/// The Mastodon v2 CRUD: filters, keywords and status entries, the scope
+/// gates, the validation wording and the 404s.
+mod v2_crud;
