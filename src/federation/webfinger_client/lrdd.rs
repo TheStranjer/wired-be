@@ -78,7 +78,7 @@ mod tests {
 
     use axum::http::StatusCode;
     use serde_json::json;
-    use tokio::net::TcpListener;
+    use tokio::net::TcpSocket;
 
     use super::*;
     use crate::federation::webfinger_client::{
@@ -196,14 +196,18 @@ mod tests {
 
     #[tokio::test]
     async fn network_failure_reports_the_first_attempt_error_when_host_meta_fails() {
-        // A port nothing listens on: both the WebFinger attempt and the
-        // host-meta fallback fail to connect, and the first error survives.
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let dead_base = format!("http://{}", listener.local_addr().unwrap());
-        drop(listener);
+        // A port bound but never listened on: both the WebFinger attempt and
+        // the host-meta fallback are refused, and the first error survives.
+        // The socket stays bound for the whole test so no concurrently
+        // running test's server can take the port (binding a listener and
+        // dropping it let another test's WebFinger mock answer here).
+        let socket = TcpSocket::new_v4().unwrap();
+        socket.bind(([127, 0, 0, 1], 0).into()).unwrap();
+        let dead_base = format!("http://{}", socket.local_addr().unwrap());
         let error = resolve_acct_with_base(&client(), ACCT, Some(&dead_base))
             .await
             .unwrap_err();
+        drop(socket);
         assert!(
             matches!(error, WebfingerError::Http(HttpError::Connect(_))),
             "a refused connection is reported: {error:?}"
