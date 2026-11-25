@@ -19,6 +19,7 @@ use crate::{
     app,
     config::Config,
     jobs::{Worker, scheduler},
+    oauth::frontend_trust::trust_frontend_apps,
     services::{emoji_packs, instance_actor, runtime_config, vapid},
     state::AppState,
     streaming,
@@ -43,7 +44,9 @@ pub async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::migrate::MigrateE
 /// the streaming listener, and shuts everything down on ctrl-c or on a
 /// graceful restart requested through the admin API.
 ///
-/// Connects to PostgreSQL, applies [`MIGRATOR`], syncs the emoji packs
+/// Connects to PostgreSQL, applies [`MIGRATOR`], marks the existing
+/// frontend-origin OAuth apps trusted
+/// ([`trust_frontend_apps`]), syncs the emoji packs
 /// (see [`crate::services::emoji_packs`]), provisions the instance actor
 /// (see [`crate::services::instance_actor`]) and the VAPID key pair (see
 /// [`crate::services::vapid`]), binds
@@ -103,6 +106,8 @@ pub async fn serve(config: Config) -> Result<(), Box<dyn Error + Send + Sync>> {
     run_migrations(&db).await?;
     info!("database migrations applied");
     let config = Arc::new(config);
+    let trusted_apps = trust_frontend_apps(&db, &config.frontend_base_url).await?;
+    info!(trusted_apps, "frontend-origin OAuth apps marked trusted");
     let emoji_count =
         emoji_packs::sync_custom_emojis(&db, &config.base_url, &config.emoji_dir).await?;
     info!(emoji_count, "emoji packs synced into custom_emojis");

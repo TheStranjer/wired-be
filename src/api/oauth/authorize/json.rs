@@ -14,7 +14,9 @@
 //! `authorization[name]`/`authorization[password]` form post included —
 //! is refused with a 400 `invalid_request`. The bearer token must belong to a *trusted* app
 //! (`oauth_apps.trusted`, set through
-//! `PATCH /api/v1/pleroma/admin/oauth_app/{id}`) and cover every
+//! `PATCH /api/v1/pleroma/admin/oauth_app/{id}`, or at registration for an
+//! app whose every `redirect_uri` is on the `FRONTEND_BASE_URL` origin,
+//! WBE-822) and cover every
 //! requested scope, so a token can never mint a code for more than it
 //! holds, nor can an arbitrary app mint codes for another. Approval
 //! mints the code for the token's user — no MFA detour, since that user

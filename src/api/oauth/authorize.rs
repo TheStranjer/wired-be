@@ -23,8 +23,11 @@
 //! `POST` with a bearer token and a JSON body approves or denies it, but
 //! only for a token whose own app is trusted (WBE-205, WBE-666): admins
 //! set the `oauth_apps.trusted` flag through
-//! `PATCH /api/v1/pleroma/admin/oauth_app/{id}`. **`WiredFE`'s own app
-//! must therefore be marked `trusted`.** Any other `POST` — in particular
+//! `PATCH /api/v1/pleroma/admin/oauth_app/{id}`, or automatically (WBE-822,
+//! [`crate::oauth::frontend_trust`]) for an app registered with every
+//! `redirect_uri` on the origin of `FRONTEND_BASE_URL`, which is how
+//! `WiredFE`'s per-browser app becomes trusted; the `GET` that describes
+//! a request never depends on trust. Any other `POST` — in particular
 //! the retired `authorization[name]`/`authorization[password]` form post —
 //! is a 400.
 //!

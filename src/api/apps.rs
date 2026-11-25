@@ -24,6 +24,11 @@
 //! 401 "Invalid credentials"; an unknown, expired or deactivated-owner
 //! token is the 401 "The access token is invalid".
 //!
+//! An app whose every `redirect_uri` is on the origin of
+//! `FRONTEND_BASE_URL` is registered `trusted` (WBE-822, see
+//! [`crate::oauth::frontend_trust`]), so the first-party frontend's
+//! per-browser app can approve authorizations at `POST /oauth/authorize`.
+//!
 //! Both responses carry `vapid_key`, the instance Web Push public key
 //! (see [`crate::services::vapid`]) — the key push clients need before
 //! they can register a subscription.
@@ -43,8 +48,8 @@ use crate::{
     entities::application::Application,
     error::{AppError, AppResult},
     extract::ApiBody,
-    models::oauth_app::{self, NewOauthApp},
-    oauth::scopes::Scopes,
+    models::oauth_app::{self, AppChanges, NewOauthApp},
+    oauth::{frontend_trust::on_frontend_origin, scopes::Scopes},
     services::vapid,
     state::AppState,
 };
@@ -90,7 +95,8 @@ async fn create_app(
         ));
     }
     check_redirect_uris(&redirect_uris).map_err(|reason| field_error("redirect_uris", &reason))?;
-    let app = oauth_app::create(
+    let trusted = on_frontend_origin(&redirect_uris, &state.config.frontend_base_url);
+    let mut app = oauth_app::create(
         &state.db,
         &NewOauthApp {
             client_name,
@@ -101,6 +107,15 @@ async fn create_app(
         },
     )
     .await?;
+    if trusted {
+        let changes = AppChanges {
+            trusted: Some(true),
+            ..AppChanges::default()
+        };
+        if let Some(updated) = oauth_app::update(&state.db, app.id, &changes).await? {
+            app = updated;
+        }
+    }
     // The VAPID read seeds the instance key pair on first use (see
     // [`vapid::vapid_public_key`]).
     let vapid_key = vapid::vapid_public_key(&state.db).await?;

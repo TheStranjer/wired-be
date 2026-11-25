@@ -690,3 +690,66 @@ fn assert_no_secrets(body: &Value) {
         assert!(!fields.contains_key(secret), "`{secret}` must be absent");
     }
 }
+
+/// Registers an app with `redirect_uris` and returns its stored `trusted` flag.
+async fn registered_trust(pool: &PgPool, app: &Router, redirect_uris: &Value) -> bool {
+    let response = post_json(
+        app,
+        &json!({ "client_name": "Trust Probe", "redirect_uris": redirect_uris }),
+    )
+    .await;
+    assert_eq!(response.status, StatusCode::OK, "{}", response.text());
+    let client_id = response.json_value()["client_id"]
+        .as_str()
+        .expect("a client_id")
+        .to_owned();
+    oauth_app::get_by_client_id(pool, &client_id)
+        .await
+        .expect("the lookup reaches the database")
+        .expect("the registration stored a row")
+        .trusted
+}
+
+/// An app whose every redirect URI is on the `FRONTEND_BASE_URL` origin
+/// (the test config's `https://test.example`) registers trusted (WBE-822).
+#[tokio::test]
+async fn frontend_origin_registrations_are_trusted() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let router = common::test_app(pool.clone());
+    assert!(
+        registered_trust(&pool, &router, &json!("https://test.example/")).await,
+        "the frontend root"
+    );
+    assert!(
+        registered_trust(
+            &pool,
+            &router,
+            &json!(["https://test.example/a", "https://test.example/b"])
+        )
+        .await,
+        "several frontend URIs"
+    );
+}
+
+/// One redirect URI elsewhere, the out-of-band URN or another scheme or
+/// port keeps the registration untrusted.
+#[tokio::test]
+async fn other_registrations_stay_untrusted() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let router = common::test_app(pool.clone());
+    for uris in [
+        json!(["https://test.example/", "https://client.example/cb"]),
+        json!("urn:ietf:wg:oauth:2.0:oob"),
+        json!(["https://test.example/", "urn:ietf:wg:oauth:2.0:oob"]),
+        json!("http://test.example/"),
+        json!("https://test.example:8443/"),
+        json!("https://client.example/cb"),
+    ] {
+        assert!(
+            !registered_trust(&pool, &router, &uris).await,
+            "`{uris}` is not trusted"
+        );
+    }
+}
