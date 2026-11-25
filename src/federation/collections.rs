@@ -43,6 +43,7 @@ use crate::{
     error::{AppError, AppResult},
     federation::note,
     models::{
+        activitypub_actor,
         follow::{self, FollowPageEntry},
         pinned_status,
         status::{self, Status},
@@ -388,9 +389,16 @@ async fn outbox_activities(
     author: &User,
     rows: &[Status],
 ) -> AppResult<Vec<Value>> {
+    let followers_url = activitypub_actor::get(pool, author.id)
+        .await?
+        .and_then(|row| row.followers_url);
+    let booster = note::Booster {
+        account: author,
+        followers_url: followers_url.as_deref(),
+    };
     let mut items = Vec::with_capacity(rows.len());
     for row in rows {
-        items.extend(outbox_activity(pool, config, author, row).await?);
+        items.extend(outbox_activity(pool, config, booster, row).await?);
     }
     Ok(items)
 }
@@ -399,7 +407,7 @@ async fn outbox_activities(
 async fn outbox_activity(
     pool: &PgPool,
     config: &Config,
-    author: &User,
+    author: note::Booster<'_>,
     row: &Status,
 ) -> AppResult<Option<Value>> {
     match row.reblog_of_id {
@@ -415,7 +423,7 @@ async fn outbox_activity(
 async fn announce_of(
     pool: &PgPool,
     config: &Config,
-    author: &User,
+    author: note::Booster<'_>,
     row: &Status,
     original_id: Uuid,
 ) -> AppResult<Option<Value>> {

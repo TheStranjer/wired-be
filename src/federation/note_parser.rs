@@ -150,8 +150,10 @@ const DEFAULT_HTML_CONTENT_TYPE: &str = "text/html";
 ///
 /// `author` is the stored mirror of the actor that sent the activity: the
 /// document's `attributedTo` must name exactly that actor and share the
-/// object id's host, or the parse fails containment. `now` anchors the
-/// `published` clamp. The returned [`NewStatus`] is remote (`local` unset)
+/// object id's host, or the parse fails containment. `followers_url` is the
+/// followers collection on `author`'s `activitypub_actors` row (`None` when
+/// it names none): the audience rules take it for the author's own
+/// followers. `now` anchors the `published` clamp. The returned [`NewStatus`] is remote (`local` unset)
 /// with its `uri`, `url`, text, `spoiler_text`, `sensitive`, `visibility`
 /// and timestamps filled; every field that depends on other rows — reply,
 /// quote, mentions, media, poll — stays on [`ParsedNote`] for the caller.
@@ -168,6 +170,7 @@ const DEFAULT_HTML_CONTENT_TYPE: &str = "text/html";
 pub fn parse_note(
     json: &Value,
     author: &User,
+    followers_url: Option<&str>,
     now: DateTime<Utc>,
 ) -> Result<ParsedNote, ParseError> {
     check_size(json)?;
@@ -192,7 +195,7 @@ pub fn parse_note(
         content_type: text.content_type,
         spoiler_text: truncate_chars(&strip_html(summary), MAX_SPOILER_CHARS),
         sensitive: parse_sensitive(json, !summary.trim().is_empty()),
-        visibility: parse_visibility(json, author),
+        visibility: parse_visibility(json, followers_url),
         edited_at: times.edited_at,
         inserted_at: Some(times.inserted_at),
         language: parse_language(json),
@@ -203,7 +206,7 @@ pub fn parse_note(
         status,
         hashtags: tags.hashtags,
         mention_hrefs: tags.mention_hrefs,
-        audience: addressed_actor_ids(json, author),
+        audience: addressed_actor_ids(json, followers_url),
         emojis: tags.emojis,
         attachments: parse_attachments(json),
         reply_to_uri: json.get("inReplyTo").and_then(value_or_id),

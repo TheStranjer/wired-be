@@ -250,6 +250,7 @@ mod tests {
     use crate::{
         federation::{mrf::simple::test_support::*, note_parser},
         models::{
+            activitypub_actor,
             status::Visibility,
             user::{self, Flag, NewUser},
         },
@@ -338,10 +339,18 @@ mod tests {
     async fn the_addressing_rewrites_read_back_as_their_visibility() {
         let db = crate::test_db::test_db().await.expect("test database slot");
         let author = stored_author(db.pool()).await;
+        let followers = activitypub_actor::followers_url(db.pool(), author.id)
+            .await
+            .expect("the actor row reads");
 
         let limited = accepted(&json!({"followers_only": [PEER]}), create());
-        let parsed = note_parser::parse_note(object_of(&limited), &author, Utc::now())
-            .expect("the rewritten note parses");
+        let parsed = note_parser::parse_note(
+            object_of(&limited),
+            &author,
+            followers.as_deref(),
+            Utc::now(),
+        )
+        .expect("the rewritten note parses");
         assert_eq!(
             parsed.status.visibility,
             Visibility::Private,
@@ -349,8 +358,13 @@ mod tests {
         );
 
         let unlisted = accepted(&json!({"federated_timeline_removal": [PEER]}), create());
-        let relaxed = note_parser::parse_note(object_of(&unlisted), &author, Utc::now())
-            .expect("the rewritten note parses");
+        let relaxed = note_parser::parse_note(
+            object_of(&unlisted),
+            &author,
+            followers.as_deref(),
+            Utc::now(),
+        )
+        .expect("the rewritten note parses");
         assert_eq!(
             relaxed.status.visibility,
             Visibility::Unlisted,

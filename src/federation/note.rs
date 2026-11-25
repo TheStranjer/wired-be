@@ -51,14 +51,14 @@ pub mod tags;
 pub mod test_support;
 
 pub use activities::{
-    NoteDeletion, announce_activity_json, boost_addressing, create_activity_json,
+    Booster, NoteDeletion, announce_activity_json, boost_addressing, create_activity_json,
     delete_activity_json, litepub_context_json, tombstone_json, update_activity_json,
 };
 pub use fields::note_json;
 pub use load::load_note_context;
 
 pub(crate) use activities::json_ld_context;
-pub(crate) use fields::address_lines;
+pub(crate) use fields::{address_lines, audience_lines};
 pub(crate) use load::load_mentions;
 pub(crate) use tags::attachment_json;
 
@@ -113,6 +113,11 @@ pub struct NoteContext {
     /// The author; their actor id and followers collection drive the
     /// addressing.
     pub author: User,
+    /// The followers collection id on the author's `activitypub_actors`
+    /// row, which the addressing names; `None` when the row carries none
+    /// (or the author has no row), and the id is then built from the
+    /// author's actor id.
+    pub author_followers_url: Option<String>,
     /// The answered status's object id, resolved by
     /// [`load_note_context`] from [`Status::in_reply_to_id`] or the still
     /// unresolved [`Status::in_reply_to_ap_id`]; `None` for a root status.

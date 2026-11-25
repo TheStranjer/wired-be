@@ -9,23 +9,26 @@ use crate::{
         json::{as_array, value_or_id},
         vocab::is_public_address,
     },
-    models::{status::Visibility, user::User},
+    models::status::Visibility,
 };
 
 /// The visibility from `to` and `cc`: the public recipient in `to` is
 /// public, in `cc` alone unlisted, the author's followers collection (and
 /// nobody public) private, anything else direct.
 ///
+/// `followers_url` is the collection id on the author's
+/// `activitypub_actors` row, `None` for an author whose row names none.
+///
 /// `pub(crate)` because the C2S outbox in [`crate::api::activitypub`]
 /// derives a posted `Create`'s audience with exactly this rule.
-pub(crate) fn parse_visibility(json: &Value, author: &User) -> Visibility {
+pub(crate) fn parse_visibility(json: &Value, followers_url: Option<&str>) -> Visibility {
     let to = recipients(json, "to");
     let cc = recipients(json, "cc");
     if to.iter().any(|recipient| is_public_address(recipient)) {
         Visibility::Public
     } else if cc.iter().any(|recipient| is_public_address(recipient)) {
         Visibility::Unlisted
-    } else if addresses_followers(&to, &cc, author.followers_url.as_deref()) {
+    } else if addresses_followers(&to, &cc, followers_url) {
         Visibility::Private
     } else {
         Visibility::Direct
@@ -33,13 +36,12 @@ pub(crate) fn parse_visibility(json: &Value, author: &User) -> Visibility {
 }
 
 /// The actor ids a document addresses in `to` and `cc`: every recipient
-/// that is neither a [public spelling](is_public_address) nor `author`'s
-/// followers collection, each once, `to` first. Mastodon's
+/// that is neither a [public spelling](is_public_address) nor the author's
+/// followers collection, `followers_url`, each once, `to` first. Mastodon's
 /// `process_audience` and Pleroma's `to` check both grant a known local
 /// account named here access without a `Mention` tag; resolving which of
 /// these are local accounts is the ingest's job.
-pub(crate) fn addressed_actor_ids(json: &Value, author: &User) -> Vec<String> {
-    let followers_url = author.followers_url.as_deref();
+pub(crate) fn addressed_actor_ids(json: &Value, followers_url: Option<&str>) -> Vec<String> {
     let mut ids: Vec<String> = Vec::new();
     for recipient in recipients(json, "to")
         .into_iter()
@@ -164,7 +166,7 @@ mod tests {
         document["cc"] = json!([{"id": alice}, "https://us.example/users/carol", FOLLOWERS]);
 
         assert_eq!(
-            addressed_actor_ids(&document, &author()),
+            addressed_actor_ids(&document, Some(FOLLOWERS)),
             [alice, "https://us.example/users/carol"],
             "public spellings and the followers url drop; duplicates collapse"
         );
@@ -177,7 +179,7 @@ mod tests {
         remove(&mut document, "cc");
 
         assert!(
-            addressed_actor_ids(&document, &author()).is_empty(),
+            addressed_actor_ids(&document, Some(FOLLOWERS)).is_empty(),
             "no lists, no audience"
         );
     }
@@ -189,7 +191,7 @@ mod tests {
         document["to"] = json!([foreign]);
 
         assert_eq!(
-            addressed_actor_ids(&document, &author()),
+            addressed_actor_ids(&document, Some(FOLLOWERS)),
             [foreign],
             "only the author's own followers url is filtered"
         );

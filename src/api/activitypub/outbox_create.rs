@@ -16,7 +16,7 @@ use crate::{
     error::{AppError, AppResult},
     extract::ApiBody,
     federation::{json as ap_json, note_parser},
-    models::{oauth_app, user::User},
+    models::{activitypub_actor, oauth_app, user::User},
     oauth::scopes::WRITE_STATUSES,
     services::{
         create_status::{self, CreateStatusParams},
@@ -126,14 +126,18 @@ pub(super) fn ensure_own_actor(user: &User, nickname: &str) -> AppResult<()> {
 /// [`create_activity_json`](crate::federation::note::create_activity_json) writes).
 async fn post_create(state: &AppState, auth: &AuthUser, activity: &Value) -> AppResult<String> {
     let object = note_object(activity)?;
+    let followers_url = activitypub_actor::followers_url(&state.db, auth.0.id).await?;
     let params = CreateStatusParams {
         status: text_field(object, "content"),
         spoiler_text: text_field(object, "summary"),
         sensitive: object.get("sensitive").and_then(Value::as_bool),
         visibility: Some(
-            note_parser::parse_visibility(&create_addressing(object, activity), &auth.0)
-                .as_str()
-                .to_owned(),
+            note_parser::parse_visibility(
+                &create_addressing(object, activity),
+                followers_url.as_deref(),
+            )
+            .as_str()
+            .to_owned(),
         ),
         in_reply_to_id: replied_to(state, object).await?,
         media_ids: Some(attachment_ids(object)),

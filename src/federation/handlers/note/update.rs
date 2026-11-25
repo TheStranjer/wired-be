@@ -22,6 +22,7 @@ use crate::{
         note_parser::{self, ParsedNote},
     },
     models::{
+        activitypub_actor,
         status::{self, Status},
         status_edit::{self, EditParams},
         user::User,
@@ -104,7 +105,10 @@ async fn fold_edit(
 ) -> Result<Outcome, FederationError> {
     let now = Utc::now();
     let recency = recency(object, stored, now);
-    let parsed = match note_parser::parse_note(object, signer, now) {
+    let followers_url = activitypub_actor::followers_url(&state.db, signer.id)
+        .await
+        .transient("the signer's followers collection could not be read")?;
+    let parsed = match note_parser::parse_note(object, signer, followers_url.as_deref(), now) {
         Ok(parsed) => parsed,
         Err(_) if recency == Ordering::Less => return Ok(ignore_stale(stored)),
         Err(err) => {

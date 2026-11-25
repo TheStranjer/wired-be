@@ -16,7 +16,7 @@ use crate::{
     federation::{
         activities::activity_id,
         actor::{actor_json, profile_emojis, stored_public_key},
-        delivery::best_inbox,
+        delivery::best_inboxes,
         note, publisher,
         vocab::AS_PUBLIC,
     },
@@ -146,9 +146,9 @@ pub async fn after_account_deleted(state: &AppState, account: &User) -> AppResul
     }
     let mut recipients: Vec<String> = Vec::new();
     let fans = follow::remote_followers(&state.db, account.id).await?;
-    recipients.extend(fans.iter().filter_map(best_inbox));
+    recipients.extend(best_inboxes(&state.db, &fans).await?);
     let idols = follow::remote_followees(&state.db, account.id).await?;
-    recipients.extend(idols.iter().filter_map(best_inbox));
+    recipients.extend(best_inboxes(&state.db, &idols).await?);
     recipients.extend(relay::accepted_inboxes(&state.db).await?);
     // Two remote accounts on one instance name one shared inbox; the
     // publisher's fan-out deduplicates by URL, so the snapshot POSTs there

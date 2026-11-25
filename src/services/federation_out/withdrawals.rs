@@ -16,7 +16,11 @@ use super::notes::federates_as_note;
 use super::{load_user, queue_activity, status_action};
 use crate::{
     federation::note,
-    models::status::{self, Status, Visibility},
+    models::{
+        activitypub_actor,
+        status::{self, Status, Visibility},
+        user::followers_address_of,
+    },
     state::AppState,
 };
 
@@ -67,7 +71,7 @@ async fn boost_withdrawal(state: &AppState, deleted: &Status, original_id: Uuid)
 ///
 /// The audience is the part that cannot be re-read: the live row is a
 /// tombstone by the time this runs ([`note::load_note_context`] answers one
-/// with a miss), so the two lines come from [`note::address_lines`] run over
+/// with a miss), so the two lines come from [`note::audience_lines`] run over
 /// the pre-delete row the delete service holds and the mention links still
 /// attached to it — the very rule that wrote the note's own `to` and `cc`,
 /// which is what makes the withdrawal reach exactly the inboxes that hold
@@ -101,7 +105,19 @@ async fn note_withdrawal(state: &AppState, deleted: &Status) {
             return;
         }
     };
-    let (to, cc) = note::address_lines(deleted.visibility, &author, &mentions);
+    let followers_url = match activitypub_actor::get(&state.db, author.id).await {
+        Ok(row) => row.and_then(|row| row.followers_url),
+        Err(err) => {
+            warn!(
+                %err,
+                status = %deleted.id,
+                "note withdrawal could not read the author's followers collection"
+            );
+            return;
+        }
+    };
+    let followers = followers_address_of(&author.ap_id, followers_url.as_deref());
+    let (to, cc) = note::audience_lines(deleted.visibility, &followers, &mentions);
     let row = withdrawn_row(state, deleted).await;
     let document = note::delete_activity_json(&note::NoteDeletion {
         config: &state.config,

@@ -15,7 +15,7 @@ use crate::{
     federation::vocab::{AS_PUBLIC, AS_VOCABULARY},
     models::{
         status::{Status, Visibility},
-        user::{User, followers_address},
+        user::{User, followers_address_of},
     },
     util::{id::activity_ap_id, time::mastodon_time},
 };
@@ -241,10 +241,22 @@ pub fn delete_activity_json(deletion: &NoteDeletion<'_>) -> Value {
     })
 }
 
+/// The account that boosts, and the followers collection its
+/// `activitypub_actors` row stores.
+#[derive(Clone, Copy, Debug)]
+pub struct Booster<'a> {
+    /// The boosting account: its actor id is the `Announce`'s `actor`.
+    pub account: &'a User,
+    /// The followers collection id on the account's `activitypub_actors`
+    /// row; `None` when the row carries none (or there is no row), and the
+    /// id is then built from the account's actor id.
+    pub followers_url: Option<&'a str>,
+}
+
 /// The `Announce` a reblog row federates as.
 ///
 /// Its own stored `uri` is already the `{BASE_URL}/activities/{id}` address
-/// (decision 6), so this is that row spoken as an activity of `author`
+/// (decision 6), so this is that row spoken as an activity of `booster`
 /// boosting `original_uri` by `original_author_ap_id`.
 ///
 /// The addressing is [`boost_addressing`]'s, and this is the one renderer
@@ -254,7 +266,7 @@ pub fn delete_activity_json(deletion: &NoteDeletion<'_>) -> Value {
 #[must_use]
 pub fn announce_activity_json(
     reblog: &Status,
-    author: &User,
+    booster: Booster<'_>,
     original_uri: &str,
     original_author_ap_id: &str,
     config: &Config,
@@ -262,13 +274,13 @@ pub fn announce_activity_json(
     if reblog.visibility == Visibility::Local {
         return None;
     }
-    let followers_addr = followers_address(author);
+    let followers_addr = followers_address_of(&booster.account.ap_id, booster.followers_url);
     let (to, cc) = boost_addressing(reblog.visibility, &followers_addr, original_author_ap_id);
     Some(json!({
         "@context": json_ld_context(config),
         "id": &reblog.uri,
         "type": TYPE_ANNOUNCE,
-        "actor": &author.ap_id,
+        "actor": &booster.account.ap_id,
         "object": original_uri,
         "published": mastodon_time(&reblog.inserted_at),
         "to": to,
@@ -325,6 +337,15 @@ mod tests {
         federation::note::{PollData, PollOptionData, note_json, test_support::*},
         util::time::parse_time,
     };
+
+    /// `account` boosting, its `activitypub_actors` row carrying no
+    /// followers collection.
+    const fn booster_of(account: &User) -> Booster<'_> {
+        Booster {
+            account,
+            followers_url: None,
+        }
+    }
 
     #[test]
     fn the_note_context_is_the_documented_schema_chain() {
@@ -473,8 +494,9 @@ mod tests {
     fn a_public_reblog_announces_to_the_world() {
         let reblog = base_status(Visibility::Public);
         let config = Config::for_tests();
-        let activity = announce_activity_json(&reblog, &author(), PARENT_URI, BOB_AP, &config)
-            .expect("a public announce renders");
+        let activity =
+            announce_activity_json(&reblog, booster_of(&author()), PARENT_URI, BOB_AP, &config)
+                .expect("a public announce renders");
         assert_eq!(
             json_keys(&activity),
             [
@@ -514,8 +536,9 @@ mod tests {
     fn an_unlisted_reblog_announces_to_the_followers() {
         let reblog = base_status(Visibility::Unlisted);
         let config = Config::for_tests();
-        let activity = announce_activity_json(&reblog, &author(), PARENT_URI, BOB_AP, &config)
-            .expect("an unlisted announce renders");
+        let activity =
+            announce_activity_json(&reblog, booster_of(&author()), PARENT_URI, BOB_AP, &config)
+                .expect("an unlisted announce renders");
         assert_eq!(
             activity["to"],
             json!([format!("{AUTHOR_AP}/followers")]),
@@ -532,8 +555,9 @@ mod tests {
     fn a_private_reblog_announces_to_followers_only() {
         let reblog = base_status(Visibility::Private);
         let config = Config::for_tests();
-        let activity = announce_activity_json(&reblog, &author(), PARENT_URI, BOB_AP, &config)
-            .expect("a private announce renders");
+        let activity =
+            announce_activity_json(&reblog, booster_of(&author()), PARENT_URI, BOB_AP, &config)
+                .expect("a private announce renders");
         assert_eq!(
             activity["to"],
             json!([format!("{AUTHOR_AP}/followers")]),
@@ -547,17 +571,36 @@ mod tests {
     }
 
     #[test]
-    fn an_announce_names_the_stored_followers_collection() {
+    fn an_announce_names_the_actor_rows_followers_collection() {
         let reblog = base_status(Visibility::Private);
         let config = Config::for_tests();
-        let mut booster = author();
-        booster.followers_url = Some("https://test.example/custom/followers".to_owned());
-        let activity = announce_activity_json(&reblog, &booster, PARENT_URI, BOB_AP, &config)
+        let account = author();
+        let booster = Booster {
+            account: &account,
+            followers_url: Some("https://test.example/custom/followers"),
+        };
+        let activity = announce_activity_json(&reblog, booster, PARENT_URI, BOB_AP, &config)
             .expect("a private announce renders");
         assert_eq!(
             activity["to"],
             json!(["https://test.example/custom/followers"]),
             "a stored followers_url wins over the constructed one"
+        );
+    }
+
+    #[test]
+    fn an_announce_ignores_the_users_followers_url() {
+        let reblog = base_status(Visibility::Private);
+        let config = Config::for_tests();
+        let mut account = author();
+        account.followers_url = Some("https://test.example/old/followers".to_owned());
+        let activity =
+            announce_activity_json(&reblog, booster_of(&account), PARENT_URI, BOB_AP, &config)
+                .expect("a private announce renders");
+        assert_eq!(
+            activity["to"],
+            json!([format!("{AUTHOR_AP}/followers")]),
+            "the `users` column no longer names the collection"
         );
     }
 
@@ -594,7 +637,8 @@ mod tests {
         let reblog = base_status(Visibility::Local);
         let config = Config::for_tests();
         assert!(
-            announce_activity_json(&reblog, &author(), PARENT_URI, BOB_AP, &config).is_none(),
+            announce_activity_json(&reblog, booster_of(&author()), PARENT_URI, BOB_AP, &config)
+                .is_none(),
             "a local boost has no activity"
         );
     }

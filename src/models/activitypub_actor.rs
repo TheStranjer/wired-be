@@ -15,7 +15,10 @@
 //! The readers are moving here one area at a time: the actor document's
 //! public key, the signature check's key lookup, the instance actor's
 //! signing key, the featured collection id and the remote mirror's fetch
-//! stamp already come from this table, not from `users`. The migration
+//! stamp already come from this table, not from `users`, and so do
+//! delivery and publishing (inbox choice, the signing key, the followers
+//! collection) and the note and `Announce` documents' addressing. The
+//! migration
 //! backfilled it from `users`, and every writer of the moved columns now
 //! writes both tables in one transaction ([`upsert_from_user`] is how):
 //! `models::user::insert` for every new local or remote account, and
@@ -218,6 +221,23 @@ where
         .fetch_optional(executor)
         .await?;
     Ok(row)
+}
+
+/// The followers collection id on `user_id`'s row.
+///
+/// `None` when the account has no row or its row carries none; callers that
+/// address a followers collection then build the id from the actor's own.
+///
+/// # Errors
+///
+/// Any database failure (connection, encoding) arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn followers_url<'e, E>(executor: E, user_id: Uuid) -> AppResult<Option<String>>
+where
+    E: Executor<'e, Database = Postgres>,
+{
+    let row = get(executor, user_id).await?;
+    Ok(row.and_then(|actor| actor.followers_url))
 }
 
 /// The `ActivityPub` rows of `user_ids`, in one statement.

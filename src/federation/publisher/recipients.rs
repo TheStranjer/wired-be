@@ -10,9 +10,9 @@ use uuid::Uuid;
 use super::ADDRESSING_FIELDS;
 use crate::{
     error::AppResult,
-    federation::{delivery::best_inbox, json, vocab::is_public_address},
+    federation::{delivery::best_inboxes, json, vocab::is_public_address},
     models::{
-        follow,
+        activitypub_actor, follow,
         user::{INSTANCE_ACTOR_NICKNAME, User, get_by_ap_id},
     },
 };
@@ -30,15 +30,16 @@ pub(super) fn addressed_to(activity: &Value) -> Vec<String> {
 }
 
 /// Whether `addresses` reach beyond named actors: they carry the public
-/// address or `actor`'s own followers collection.
+/// address or the publishing actor's own followers collection,
+/// `followers_url`.
 ///
 /// Such an activity is broadcast, so every recipient on a host collapses
 /// onto that host's shared inbox; one that names only actors is direct and
 /// each is reached at their personal inbox.
-fn is_broadcast(actor: &User, addresses: &[String]) -> bool {
-    addresses.iter().any(|address| {
-        is_public_address(address) || actor.followers_url.as_deref() == Some(address.as_str())
-    })
+fn is_broadcast(followers_url: Option<&str>, addresses: &[String]) -> bool {
+    addresses
+        .iter()
+        .any(|address| is_public_address(address) || followers_url == Some(address.as_str()))
 }
 
 /// Resolves recipient addresses to candidate inbox URLs: the followers
@@ -50,23 +51,32 @@ fn is_broadcast(actor: &User, addresses: &[String]) -> bool {
 /// their shared inbox when they publish one, so the host that also holds
 /// followers is delivered to once; a direct activity reaches them at their
 /// personal inbox.
+///
+/// The actor's followers collection and every recipient's inbox come from
+/// the `activitypub_actors` table. The named recipients are collected first
+/// so their rows are read in one statement, not one per recipient.
 pub(super) async fn expand_recipients(
     pool: &PgPool,
     actor: &User,
     addresses: &[String],
 ) -> AppResult<Vec<String>> {
-    let broadcast = is_broadcast(actor, addresses);
+    let followers_url = activitypub_actor::get(pool, actor.id)
+        .await?
+        .and_then(|row| row.followers_url);
+    let broadcast = is_broadcast(followers_url.as_deref(), addresses);
     let mut inboxes = Vec::new();
+    let mut recipients = Vec::new();
     for address in addresses {
         if is_public_address(address) {
             continue;
         }
-        if actor.followers_url.as_deref() == Some(address.as_str()) {
+        if followers_url.as_deref() == Some(address.as_str()) {
             inboxes.extend(follower_inboxes(pool, actor.id).await?);
-        } else if let Some(inbox) = recipient_inbox(pool, address, actor, broadcast).await? {
-            inboxes.push(inbox);
+        } else if let Some(recipient) = receiving_account(pool, address, actor).await? {
+            recipients.push(recipient);
         }
     }
+    inboxes.extend(recipient_inboxes(pool, &recipients, broadcast).await?);
     Ok(inboxes)
 }
 
@@ -76,32 +86,35 @@ pub(super) async fn expand_recipients(
 /// [`deliverable_inboxes`](super::inboxes::deliverable_inboxes).
 async fn follower_inboxes(pool: &PgPool, actor_id: Uuid) -> AppResult<Vec<String>> {
     let followers = follow::remote_followers(pool, actor_id).await?;
-    Ok(followers.iter().filter_map(best_inbox).collect())
+    best_inboxes(pool, &followers).await
 }
 
-/// The inbox of a directly addressed recipient — their
-/// [`best_inbox`] when `broadcast`, their personal inbox otherwise — or
-/// `None` when `address` resolves to nobody who may receive a delivery: an
-/// unknown address (never seen, so never stored), a local user (their
-/// timeline is the delivery), the actor itself, this instance's own actor, a
-/// deactivated or suspended mirror, or a remote row that published no usable
-/// inbox at all.
-async fn recipient_inbox(
+/// The account a directly addressed `address` names, when it may receive a
+/// delivery; `None` for an unknown address (never seen, so never stored), a
+/// local user (their timeline is the delivery), the actor itself, this
+/// instance's own actor, and a deactivated or suspended mirror.
+async fn receiving_account(pool: &PgPool, address: &str, actor: &User) -> AppResult<Option<User>> {
+    let recipient = get_by_ap_id(pool, address).await?;
+    Ok(recipient.filter(|candidate| may_receive(candidate, actor)))
+}
+
+/// The inboxes of the directly addressed `recipients`, read from their
+/// `activitypub_actors` rows in one statement: each one's
+/// [`best_inbox`](crate::federation::delivery::best_inbox) when `broadcast`, their personal inbox otherwise.
+///
+/// A recipient whose row publishes no usable inbox (or has no row)
+/// contributes nothing.
+async fn recipient_inboxes(
     pool: &PgPool,
-    address: &str,
-    actor: &User,
+    recipients: &[User],
     broadcast: bool,
-) -> AppResult<Option<String>> {
-    let Some(recipient) = get_by_ap_id(pool, address).await? else {
-        return Ok(None);
-    };
-    if !may_receive(&recipient, actor) {
-        return Ok(None);
-    }
+) -> AppResult<Vec<String>> {
     if broadcast {
-        return Ok(best_inbox(&recipient));
+        return best_inboxes(pool, recipients).await;
     }
-    Ok(recipient.inbox)
+    let ids: Vec<Uuid> = recipients.iter().map(|recipient| recipient.id).collect();
+    let rows = activitypub_actor::get_many(pool, &ids).await?;
+    Ok(rows.into_iter().filter_map(|row| row.inbox).collect())
 }
 
 /// Whether a resolved recipient row may receive a delivery: a remote,

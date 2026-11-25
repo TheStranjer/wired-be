@@ -178,7 +178,7 @@ mod tests {
         for (name, break_it, expected) in rejections() {
             let mut document = fixture(MASTODON);
             break_it(&mut document);
-            let error = parse_note(&document, &author(), now()).unwrap_err();
+            let error = parse_note(&document, &author(), Some(FOLLOWERS), now()).unwrap_err();
             assert!(
                 expected(&error),
                 "{name}: rejected with the wrong error: {error}"
@@ -211,7 +211,7 @@ mod tests {
             json!(null),
             json!(1),
         ] {
-            let error = parse_note(&document, &author(), now()).unwrap_err();
+            let error = parse_note(&document, &author(), Some(FOLLOWERS), now()).unwrap_err();
             assert!(
                 matches!(error, ParseError::UnsupportedType(_)),
                 "a document that is not an object fails UnsupportedType, got {error}"
@@ -223,7 +223,7 @@ mod tests {
     fn oversized_documents_are_rejected() {
         let mut document = minimal_note();
         document["content"] = json!("x".repeat(2_500_000));
-        let error = parse_note(&document, &author(), now()).unwrap_err();
+        let error = parse_note(&document, &author(), Some(FOLLOWERS), now()).unwrap_err();
         assert_eq!(error, ParseError::TooLarge, "2.5 MB goes over the cap");
         document["content"] = json!("x".repeat(2_000_000));
         let kept = parse(&document);

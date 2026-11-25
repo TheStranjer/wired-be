@@ -11,7 +11,7 @@ use serde_json::Value;
 
 use super::{StatusAction, queue_activity, status_action, withdrawal};
 use crate::{
-    federation::note::announce_activity_json,
+    federation::note::{Booster, announce_activity_json},
     models::status::{Status, Visibility},
     state::AppState,
 };
@@ -66,9 +66,13 @@ pub(super) fn reblog_activity(
     action: &StatusAction,
     undo: bool,
 ) -> Option<Value> {
+    let booster = Booster {
+        account: &action.actor,
+        followers_url: action.actor_followers_url.as_deref(),
+    };
     let announce = announce_activity_json(
         reblog,
-        &action.actor,
+        booster,
         &action.status.uri,
         &action.author.ap_id,
         &state.config,

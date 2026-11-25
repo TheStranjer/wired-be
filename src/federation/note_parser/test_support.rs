@@ -126,7 +126,7 @@ pub(super) fn fixture(text: &str) -> Value {
 /// Parses `document` by the fixture author at [`now`]; documents the
 /// ticket expects to parse.
 pub(super) fn parse(document: &Value) -> ParsedNote {
-    parse_note(document, &author(), now()).unwrap()
+    parse_note(document, &author(), Some(FOLLOWERS), now()).unwrap()
 }
 
 /// The smallest document that parses: a public note with one sentence.

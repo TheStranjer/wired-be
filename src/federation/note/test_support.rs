@@ -176,6 +176,7 @@ pub(super) fn note_context(visibility: Visibility) -> NoteContext {
     NoteContext {
         status: base_status(visibility),
         author: author(),
+        author_followers_url: None,
         reply_parent_uri: None,
         mentions: Vec::new(),
         hashtags: Vec::new(),

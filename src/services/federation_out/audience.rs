@@ -17,7 +17,7 @@ use uuid::Uuid;
 
 use crate::{
     error::AppResult,
-    federation::{delivery::best_inbox, publisher},
+    federation::{delivery::best_inboxes, publisher},
     models::{
         block, domain_block,
         status::{remote_boosters, remote_voters},
@@ -69,17 +69,18 @@ async fn try_extra_inboxes(
         .await?
         .into_iter()
         .collect();
-    let mut seen: HashSet<String> = HashSet::new();
-    let mut inboxes = Vec::new();
+    let mut tellable = Vec::new();
     for account in accounts {
-        if may_tell(state, author, &blocked, &account).await?
-            && let Some(inbox) = best_inbox(&account)
-            && seen.insert(inbox.clone())
-        {
-            inboxes.push(inbox);
+        if may_tell(state, author, &blocked, &account).await? {
+            tellable.push(account);
         }
     }
-    Ok(inboxes)
+    let mut seen: HashSet<String> = HashSet::new();
+    let inboxes = best_inboxes(&state.db, &tellable).await?;
+    Ok(inboxes
+        .into_iter()
+        .filter(|inbox| seen.insert(inbox.clone()))
+        .collect())
 }
 
 /// Whether `author` may tell `account`: not blocked by them, and not on a
