@@ -346,6 +346,10 @@ impl StatusQuote {
                 state: "unauthorized",
                 quoted_status: None,
             }),
+            Some(QuoteSlot::Pending) => Self::Entity(QuoteEntity {
+                state: "pending",
+                quoted_status: None,
+            }),
             Some(QuoteSlot::Rejected) => Self::Entity(QuoteEntity {
                 state: "rejected",
                 quoted_status: None,

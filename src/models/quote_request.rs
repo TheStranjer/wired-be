@@ -51,10 +51,10 @@ const SET_STATE_SQL: &str = "UPDATE quote_requests
 const ACCEPTED_SQL: &str = "SELECT authorization_uri FROM quote_requests
       WHERE quoting_status_id = $1 AND state = 'accepted'";
 
-/// [`denied_for_statuses`]: the quotes whose author said no, or took the
-/// yes back.
-const DENIED_SQL: &str = "SELECT quoting_status_id, state FROM quote_requests
-      WHERE quoting_status_id = ANY($1) AND state IN ('rejected', 'revoked')";
+/// [`unaccepted_for_statuses`]: the quotes whose author has not said yes
+/// (or took the yes back).
+const UNACCEPTED_SQL: &str = "SELECT quoting_status_id, state FROM quote_requests
+      WHERE quoting_status_id = ANY($1) AND state IN ('pending', 'rejected', 'revoked')";
 
 /// Where one request stands.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -242,23 +242,25 @@ pub async fn accepted_authorization(pool: &PgPool, status_id: Uuid) -> AppResult
     Ok(uri.flatten())
 }
 
-/// Of the quoting statuses `status_ids`, which ones were refused or
-/// revoked, and in which state.
+/// Of the quoting statuses `status_ids`, which ones are not accepted:
+/// still pending, refused or revoked, and in which state.
 ///
-/// One read for a whole page; an empty list asks the database nothing.
+/// A status with no request (a quote of a local post) is absent, and an
+/// accepted one is too. One read for a whole page; an empty list asks the
+/// database nothing.
 ///
 /// # Errors
 ///
 /// Any database failure arrives as
 /// [`AppError::Database`](crate::error::AppError).
-pub async fn denied_for_statuses(
+pub async fn unaccepted_for_statuses(
     pool: &PgPool,
     status_ids: &[Uuid],
 ) -> AppResult<HashMap<Uuid, QuoteRequestState>> {
     if status_ids.is_empty() {
         return Ok(HashMap::new());
     }
-    let rows: Vec<(Uuid, String)> = sqlx::query_as(DENIED_SQL)
+    let rows: Vec<(Uuid, String)> = sqlx::query_as(UNACCEPTED_SQL)
         .bind(status_ids)
         .fetch_all(pool)
         .await?;
@@ -368,6 +370,13 @@ mod tests {
         let grant = "https://remote.example/quote_authorizations/1";
 
         accept(pool, row.id, grant).await.expect("the grant stores");
+        assert!(
+            unaccepted_for_statuses(pool, &[quoting.id])
+                .await
+                .expect("the read runs")
+                .is_empty(),
+            "an accepted request is not reported"
+        );
 
         assert_eq!(
             accepted_authorization(pool, quoting.id)
@@ -397,19 +406,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_refusal_and_a_revocation_show_as_denied_and_hold_no_grant() {
+    async fn a_pending_refused_or_revoked_quote_is_unaccepted_and_holds_no_grant() {
         let db = crate::test_db::test_db().await.expect("test database slot");
         let pool = db.pool();
         let (quoting, row) = stored(pool).await;
-        assert!(
-            denied_for_statuses(pool, &[quoting.id])
-                .await
-                .expect("the read runs")
-                .is_empty(),
-            "a pending request is not denied"
+        let pending = unaccepted_for_statuses(pool, &[quoting.id])
+            .await
+            .expect("the read runs");
+        assert_eq!(
+            pending.get(&quoting.id),
+            Some(&QuoteRequestState::Pending),
+            "a pending request is reported"
         );
         assert!(
-            denied_for_statuses(pool, &[])
+            unaccepted_for_statuses(pool, &[])
                 .await
                 .expect("the empty read runs")
                 .is_empty(),
@@ -419,7 +429,7 @@ mod tests {
         set_state(pool, row.id, QuoteRequestState::Rejected)
             .await
             .expect("the refusal stores");
-        let refused = denied_for_statuses(pool, &[quoting.id])
+        let refused = unaccepted_for_statuses(pool, &[quoting.id])
             .await
             .expect("the read runs");
         assert_eq!(
@@ -438,7 +448,7 @@ mod tests {
         set_state(pool, row.id, QuoteRequestState::Revoked)
             .await
             .expect("the revocation stores");
-        let revoked = denied_for_statuses(pool, &[quoting.id])
+        let revoked = unaccepted_for_statuses(pool, &[quoting.id])
             .await
             .expect("the read runs");
         assert_eq!(

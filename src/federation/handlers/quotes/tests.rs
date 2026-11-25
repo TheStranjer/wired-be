@@ -14,7 +14,7 @@ use crate::{
     },
     models::{
         block,
-        status::{NewStatus, Visibility},
+        status::{NewStatus, QuoteApprovalPolicy, Visibility},
         user::{NewUser, insert},
     },
     test_fixtures::remote_new,
@@ -260,6 +260,76 @@ async fn a_private_post_is_granted_to_followers_only() {
         "Accept",
         "and is told so"
     );
+}
+
+/// A public post of `author` under the author's own quote `policy`.
+async fn post_under(pool: &PgPool, author: &User, policy: QuoteApprovalPolicy) -> Status {
+    status::insert(
+        pool,
+        TEST_BASE_URL,
+        &NewStatus {
+            quote_approval_policy: Some(policy),
+            ..NewStatus::local(author, "quote me, or not")
+        },
+    )
+    .await
+    .expect("the quoted post inserts")
+}
+
+/// A public post whose author chose `nobody` is refused with a `Reject`
+/// and stores no grant.
+#[tokio::test]
+async fn a_nobody_policy_rejects_even_a_follower() {
+    let db = crate::test_db::test_db().await.expect("test database slot");
+    let pool = db.pool().clone();
+    let alice = local_user(&pool, "alice").await;
+    let bob = remote(&pool, "bob").await;
+    accepted_follow(&pool, &bob, &alice).await;
+    let quoted = post_under(&pool, &alice, QuoteApprovalPolicy::Nobody).await;
+
+    let outcome = handle_quote_request(
+        app_state(&pool),
+        request("q1", &quoted.uri, &quoting_note(BOB, None)),
+        bob,
+    )
+    .await;
+
+    assert_handled(&outcome);
+    assert_eq!(grants(&pool).await, 0, "nothing is granted");
+    assert_eq!(
+        deliveries(&pool).await[0]["type"],
+        "Reject",
+        "and the quoter is told so"
+    );
+}
+
+/// A public post whose author chose `followers` is granted to an accepted
+/// follower and refused to a stranger.
+#[tokio::test]
+async fn a_followers_policy_grants_followers_and_rejects_strangers() {
+    let db = crate::test_db::test_db().await.expect("test database slot");
+    let pool = db.pool().clone();
+    let alice = local_user(&pool, "alice").await;
+    let bob = remote(&pool, "bob").await;
+    let quoted = post_under(&pool, &alice, QuoteApprovalPolicy::Followers).await;
+    let note = quoting_note(BOB, None);
+
+    let stranger = handle_quote_request(
+        app_state(&pool),
+        request("q1", &quoted.uri, &note),
+        bob.clone(),
+    )
+    .await;
+    assert_handled(&stranger);
+    assert_eq!(grants(&pool).await, 0, "a stranger is granted nothing");
+    assert_eq!(deliveries(&pool).await[0]["type"], "Reject", "and is told");
+
+    accepted_follow(&pool, &bob, &alice).await;
+    let follower =
+        handle_quote_request(app_state(&pool), request("q2", &quoted.uri, &note), bob).await;
+    assert_handled(&follower);
+    assert_eq!(grants(&pool).await, 1, "a follower is granted");
+    assert_eq!(deliveries(&pool).await[1]["type"], "Accept", "and is told");
 }
 
 /// A direct post, and a post of an author who blocks the quoter, are

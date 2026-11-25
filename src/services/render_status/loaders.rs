@@ -94,21 +94,25 @@ pub(super) async fn load_quotes(
     Ok((quoted, visible_quotes))
 }
 
-/// The quotes among `quoting_ids` whose author said no, as render slots.
+/// The quotes among `quoting_ids` whose author has not said yes, as render
+/// slots.
 ///
-/// A refused request or a withdrawn grant becomes the [`QuoteSlot`] that
-/// renders it. One read per page; an empty list asks nothing.
+/// A request still waiting for its answer, a refused one and a withdrawn
+/// grant become the [`QuoteSlot`] that renders each. A quote with no
+/// request (of a local post) or with an accepted one has no slot. One read
+/// per page; an empty list asks nothing.
 pub(super) async fn load_quote_denials(
     pool: &PgPool,
     quoting_ids: &[Uuid],
 ) -> AppResult<HashMap<Uuid, QuoteSlot>> {
-    let denied = quote_request::denied_for_statuses(pool, quoting_ids).await?;
-    Ok(denied
+    let unaccepted = quote_request::unaccepted_for_statuses(pool, quoting_ids).await?;
+    Ok(unaccepted
         .into_iter()
         .filter_map(|(id, state)| match state {
+            QuoteRequestState::Pending => Some((id, QuoteSlot::Pending)),
             QuoteRequestState::Rejected => Some((id, QuoteSlot::Rejected)),
             QuoteRequestState::Revoked => Some((id, QuoteSlot::Revoked)),
-            QuoteRequestState::Pending | QuoteRequestState::Accepted => None,
+            QuoteRequestState::Accepted => None,
         })
         .collect())
 }

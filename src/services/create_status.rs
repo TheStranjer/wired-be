@@ -145,6 +145,7 @@ pub mod edit_media;
 pub mod idempotency;
 pub mod params;
 pub mod preview;
+pub mod quote_consent;
 pub mod quote_fallback;
 pub mod reply;
 pub mod reply_thread;
@@ -203,6 +204,14 @@ const OVER_LIMIT: &str = "The status is over the character limit";
 /// 422 body for a submitted visibility outside the five names, Pleroma's
 /// message for its `:visibility_error`.
 const INVALID_VISIBILITY: &str = "Invalid visibility";
+
+/// 422 body for a submitted `quote_approval_policy` outside `public`,
+/// `followers` and `nobody`.
+const INVALID_QUOTE_POLICY: &str = "Invalid quote_approval_policy";
+
+/// 422 body for quoting a status whose author's quote policy denies the
+/// poster: Mastodon's own wording.
+const QUOTE_DENIED: &str = "You are not allowed to quote this post";
 
 /// 422 body for a submitted MIME type outside [`CONTENT_TYPES`].
 const INVALID_CONTENT_TYPE: &str = "Invalid content_type";
