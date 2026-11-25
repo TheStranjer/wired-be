@@ -495,6 +495,9 @@ mod pins;
 /// stored once per replayed key and never by a preview.
 mod polls;
 
+/// The posting and reading defaults (`GET /api/v1/preferences`, WBE-826).
+mod preferences;
+
 /// Inbound poll votes over federation (WBE-174): the dispatcher folding a
 /// `Create` of a bodyless `Note` that names one option of this instance's
 /// own poll — counts, dedupe, refusals, the author's telling — and the

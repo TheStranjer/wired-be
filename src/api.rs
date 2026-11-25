@@ -84,6 +84,7 @@ pub mod pleroma_bookmark_folders;
 pub mod pleroma_import;
 pub mod pleroma_settings;
 pub mod polls;
+pub mod preferences;
 pub mod push;
 pub mod remote_interaction;
 pub mod report_render;
