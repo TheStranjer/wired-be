@@ -105,6 +105,11 @@ pub(super) const ROWS: &[RouteSpec] = &[
         auth: AuthClass::User,
     },
     RouteSpec {
+        method: "GET",
+        path: "/api/v1/preferences",
+        auth: AuthClass::User,
+    },
+    RouteSpec {
         method: "POST",
         path: "/api/v1/media",
         auth: AuthClass::User,
