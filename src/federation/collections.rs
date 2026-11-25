@@ -46,6 +46,7 @@ use crate::{
         follow::{self, FollowPageEntry},
         pinned_status,
         status::{self, Status},
+        status_visibility,
         user::{User, featured, get_by_id as user_by_id, outbox},
     },
     pagination::{MAX_LIMIT, PageParams},
@@ -496,12 +497,22 @@ pub async fn follows_document(
 /// each pin's status as its full note object (Pleroma's
 /// `render("featured.json", …)`).
 ///
+/// Defence in depth: the pin API only stores public and unlisted rows, but
+/// this reader does not rely on that. The pins pass the anonymous
+/// [`status_visibility::filter_visible`] gate, as the outbox's rows do, and
+/// an account that is not local and active lists nothing.
+///
 /// # Errors
 ///
 /// Any database failure arrives as
 /// [`AppError::Database`](crate::error::AppError).
 pub async fn featured_document(pool: &PgPool, config: &Config, user: &User) -> AppResult<Value> {
-    let rows = pinned_status::list_for_user(pool, user.id).await?;
+    let rows = if user.is_local_active() {
+        let pinned = pinned_status::list_for_user(pool, user.id).await?;
+        status_visibility::filter_visible(pool, pinned, None).await?
+    } else {
+        Vec::new()
+    };
     let mut objects = Vec::with_capacity(rows.len());
     for row in &rows {
         objects.extend(featured_object(pool, config, row).await?);
@@ -556,7 +567,10 @@ pub async fn replies_document(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::user::{Flag, NewUser, insert};
+    use crate::models::{
+        status::Visibility,
+        user::{Flag, NewUser, insert},
+    };
 
     /// The collection address every pure builder is tested against.
     const ROOT: &str = "https://test.example/users/alice/outbox";
@@ -824,5 +838,83 @@ mod tests {
             None,
             "both sides"
         );
+    }
+
+    /// Inserts a post by `author` with `visibility` and pins it.
+    async fn pinned_post(pool: &PgPool, author: &User, visibility: Visibility) -> Status {
+        let row = status::insert(
+            pool,
+            "https://test.example",
+            &status::NewStatus {
+                visibility,
+                ..status::NewStatus::local(author, "a pinned post")
+            },
+        )
+        .await
+        .expect("the fixture post inserts");
+        let stored = pinned_status::pin(pool, author.id, row.id)
+            .await
+            .expect("the fixture pin stores");
+        assert!(stored.is_some(), "the pin row was new");
+        row
+    }
+
+    /// The ids of the objects a featured document lists.
+    fn listed(document: &Value) -> Vec<&str> {
+        document["orderedItems"]
+            .as_array()
+            .expect("ordered items")
+            .iter()
+            .filter_map(|object| object["id"].as_str())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_pinned_non_public_row_is_not_featured() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool();
+        let alice = insert(
+            pool,
+            &NewUser::local("alice", "https://test.example/users/alice"),
+        )
+        .await
+        .expect("the fixture inserts");
+        let public = pinned_post(pool, &alice, Visibility::Public).await;
+        let unlisted = pinned_post(pool, &alice, Visibility::Unlisted).await;
+        let _private = pinned_post(pool, &alice, Visibility::Private).await;
+        let _direct = pinned_post(pool, &alice, Visibility::Direct).await;
+
+        let document = featured_document(pool, &config(), &alice)
+            .await
+            .expect("the document renders");
+        let mut ids = listed(&document);
+        ids.sort_unstable();
+        let mut expected = [public.uri.as_str(), unlisted.uri.as_str()];
+        expected.sort_unstable();
+        assert_eq!(ids, expected, "only public and unlisted pins are served");
+        assert_eq!(document["totalItems"], 2, "the count matches the list");
+    }
+
+    #[tokio::test]
+    async fn a_deactivated_authors_pins_are_not_featured() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool();
+        let alice = insert(
+            pool,
+            &NewUser::local("alice", "https://test.example/users/alice"),
+        )
+        .await
+        .expect("the fixture inserts");
+        let _pin = pinned_post(pool, &alice, Visibility::Public).await;
+        let deactivated = crate::models::user::admin::set_active(pool, alice.id, false)
+            .await
+            .expect("the deactivation stores")
+            .expect("the account exists");
+
+        let document = featured_document(pool, &config(), &deactivated)
+            .await
+            .expect("the document renders");
+        assert!(listed(&document).is_empty(), "no pin of a closed account");
+        assert_eq!(document["totalItems"], 0, "and nothing is counted");
     }
 }
