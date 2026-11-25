@@ -8,12 +8,13 @@ use serde_json::Value;
 
 use super::super::test_support::{
     Setup, account, app_state_with, captured_body, client_keys, header, mock_push_service,
-    note_about, open_pref, run, setup, subscribe,
+    note_about, open_pref, run, served, setup, subscribe,
 };
 use super::*;
 use crate::{
     config::{Config, TEST_BASE_URL},
     entities::account::DEFAULT_AVATAR_PATH,
+    http_client::HttpClient,
     services::media_proxy,
 };
 
@@ -216,6 +217,34 @@ async fn server_gone_stays_gone(pool: &PgPool, s: &Setup) {
             .is_none(),
         "the delete went through the token, the row's unique key"
     );
+}
+
+/// A subscription whose endpoint the SSRF guard blocks (a loopback mock
+/// under the production client) completes the job and is deleted, instead
+/// of retrying a delivery that can never pass.
+#[tokio::test]
+async fn a_guard_blocked_endpoint_retires_the_subscription_and_completes() {
+    let db = crate::test_db::test_db().await.expect("test database slot");
+    let pool = db.pool().clone();
+    let s = setup(&pool, 201).await;
+    let guarded = AppState {
+        http_client: HttpClient::new("Wired (https://wired.test)"),
+        ..s.state.clone()
+    };
+
+    let outcome = run(&guarded, s.note.id, s.subscription.id).await;
+
+    assert_eq!(outcome, Ok(()), "a blocked endpoint is not a retry");
+    assert!(!served(&s.seen), "the guard stopped the POST");
+    assert!(
+        web_push_subscription::find_by_id(&pool, s.subscription.id)
+            .await
+            .expect("the lookup runs")
+            .is_none(),
+        "the blocked subscription is deleted"
+    );
+    server_gone_stays_gone(&pool, &s).await;
+    s.server.abort();
 }
 
 #[tokio::test]

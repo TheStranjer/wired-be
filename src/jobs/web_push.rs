@@ -24,8 +24,8 @@
 //! `POST`ed.
 //!
 //! The failure mapping follows the ticket: a
-//! [`Gone`](web_push::PushError::Gone) delivery (404/410 or keys that can
-//! decrypt nothing) deletes the subscription and completes the job — there
+//! [`Gone`](web_push::PushError::Gone) delivery (404/410, keys that can
+//! decrypt nothing, or an endpoint the SSRF guard blocks) deletes the subscription and completes the job — there
 //! is nothing to retry and nobody to wake again; a
 //! [`Retryable`](web_push::PushError::Retryable) one (5xx, 429, transport,
 //! or a database hiccup on the reads) hands the job back to the queue,
