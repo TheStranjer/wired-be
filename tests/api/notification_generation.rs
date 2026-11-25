@@ -29,8 +29,7 @@
 //!
 //! WBE-113 adds the four remaining generation types to the same view:
 //!
-//! - `poll` — every ballot on an account's poll tells its author (once per
-//!   voter and poll), and the `polls.end_notify` sweep tells the author
+//! - `poll` — a ballot tells nobody, and the `polls.end_notify` sweep tells the author
 //!   (Pleroma's exemption: their own poll's closing is their news) and
 //!   every local voter exactly once across reruns.
 //! - `update` — an edit tells the post's local boosters, and nobody else.
@@ -583,18 +582,17 @@ async fn a_blocked_actor_is_hidden_even_under_with_muted() {
 }
 
 #[tokio::test]
-async fn a_poll_vote_tells_the_author_per_ballot() {
+async fn a_poll_vote_tells_the_author_nothing() {
     let db = common::test_db().await;
     let pool = db.pool().clone();
     let app = common::test_app(pool.clone());
     let (_alice, alice_token) = fixture(&pool, "gnv-alice").await;
-    let (bob, bob_token) = fixture(&pool, "gnv-bob").await;
-    let (carol, carol_token) = fixture(&pool, "gnv-carol").await;
+    let (_bob, bob_token) = fixture(&pool, "gnv-bob").await;
+    let (_carol, carol_token) = fixture(&pool, "gnv-carol").await;
 
-    let (status_id, poll_id) = create_poll(&app, &alice_token, "tea or coffee?").await;
+    let (_status_id, poll_id) = create_poll(&app, &alice_token, "tea or coffee?").await;
     vote(&app, &bob_token, &poll_id).await;
-    // The endpoint's own refusal: a second ballot from bob is 422, and the
-    // telling underneath stays one.
+    // The endpoint's own refusal: a second ballot from bob is 422.
     let again = vote_raw(&app, &bob_token, &poll_id).await;
     common::assert_answer(
         &again,
@@ -603,22 +601,9 @@ async fn a_poll_vote_tells_the_author_per_ballot() {
     );
     vote(&app, &carol_token, &poll_id).await;
 
-    let told: Vec<String> = facts(&app, &alice_token)
-        .await
-        .into_iter()
-        .map(|(_kind, actor, _status)| actor)
-        .collect();
-    assert_eq!(
-        told,
-        vec![carol.id.to_string(), bob.id.to_string()],
-        "each voter's ballot is told once, newest first, about one status"
-    );
     assert!(
-        facts(&app, &alice_token)
-            .await
-            .into_iter()
-            .all(|(_kind, _actor, status)| status.as_deref() == Some(status_id.as_str())),
-        "both tellings name the poll's status"
+        listed(&app, &alice_token).await.is_empty(),
+        "no ballot raises a poll notification for the author"
     );
     assert!(
         listed(&app, &bob_token).await.is_empty() && listed(&app, &carol_token).await.is_empty(),
@@ -632,10 +617,14 @@ async fn the_poll_end_sweep_notifies_author_and_voters_exactly_once() {
     let pool = db.pool().clone();
     let app = common::test_app(pool.clone());
     let (alice, alice_token) = fixture(&pool, "gne-alice").await;
-    let (bob, bob_token) = fixture(&pool, "gne-bob").await;
+    let (_bob, bob_token) = fixture(&pool, "gne-bob").await;
 
     let (status_id, poll_id) = create_poll(&app, &alice_token, "closing soon").await;
     vote(&app, &bob_token, &poll_id).await;
+    assert!(
+        listed(&app, &alice_token).await.is_empty(),
+        "the ballot told the author nothing while the poll is open"
+    );
     expire_poll(&pool, &poll_id, 1).await;
 
     run_end_notify(&pool).await;
@@ -646,15 +635,8 @@ async fn the_poll_end_sweep_notifies_author_and_voters_exactly_once() {
     );
     assert_eq!(
         facts(&app, &alice_token).await,
-        vec![
-            closing.clone(),
-            (
-                "poll".to_owned(),
-                bob.id.to_string(),
-                Some(status_id.clone())
-            ),
-        ],
-        "the author gains the closing (actor: themselves) beside the ballot"
+        vec![closing.clone()],
+        "the author gains the one closing (actor: themselves)"
     );
     assert_eq!(
         facts(&app, &bob_token).await,
@@ -667,10 +649,7 @@ async fn the_poll_end_sweep_notifies_author_and_voters_exactly_once() {
     run_end_notify(&pool).await;
     assert_eq!(
         facts(&app, &alice_token).await,
-        vec![
-            closing.clone(),
-            ("poll".to_owned(), bob.id.to_string(), Some(status_id)),
-        ],
+        vec![closing.clone()],
         "the rerun tells nobody twice"
     );
     assert_eq!(
@@ -867,11 +846,9 @@ async fn a_stranger_is_withheld_from_a_gated_account_under_the_new_types_too() {
         .await;
     common::assert_answer(&setting, StatusCode::OK, "the setting write");
 
-    // Bob owns a poll alice votes on, and a post alice reacts to: both
-    // tellings name a stranger and stand withheld, exactly like the
-    // favourite, mention and follow of the setting's original test.
-    let (_status_id, poll_id) = create_poll(&app, &bob_token, "gate my poll").await;
-    vote(&app, &alice_token, &poll_id).await;
+    // Bob owns a post alice reacts to: the telling names a stranger and
+    // stands withheld, exactly like the favourite, mention and follow of
+    // the setting's original test.
     let own = common::create_status(&pool, &bob, "gate my post", Visibility::Public).await;
     react_write(
         &app,
@@ -884,6 +861,6 @@ async fn a_stranger_is_withheld_from_a_gated_account_under_the_new_types_too() {
 
     assert!(
         listed(&app, &bob_token).await.is_empty(),
-        "a stranger's ballot and reaction are withheld by the setting"
+        "a stranger's reaction is withheld by the setting"
     );
 }

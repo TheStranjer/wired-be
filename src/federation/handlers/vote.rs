@@ -34,8 +34,8 @@
 //!   its poll. What it accepts it records through [`poll::cast_vote`] — the
 //!   one write `POST /api/v1/polls/{id}/votes` runs — and finishes with the
 //!   vote endpoint's `after_vote_cast` hook
-//!   ([`crate::api::polls`]), so the author's telling lands
-//!   from either door alike.
+//!   ([`crate::api::polls`]). No ballot notifies the author; `poll` is
+//!   raised only when the poll ends.
 //!
 //! A `Create` naming one option of a [`multiple`](Poll::multiple) poll is
 //! therefore one more mark on its voter's ballot rather than a refused second
@@ -334,10 +334,9 @@ async fn gate(
 
 /// The ballot's write: [`poll::cast_vote`] for the mark, then the vote
 /// endpoint's documented [`after_vote_cast`] hook over the row as the
-/// transaction left it, so the poll's author is told of a federated ballot
-/// exactly as of a local one — and told once, since a
-/// [`multiple`](Poll::multiple) poll's later options are the same voter's
-/// same telling.
+/// transaction left it. A ballot (one `Create` per option of a
+/// [`multiple`](Poll::multiple) poll) raises no notification: the author
+/// is told `poll` only when the poll ends.
 ///
 /// # Errors
 ///

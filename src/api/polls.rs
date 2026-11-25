@@ -67,10 +67,9 @@
 //! all deserializing to the same list. A value that is no integer at all
 //! is the extractor's own 422, before any poll is looked up.
 //!
-//! The telling of the poll's author is landed: the vote runs
-//! [`on_poll_vote`](crate::services::notify::on_poll_vote) through this
-//! module's `after_vote_cast` hook, one `poll` notification per voter and
-//! poll. The same hook federates the answer activities the ballot becomes:
+//! A ballot notifies nobody: the `poll` notification is the end-of-poll
+//! telling only (see [`crate::services::notify::on_poll_ended`]). The
+//! `after_vote_cast` hook federates the answer activities the ballot becomes:
 //! a vote on a REMOTE status's poll sends one `Create` per chosen option to
 //! the poll author's inbox ([`federation_out::after_poll_vote`], the way
 //! [`crate::api::reports`] lands `after_report_created`), and a vote on a
@@ -101,7 +100,7 @@ use crate::{
         user::User,
     },
     oauth::scopes::{READ_STATUSES, WRITE_STATUSES},
-    services::{federation_out, notify},
+    services::federation_out,
     state::AppState,
     util::id::parse_id,
 };
@@ -424,12 +423,11 @@ fn choice_index(value: &Value) -> Option<i32> {
     }
 }
 
-/// Post-write hook of `POST /api/v1/polls/{id}/votes`: the telling of the
-/// poll's author of the ballot just cast — Pleroma's `CommonAPI.vote` runs
-/// each `Answer` through `Pipeline.common_pipeline`, which lands the
-/// notification — is landed here from [`notify::on_poll_vote`], deduplicated
-/// per voter and poll. The federation of the answer activities the ballot
-/// becomes is landed here too, from
+/// Post-write hook of `POST /api/v1/polls/{id}/votes`.
+///
+/// It raises no notification: Mastodon and Pleroma tell `poll` only when a
+/// poll ends (Pleroma skips notifications for `Answer`s). It federates the
+/// answer activities the ballot becomes, from
 /// [`federation_out::after_poll_vote`]: when the poll stands on a REMOTE
 /// status one `Create` per chosen option travels to the poll author's inbox
 /// (Pleroma's pipeline delivers the same answers through the ordinary
@@ -439,12 +437,10 @@ fn choice_index(value: &Value) -> Option<i32> {
 /// `poll` is the row as the transaction left it, `voter` the account
 /// that cast the ballot, and `option_ids` the options it marked — the
 /// same ids [`poll::cast_vote`] wrote. The federated ballot
-/// ([`crate::federation::handlers::vote`]) calls the same hook, so an
-/// author is told about a remote vote exactly as about a local one — and
-/// nothing more federates out of that door: the fold only ever marks
+/// ([`crate::federation::handlers::vote`]) calls the same hook, and
+/// nothing federates out of that door: the fold only ever marks
 /// questions this instance owns, and their answers stay local.
 ///
-/// [`notify::on_poll_vote`]: crate::services::notify::on_poll_vote
 /// [`federation_out::after_poll_vote`]: crate::services::federation_out::after_poll_vote
 pub(crate) async fn after_vote_cast(
     state: &AppState,
@@ -452,7 +448,6 @@ pub(crate) async fn after_vote_cast(
     voter: &User,
     option_ids: &[Uuid],
 ) {
-    notify::on_poll_vote(state, poll, voter).await;
     federation_out::after_poll_vote(state, poll, voter, option_ids).await;
 }
 

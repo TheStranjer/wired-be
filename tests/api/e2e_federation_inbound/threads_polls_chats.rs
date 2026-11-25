@@ -118,7 +118,7 @@ async fn a_reply_to_a_missing_parent_stands_when_the_peer_404s() {
 /// Scenario: a remote ballot on a local poll. A delivered `Create` of the
 /// answer shape `src/federation/handlers/vote.rs` accepts marks the option's
 /// count through `GET /api/v1/polls/{id}`, is idempotent when restated, and
-/// moves the local poster's `poll` notification.
+/// raises no `poll` notification for the local poster.
 #[tokio::test]
 async fn a_remote_ballot_marks_a_local_poll_and_tells_its_author() {
     let db = common::test_db().await;
@@ -152,10 +152,9 @@ async fn a_remote_ballot_marks_a_local_poll_and_tells_its_author() {
         "the delivered ballot marked the tea option"
     );
     assert_eq!(stand["votes_count"], json!(1), "and the poll's total");
-    assert_eq!(
-        told_of(&app, &alice_token, "poll").await.len(),
-        1,
-        "the author is told once"
+    assert!(
+        told_of(&app, &alice_token, "poll").await.is_empty(),
+        "the ballot tells the author nothing"
     );
 
     deliver(&app, &state, &peer, BOB, &vote).await;

@@ -42,8 +42,8 @@ const ALREADY_TOLD_SQL: &str = "SELECT EXISTS (SELECT 1 FROM notifications \
 /// Whether `telling` is already told: a live (undismissed) row matches
 /// every one of its five parts.
 ///
-/// The deduplication the repeat-prone tellings owe — the poll ballot whose
-/// endpoint could re-fire, the reaction a client may `PUT` again on an
+/// The deduplication the repeat-prone tellings owe — the poll closing a
+/// retried sweep could re-fire, the reaction a client may `PUT` again on an
 /// idempotent write, the second `POST …/follow` of an open pair (Pleroma's
 /// `recently_followed` skip) — on the full key, so a second reaction with
 /// another emoji is a fresh fact and not a duplicate. A dismissed row does

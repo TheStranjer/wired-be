@@ -16,6 +16,8 @@ mod chats;
 #[cfg(test)]
 mod oauth_token_digests;
 #[cfg(test)]
+mod poll_notifications;
+#[cfg(test)]
 mod push;
 #[cfg(test)]
 mod status_fk_indexes;
