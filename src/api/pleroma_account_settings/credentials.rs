@@ -7,6 +7,7 @@ use axum::{Json, extract::State};
 use serde::Deserialize;
 use serde_json::Value;
 use tracing::debug;
+use uuid::Uuid;
 
 use super::{
     EMAIL_INVALID_FORMAT, EMAIL_TAKEN, INVALID_PASSWORD, PASSWORD_MISMATCH, PASSWORD_TOO_SHORT,
@@ -21,6 +22,7 @@ use crate::{
         user::{self, User, confirmation, get_by_email},
     },
     oauth::scopes::WRITE_ACCOUNTS,
+    protocols::events::{self, AccountEvent},
     state::AppState,
     util::password::hash_password,
 };
@@ -97,23 +99,34 @@ pub(super) async fn change_password(
         return Ok(error_body(PASSWORD_TOO_SHORT));
     }
     let hash = hash_password(&params.new_password)?;
-    let revoked = write_password_and_revoke(&state, &auth, &hash).await?;
+    let revoked =
+        write_password_and_revoke(&state, &auth.0, auth.1.id, &params.new_password, &hash).await?;
     debug!(account = %auth.0.nickname, revoked, "password changed: other tokens revoked");
     Ok(success_body())
 }
 
 /// The `change_password` write: the new hash and the revocation of every
-/// token but the request's own, as one transaction — half of it is never
+/// token but `keep_token`, as one transaction — half of it is never
 /// a state an account is left in.
+///
+/// Right after the hash is set, every enabled protocol is handed the
+/// plaintext `new_password` inside the transaction
+/// ([`events::password_changed_in_tx`]); a protocol that refuses rolls the
+/// change back. Once the transaction commits they all hear
+/// [`AccountEvent::PasswordChanged`].
 async fn write_password_and_revoke(
     state: &AppState,
-    auth: &AuthUser,
+    account: &User,
+    keep_token: Uuid,
+    new_password: &str,
     hash: &str,
 ) -> AppResult<u64> {
     let mut tx = state.db.begin().await?;
-    user::set_password(&mut *tx, auth.0.id, hash).await?;
-    let revoked = oauth_token::delete_all_for_user_except(&mut *tx, auth.0.id, auth.1.id).await?;
+    user::set_password(&mut *tx, account.id, hash).await?;
+    events::password_changed_in_tx(&mut tx, state, account, new_password).await?;
+    let revoked = oauth_token::delete_all_for_user_except(&mut *tx, account.id, keep_token).await?;
     tx.commit().await?;
+    events::dispatch(state, account, AccountEvent::PasswordChanged).await;
     Ok(revoked)
 }
 
@@ -172,6 +185,16 @@ mod tests {
 
     use super::super::PasswordParams;
     use super::*;
+    use crate::{
+        protocols::fixture::{Recorded, recorded_for},
+        test_support::app_state_with_fixture,
+        util::password::verify_password,
+    };
+
+    /// The password an account has before the change.
+    const OLD_PASSWORD: &str = "old-password-1";
+    /// The password the change sets.
+    const NEW_PASSWORD: &str = "new-password-2";
 
     #[test]
     fn change_password_params_debug_redacts_all_three_secrets() {
@@ -209,6 +232,77 @@ mod tests {
         assert!(
             !bare_shown.contains("hunter2"),
             "the lone-password params hide their secret: {bare_shown}"
+        );
+    }
+
+    /// Inserts the local account `nickname` whose password is [`OLD_PASSWORD`].
+    async fn account_with_old_password(state: &AppState, nickname: &str) -> User {
+        let ap_id = user::local_ap_id(&state.config.base_url, nickname);
+        let new = user::NewUser {
+            password_hash: Some(hash_password(OLD_PASSWORD).expect("the password hashes")),
+            ..user::NewUser::local(nickname, &ap_id)
+        };
+        user::insert(&state.db, &new)
+            .await
+            .expect("the account fixture inserts")
+    }
+
+    /// The stored password hash of `account`.
+    async fn stored_hash(state: &AppState, account: &User) -> String {
+        user::get_by_id(&state.db, account.id)
+            .await
+            .expect("the account reads")
+            .expect("the account exists")
+            .password_hash
+            .expect("the account has a password")
+    }
+
+    #[tokio::test]
+    async fn a_password_change_runs_the_in_transaction_hook_then_announces_it() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let state = app_state_with_fixture(db.pool());
+        let account = account_with_old_password(&state, "change_events").await;
+
+        let hash = hash_password(NEW_PASSWORD).expect("the password hashes");
+        let revoked =
+            write_password_and_revoke(&state, &account, Uuid::now_v7(), NEW_PASSWORD, &hash)
+                .await
+                .expect("the change lands");
+
+        assert_eq!(revoked, 0, "the account held no tokens to revoke");
+        assert_eq!(
+            recorded_for(account.id),
+            vec![
+                Recorded::PasswordChangedInTx,
+                Recorded::Event(AccountEvent::PasswordChanged),
+            ],
+            "the in-transaction call came first, the event after the commit"
+        );
+        assert!(
+            verify_password(NEW_PASSWORD, &stored_hash(&state, &account).await),
+            "the new password"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failing_in_transaction_hook_rolls_the_password_change_back() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let state = app_state_with_fixture(db.pool());
+        let account = account_with_old_password(&state, "fail-hook-change").await;
+
+        let hash = hash_password(NEW_PASSWORD).expect("the password hashes");
+        let outcome =
+            write_password_and_revoke(&state, &account, Uuid::now_v7(), NEW_PASSWORD, &hash).await;
+
+        assert!(outcome.is_err(), "the hook's failure fails the change");
+        assert!(
+            verify_password(OLD_PASSWORD, &stored_hash(&state, &account).await),
+            "the old password still works"
+        );
+        assert_eq!(
+            recorded_for(account.id),
+            vec![Recorded::PasswordChangedInTx],
+            "no event for a change that never committed"
         );
     }
 }

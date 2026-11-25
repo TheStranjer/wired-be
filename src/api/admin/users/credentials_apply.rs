@@ -13,6 +13,7 @@ use crate::{
         oauth_token,
         user::{self, User, register},
     },
+    protocols::events::{self, AccountEvent},
     state::AppState,
     util::password::hash_password,
 };
@@ -91,11 +92,17 @@ pub(super) fn check_password(
 /// [`set_password`] rule): an admin who just chose the password has ended
 /// any pending reset.
 ///
+/// Right after the hash is set, every enabled protocol is handed the
+/// plaintext inside that transaction ([`events::password_changed_in_tx`]);
+/// a protocol that refuses rolls the password change back. Once the
+/// transaction commits they all hear [`AccountEvent::PasswordChanged`].
+///
 /// # Errors
 ///
 /// [`AppError::Internal`] when the profile write matches no row (the
 /// account vanished mid-request) or the hashing fails;
-/// [`AppError::Database`] from any statement.
+/// [`AppError::Database`] from any statement, or the error of a protocol's
+/// in-transaction password hook.
 ///
 /// [`password_reset_pending`]: User::password_reset_pending
 /// [`set_password`]: crate::models::user::set_password
@@ -117,8 +124,10 @@ pub(super) async fn apply_credentials(
         let hash = hash_password(password)?;
         let mut tx = state.db.begin().await?;
         user::set_password(&mut *tx, current.id, &hash).await?;
+        events::password_changed_in_tx(&mut tx, state, current, password).await?;
         let revoked = oauth_token::delete_all_for_user(&mut *tx, current.id).await?;
         tx.commit().await?;
+        events::dispatch(state, current, AccountEvent::PasswordChanged).await;
         debug!(
             revoked,
             "admin credentials write revoked the account's tokens"
@@ -132,7 +141,92 @@ mod tests {
     use super::*;
     use serde_json::{Value, json};
 
-    use crate::api::admin::users::test_support::params;
+    use crate::{
+        api::admin::users::test_support::params,
+        protocols::fixture::{Recorded, recorded_for},
+        test_support::app_state_with_fixture,
+        util::password::verify_password,
+    };
+
+    /// The password an account has before staff set another.
+    const OLD_PASSWORD: &str = "old-password-1";
+    /// The password staff set.
+    const NEW_PASSWORD: &str = "new-password-2";
+
+    /// Inserts the local account `nickname` whose password is [`OLD_PASSWORD`].
+    async fn account_with_old_password(state: &AppState, nickname: &str) -> User {
+        let ap_id = user::local_ap_id(&state.config.base_url, nickname);
+        let new = user::NewUser {
+            password_hash: Some(hash_password(OLD_PASSWORD).expect("the password hashes")),
+            ..user::NewUser::local(nickname, &ap_id)
+        };
+        user::insert(&state.db, &new)
+            .await
+            .expect("the account fixture inserts")
+    }
+
+    /// A patch that only sets [`NEW_PASSWORD`].
+    fn password_patch() -> CredentialsPatch {
+        CredentialsPatch {
+            profile: None,
+            email: None,
+            password: Some(NEW_PASSWORD.to_owned()),
+        }
+    }
+
+    /// The stored password hash of `account`.
+    async fn stored_hash(state: &AppState, account: &User) -> String {
+        user::get_by_id(&state.db, account.id)
+            .await
+            .expect("the account reads")
+            .expect("the account exists")
+            .password_hash
+            .expect("the account has a password")
+    }
+
+    #[tokio::test]
+    async fn setting_a_password_runs_the_in_transaction_hook_then_announces_it() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let state = app_state_with_fixture(db.pool());
+        let account = account_with_old_password(&state, "admin_set_events").await;
+
+        apply_credentials(&state, &account, password_patch())
+            .await
+            .expect("the write lands");
+
+        assert_eq!(
+            recorded_for(account.id),
+            vec![
+                Recorded::PasswordChangedInTx,
+                Recorded::Event(AccountEvent::PasswordChanged),
+            ],
+            "the in-transaction call came first, the event after the commit"
+        );
+        assert!(
+            verify_password(NEW_PASSWORD, &stored_hash(&state, &account).await),
+            "the new password"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failing_in_transaction_hook_rolls_the_admin_password_write_back() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let state = app_state_with_fixture(db.pool());
+        let account = account_with_old_password(&state, "fail-hook-admin-set").await;
+
+        let outcome = apply_credentials(&state, &account, password_patch()).await;
+
+        assert!(outcome.is_err(), "the hook's failure fails the write");
+        assert!(
+            verify_password(OLD_PASSWORD, &stored_hash(&state, &account).await),
+            "the old password still works"
+        );
+        assert_eq!(
+            recorded_for(account.id),
+            vec![Recorded::PasswordChangedInTx],
+            "no event for a change that never committed"
+        );
+    }
 
     /// The password check reports the password's own fault and the
     /// confirmation's mismatch independently, the way a changeset does:
