@@ -68,8 +68,9 @@ pub use vapid::{TTL_HEADER, URGENCY_HEADER, vapid_headers, vapid_subject};
 /// Why a push delivery did not happen, as [`send`] reports it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PushError {
-    /// The subscription is dead: the push service answered 404 or 410, or
-    /// the stored keys can encrypt nothing. The caller deletes the
+    /// The subscription is dead: the push service answered 404 or 410,
+    /// the stored keys can encrypt nothing, or the SSRF guard blocks the
+    /// endpoint (every retry would be blocked too). The caller deletes the
     /// subscription — sending to it will never work again.
     Gone,
     /// The delivery may succeed later: a 5xx, a 429, a transport failure,

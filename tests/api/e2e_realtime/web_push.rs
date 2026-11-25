@@ -92,10 +92,9 @@ async fn catch_push(
 
 /// Serves a mock push service answering every `POST /push` with `status`,
 /// on a fresh loopback port: the endpoint URL, its capture, and the task.
-/// A plain-`http` loopback is exactly what the subscription endpoint
-/// accepts (the `src/api/push.rs` gate follows Pleroma, which stores any
-/// URL the delivery can call), and the instance's own client reaches it
-/// because the test config allows private hosts.
+/// The test config allows private hosts (the local-delivery mode), so the
+/// subscription endpoint accepts a plain-`http` loopback and the
+/// instance's own client reaches it; with the SSRF guard on, both refuse.
 async fn mock_push_service(status: u16) -> (String, Arc<MockPush>, JoinHandle<()>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await

@@ -208,6 +208,30 @@ impl HttpClient {
         })
     }
 
+    /// Vets `url` the way a request would be vetted, without sending one.
+    ///
+    /// Callers that store a URL for later delivery use it to refuse a
+    /// target the SSRF guard would block at send time. With the guard off
+    /// (`HTTP_ALLOW_PRIVATE_HOSTS`) only the scheme is checked.
+    ///
+    /// # Errors
+    ///
+    /// [`HttpError::InvalidUrl`] if `url` is unparsable or not an
+    /// `http`/`https` URL, [`HttpError::Blocked`] if the SSRF guard
+    /// refuses the target.
+    pub async fn check_target(&self, url: &str) -> Result<(), HttpError> {
+        let Ok(parsed) = Url::parse(url) else {
+            return Err(HttpError::InvalidUrl);
+        };
+        if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+            return Err(HttpError::InvalidUrl);
+        }
+        if let Some(guard) = &self.ssrf {
+            guard.check_target(&parsed).await?;
+        }
+        Ok(())
+    }
+
     /// Fetches `url` with a `GET`, plus `headers`, reading the response
     /// body incrementally and giving up with [`HttpError::TooLarge`] as
     /// soon as more than `max_bytes` have arrived.
@@ -494,5 +518,40 @@ mod tests {
             "a clone sends with the same configuration"
         );
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn check_target_applies_the_guard_without_sending() {
+        let guarded = HttpClient::new(TEST_UA);
+        for url in [
+            "http://127.0.0.1:8080/push",
+            "http://10.0.0.5/x",
+            "https://192.168.1.1/x",
+            "http://[::1]/x",
+            "http://169.254.169.254/latest",
+        ] {
+            assert!(
+                matches!(guarded.check_target(url).await, Err(HttpError::Blocked(_))),
+                "{url} is refused by the guard"
+            );
+        }
+        for url in ["ftp://example.com/x", "not a url", "https://"] {
+            assert_eq!(
+                guarded.check_target(url).await,
+                Err(HttpError::InvalidUrl),
+                "{url} is no http(s) URL"
+            );
+        }
+        assert_eq!(
+            guarded.check_target("https://8.8.8.8/x").await,
+            Ok(()),
+            "a public literal passes"
+        );
+        let open = HttpClient::new_for_tests(TEST_UA);
+        assert_eq!(
+            open.check_target("http://127.0.0.1:8080/push").await,
+            Ok(()),
+            "with the guard off a loopback target passes"
+        );
     }
 }
