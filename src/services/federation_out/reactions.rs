@@ -5,10 +5,10 @@
 //! The shared rows, addressing and publisher hand stand in the module root;
 //! the like twin is [`super::likes`].
 
-use super::{queue_activity, status_action, withdrawal};
+use super::{load_collections, queue_activity, status_action, withdrawal};
 use crate::{
     federation::activities::{EmojiReactContext, emoji_react_json},
-    models::{emoji_reaction::EmojiReaction, user::followers_address},
+    models::emoji_reaction::EmojiReaction,
     state::AppState,
 };
 
@@ -39,7 +39,10 @@ pub async fn after_reaction_changed(state: &AppState, reaction: &EmojiReaction, 
     let Some(action) = status_action(state, reaction.user_id, reaction.status_id).await else {
         return;
     };
-    let followers = followers_address(&action.actor);
+    let Some(collections) = load_collections(state, &action.actor).await else {
+        return;
+    };
+    let followers = collections.followers;
     let to = [action.author.ap_id.as_str()];
     let cc: Vec<&str> = if action.public {
         vec![followers.as_str()]

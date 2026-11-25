@@ -15,10 +15,15 @@
 //! The readers are moving here one area at a time: the actor document's
 //! public key, the signature check's key lookup, the instance actor's
 //! signing key, the featured collection id and the remote mirror's fetch
-//! stamp already come from this table, not from `users`. The migration
-//! backfilled it from `users`, and every writer of the moved columns now
-//! writes both tables in one transaction ([`upsert_from_user`] is how):
-//! `models::user::insert` for every new local or remote account, and
+//! stamp already come from this table, not from `users`. So do the
+//! readers outside `federation`: [`followers_address`] and
+//! [`featured_address`] name a collection, [`with_plumbing`] hands a
+//! [`User`] the row's values for the code that renders it as an actor
+//! document or a quote policy, and `get_by_public_key_id` and
+//! `all_remote_inboxes` join this table. The migration backfilled it from
+//! `users`, and every writer of the moved columns now writes both tables in
+//! one transaction ([`upsert_from_user`] is how): `models::user::insert`
+//! for every new local or remote account, and
 //! `federation::remote_actor::upsert_remote_user` for every fetch of a
 //! remote actor.
 //!
@@ -33,13 +38,16 @@
 //! [`upsert`] writes the whole row: it inserts, or on a conflict of
 //! `user_id` overwrites every column and moves `updated_at`.
 
-use std::fmt;
+use std::{collections::HashMap, fmt};
 
 use chrono::{DateTime, Utc};
 use sqlx::{Executor, Postgres};
 use uuid::Uuid;
 
-use crate::{error::AppResult, models::user::User};
+use crate::{
+    error::AppResult,
+    models::user::{User, featured, followers},
+};
 
 /// [`get`]: one account's row, or none without an `ActivityPub` identity.
 const GET_SQL: &str = "SELECT user_id, status, inbox, shared_inbox, outbox, followers_url,
@@ -313,6 +321,114 @@ where
         last_fetched_at: user.last_fetched_at,
     };
     upsert(executor, &write).await
+}
+
+/// `user` with its moved columns replaced by the account's row.
+///
+/// The actor document builder reads `inbox` and the public key off a
+/// [`User`]; this is how the document follows `activitypub_actors` while
+/// `users` still carries the old columns. An account with no row gets
+/// `None` in every moved column, as an unprovisioned `users` row would
+/// have. Temporary like [`upsert_from_user`]: once `users` loses the
+/// columns the builder takes the [`ActivityPubActor`] itself.
+///
+/// # Errors
+///
+/// Any database failure arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn with_plumbing<'e, E>(executor: E, user: User) -> AppResult<User>
+where
+    E: Executor<'e, Database = Postgres>,
+{
+    let row = get(executor, user.id).await?;
+    Ok(apply_row(user, row))
+}
+
+/// [`with_plumbing`] for many accounts, with one read for all of them.
+///
+/// The accounts come back in the order given, and no query runs for an empty
+/// list.
+///
+/// # Errors
+///
+/// Any database failure arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn with_plumbing_many<'e, E>(executor: E, users: Vec<User>) -> AppResult<Vec<User>>
+where
+    E: Executor<'e, Database = Postgres>,
+{
+    if users.is_empty() {
+        return Ok(users);
+    }
+    let ids: Vec<Uuid> = users.iter().map(|user| user.id).collect();
+    let mut rows: HashMap<Uuid, ActivityPubActor> = get_many(executor, &ids)
+        .await?
+        .into_iter()
+        .map(|row| (row.user_id, row))
+        .collect();
+    Ok(users
+        .into_iter()
+        .map(|user| {
+            let row = rows.remove(&user.id);
+            apply_row(user, row)
+        })
+        .collect())
+}
+
+/// [`with_plumbing`] without the read, for a caller already holding `row`.
+#[must_use]
+pub fn apply_row(user: User, row: Option<ActivityPubActor>) -> User {
+    let Some(row) = row else {
+        return User {
+            inbox: None,
+            shared_inbox: None,
+            outbox: None,
+            followers_url: None,
+            following_url: None,
+            featured_url: None,
+            public_key: None,
+            private_key: None,
+            last_fetched_at: None,
+            ..user
+        };
+    };
+    User {
+        inbox: row.inbox,
+        shared_inbox: row.shared_inbox,
+        outbox: row.outbox,
+        followers_url: row.followers_url,
+        following_url: row.following_url,
+        featured_url: row.featured_url,
+        public_key: row.public_key,
+        private_key: row.private_key,
+        last_fetched_at: row.last_fetched_at,
+        ..user
+    }
+}
+
+/// The address naming the followers collection of actor `ap_id`.
+///
+/// It is the row's stored `followers_url` (what the publisher expands, and
+/// what a peer's own documents name), with the [`followers`] construction
+/// behind an account whose row is missing or carries none.
+#[must_use]
+pub fn followers_address(actor: Option<&ActivityPubActor>, ap_id: &str) -> String {
+    actor
+        .and_then(|row| row.followers_url.clone())
+        .unwrap_or_else(|| followers(ap_id))
+}
+
+/// The address naming the featured (pinned) collection of actor `ap_id`.
+///
+/// It is the row's stored `featured_url` — the very url a peer's
+/// `Add`/`Remove` handler matches the `target` against — with the
+/// [`featured`] construction behind an account whose row is missing or
+/// carries none.
+#[must_use]
+pub fn featured_address(actor: Option<&ActivityPubActor>, ap_id: &str) -> String {
+    actor
+        .and_then(|row| row.featured_url.clone())
+        .unwrap_or_else(|| featured(ap_id))
 }
 
 #[cfg(test)]
@@ -681,3 +797,6 @@ FROM users";
         );
     }
 }
+
+#[cfg(test)]
+mod readers_tests;

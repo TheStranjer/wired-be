@@ -637,3 +637,47 @@ async fn profile_custom_emoji_are_tagged_on_the_served_actor() {
         "one tag for the known emoji, however often it is used"
     );
 }
+
+/// The served document's `publicKey` and `inbox` are the account's
+/// `activitypub_actors` row's: only that table changes here, and the served
+/// JSON follows it.
+#[tokio::test]
+async fn the_actor_document_takes_its_key_and_inbox_from_activitypub_actors() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let alice = common::create_local_user_with(&pool, "alice", |new| NewUser {
+        public_key: Some(PUBLIC_PEM.to_owned()),
+        ..new
+    })
+    .await;
+    let row_pem = "-----BEGIN PUBLIC KEY-----\nMIIB-ACTOR-ROW\n-----END PUBLIC KEY-----\n";
+    let row_inbox = format!("{BASE}/inboxes/alice");
+
+    let changed =
+        sqlx::query("UPDATE activitypub_actors SET public_key = $2, inbox = $3 WHERE user_id = $1")
+            .bind(alice.id)
+            .bind(row_pem)
+            .bind(&row_inbox)
+            .execute(&pool)
+            .await
+            .expect("the actor row updates")
+            .rows_affected();
+    assert_eq!(changed, 1, "the account has exactly one actor row");
+
+    let document = fetch_actor(&pool, &alice).await;
+    assert_eq!(
+        document["publicKey"]["publicKeyPem"],
+        json!(row_pem),
+        "the key is the row's, not the one still in `users`"
+    );
+    assert_eq!(
+        document["inbox"],
+        json!(row_inbox),
+        "the inbox is the row's, not the built address"
+    );
+    assert_eq!(
+        document["publicKey"]["id"],
+        json!(format!("{BASE}/users/alice#main-key")),
+        "the key id stays the actor id with the fragment"
+    );
+}

@@ -19,11 +19,12 @@ use crate::{
     config::Config,
     error::{AppError, AppResult},
     federation::{
-        actor::{actor_json, profile_emojis, stored_public_key},
+        actor::{actor_json, profile_emojis},
         note::{create_activity_json, load_note_context, note_json},
         vocab::AS_VOCABULARY,
     },
     models::{
+        activitypub_actor::with_plumbing,
         bookmark,
         custom_emoji::CustomEmoji,
         favourite,
@@ -112,12 +113,12 @@ pub async fn build(state: &AppState, user: &User, file_name: &str) -> AppResult<
             .try_clone()
             .map_err(|err| archive_error("open temp file", &err))?,
     );
-    let emojis = profile_emojis(&state.db, user).await?;
-    let public_key = stored_public_key(&state.db, user).await?;
+    let actor = with_plumbing(&state.db, user.clone()).await?;
+    let emojis = profile_emojis(&state.db, &actor).await?;
     write_actor(
         &mut zip,
-        user,
-        public_key.as_deref(),
+        &actor,
+        actor.public_key.as_deref(),
         &state.config,
         &emojis,
     )?;

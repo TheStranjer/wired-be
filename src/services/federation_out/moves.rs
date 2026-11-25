@@ -7,10 +7,10 @@
 //! row; the followers address and the publisher hand are the root's.
 
 use super::after_profile_updated;
-use super::{load_user, queue_activity};
+use super::{load_collections, load_user, queue_activity};
 use crate::{
     federation::activities::{TargetedActivityContext, move_json},
-    models::user::{User, followers_address},
+    models::user::User,
     state::AppState,
     util::id::new_id,
 };
@@ -46,7 +46,10 @@ pub async fn after_account_moved(state: &AppState, old: &User, new: &User) {
     let Some(moved) = load_user(state, old.id).await else {
         return; // the account is gone; there is nothing left to tell
     };
-    let followers = followers_address(&moved);
+    let Some(collections) = load_collections(state, &moved).await else {
+        return;
+    };
+    let followers = collections.followers;
     let now = chrono::Utc::now();
     let to = [followers.as_str()];
     let document = move_json(&TargetedActivityContext {

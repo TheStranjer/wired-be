@@ -5,16 +5,13 @@
 //! `cc`; the followers address, the row readers and the publisher hand are
 //! the root's. List membership is private: it is never announced.
 
-use super::{load_status, load_user, queue_activity};
+use super::{load_collections, load_status, load_user, queue_activity};
 use crate::{
     federation::{
         activities::{TargetedActivityContext, add_json, remove_json},
         vocab::AS_PUBLIC,
     },
-    models::{
-        pinned_status::PinnedStatus,
-        user::{User, featured, followers_address},
-    },
+    models::pinned_status::PinnedStatus,
     state::AppState,
     util::id::new_id,
 };
@@ -42,10 +39,12 @@ pub async fn after_pin_changed(state: &AppState, pinned: &PinnedStatus, pinning:
     let Some(pinned_status) = load_status(state, pinned.status_id).await else {
         return; // a gone status leaves no feature to announce
     };
-    let followers = followers_address(&actor);
-    let featured_collection = featured_address(&actor);
+    let Some(collections) = load_collections(state, &actor).await else {
+        return;
+    };
+    let featured_collection = collections.featured;
     let to = [AS_PUBLIC];
-    let cc = [followers.as_str()];
+    let cc = [collections.followers.as_str()];
     let ctx = TargetedActivityContext {
         config: &state.config,
         id: new_id(),
@@ -64,19 +63,6 @@ pub async fn after_pin_changed(state: &AppState, pinned: &PinnedStatus, pinning:
     queue_activity(state, &actor, &document, "pin").await;
 }
 
-/// The address naming the actor's featured (pinned) collection: the stored
-/// `featured_url` — the very url a peer's `Add`/`Remove` handler matches
-/// the `target` against — with the [`featured`] construction behind a row
-/// that carries none, the way [`followers_address`] treats its column.
-///
-/// [`featured`]: crate::models::user::featured
-fn featured_address(actor: &User) -> String {
-    actor
-        .featured_url
-        .clone()
-        .unwrap_or_else(|| featured(&actor.ap_id))
-}
-
 #[cfg(test)]
 mod tests {
     use serde_json::json;
@@ -88,7 +74,7 @@ mod tests {
         config::TEST_BASE_URL,
         models::{
             pinned_status,
-            user::{NewUser, featured, insert, local_ap_id},
+            user::{NewUser, User, featured, insert, local_ap_id},
         },
         services::federation_out::test_support::{
             accepted_follow, app_state, delivered_inboxes, job_count, local, local_status, remote,

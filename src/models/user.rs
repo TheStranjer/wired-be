@@ -186,6 +186,11 @@ pub fn followers(ap_id: &str) -> String {
 /// It is the stored `followers_url` (what the publisher expands, and what a
 /// peer's own documents name), with the [`followers`] construction behind a
 /// row that carries none.
+///
+/// This reads the `User`'s own column, for code under `federation`. Outside
+/// it, [`activitypub_actor::followers_address`] reads the actor row.
+///
+/// [`activitypub_actor::followers_address`]: crate::models::activitypub_actor::followers_address
 #[must_use]
 pub fn followers_address(user: &User) -> String {
     user.followers_url

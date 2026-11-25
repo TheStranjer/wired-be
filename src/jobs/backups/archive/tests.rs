@@ -12,6 +12,7 @@ use zip::ZipArchive;
 
 use super::*;
 use crate::{
+    federation::actor::stored_public_key,
     jobs::backups::test_support::{like, mark, post, user},
     models::{
         backup::file_name,

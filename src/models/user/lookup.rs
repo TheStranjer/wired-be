@@ -83,8 +83,9 @@ pub async fn get_by_ap_id(pool: &PgPool, ap_id: &str) -> AppResult<Option<User>>
 
 /// Fetches the user whose document named `key_id` as its `publicKey.id`.
 ///
-/// `None` when no mirror stored it. The comparison is exact and served by
-/// the unique partial index on the column; it is how an inbox signature's
+/// `None` when no mirror stored it. The key id lives in
+/// `activitypub_actors`, which this joins to `users`. The comparison is exact
+/// and served by the unique partial index on the column; it is how an inbox signature's
 /// `keyId` finds a path-style key (`GoToSocial`'s `.../users/alice/main-key`)
 /// that is not the actor URL plus a fragment.
 ///
@@ -93,10 +94,14 @@ pub async fn get_by_ap_id(pool: &PgPool, ap_id: &str) -> AppResult<Option<User>>
 /// Any database failure (connection, encoding) arrives as
 /// [`AppError::Database`](crate::error::AppError).
 pub async fn get_by_public_key_id(pool: &PgPool, key_id: &str) -> AppResult<Option<User>> {
-    let user = sqlx::query_as::<_, User>("SELECT * FROM users WHERE public_key_id = $1")
-        .bind(key_id)
-        .fetch_optional(pool)
-        .await?;
+    let user = sqlx::query_as::<_, User>(
+        "SELECT u.* FROM users u
+           JOIN activitypub_actors a ON a.user_id = u.id
+          WHERE a.public_key_id = $1",
+    )
+    .bind(key_id)
+    .fetch_optional(pool)
+    .await?;
     Ok(user)
 }
 

@@ -10,10 +10,12 @@ use crate::error::AppResult;
 /// a live remote mirror publishes — its shared (instance-wide) inbox when
 /// it has one, its personal inbox otherwise — the same preference the
 /// publisher's `best_inbox` applies. A mirror with neither, and a mirror
-/// the instance has deleted, contribute nothing.
-const ALL_REMOTE_INBOXES_SQL: &str = "SELECT DISTINCT COALESCE(shared_inbox, inbox) FROM users \
-     WHERE local = false AND deleted_at IS NULL \
-       AND COALESCE(shared_inbox, inbox) IS NOT NULL \
+/// the instance has deleted, contribute nothing. The inboxes are read from
+/// `activitypub_actors`, joined to the mirror's `users` row.
+const ALL_REMOTE_INBOXES_SQL: &str = "SELECT DISTINCT COALESCE(a.shared_inbox, a.inbox) \
+       FROM users u JOIN activitypub_actors a ON a.user_id = u.id \
+     WHERE u.local = false AND u.deleted_at IS NULL \
+       AND COALESCE(a.shared_inbox, a.inbox) IS NOT NULL \
      ORDER BY 1";
 
 /// Every distinct inbox of a live remote account this instance has ever
@@ -111,5 +113,31 @@ mod tests {
                 "https://c.example/users/c/inbox".to_owned(),
             ]
         );
+    }
+
+    /// The census reads `activitypub_actors`: a change to that table alone
+    /// moves the answer.
+    #[tokio::test]
+    async fn the_census_follows_the_actor_rows() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        mirror(
+            &pool,
+            "a",
+            Some("https://a.example/users/a/inbox"),
+            Some("https://a.example/inbox"),
+        )
+        .await;
+        let moved = sqlx::query("UPDATE activitypub_actors SET shared_inbox = $1")
+            .bind("https://moved.example/inbox")
+            .execute(&pool)
+            .await
+            .expect("the actor row updates")
+            .rows_affected();
+        assert_eq!(moved, 1, "the mirror has one actor row");
+
+        let inboxes = all_remote_inboxes(&pool).await.expect("the census reads");
+
+        assert_eq!(inboxes, vec!["https://moved.example/inbox".to_owned()]);
     }
 }

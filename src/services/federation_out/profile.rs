@@ -15,15 +15,16 @@ use crate::{
     error::AppResult,
     federation::{
         activities::activity_id,
-        actor::{actor_json, profile_emojis, stored_public_key},
+        actor::{actor_json, profile_emojis},
         delivery::best_inbox,
         note, publisher,
         vocab::AS_PUBLIC,
     },
     models::{
+        activitypub_actor,
         custom_emoji::CustomEmoji,
         follow, relay,
-        user::{self, User, followers_address},
+        user::{self, User},
     },
     state::AppState,
     util::id::new_id,
@@ -51,9 +52,20 @@ pub async fn after_profile_updated(state: &AppState, account: &User) {
     if !account.local.get() {
         return; // only our own actors publish
     }
-    let Some(followers_collection) = account.followers_url.as_deref() else {
+    let row = match activitypub_actor::get(&state.db, account.id).await {
+        Ok(row) => row,
+        Err(err) => {
+            warn!(%err, actor = %account.ap_id, "could not load the actor row for the Update");
+            return;
+        }
+    };
+    let Some(followers_collection) = row.as_ref().and_then(|stored| stored.followers_url.clone())
+    else {
         return; // an actor with no followers collection has nobody to tell
     };
+    // From here `account` carries the actor row's key and inbox, which the
+    // document names.
+    let account = &activitypub_actor::apply_row(account.clone(), row);
     let emojis = match profile_emojis(&state.db, account).await {
         Ok(emojis) => emojis,
         Err(err) => {
@@ -61,18 +73,11 @@ pub async fn after_profile_updated(state: &AppState, account: &User) {
             return;
         }
     };
-    let public_key = match stored_public_key(&state.db, account).await {
-        Ok(public_key) => public_key,
-        Err(err) => {
-            warn!(%err, actor = %account.ap_id, "could not load the public key for the Update");
-            return;
-        }
-    };
     let document = update_document(
         state,
         account,
-        followers_collection,
-        public_key.as_deref(),
+        &followers_collection,
+        account.public_key.as_deref(),
         &emojis,
     );
     let unique_key = format!("profile-update:{}", account.id);
@@ -164,7 +169,9 @@ pub async fn after_account_deleted(state: &AppState, account: &User) -> AppResul
     if recipients.is_empty() && long_tail.is_empty() {
         return Ok(()); // nobody on another instance ever knew this account
     }
-    let document = delete_document(state, account);
+    let actor_row = activitypub_actor::get(&state.db, account.id).await?;
+    let followers = activitypub_actor::followers_address(actor_row.as_ref(), &account.ap_id);
+    let document = delete_document(state, account, &followers);
     for (batch, priority) in [(&recipients, "peers"), (&long_tail, "long tail")] {
         if batch.is_empty() {
             continue;
@@ -182,13 +189,13 @@ pub async fn after_account_deleted(state: &AppState, account: &User) -> AppResul
 
 /// The account `Delete` activity: the actor id as both `actor` and
 /// `object`, addressed to the public with the followers collection in `cc`,
-/// under the deterministic id the ticket pins.
-fn delete_document(state: &AppState, account: &User) -> Value {
+/// under the deterministic id the ticket pins. `followers` is the address of
+/// the account's followers collection.
+fn delete_document(state: &AppState, account: &User, followers: &str) -> Value {
     let id = format!(
         "{}/activities/delete-user-{}",
         state.config.base_url, account.id
     );
-    let followers = followers_address(account);
     json!({
         "@context": note::json_ld_context(&state.config),
         "id": id,
@@ -291,6 +298,43 @@ mod tests {
             }]),
             "one tag for the known emoji, none for `:nosuch:`"
         );
+    }
+
+    /// The `Update` reads the actor row: the document's key and inbox, and
+    /// the `cc` collection, are the row's although `users` says otherwise.
+    #[tokio::test]
+    async fn the_update_document_follows_the_actor_row() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = local(&pool, "alice").await;
+        let carol = remote(&pool, "carol").await;
+        accepted_follow(&pool, &carol, &alice).await;
+        let changed = sqlx::query(
+            "UPDATE activitypub_actors
+                SET public_key = 'ROW-KEY', inbox = $2, followers_url = $3
+              WHERE user_id = $1",
+        )
+        .bind(alice.id)
+        .bind("https://test.example/row-inbox")
+        .bind("https://test.example/row-followers")
+        .execute(&pool)
+        .await
+        .expect("the actor row updates")
+        .rows_affected();
+        assert_eq!(changed, 1, "the account has one actor row");
+        let state = app_state(&pool);
+
+        after_profile_updated(&state, &alice).await;
+
+        let jobs = publish_jobs(&pool).await;
+        let (args, _key) = &jobs[0];
+        let activity = &args["activity"];
+        assert_eq!(activity["object"]["publicKey"]["publicKeyPem"], "ROW-KEY");
+        assert_eq!(
+            activity["object"]["inbox"],
+            "https://test.example/row-inbox"
+        );
+        assert_eq!(activity["cc"][0], "https://test.example/row-followers");
     }
 
     /// The account `Delete` names the actor id as both `actor` and

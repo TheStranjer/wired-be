@@ -170,6 +170,7 @@ use crate::{
         publisher::{self, PublishOpts},
     },
     models::{
+        activitypub_actor,
         status::{self, Status, Visibility},
         user::{self, User},
     },
@@ -346,6 +347,35 @@ fn withdrawal(
         answered,
         published: &now,
     })
+}
+
+/// The addresses of a local actor's collections, as `activitypub_actors`
+/// stores them.
+#[derive(Debug)]
+struct ActorCollections {
+    /// The followers collection a document names in `cc`.
+    followers: String,
+    /// The featured (pinned) collection a pin document names as `target`.
+    featured: String,
+}
+
+/// Reads the collection addresses of `actor` from its `activitypub_actors`
+/// row, answering `None` for a database that will not answer (a federation
+/// miss, never a failure).
+///
+/// An actor with no row, or a row carrying no address, gets the built
+/// address of that collection, as an unset column always did.
+async fn load_collections(state: &AppState, actor: &User) -> Option<ActorCollections> {
+    match activitypub_actor::get(&state.db, actor.id).await {
+        Ok(row) => Some(ActorCollections {
+            followers: activitypub_actor::followers_address(row.as_ref(), &actor.ap_id),
+            featured: activitypub_actor::featured_address(row.as_ref(), &actor.ap_id),
+        }),
+        Err(err) => {
+            warn!(%err, id = %actor.id, "federation hook could not read an actor row");
+            None
+        }
+    }
 }
 
 /// Reads one user row for the hooks, answering `None` for a gone row or a

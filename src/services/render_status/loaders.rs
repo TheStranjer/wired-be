@@ -14,7 +14,7 @@ use crate::{
     entities::status::QuoteSlot,
     error::AppResult,
     models::{
-        bookmark, conversation, conversation_mute,
+        activitypub_actor, bookmark, conversation, conversation_mute,
         emoji_reaction::{self, ReactionSummary},
         favourite,
         hashtag::{self, Hashtag},
@@ -141,13 +141,23 @@ pub(super) async fn load_visible_parents(
 
 /// [`user::get_many`] keyed by id — one query for every author and
 /// replied-to author on the page.
+///
+/// The remote accounts' `ActivityPub` columns (the followers and following
+/// collections a remote quote policy names) come from
+/// `activitypub_actors`, one more query for all of them; a page of local
+/// accounts skips it.
 pub(super) async fn load_users(pool: &PgPool, ids: &[Uuid]) -> AppResult<HashMap<Uuid, User>> {
     if ids.is_empty() {
         return Ok(HashMap::new());
     }
-    let accounts = user::get_many(pool, ids).await?;
-    Ok(accounts
+    let (remote, local): (Vec<User>, Vec<User>) = user::get_many(pool, ids)
+        .await?
         .into_iter()
+        .partition(|account| !account.local.get());
+    let remote = activitypub_actor::with_plumbing_many(pool, remote).await?;
+    Ok(local
+        .into_iter()
+        .chain(remote)
         .map(|account| (account.id, account))
         .collect())
 }
@@ -296,4 +306,46 @@ pub(super) async fn load_direct_participations(
         return Ok(HashMap::new());
     };
     conversation::participation_ids(pool, viewer.id, direct_ids).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_fixtures::{local_user, remote_user};
+
+    /// Points every actor row's followers collection at `url`.
+    async fn point_followers_at(pool: &PgPool, url: &str) {
+        let changed = sqlx::query("UPDATE activitypub_actors SET followers_url = $1")
+            .bind(url)
+            .execute(pool)
+            .await
+            .expect("the actor rows update")
+            .rows_affected();
+        assert_eq!(changed, 2, "both fixture accounts have a row");
+    }
+
+    /// A remote account's collections are its actor row's; a local one is
+    /// left as `users` has it, since nothing on a page reads its row.
+    #[tokio::test]
+    async fn remote_accounts_carry_the_collections_of_their_actor_rows() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = local_user(&pool, "alice").await;
+        let far = remote_user(&pool, "far").await;
+        point_followers_at(&pool, "https://row.example/followers").await;
+
+        let users = load_users(&pool, &[alice.id, far.id])
+            .await
+            .expect("the users load");
+
+        assert_eq!(
+            users[&far.id].followers_url.as_deref(),
+            Some("https://row.example/followers"),
+            "the remote account follows its actor row"
+        );
+        assert_eq!(
+            users[&alice.id].followers_url, alice.followers_url,
+            "the local account is as `users` holds it"
+        );
+    }
 }

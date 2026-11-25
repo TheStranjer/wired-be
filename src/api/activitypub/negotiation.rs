@@ -15,10 +15,10 @@ use crate::{
     config::Config,
     error::{AppError, AppResult},
     federation::{
-        actor::{actor_json, instance_actor_json, profile_emojis, stored_public_key},
+        actor::{actor_json, instance_actor_json, profile_emojis},
         vocab::{ACTIVITY_JSON, AP_MEDIA_TYPES},
     },
-    models::user::User,
+    models::{activitypub_actor::with_plumbing, user::User},
     state::AppState,
 };
 
@@ -73,15 +73,18 @@ pub(super) fn frontend_redirect(config: &Config, path: &str) -> AppResult<Respon
 /// The actor document for `user` as an `ActivityPub` response, carrying
 /// the `Emoji` tags of the custom emojis the profile uses.
 ///
+/// The `inbox` and `publicKey` it names are the account's
+/// `activitypub_actors` row's.
+///
 /// # Errors
 ///
-/// Any database failure of the emoji or public key lookup.
+/// Any database failure of the row or emoji lookup.
 pub(super) async fn actor_response(state: &AppState, user: &User) -> AppResult<Response> {
-    let emojis = profile_emojis(&state.db, user).await?;
-    let public_key = stored_public_key(&state.db, user).await?;
+    let user = with_plumbing(&state.db, user.clone()).await?;
+    let emojis = profile_emojis(&state.db, &user).await?;
     Ok(document_response(&actor_json(
-        user,
-        public_key.as_deref(),
+        &user,
+        user.public_key.as_deref(),
         &state.config,
         &emojis,
     )))
@@ -92,13 +95,13 @@ pub(super) async fn actor_response(state: &AppState, user: &User) -> AppResult<R
 ///
 /// # Errors
 ///
-/// Any database failure of the emoji or public key lookup.
+/// Any database failure of the row or emoji lookup.
 pub(super) async fn instance_actor_response(state: &AppState, user: &User) -> AppResult<Response> {
-    let emojis = profile_emojis(&state.db, user).await?;
-    let public_key = stored_public_key(&state.db, user).await?;
+    let user = with_plumbing(&state.db, user.clone()).await?;
+    let emojis = profile_emojis(&state.db, &user).await?;
     Ok(document_response(&instance_actor_json(
-        user,
-        public_key.as_deref(),
+        &user,
+        user.public_key.as_deref(),
         &state.config,
         &emojis,
     )))
