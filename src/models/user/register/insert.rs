@@ -1,31 +1,33 @@
 //! The write half of a registration: the up-front availability check, the
-//! assembled [`NewUser`] and the insert that lands it — on the pool alone,
-//! or, when the request came in on an invite, inside the one transaction
-//! that also spends the token — plus the display-name fallback that
-//! decides what `name` says.
+//! assembled [`NewUser`] and the one transaction that lands it — the user
+//! row, one claimed identity per enabled protocol (see [`super::claims`]) and,
+//! when the request came in on an invite, the spent token — plus the
+//! display-name fallback that decides what `name` says.
 //!
 //! Everything here runs once the rules in [`super::validate`] have passed;
 //! a database failure that names one of `users`' unique constraints still
 //! arrives as the field error the availability check would have produced
 //! (see [`map_insert_error`]).
 
-use sqlx::PgPool;
+use std::collections::BTreeMap;
 
 use super::{
     FieldErrors, RegisterError, RegisterParams,
+    claims::claim_identities,
     error::{add_error, map_insert_error},
     modes::registration_waits_for_approval,
     validate::HAS_ALREADY_BEEN_TAKEN,
 };
 use crate::{
-    error::{AppError, AppResult},
+    error::AppError,
     models::{
         invite_token::{self, INVALID_INVITE_MESSAGE, InviteToken},
         user::{
-            Flag, NewUser, User, featured, followers, following, get_by_email, inbox, insert,
+            Flag, NewUser, User, featured, followers, following, get_by_email, inbox, insert_row,
             local_ap_id, nickname_taken, outbox,
         },
     },
+    protocols::ProtocolId,
     state::AppState,
     util::{
         format::text_to_html, keys::generate_keypair_async, password::hash_password,
@@ -35,8 +37,8 @@ use crate::{
 
 /// The registration's second half, reached only once every rule passed:
 /// hash the password, generate the keys, assemble the [`NewUser`] and
-/// insert it — on the pool alone, or, when `invite` names one, inside a
-/// transaction with the invite's consumption (see [`create_local_user`]).
+/// store it in one transaction (see [`store_account`] and
+/// [`create_local_user`]).
 ///
 /// The two registration modes decide the account's starting state here
 /// (Pleroma's `register_changeset`, which reads the same two config keys):
@@ -88,39 +90,39 @@ pub(super) async fn build_and_insert(
         private_key: Some(keys.private_pem),
         ..NewUser::local(nickname, &ap_id)
     };
-    let inserted = match invite {
-        None => insert(&state.db, &new_user).await,
-        Some(spent) => insert_with_invite(&state.db, &new_user, spent).await,
-    };
-    match inserted {
-        Ok(user) => Ok(user),
-        Err(err) => Err(map_insert_error(err)),
-    }
+    store_account(state, &new_user, &params.identifiers, invite).await
 }
 
-/// The invited registration's write: user insert and invite consumption
-/// in one transaction, so the two land together or not at all. A failed
-/// insert aborts the transaction and the invite keeps its count and its
-/// flag; the [`AppError`]s propagate as the caller's own. [`consume`] is
-/// conditional, so an invite that was valid when `spent` was read but is
-/// spent, capped, expired or revoked by now (a concurrent registration won
-/// it) answers `false`: the transaction is dropped, rolling the user back,
-/// and the registration fails with the same 400 [`INVALID_INVITE_MESSAGE`]
-/// the endpoint gives for any invalid invite.
+/// Writes the user, its identity claims and the invite's spend in one transaction.
+///
+/// They land together or not at all. After the user insert, [`claim_identities`] claims one identity per enabled
+/// protocol; any invalid or taken ID fails the registration with every
+/// failure listed. [`consume`] is conditional, so an invite that was valid
+/// when `spent` was read but is spent, capped, expired or revoked by now (a
+/// concurrent registration won it) answers `false` and the registration
+/// fails with the same 400 [`INVALID_INVITE_MESSAGE`] the endpoint gives for
+/// any invalid invite. Every failure returns before the commit, which drops
+/// the transaction and rolls the user, the identities and the invite's
+/// count back.
 ///
 /// [`consume`]: invite_token::consume
-/// [`AppError`]: crate::error::AppError
-async fn insert_with_invite(
-    pool: &PgPool,
+async fn store_account(
+    state: &AppState,
     new_user: &NewUser,
-    spent: &InviteToken,
-) -> AppResult<User> {
-    let mut tx = pool.begin().await?;
-    let user = insert(&mut *tx, new_user).await?;
-    if !invite_token::consume(&mut *tx, spent.id).await? {
-        return Err(AppError::BadRequest(INVALID_INVITE_MESSAGE.to_owned()));
+    requested: &BTreeMap<ProtocolId, String>,
+    invite: Option<&InviteToken>,
+) -> Result<User, RegisterError> {
+    let mut tx = state.db.begin().await.map_err(AppError::from)?;
+    let user = insert_row(&mut tx, new_user)
+        .await
+        .map_err(map_insert_error)?;
+    claim_identities(&mut tx, state, &user, requested).await?;
+    if let Some(spent) = invite
+        && !invite_token::consume(&mut *tx, spent.id).await?
+    {
+        return Err(AppError::BadRequest(INVALID_INVITE_MESSAGE.to_owned()).into());
     }
-    tx.commit().await?;
+    tx.commit().await.map_err(AppError::from)?;
     Ok(user)
 }
 
@@ -155,11 +157,13 @@ fn display_name(requested: Option<&str>, nickname: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use sqlx::PgPool;
     use uuid::Uuid;
 
     use super::*;
     use crate::{
         config::{Config, TEST_BASE_URL},
+        models::user::insert,
         models::user::register::{
             create_local_user,
             test_support::*,
@@ -218,6 +222,7 @@ mod tests {
             bio: None,
             reason: None,
             provider_email_verified: false,
+            identifiers: BTreeMap::new(),
         };
         let user = create_local_user(&state, params, None).await.unwrap();
         assert!(user.email.is_none(), "the account has no email");
@@ -244,6 +249,7 @@ mod tests {
             bio: None,
             reason: None,
             provider_email_verified: false,
+            identifiers: BTreeMap::new(),
         };
         let shape_err = create_local_user(&state, bad_shape, None)
             .await
@@ -275,6 +281,7 @@ mod tests {
             bio: None,
             reason: None,
             provider_email_verified: false,
+            identifiers: BTreeMap::new(),
         };
         let blank_err = create_local_user(&state, all_blank, None)
             .await
@@ -408,17 +415,23 @@ mod tests {
         let invite = invite_token::create(&pool, &invite_token::InviteParams::one_time())
             .await
             .expect("the invite mints");
+        let state = app_state(&pool);
+        let no_ids = BTreeMap::new();
         // Both registrations hold the same pre-read, still-valid row, as two
         // concurrent requests would.
-        let first = insert_with_invite(&pool, &local_new("first"), &invite)
+        let first = store_account(&state, &local_new("first"), &no_ids, Some(&invite))
             .await
             .expect("the first registration spends the invite");
         assert_eq!(first.nickname, "first", "the first user landed");
-        let err = insert_with_invite(&pool, &local_new("second"), &invite)
+        let err = store_account(&state, &local_new("second"), &no_ids, Some(&invite))
             .await
             .expect_err("the second registration finds the invite spent");
         assert!(
-            matches!(&err, AppError::BadRequest(message) if message == INVALID_INVITE_MESSAGE),
+            matches!(
+                &err,
+                RegisterError::Failed(AppError::BadRequest(message))
+                    if message == INVALID_INVITE_MESSAGE
+            ),
             "the invalid-invite refusal, got {err:?}"
         );
         assert_eq!(user_count(&pool).await, 1, "only one user exists");

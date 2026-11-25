@@ -55,7 +55,7 @@ pub use credentials::{set_activation, set_email, set_password, set_password_rese
 pub use deletion::{mark_deleted, mark_deleted_by_domain, purge_personal_data};
 pub use directory::{DirectoryOrder, directory_page};
 pub use inboxes::all_remote_inboxes;
-pub use insert::{CountDelta, insert};
+pub use insert::{CountDelta, insert, insert_row};
 pub use lookup::{
     active_local_ids, find_password_reset_target, get_by_acct, get_by_ap_id, get_by_email,
     get_by_id, get_by_nickname, get_by_public_key_id, get_many, nickname_taken,

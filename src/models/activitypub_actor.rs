@@ -25,9 +25,11 @@
 //! and `Announce` documents' addressing. The migration backfilled it from
 //! `users`, and every writer of the moved columns now writes both tables in
 //! one transaction ([`upsert_from_user`] is how): `models::user::insert`
-//! for every new local or remote account, and
+//! for every account it inserts, and
 //! `federation::remote_actor::upsert_remote_user` for every fetch of a
-//! remote actor.
+//! remote actor. Registration is the exception: it does not dual write but
+//! claims the identity through `ActivityPub`'s adapter, which writes the
+//! local row with [`insert_new`].
 //!
 //! **The dual write is temporary.** It keeps the two tables in step while
 //! the readers move over; the ticket that drops the moved columns from
@@ -90,6 +92,14 @@ ON CONFLICT (user_id) DO UPDATE SET
   RETURNING user_id, status, inbox, shared_inbox, outbox, followers_url,
          following_url, featured_url, public_key, private_key, public_key_id,
          last_fetched_at, inserted_at, updated_at";
+
+/// [`insert_new`]: inserts the row unless the account or key id already has one.
+const INSERT_NEW_SQL: &str = "INSERT INTO activitypub_actors (
+         user_id, status, inbox, shared_inbox, outbox, followers_url,
+         following_url, featured_url, public_key, private_key, public_key_id,
+         last_fetched_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+ON CONFLICT DO NOTHING";
 
 /// Whether an account's `ActivityPub` identity is claimed (the
 /// `activitypub_actors.status` column).
@@ -213,6 +223,30 @@ impl fmt::Debug for ActivityPubActorWrite {
     }
 }
 
+impl ActivityPubActorWrite {
+    /// The write that mirrors the moved columns of `user`, as an active identity.
+    ///
+    /// `public_key_id` is not a field of [`User`], so the writer that sets it
+    /// passes the value it stored.
+    #[must_use]
+    pub fn for_user(user: &User, public_key_id: Option<&str>) -> Self {
+        Self {
+            user_id: user.id,
+            status: ActorStatus::Active,
+            inbox: user.inbox.clone(),
+            shared_inbox: user.shared_inbox.clone(),
+            outbox: user.outbox.clone(),
+            followers_url: user.followers_url.clone(),
+            following_url: user.following_url.clone(),
+            featured_url: user.featured_url.clone(),
+            public_key: user.public_key.clone(),
+            private_key: user.private_key.clone(),
+            public_key_id: public_key_id.map(str::to_owned),
+            last_fetched_at: user.last_fetched_at,
+        }
+    }
+}
+
 /// The `ActivityPub` row of `user_id`, or `None` when the account has none.
 ///
 /// # Errors
@@ -304,6 +338,41 @@ where
     Ok(row)
 }
 
+/// Writes `write` as a new row, or reports that one already exists.
+///
+/// Returns `true` when the row was inserted and `false` when the account
+/// (`user_id`) or the `public_key_id` already has a row, leaving it untouched.
+/// A conflict is an answer, not a database error, so it does not abort an
+/// open transaction. This is how a claim of the `ActivityPub` identity
+/// reports it is taken.
+///
+/// # Errors
+///
+/// A `user_id` that names no `users` row fails the foreign key; any database
+/// failure arrives as [`AppError::Database`](crate::error::AppError).
+pub async fn insert_new<'e, E>(executor: E, write: &ActivityPubActorWrite) -> AppResult<bool>
+where
+    E: Executor<'e, Database = Postgres>,
+{
+    let inserted = sqlx::query(INSERT_NEW_SQL)
+        .bind(write.user_id)
+        .bind(write.status)
+        .bind(write.inbox.as_deref())
+        .bind(write.shared_inbox.as_deref())
+        .bind(write.outbox.as_deref())
+        .bind(write.followers_url.as_deref())
+        .bind(write.following_url.as_deref())
+        .bind(write.featured_url.as_deref())
+        .bind(write.public_key.as_deref())
+        .bind(write.private_key.as_deref())
+        .bind(write.public_key_id.as_deref())
+        .bind(write.last_fetched_at)
+        .execute(executor)
+        .await?
+        .rows_affected();
+    Ok(inserted == 1)
+}
+
 /// Mirrors the moved columns of `user` into the account's row.
 ///
 /// Returns the row as stored. This is the temporary dual write: a writer of `users` calls it on the same
@@ -325,20 +394,7 @@ pub async fn upsert_from_user<'e, E>(
 where
     E: Executor<'e, Database = Postgres>,
 {
-    let write = ActivityPubActorWrite {
-        user_id: user.id,
-        status: ActorStatus::Active,
-        inbox: user.inbox.clone(),
-        shared_inbox: user.shared_inbox.clone(),
-        outbox: user.outbox.clone(),
-        followers_url: user.followers_url.clone(),
-        following_url: user.following_url.clone(),
-        featured_url: user.featured_url.clone(),
-        public_key: user.public_key.clone(),
-        private_key: user.private_key.clone(),
-        public_key_id: public_key_id.map(str::to_owned),
-        last_fetched_at: user.last_fetched_at,
-    };
+    let write = ActivityPubActorWrite::for_user(user, public_key_id);
     upsert(executor, &write).await
 }
 
@@ -744,6 +800,31 @@ FROM users";
         let _none = upsert(&pool, &bare_write(second.id))
             .await
             .expect("a row without a key id is no conflict");
+    }
+
+    /// `insert_new` writes a missing row and leaves an existing one alone.
+    #[tokio::test]
+    async fn insert_new_writes_once_and_reports_the_conflict() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = local_user(&pool, "alice").await;
+        drop_rows(&pool).await;
+        let first = ActivityPubActorWrite {
+            inbox: Some("https://test.example/first".to_owned()),
+            ..bare_write(alice.id)
+        };
+        let second = ActivityPubActorWrite {
+            inbox: Some("https://test.example/second".to_owned()),
+            ..bare_write(alice.id)
+        };
+
+        let inserted = insert_new(&pool, &first).await.expect("the first insert");
+        let repeated = insert_new(&pool, &second).await.expect("the second insert");
+
+        assert!(inserted, "a missing row is inserted");
+        assert!(!repeated, "an existing row is reported, not an error");
+        let stored = get(&pool, alice.id).await.unwrap().expect("the row");
+        assert_eq!(stored.inbox, first.inbox, "the first write is kept");
     }
 
     #[tokio::test]

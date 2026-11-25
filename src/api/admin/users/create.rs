@@ -1,7 +1,7 @@
 //! The batch create: the body shapes, the per-item creation and the
 //! answer and refusal renderers.
 
-use std::fmt;
+use std::{collections::BTreeMap, fmt};
 
 use axum::{Json, extract::State};
 use serde::Deserialize;
@@ -147,6 +147,7 @@ pub(super) async fn create_one(state: &AppState, item: &CreateUserItem) -> AppRe
         bio: None,
         reason: None,
         provider_email_verified: true,
+        identifiers: BTreeMap::new(),
     };
     match register::create_local_user(state, params, None).await {
         Ok(stored) => Ok(Creation::Created(Box::new(

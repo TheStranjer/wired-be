@@ -61,6 +61,8 @@ const INSERT_SQL: &str = "INSERT INTO users (
 /// row ([`activitypub_actor::upsert_from_user`]), in one transaction with
 /// the `users` row: a pool opens its own, an open transaction takes a
 /// savepoint. The dual write is temporary (see [`activitypub_actor`]).
+/// Registration does not call this function: it uses [`insert_row`] and claims
+/// each enabled protocol's identity instead.
 ///
 /// # Errors
 ///
@@ -80,8 +82,15 @@ where
     Ok(user)
 }
 
-/// Runs [`INSERT_SQL`] for `new_user` on `conn` and returns the stored row.
-async fn insert_row(conn: &mut PgConnection, new_user: &NewUser) -> AppResult<User> {
+/// Runs the `users` insert for `new_user` on `conn` and returns the stored row.
+///
+/// Unlike [`insert`] it writes no protocol identity: the caller claims one per
+/// enabled protocol afterwards. Registration is that caller.
+///
+/// # Errors
+///
+/// As [`insert`].
+pub async fn insert_row(conn: &mut PgConnection, new_user: &NewUser) -> AppResult<User> {
     let user = sqlx::query_as::<_, User>(INSERT_SQL)
         .bind(new_id())
         .bind(new_user.nickname.as_str())

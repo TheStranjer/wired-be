@@ -5,7 +5,7 @@
 //! resolves them. The routes that render and consume them are the sibling
 //! `registration` child's.
 
-use std::fmt;
+use std::{collections::BTreeMap, fmt};
 
 use serde::Deserialize;
 
@@ -153,6 +153,7 @@ impl Submitted {
             bio: self.bio,
             reason: None,
             provider_email_verified: self.provider_email_verified,
+            identifiers: BTreeMap::new(),
         }
     }
 }

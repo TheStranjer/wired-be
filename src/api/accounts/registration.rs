@@ -4,6 +4,8 @@
 //!
 //! [`register`]: super::register
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -79,6 +81,7 @@ impl CreateAccountParams {
             // This endpoint carries no provider: the email is only ever
             // confirmed by the link the confirmation letter sends.
             provider_email_verified: false,
+            identifiers: BTreeMap::new(),
         }
     }
 }
