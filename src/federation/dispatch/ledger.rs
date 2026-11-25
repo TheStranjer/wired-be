@@ -29,9 +29,9 @@ const PRUNE_RECEIVED_SQL: &str = "DELETE FROM received_activities WHERE inserted
 /// The claim itself failing is the database being unreachable — the one
 /// failure mode that must retry before anything is decided about the
 /// activity.
-pub(super) async fn claim_ledger_row(state: &AppState, ap_id: &str) -> Result<bool, JobError> {
+pub(super) async fn claim_ledger_row(state: &AppState, key: &str) -> Result<bool, JobError> {
     let written = sqlx::query(INSERT_RECEIVED_SQL)
-        .bind(ap_id)
+        .bind(key)
         .execute(&state.db)
         .await
         .map_err(|err| JobError::Retry(format!("the received-activity claim failed: {err}")))?;
@@ -78,10 +78,10 @@ mod tests {
     use super::*;
     use crate::federation::{
         dispatch::{
-            dispatch_activity, handle_cleanup_received,
+            Handlers, dedupe_key, dispatch_activity, handle_cleanup_received,
             test_support::{
                 FIRST_ATTEMPT, app_state, broken_state, follow_activity, incoming_args,
-                ledger_rows, seen, signer, test_handlers,
+                ledger_rows, ok_handler, seen, signer, test_handlers,
             },
         },
         mrf,
@@ -115,6 +115,50 @@ mod tests {
             1,
             "one ledger row per activity id"
         );
+    }
+
+    /// A same-second `Update` under a reused activity id claims its own
+    /// row when its object differs; an exact redelivery is still deduplicated.
+    #[tokio::test]
+    async fn updates_sharing_an_id_are_deduplicated_by_object() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let state = app_state(&pool);
+        let alice = signer(&pool).await;
+        let mut handlers = Handlers::new();
+        handlers.register_update("Note", ok_handler);
+        let update = |content: &str| {
+            json!({
+                "id": "https://peer.example/activities/same-second#updates/1",
+                "type": "Update",
+                "actor": "https://peer.example/users/alice",
+                "object": {"id": "https://peer.example/objects/n1", "type": "Note", "content": content},
+            })
+        };
+
+        for content in ["second", "third", "third"] {
+            let outcome = dispatch_activity(
+                &state,
+                incoming_args(&update(content), &alice),
+                &handlers,
+                mrf::filter_incoming_boxed,
+            )
+            .await;
+            assert_eq!(outcome, Ok(()), "{content} completes");
+        }
+
+        assert_eq!(
+            seen(
+                "ok",
+                "https://peer.example/activities/same-second#updates/1"
+            ),
+            2,
+            "the two distinct objects ran, the redelivery did not"
+        );
+        for content in ["second", "third"] {
+            let key = dedupe_key(&update(content)).expect("the update has an id");
+            assert_eq!(ledger_rows(&pool, &key).await, 1, "one row for {content}");
+        }
     }
 
     /// A handler that fails transiently asks for a retry — and the ledger

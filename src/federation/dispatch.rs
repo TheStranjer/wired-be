@@ -23,7 +23,8 @@
 //!    own `id` must too — unless the activity type is one whose object is
 //!    by nature someone else's content (`FOREIGN_OBJECT_TYPES`);
 //! 3. the dedupe ledger: one `INSERT … ON CONFLICT DO NOTHING` row of
-//!    `received_activities` claims the activity; a lost claim means the
+//!    `received_activities` claims the activity under its [`dedupe_key`]
+//!    (the id, plus an object digest for an `Update`); a lost claim means the
 //!    activity was seen before and the job completes. A retryable failure
 //!    afterwards deletes the row again, so the retry is not swallowed;
 //! 4. the policy hooks: [`mrf::filter_incoming`] (the Pleroma pipeline's
@@ -72,6 +73,7 @@ use crate::{
 mod containment;
 mod error;
 mod handlers;
+mod identity;
 mod ledger;
 mod pipeline;
 mod reachability;
@@ -82,6 +84,7 @@ mod types;
 
 pub use error::FederationError;
 pub use handlers::Handlers;
+pub use identity::dedupe_key;
 pub use types::{ActivityView, CreatePreCheck, HandlerFn, ObjectRef, Outcome, UndoFn};
 
 use ledger::prune_ledger;

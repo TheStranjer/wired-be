@@ -10,6 +10,7 @@ use super::{
     Handlers, KIND_INCOMING,
     containment::containment_failure,
     error::is_retryable,
+    identity::dedupe_key,
     ledger::{claim_ledger_row, release_ledger_row},
     routing::route,
     types::{ActivityView, MrfFn},
@@ -80,7 +81,8 @@ pub(super) async fn run_pipeline(
         debug!(reason = %reason, "the activity fails containment; discarding");
         return Ok(());
     }
-    if !claim_ledger_row(state, &view.id).await? {
+    let ledger_key = dedupe_key(&view.raw).unwrap_or_else(|| view.id.clone());
+    if !claim_ledger_row(state, &ledger_key).await? {
         debug!("this activity has already been received; nothing to do");
         return Ok(());
     }
@@ -88,7 +90,7 @@ pub(super) async fn run_pipeline(
     if let Err(err) = &outcome
         && is_retryable(err)
     {
-        release_ledger_row(state, &view.id).await;
+        release_ledger_row(state, &ledger_key).await;
     }
     outcome
 }

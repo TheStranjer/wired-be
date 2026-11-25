@@ -18,7 +18,7 @@ use crate::{
     error::{AppError, AppResult},
     federation::{
         collections,
-        dispatch::KIND_INCOMING,
+        dispatch::{KIND_INCOMING, dedupe_key},
         inbox_auth::{InboxAuthError, SignedActivity},
         note::{create_activity_json, load_note_context, note_json},
     },
@@ -133,7 +133,8 @@ fn require_activity_fields(json: &Value) -> AppResult<&str> {
 /// [`KIND_INCOMING`] job on [`QUEUE_FEDERATOR_INCOMING`] with the
 /// [`INCOMING_MAX_ATTEMPTS`] budget, carrying the activity's JSON, the
 /// signer's id and the local owner's id (null for the shared inboxes),
-/// deduplicated on `incoming:{activity id}` so a redelivered activity is
+/// deduplicated on `incoming:{dedupe key}` (the activity id, plus an object
+/// digest for an `Update`, see [`dedupe_key`]) so a redelivered activity is
 /// processed once. A duplicate of a still-live job is swallowed by the
 /// queue and changes the answer not at all — both deliveries are
 /// accepted, one job exists.
@@ -143,7 +144,8 @@ async fn enqueue_incoming(
     owner_id: Option<Uuid>,
     activity_id: &str,
 ) -> AppResult<()> {
-    let unique_key = format!("{INCOMING_UNIQUE_PREFIX}:{activity_id}");
+    let identity = dedupe_key(&activity.json).unwrap_or_else(|| activity_id.to_owned());
+    let unique_key = format!("{INCOMING_UNIQUE_PREFIX}:{identity}");
     let queued = enqueue(
         &state.db,
         NewJob {
