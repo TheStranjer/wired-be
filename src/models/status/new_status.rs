@@ -92,6 +92,12 @@ pub struct NewStatus {
     /// them to the new row in its transaction (see
     /// [`crate::models::mention`]); empty in the default.
     pub mentioned_user_ids: Vec<Uuid>,
+    /// Accounts this status addresses in `to`/`cc` without mentioning them:
+    /// [`insert`] links them silently (see
+    /// `mention::link_silent_conn`), so they keep access
+    /// but are neither notified nor counted as mentioned; empty in the
+    /// default.
+    pub silent_user_ids: Vec<Uuid>,
     /// Hashtags this status carries, as written: [`insert`] upserts the
     /// usable ones by name and links them to the new row in its
     /// transaction (see [`crate::models::hashtag`]); empty in the default.
@@ -156,6 +162,7 @@ impl Default for NewStatus {
             quote_policy: None,
             quote_approval_policy: None,
             mentioned_user_ids: Vec::new(),
+            silent_user_ids: Vec::new(),
             hashtags: Vec::new(),
             media_ids: Vec::new(),
             schedule_id: None,
@@ -288,6 +295,7 @@ pub async fn insert_conn(
     let status = write_status(conn, base_url, new_status, parent).await?;
     claim_media(conn, new_status, status.id).await?;
     mention::link_conn(conn, status.id, &new_status.mentioned_user_ids).await?;
+    mention::link_silent_conn(conn, status.id, &new_status.silent_user_ids).await?;
     hashtag::link_names_conn(conn, status.id, &new_status.hashtags).await?;
     count_new_post(conn, &status).await?;
     Ok(status)

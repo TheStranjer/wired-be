@@ -42,11 +42,13 @@ pub(super) fn build_new_status(
     reply: &ReplyLink,
     quote_of_id: Option<Uuid>,
     mentioned: &[User],
+    silent: &[User],
 ) -> NewStatus {
     NewStatus {
         ap_context: parsed.ap_context.clone(),
         hashtags: parsed.hashtags.clone(),
         mentioned_user_ids: mentioned.iter().map(|account| account.id).collect(),
+        silent_user_ids: silent.iter().map(|account| account.id).collect(),
         in_reply_to_id: reply.parent.as_ref().map(|parent| parent.id),
         in_reply_to_account_id: reply.parent.as_ref().map(|parent| parent.user_id),
         in_reply_to_ap_id: reply.unresolved_ap_id.clone(),

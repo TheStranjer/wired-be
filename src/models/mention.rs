@@ -42,8 +42,8 @@ use crate::{
 /// the subquery alone.
 ///
 /// [`WITH ORDINALITY`]: https://www.postgresql.org/docs/current/functions-array.html
-const LINK_SQL: &str = "INSERT INTO status_mentions (status_id, user_id, position)
-     SELECT s.status_id, u.user_id, (s.next_pos + u.ord - 1)::int
+const LINK_SQL: &str = "INSERT INTO status_mentions (status_id, user_id, position, silent)
+     SELECT s.status_id, u.user_id, (s.next_pos + u.ord - 1)::int, $3::boolean
        FROM (SELECT $1::uuid AS status_id,
                     COALESCE(MAX(m.position), -1) + 1 AS next_pos
                FROM status_mentions m WHERE m.status_id = $1) AS s,
@@ -63,6 +63,13 @@ const DELETE_FOR_STATUS_SQL: &str = "DELETE FROM status_mentions WHERE status_id
 /// where [`for_statuses`] binds and the plain (non-builder) query numbers
 /// it `$1`.
 const FOR_STATUSES_SQL: &str = "SELECT sm.status_id, u.* FROM status_mentions sm
+      JOIN users u ON u.id = sm.user_id
+     WHERE sm.status_id = ANY($1) AND NOT sm.silent
+     ORDER BY sm.status_id, sm.position, sm.user_id";
+
+/// [`access_for_statuses`]: [`FOR_STATUSES_SQL`] without the silent filter,
+/// every account with a link to the status.
+const ACCESS_FOR_STATUSES_SQL: &str = "SELECT sm.status_id, u.* FROM status_mentions sm
       JOIN users u ON u.id = sm.user_id
      WHERE sm.status_id = ANY($1)
      ORDER BY sm.status_id, sm.position, sm.user_id";
@@ -122,12 +129,44 @@ pub(crate) async fn link_conn(
     status_id: Uuid,
     user_ids: &[Uuid],
 ) -> AppResult<()> {
+    link_with(conn, status_id, user_ids, false).await
+}
+
+/// [`link_conn`] for silent links: accounts a status addresses in `to`/`cc`
+/// without mentioning them.
+///
+/// A silent link keeps the account's access (direct thread, private
+/// audience, every visibility rule reading `status_mentions`) but is not a
+/// mention: [`for_statuses`] skips it, so it renders in no `mentions` array
+/// and notifies nobody. An account the status already links, silently or
+/// not, keeps that link.
+///
+/// # Errors
+///
+/// Those of [`link_conn`].
+pub(crate) async fn link_silent_conn(
+    conn: &mut PgConnection,
+    status_id: Uuid,
+    user_ids: &[Uuid],
+) -> AppResult<()> {
+    link_with(conn, status_id, user_ids, true).await
+}
+
+/// The statement behind [`link_conn`] and [`link_silent_conn`]; `silent` is
+/// the flag every inserted row takes.
+async fn link_with(
+    conn: &mut PgConnection,
+    status_id: Uuid,
+    user_ids: &[Uuid],
+    silent: bool,
+) -> AppResult<()> {
     if user_ids.is_empty() {
         return Ok(());
     }
     sqlx::query(LINK_SQL)
         .bind(status_id)
         .bind(dedupe(user_ids))
+        .bind(silent)
         .execute(&mut *conn)
         .await
         .map(drop)?;
@@ -189,8 +228,34 @@ pub(crate) async fn replace_conn(
 /// Any database failure (connection, encoding) arrives as
 /// [`AppError::Database`](crate::error::AppError).
 pub async fn for_statuses(pool: &PgPool, ids: &[Uuid]) -> AppResult<HashMap<Uuid, Vec<User>>> {
+    grouped_links(pool, FOR_STATUSES_SQL, ids).await
+}
+
+/// [`for_statuses`] with the silent links too.
+///
+/// Every account that has access to a status through `status_mentions`,
+/// mentioned or merely addressed. Visibility and thread membership read
+/// this; the entity and the notifications read [`for_statuses`].
+///
+/// # Errors
+///
+/// Those of [`for_statuses`].
+pub async fn access_for_statuses(
+    pool: &PgPool,
+    ids: &[Uuid],
+) -> AppResult<HashMap<Uuid, Vec<User>>> {
+    grouped_links(pool, ACCESS_FOR_STATUSES_SQL, ids).await
+}
+
+/// Runs one of the two link reads (`sql` takes the id list as `$1`) and
+/// groups its rows by status.
+async fn grouped_links(
+    pool: &PgPool,
+    sql: &'static str,
+    ids: &[Uuid],
+) -> AppResult<HashMap<Uuid, Vec<User>>> {
     let ids = ids.to_vec();
-    let rows = sqlx::query_as::<_, MentionedUserRow>(FOR_STATUSES_SQL)
+    let rows = sqlx::query_as::<_, MentionedUserRow>(sql)
         .bind(&ids)
         .fetch_all(pool)
         .await?;

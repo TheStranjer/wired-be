@@ -124,22 +124,20 @@ async fn fold_edit(
     if recency != Ordering::Greater && text_unchanged {
         return refresh_tally(state, stored, &parsed).await;
     }
-    let mut mentioned = ingest::resolve_mentions(state, &parsed.mention_hrefs).await?;
-    ingest::merge_accounts(
-        &mut mentioned,
-        ingest::resolve_local_audience(state, &parsed.audience).await?,
-    );
+    let mentioned = ingest::resolve_mentions(state, &parsed.mention_hrefs).await?;
+    let silent = ingest::resolve_local_audience(state, &parsed.audience, &mentioned).await?;
     let media = stored_media(&state.db, stored.id)
         .await
         .map_err(|err| FederationError::transient("the attachment read failed", &err))?;
     let media_plan = plan_media(&media, &parsed.attachments);
-    let params = edit_params(
+    let mut params = edit_params(
         &parsed,
         stored,
         &mentioned,
         &media_plan,
         update_time(object, now),
     );
+    params.silent_user_ids = silent.iter().map(|account| account.id).collect();
     let Some(updated) = status_edit::update_status(&state.db, stored.id, params)
         .await
         .map_err(|err| FederationError::transient("the status edit failed", &err))?
@@ -191,6 +189,7 @@ fn edit_params(
         sensitive: parsed.status.sensitive,
         language: stored.language.clone(),
         mentioned_user_ids: mentioned.iter().map(|account| account.id).collect(),
+        silent_user_ids: Vec::new(),
         hashtags: parsed.hashtags.clone(),
         media_ids: media_plan.replaces().then(Vec::new),
         edited_at,

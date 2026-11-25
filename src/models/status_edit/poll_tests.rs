@@ -47,6 +47,7 @@ fn restating(posted: &Status, poll: Option<PollEdit>) -> EditParams {
         sensitive: posted.sensitive,
         language: posted.language.clone(),
         mentioned_user_ids: Vec::new(),
+        silent_user_ids: Vec::new(),
         hashtags: Vec::new(),
         media_ids: None,
         edited_at: None,

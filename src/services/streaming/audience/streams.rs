@@ -87,11 +87,11 @@ pub(super) async fn followers_of(
     follow::accepted_local_follower_ids(pool, author.id, row.reblog_of_id.is_some()).await
 }
 
-/// The `status_mentions` accounts of `row` that this instance owns: the
+/// The `status_mentions` accounts of `row` (silent links included) that this instance owns: the
 /// local half of a direct audience and of the home rule's mention side (a
 /// remote mention holds no socket here).
 pub(super) async fn mentioned_local_ids(pool: &PgPool, status_id: Uuid) -> AppResult<Vec<Uuid>> {
-    let mut grouped = mention::for_statuses(pool, &[status_id]).await?;
+    let mut grouped = mention::access_for_statuses(pool, &[status_id]).await?;
     let some_users = grouped.remove(&status_id).unwrap_or_default();
     Ok(some_users
         .into_iter()

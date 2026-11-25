@@ -304,7 +304,7 @@ async fn a_lost_uri_race_reports_raced_and_writes_nothing() {
     let object = satellites_object();
     let parsed = crate::federation::note_parser::parse_note(&object, &bob, chrono::Utc::now())
         .expect("the note parses");
-    let new = build_new_status(&parsed, &ReplyLink::default(), None, &[]);
+    let new = build_new_status(&parsed, &ReplyLink::default(), None, &[], &[]);
 
     let first = write_ingested(&state, &new, &parsed)
         .await

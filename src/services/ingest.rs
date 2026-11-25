@@ -139,7 +139,7 @@ pub mod write;
 mod test_support;
 
 pub(crate) use self::{
-    resolve::{merge_accounts, resolve_local_audience, resolve_mentions, upsert_emojis},
+    resolve::{resolve_local_audience, resolve_mentions, upsert_emojis},
     write::{insert_media, insert_poll},
 };
 use self::{
@@ -321,24 +321,24 @@ async fn ingest_note_inner(
     }
     let reply = resolve_reply(state, &parsed).await?;
     let quote_of_id = resolve_quote(state, parsed.quote_uri.as_deref()).await?;
-    let mut mentioned = resolve_mentions(state, &parsed.mention_hrefs).await?;
-    merge_accounts(
-        &mut mentioned,
-        resolve_local_audience(state, &parsed.audience).await?,
-    );
+    let mentioned = resolve_mentions(state, &parsed.mention_hrefs).await?;
+    let mut silent = resolve_local_audience(state, &parsed.audience, &mentioned).await?;
     if let Some(owner) = owner
         && parsed.status.visibility == Visibility::Direct
         && owner.local.get()
-        && mentioned.iter().all(|account| account.id != owner.id)
+        && mentioned
+            .iter()
+            .chain(&silent)
+            .all(|account| account.id != owner.id)
     {
-        mentioned.push(owner.clone());
+        silent.push(owner.clone());
     }
     if drops_unsolicited(state, &parsed, author, &reply, &mentioned).await? {
         debug!(account = %author.ap_id, "an unsolicited public post from an unfollowed author is dropped");
         return Ok(IngestOutcome::Ignored("unsolicited public"));
     }
     upsert_emojis(state, &parsed.emojis).await?;
-    let new = build_new_status(&parsed, &reply, quote_of_id, &mentioned);
+    let new = build_new_status(&parsed, &reply, quote_of_id, &mentioned, &silent);
     let (row, late_quotes) = match write_ingested(state, &new, &parsed).await? {
         Written::Created(row, late_quotes) => (*row, late_quotes),
         Written::Raced => return raced_outcome(state, uri).await,
@@ -467,7 +467,9 @@ async fn raced_outcome(state: &AppState, uri: &str) -> Result<IngestOutcome, Fed
 ///
 /// The gate answers `true` — drop — only while the setting is off, for a
 /// `public` or `unlisted` status whose author no local account follows and
-/// that neither mentions a local user nor answers a local status. Every
+/// that neither mentions a local user (a `Mention` tag — naming a local
+/// account only in `to`/`cc` does not count, any remote actor can do that)
+/// nor answers a local status. Every
 /// other post keeps its author's reasons for having arrived here:
 /// followers-addressed and direct posts were aimed at somebody on this
 /// instance, and a followed author's post is solicited by definition.

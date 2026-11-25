@@ -178,7 +178,7 @@ pub async fn participate_for_status(pool: &PgPool, status: &Status) -> AppResult
         return Ok(());
     }
     let mut everyone: Vec<Uuid> = vec![status.user_id];
-    let mentioned = mention::for_statuses(pool, std::slice::from_ref(&status.id)).await?;
+    let mentioned = mention::access_for_statuses(pool, std::slice::from_ref(&status.id)).await?;
     for account in mentioned.get(&status.id).map_or(&[][..], Vec::as_slice) {
         if !everyone.contains(&account.id) {
             everyone.push(account.id);
