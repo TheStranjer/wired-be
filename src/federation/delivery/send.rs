@@ -22,7 +22,10 @@ use crate::{
         vocab::ACTIVITY_JSON,
     },
     jobs::{AttemptInfo, HandlerFuture, JobError, JobErrorExt as _},
-    models::user::{self, User},
+    models::{
+        activitypub_actor,
+        user::{self, User},
+    },
     state::AppState,
     util::url::same_origin,
 };
@@ -65,12 +68,20 @@ async fn deliver(state: AppState, attempt: AttemptInfo, args: Value) -> Result<(
         "delivering activity"
     );
     let actor = signing_actor(&state, args.actor_id).await?;
-    let private_pem = actor.private_key.as_deref().ok_or_else(|| {
-        JobError::Discard(format!(
-            "the local actor {} has no private key to sign with",
-            actor.ap_id
-        ))
-    })?;
+    // The key lives on the actor's `ActivityPub` row; an account without a row
+    // has no key, exactly like a local account whose key was never generated.
+    let plumbing = activitypub_actor::get(&state.db, actor.id)
+        .await
+        .job_retry("could not read the signing actor's key")?;
+    let private_pem = plumbing
+        .as_ref()
+        .and_then(|row| row.private_key.as_deref())
+        .ok_or_else(|| {
+            JobError::Discard(format!(
+                "the local actor {} has no private key to sign with",
+                actor.ap_id
+            ))
+        })?;
     let body = serde_json::to_vec(&strip_bto_bcc(&args.body))
         .job_discard("the activity is not serializable")?;
     let key_id = format!("{}{MAIN_KEY_FRAGMENT}", actor.ap_id);
@@ -486,5 +497,39 @@ mod tests {
                 outcome_text(&outcome)
             );
         }
+    }
+
+    #[tokio::test]
+    async fn the_signing_key_is_read_from_the_actor_row() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = actor(&pool).await;
+        assert!(
+            alice.private_key.is_some(),
+            "the `users` row still holds the key"
+        );
+        let cleared =
+            sqlx::query("UPDATE activitypub_actors SET private_key = NULL WHERE user_id = $1")
+                .bind(alice.id)
+                .execute(&pool)
+                .await
+                .unwrap()
+                .rows_affected();
+        assert_eq!(cleared, 1, "the actor row's key is cleared");
+        let state = test_state(&pool);
+
+        let outcome = attempt_to(
+            &state,
+            "https://peer.example/inbox",
+            alice.id,
+            first_attempt(),
+        )
+        .await;
+
+        assert!(
+            matches!(outcome, Err(JobError::Discard(_))),
+            "a key missing from the actor row cannot sign, got {}",
+            outcome_text(&outcome)
+        );
     }
 }

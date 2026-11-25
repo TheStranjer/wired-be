@@ -188,9 +188,19 @@ pub fn followers(ap_id: &str) -> String {
 /// row that carries none.
 #[must_use]
 pub fn followers_address(user: &User) -> String {
-    user.followers_url
-        .clone()
-        .unwrap_or_else(|| followers(&user.ap_id))
+    followers_address_of(&user.ap_id, user.followers_url.as_deref())
+}
+
+/// The address naming the followers collection of actor `ap_id`, whose
+/// stored collection id is `stored`.
+///
+/// [`followers_address`] for a caller that read the stored id from the
+/// account's `activitypub_actors` row rather than from [`User`]: `stored`
+/// when the row carries one, the [`followers`] construction when it does not
+/// (or when the account has no row).
+#[must_use]
+pub fn followers_address_of(ap_id: &str, stored: Option<&str>) -> String {
+    stored.map_or_else(|| followers(ap_id), str::to_owned)
 }
 
 /// The following collection of actor `ap_id`: `{ap_id}/following`.

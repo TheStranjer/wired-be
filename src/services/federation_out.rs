@@ -170,6 +170,7 @@ use crate::{
         publisher::{self, PublishOpts},
     },
     models::{
+        activitypub_actor,
         status::{self, Status, Visibility},
         user::{self, User},
     },
@@ -226,6 +227,9 @@ pub use withdrawals::after_status_deleted;
 struct StatusAction {
     /// The local account whose write is announced.
     actor: User,
+    /// The followers collection id on the actor's `activitypub_actors` row,
+    /// for the documents that address the actor's followers.
+    actor_followers_url: Option<String>,
     /// The status the interaction names — the original, for a boost.
     status: Status,
     /// The status' author, the `to` entry of every delivered interaction.
@@ -261,9 +265,17 @@ async fn status_action(state: &AppState, actor_id: Uuid, status_id: Uuid) -> Opt
         return None; // a local-only post federates nothing about itself
     }
     let author = load_user(state, status.user_id).await?;
+    let actor_followers_url = match activitypub_actor::get(&state.db, actor.id).await {
+        Ok(row) => row.and_then(|row| row.followers_url),
+        Err(err) => {
+            warn!(%err, %actor_id, "federation hook could not read an actor's ActivityPub row");
+            return None;
+        }
+    };
     Some(StatusAction {
         public: status.visibility == Visibility::Public,
         actor,
+        actor_followers_url,
         status,
         author,
     })

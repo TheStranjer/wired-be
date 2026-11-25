@@ -13,7 +13,7 @@ use crate::{
     federation::{quotes::interaction_policy_json, vocab::AS_PUBLIC},
     models::{
         status::{Status, Visibility},
-        user::{User, followers_address},
+        user::{User, followers_address, followers_address_of},
     },
     util::time::mastodon_time,
 };
@@ -142,15 +142,34 @@ fn status_url(status: &Status) -> &str {
 }
 
 /// The `to` and `cc` arrays `ctx`'s visibility addresses, as
-/// [`address_lines`] spells them from the three facts a note's audience
+/// [`audience_lines`] spells them from the three facts a note's audience
 /// rests on.
+///
+/// The author's followers collection is the one stored on their
+/// `activitypub_actors` row, which the loader put in
+/// [`NoteContext::author_followers_url`].
 fn addressing(ctx: &NoteContext) -> (Vec<Value>, Vec<Value>) {
-    address_lines(ctx.status.visibility, &ctx.author, &ctx.mentions)
+    let followers = followers_address_of(&ctx.author.ap_id, ctx.author_followers_url.as_deref());
+    audience_lines(ctx.status.visibility, &followers, &ctx.mentions)
 }
 
-/// The `to` and `cc` lines one visibility addresses: `public` talks to the
-/// world and shows the post in the author's followers' timelines,
-/// `unlisted` inverts the pair, `private` reaches only followers and
+/// [`audience_lines`] over the followers address on the `users` row.
+///
+/// Only the scrobble documents still use this form; the ticket that moves
+/// them to `activitypub_actors` removes it.
+pub(crate) fn address_lines(
+    visibility: Visibility,
+    author: &User,
+    mentions: &[User],
+) -> (Vec<Value>, Vec<Value>) {
+    audience_lines(visibility, &followers_address(author), mentions)
+}
+
+/// The `to` and `cc` lines one visibility addresses, given the author's
+/// `followers` collection address.
+///
+/// `public` talks to the world and shows the post in the author's
+/// followers' timelines, `unlisted` inverts the pair, `private` reaches only followers and
 /// mentionees, `direct` only mentionees — and `local` addresses nothing,
 /// which [`note_json`] has already refused to render. Mentioned accounts
 /// dedupe by actor id, keeping first-mention order.
@@ -160,12 +179,12 @@ fn addressing(ctx: &NoteContext) -> (Vec<Value>, Vec<Value>) {
 /// not built from a live row: the `Delete` of a status recomputes these two
 /// lines from the row it held before the delete took it down, so the
 /// withdrawal reaches the very inboxes the post reached and no other.
-pub(crate) fn address_lines(
+pub(crate) fn audience_lines(
     visibility: Visibility,
-    author: &User,
+    followers: &str,
     mentions: &[User],
 ) -> (Vec<Value>, Vec<Value>) {
-    let followers_addr = json!(followers_address(author));
+    let followers_addr = json!(followers);
     let mentioned = mention_addresses(mentions);
     match visibility {
         Visibility::Public => (vec![json!(AS_PUBLIC)], prepend(followers_addr, mentioned)),
@@ -395,14 +414,16 @@ mod tests {
     }
 
     #[test]
-    fn address_lines_use_the_stored_followers_url_over_the_built_one() {
+    fn a_note_uses_the_actor_rows_followers_url_over_the_built_one() {
         let stored = "https://test.example/collections/alice/fans";
-        let mut alice = author();
-        alice.followers_url = Some(stored.to_owned());
-        let (to, cc) = address_lines(Visibility::Public, &alice, &[]);
+        let mut public = note_context(Visibility::Public);
+        public.author_followers_url = Some(stored.to_owned());
+        let (to, cc) = addressing(&public);
         assert_eq!(to, vec![json!(AS_PUBLIC)], "the world is addressed");
         assert_eq!(cc, vec![json!(stored)], "the stored followers collection");
-        let (private_to, private_cc) = address_lines(Visibility::Private, &alice, &[]);
+        let mut private = note_context(Visibility::Private);
+        private.author_followers_url = Some(stored.to_owned());
+        let (private_to, private_cc) = addressing(&private);
         assert_eq!(
             private_to,
             vec![json!(stored)],
@@ -412,14 +433,26 @@ mod tests {
     }
 
     #[test]
-    fn address_lines_build_the_followers_url_when_none_is_stored() {
-        let alice = author();
-        assert_eq!(alice.followers_url, None, "the fixture stores none");
-        let (to, _cc) = address_lines(Visibility::Unlisted, &alice, &[]);
+    fn a_note_builds_the_followers_url_when_the_actor_row_has_none() {
+        let ctx = note_context(Visibility::Unlisted);
+        assert_eq!(ctx.author_followers_url, None, "the fixture stores none");
+        let (to, _cc) = addressing(&ctx);
         assert_eq!(
             to,
             vec![json!(format!("{AUTHOR_AP}/followers"))],
             "the `{{ap_id}}/followers` fallback"
+        );
+    }
+
+    #[test]
+    fn a_note_ignores_the_users_followers_url() {
+        let mut ctx = note_context(Visibility::Unlisted);
+        ctx.author.followers_url = Some("https://test.example/old/followers".to_owned());
+        let (to, _cc) = addressing(&ctx);
+        assert_eq!(
+            to,
+            vec![json!(format!("{AUTHOR_AP}/followers"))],
+            "only the actor row's followers collection counts"
         );
     }
 

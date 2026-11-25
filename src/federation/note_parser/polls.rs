@@ -156,7 +156,7 @@ mod tests {
                 question_with("oneOf", json!([{"type": "Note"}, {"name": ""}])),
             ),
         ] {
-            let error = parse_note(&document, &author(), now()).unwrap_err();
+            let error = parse_note(&document, &author(), Some(FOLLOWERS), now()).unwrap_err();
             assert!(
                 matches!(error, ParseError::InvalidPoll(_)),
                 "{name}: a bad question fails InvalidPoll, got {error}"

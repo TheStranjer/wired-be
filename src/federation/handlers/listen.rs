@@ -43,6 +43,7 @@ use crate::{
         json, note_parser,
     },
     models::{
+        activitypub_actor,
         scrobble::{self, MAX_LINK_CHARS, MAX_TEXT_CHARS, MAX_TITLE_CHARS, NewScrobble},
         user::User,
     },
@@ -130,7 +131,10 @@ async fn apply_listen(
         Ok(parsed) => parsed,
         Err(reason) => return Ok(Outcome::Ignored(reason)),
     };
-    parsed.visibility = note_parser::parse_visibility(&view.raw, &signer);
+    let followers_url = activitypub_actor::followers_url(&state.db, signer.id)
+        .await
+        .transient("the signer's followers collection could not be read")?;
+    parsed.visibility = note_parser::parse_visibility(&view.raw, followers_url.as_deref());
     let now = Utc::now();
     let published = audio.get("published").or_else(|| view.raw.get("published"));
     let listened_at = json::clamped_time(published, now).unwrap_or(now);

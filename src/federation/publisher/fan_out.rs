@@ -2,6 +2,8 @@
 //! a mention and a direct message reach, which rows and hosts are
 //! excluded, and how repeated inboxes and repeated publishes collapse.
 
+use sqlx::PgPool;
+
 use super::test_support::*;
 use super::*;
 use crate::{
@@ -626,5 +628,203 @@ async fn a_repeated_publish_reuses_the_queued_delivery() {
         job_count(&pool).await,
         1,
         "the delivery's unique key swallows the repeat"
+    );
+}
+
+/// Changes the shared inbox on `user_id`'s `activitypub_actors` row alone;
+/// the `users` row keeps the one it was inserted with.
+async fn move_actor_shared_inbox(pool: &PgPool, user_id: Uuid, shared_inbox: &str) {
+    let updated = sqlx::query("UPDATE activitypub_actors SET shared_inbox = $2 WHERE user_id = $1")
+        .bind(user_id)
+        .bind(shared_inbox)
+        .execute(pool)
+        .await
+        .unwrap()
+        .rows_affected();
+    assert_eq!(updated, 1, "the account has an actor row to move");
+}
+
+/// Changes the followers collection on `user_id`'s `activitypub_actors` row
+/// alone; the `users` row keeps the one it was inserted with.
+async fn move_actor_followers_url(pool: &PgPool, user_id: Uuid, followers_url: &str) {
+    let updated =
+        sqlx::query("UPDATE activitypub_actors SET followers_url = $2 WHERE user_id = $1")
+            .bind(user_id)
+            .bind(followers_url)
+            .execute(pool)
+            .await
+            .unwrap()
+            .rows_affected();
+    assert_eq!(updated, 1, "the account has an actor row to move");
+}
+
+/// Inbox selection follows `activitypub_actors`: a follower whose shared
+/// inbox changed on that table alone is delivered to at the new address.
+#[tokio::test]
+async fn a_followers_inbox_is_read_from_the_actor_row() {
+    let db = crate::test_db::test_db().await.expect("test database slot");
+    let pool = db.pool().clone();
+    let alice = alice(&pool).await;
+    let erin = mirror(
+        &pool,
+        "erin",
+        "other.example",
+        "https://other.example/users/erin/inbox",
+        Some("https://other.example/inbox"),
+    )
+    .await;
+    followed(&pool, &erin, &alice).await;
+    move_actor_shared_inbox(&pool, erin.id, "https://moved.example/inbox").await;
+    let state = app_state(&pool);
+
+    let count = publish_ok(
+        &state,
+        &alice,
+        &public_activity(&alice),
+        PublishOpts::default(),
+    )
+    .await;
+
+    assert_eq!(count, 1, "the follower is the only target");
+    assert_eq!(
+        delivered_inboxes(&pool).await,
+        vec!["https://moved.example/inbox"],
+        "the actor row's shared inbox decides, not the `users` column"
+    );
+}
+
+/// The same holds for a directly named recipient, in a broadcast (shared
+/// inbox) and in a direct (personal inbox) activity.
+#[tokio::test]
+async fn a_mentioned_recipients_inbox_is_read_from_the_actor_row() {
+    let db = crate::test_db::test_db().await.expect("test database slot");
+    let pool = db.pool().clone();
+    let alice = alice(&pool).await;
+    let bob = mirror(
+        &pool,
+        "bob",
+        "peer.example",
+        "https://peer.example/users/bob/inbox",
+        Some("https://peer.example/inbox"),
+    )
+    .await;
+    move_actor_shared_inbox(&pool, bob.id, "https://moved.example/inbox").await;
+    let state = app_state(&pool);
+    let broadcast = json!({
+        "id": ACTIVITY_ID,
+        "type": "Create",
+        "actor": alice.ap_id,
+        "to": [bob.ap_id, PUBLIC],
+    });
+
+    let count = publish_ok(&state, &alice, &broadcast, PublishOpts::default()).await;
+
+    assert_eq!(count, 1, "the mention is the only resolved recipient");
+    assert_eq!(
+        delivered_inboxes(&pool).await,
+        vec!["https://moved.example/inbox"],
+        "a broadcast reaches the actor row's shared inbox"
+    );
+
+    let direct = json!({
+        "id": "https://test.example/activities/direct",
+        "type": "Create",
+        "actor": alice.ap_id,
+        "to": [bob.ap_id],
+    });
+    let direct_count = publish_ok(&state, &alice, &direct, PublishOpts::default()).await;
+
+    assert_eq!(direct_count, 1, "the mention is the only recipient");
+    assert_eq!(
+        delivered_inboxes(&pool).await,
+        vec![
+            "https://moved.example/inbox",
+            "https://peer.example/users/bob/inbox",
+        ],
+        "a direct activity reaches the personal inbox on the actor row"
+    );
+}
+
+/// An account whose actor row is gone has nowhere to deliver to, as one
+/// that publishes no inbox has not.
+#[tokio::test]
+async fn an_account_without_an_actor_row_is_not_delivered_to() {
+    let db = crate::test_db::test_db().await.expect("test database slot");
+    let pool = db.pool().clone();
+    let alice = alice(&pool).await;
+    let erin = mirror(
+        &pool,
+        "erin",
+        "other.example",
+        "https://other.example/users/erin/inbox",
+        None,
+    )
+    .await;
+    followed(&pool, &erin, &alice).await;
+    let removed = sqlx::query("DELETE FROM activitypub_actors WHERE user_id = $1")
+        .bind(erin.id)
+        .execute(&pool)
+        .await
+        .unwrap()
+        .rows_affected();
+    assert_eq!(removed, 1, "the follower had an actor row to lose");
+    let state = app_state(&pool);
+
+    let count = publish_ok(
+        &state,
+        &alice,
+        &public_activity(&alice),
+        PublishOpts::default(),
+    )
+    .await;
+
+    assert_eq!(count, 0, "the follower has no inbox to name");
+    assert_eq!(job_count(&pool).await, 0, "and no job is queued");
+}
+
+/// The publisher's own followers collection is the one on its actor row:
+/// an address matching only the old `users` column is no followers
+/// collection, and the row's is.
+#[tokio::test]
+async fn the_publishers_followers_collection_is_read_from_its_actor_row() {
+    let db = crate::test_db::test_db().await.expect("test database slot");
+    let pool = db.pool().clone();
+    let alice = alice(&pool).await;
+    let erin = mirror(
+        &pool,
+        "erin",
+        "other.example",
+        "https://other.example/users/erin/inbox",
+        None,
+    )
+    .await;
+    followed(&pool, &erin, &alice).await;
+    let fans = format!("{TEST_BASE_URL}/users/alice/fans");
+    move_actor_followers_url(&pool, alice.id, &fans).await;
+    let state = app_state(&pool);
+    let old_address = json!({
+        "id": ACTIVITY_ID,
+        "type": "Create",
+        "actor": alice.ap_id,
+        "to": [alice.followers_url],
+    });
+
+    let old_count = publish_ok(&state, &alice, &old_address, PublishOpts::default()).await;
+
+    assert_eq!(old_count, 0, "the `users` column's address names nobody");
+    let current = json!({
+        "id": ACTIVITY_ID,
+        "type": "Create",
+        "actor": alice.ap_id,
+        "to": [fans],
+    });
+
+    let current_count = publish_ok(&state, &alice, &current, PublishOpts::default()).await;
+
+    assert_eq!(current_count, 1, "the actor row's collection expands");
+    assert_eq!(
+        delivered_inboxes(&pool).await,
+        vec!["https://other.example/users/erin/inbox"],
+        "to the follower's inbox"
     );
 }

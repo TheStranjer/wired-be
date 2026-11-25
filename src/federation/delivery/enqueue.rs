@@ -7,8 +7,12 @@
 //!
 //! [`handle`]: crate::federation::delivery::handle
 
+use std::collections::HashMap;
+
 use serde_json::{Value, json};
+use sqlx::{Executor, Postgres};
 use tracing::{debug, warn};
+use uuid::Uuid;
 
 use super::{
     KIND_DELIVER, MAX_ATTEMPTS, UNIQUE_KEY_PREFIX,
@@ -19,6 +23,7 @@ use crate::{
     federation::policy::host_refused,
     jobs::QUEUE_FEDERATOR_OUTGOING,
     models::{
+        activitypub_actor::{self, ActivityPubActor},
         job::{NewJob, enqueue},
         user::User,
     },
@@ -36,8 +41,36 @@ use crate::{
 /// a single POST is the caller's decision, and every caller starts from the
 /// same choice.
 #[must_use]
-pub fn best_inbox(actor: &User) -> Option<String> {
+pub fn best_inbox(actor: &ActivityPubActor) -> Option<String> {
     actor.shared_inbox.clone().or_else(|| actor.inbox.clone())
+}
+
+/// The [`best_inbox`] of each of `accounts` that has one, in the order of
+/// `accounts`.
+///
+/// Reads every account's `ActivityPub` row in one statement, so a list of
+/// followers costs one query however long it is. An account with no row, or
+/// a row with no inbox, contributes nothing.
+///
+/// # Errors
+///
+/// A database failure arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn best_inboxes<'e, E>(executor: E, accounts: &[User]) -> AppResult<Vec<String>>
+where
+    E: Executor<'e, Database = Postgres>,
+{
+    let ids: Vec<Uuid> = accounts.iter().map(|account| account.id).collect();
+    let rows: HashMap<Uuid, ActivityPubActor> = activitypub_actor::get_many(executor, &ids)
+        .await?
+        .into_iter()
+        .map(|row| (row.user_id, row))
+        .collect();
+    Ok(accounts
+        .iter()
+        .filter_map(|account| rows.get(&account.id))
+        .filter_map(best_inbox)
+        .collect())
 }
 
 /// Queues one signed delivery of `activity` to `inbox`, signed as the local
@@ -181,16 +214,84 @@ mod tests {
         let nowhere = mirror(&pool, "nowhere", None, None).await;
 
         assert_eq!(
-            best_inbox(&shared).as_deref(),
+            best_inbox(&plumbing_of(&pool, &shared).await).as_deref(),
             Some("https://peer.example/inbox"),
             "one POST per instance when the actor publishes a shared inbox"
         );
         assert_eq!(
-            best_inbox(&personal).as_deref(),
+            best_inbox(&plumbing_of(&pool, &personal).await).as_deref(),
             Some("https://peer.example/users/bob/inbox"),
             "the personal inbox when there is no shared one"
         );
-        assert_eq!(best_inbox(&nowhere), None, "and nowhere to send at all");
+        assert_eq!(
+            best_inbox(&plumbing_of(&pool, &nowhere).await),
+            None,
+            "and nowhere to send at all"
+        );
+    }
+
+    /// The `activitypub_actors` row of `account`, which every inserted
+    /// account has.
+    async fn plumbing_of(pool: &sqlx::PgPool, account: &User) -> ActivityPubActor {
+        activitypub_actor::get(pool, account.id)
+            .await
+            .unwrap()
+            .expect("an inserted account has an ActivityPub row")
+    }
+
+    #[tokio::test]
+    async fn best_inboxes_reads_the_actor_rows_in_the_order_asked() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let first = mirror(
+            &pool,
+            "first",
+            Some("https://peer.example/users/first/inbox"),
+            None,
+        )
+        .await;
+        let second = mirror(
+            &pool,
+            "second",
+            Some("https://other.example/users/second/inbox"),
+            Some("https://other.example/inbox"),
+        )
+        .await;
+        let nowhere = mirror(&pool, "nowhere", None, None).await;
+        let rowless = mirror(
+            &pool,
+            "rowless",
+            Some("https://third.example/users/rowless/inbox"),
+            None,
+        )
+        .await;
+        let removed = sqlx::query("DELETE FROM activitypub_actors WHERE user_id = $1")
+            .bind(rowless.id)
+            .execute(&pool)
+            .await
+            .unwrap()
+            .rows_affected();
+        assert_eq!(removed, 1, "the row to be missing was there");
+        // Only the new table changes: the `users` columns still say otherwise.
+        let moved =
+            sqlx::query("UPDATE activitypub_actors SET shared_inbox = $2 WHERE user_id = $1")
+                .bind(first.id)
+                .bind("https://moved.example/inbox")
+                .execute(&pool)
+                .await
+                .unwrap()
+                .rows_affected();
+        assert_eq!(moved, 1, "the shared inbox moved on the actor row");
+
+        let inboxes = best_inboxes(&pool, &[second, nowhere, rowless, first])
+            .await
+            .unwrap();
+
+        assert_eq!(
+            inboxes,
+            ["https://other.example/inbox", "https://moved.example/inbox"],
+            "the actor rows decide, in the order asked; no inbox and no row add nothing"
+        );
     }
 
     #[tokio::test]

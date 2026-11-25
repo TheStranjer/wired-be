@@ -16,6 +16,7 @@ use crate::{
     config::Config,
     error::{AppError, AppResult},
     models::{
+        activitypub_actor,
         custom_emoji::{self, CustomEmoji},
         hashtag,
         media_attachment::{self, MediaAttachment},
@@ -55,6 +56,9 @@ pub async fn load_note_context(
     let author = user::get_by_id(pool, status.user_id)
         .await?
         .ok_or(AppError::NotFound)?;
+    let author_followers_url = activitypub_actor::get(pool, author.id)
+        .await?
+        .and_then(|row| row.followers_url);
     let reply_parent_uri = parent_uri(pool, &status).await?;
     let mentions = load_mentions(pool, &status).await?;
     let hashtags = load_hashtags(pool, &status).await?;
@@ -66,6 +70,7 @@ pub async fn load_note_context(
     Ok(NoteContext {
         status,
         author,
+        author_followers_url,
         reply_parent_uri,
         mentions,
         hashtags,

@@ -120,7 +120,7 @@ use crate::{
     },
     jobs::QUEUE_BACKGROUND,
     models::{
-        follow,
+        activitypub_actor, follow,
         job::{self, NewJob},
         status::{self, Status, Visibility},
         user::User,
@@ -305,9 +305,13 @@ async fn ingest_note_inner(
     owner: Option<&User>,
     depth: IngestDepth,
 ) -> Result<IngestOutcome, FederationError> {
-    let parsed = note_parser::parse_note(object, author, Utc::now()).map_err(|err| {
-        FederationError::Permanent(format!("the object is not ingestable: {err}"))
-    })?;
+    let followers_url = activitypub_actor::followers_url(&state.db, author.id)
+        .await
+        .transient("the author's followers collection could not be read")?;
+    let parsed = note_parser::parse_note(object, author, followers_url.as_deref(), Utc::now())
+        .map_err(|err| {
+            FederationError::Permanent(format!("the object is not ingestable: {err}"))
+        })?;
     let uri =
         parsed.status.uri.as_deref().ok_or_else(|| {
             FederationError::Permanent("the parsed object carries no uri".to_owned())

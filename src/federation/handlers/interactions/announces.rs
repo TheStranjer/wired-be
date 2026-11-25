@@ -15,7 +15,7 @@ use crate::{
         note_parser,
     },
     models::{
-        relay,
+        activitypub_actor, relay,
         status::{self, Status, Visibility},
         user::User,
     },
@@ -58,10 +58,15 @@ pub(super) async fn apply_announce(
             "this actor's boost of that status stands already",
         ));
     }
+    let followers_url = activitypub_actor::followers_url(&state.db, signer.id)
+        .await
+        .map_err(|err| {
+            FederationError::transient("could not read the booster's followers collection", &err)
+        })?;
     let new = status::NewStatus {
         uri: Some(view.id.clone()),
         user_id: signer.id,
-        visibility: note_parser::parse_visibility(&view.raw, &signer),
+        visibility: note_parser::parse_visibility(&view.raw, followers_url.as_deref()),
         conversation_id: Some(target.conversation_id),
         reblog_of_id: Some(target.id),
         inserted_at: Some(announced_at(&view.raw, Utc::now())),

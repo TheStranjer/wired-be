@@ -11,9 +11,13 @@ use crate::error::AppResult;
 /// it has one, its personal inbox otherwise — the same preference the
 /// publisher's `best_inbox` applies. A mirror with neither, and a mirror
 /// the instance has deleted, contribute nothing.
-const ALL_REMOTE_INBOXES_SQL: &str = "SELECT DISTINCT COALESCE(shared_inbox, inbox) FROM users \
-     WHERE local = false AND deleted_at IS NULL \
-       AND COALESCE(shared_inbox, inbox) IS NOT NULL \
+///
+/// The inboxes are the ones on the account's `activitypub_actors` row; an
+/// account without a row has no `ActivityPub` identity and adds nothing.
+const ALL_REMOTE_INBOXES_SQL: &str = "SELECT DISTINCT COALESCE(a.shared_inbox, a.inbox) \
+       FROM users u JOIN activitypub_actors a ON a.user_id = u.id \
+     WHERE u.local = false AND u.deleted_at IS NULL \
+       AND COALESCE(a.shared_inbox, a.inbox) IS NOT NULL \
      ORDER BY 1";
 
 /// Every distinct inbox of a live remote account this instance has ever
@@ -110,6 +114,57 @@ mod tests {
                 "https://a.example/inbox".to_owned(),
                 "https://c.example/users/c/inbox".to_owned(),
             ]
+        );
+    }
+
+    /// The census reads `activitypub_actors`: a change made to that table
+    /// alone moves the inbox, and an account without a row adds nothing.
+    #[tokio::test]
+    async fn follows_the_actor_rows_not_the_users_columns() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        mirror(
+            &pool,
+            "moved",
+            Some("https://old.example/users/moved/inbox"),
+            Some("https://old.example/inbox"),
+        )
+        .await;
+        mirror(
+            &pool,
+            "rowless",
+            Some("https://rowless.example/inbox"),
+            None,
+        )
+        .await;
+        let moved = sqlx::query(
+            "UPDATE activitypub_actors SET shared_inbox = $1 \
+             WHERE user_id = (SELECT id FROM users WHERE nickname = $2)",
+        )
+        .bind("https://new.example/inbox")
+        .bind("moved@host.example")
+        .execute(&pool)
+        .await
+        .expect("the actor row updates")
+        .rows_affected();
+        assert_eq!(moved, 1, "the shared inbox moved on the actor row only");
+        let dropped = sqlx::query(
+            "DELETE FROM activitypub_actors \
+             WHERE user_id = (SELECT id FROM users WHERE nickname = $1)",
+        )
+        .bind("rowless@host.example")
+        .execute(&pool)
+        .await
+        .expect("the actor row deletes")
+        .rows_affected();
+        assert_eq!(dropped, 1, "the account's actor row is gone");
+
+        let inboxes = all_remote_inboxes(&pool).await.expect("the census reads");
+
+        assert_eq!(
+            inboxes,
+            vec!["https://new.example/inbox".to_owned()],
+            "the actor row's shared inbox, and nothing for the account without a row"
         );
     }
 }

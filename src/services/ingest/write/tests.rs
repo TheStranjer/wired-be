@@ -340,8 +340,16 @@ async fn a_lost_uri_race_reports_raced_and_writes_nothing() {
     let state = app_state(&pool);
     let bob = author(&pool).await;
     let object = satellites_object();
-    let parsed = crate::federation::note_parser::parse_note(&object, &bob, chrono::Utc::now())
-        .expect("the note parses");
+    let followers = crate::models::activitypub_actor::followers_url(&pool, bob.id)
+        .await
+        .expect("the actor row reads");
+    let parsed = crate::federation::note_parser::parse_note(
+        &object,
+        &bob,
+        followers.as_deref(),
+        chrono::Utc::now(),
+    )
+    .expect("the note parses");
     let new = build_new_status(&parsed, &ReplyLink::default(), None, &[], &[]);
 
     let first = write_ingested(&state, &new, &parsed)

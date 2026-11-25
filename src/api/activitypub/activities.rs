@@ -23,11 +23,14 @@ use crate::{
             follow_json, like_json,
         },
         authorized_fetch::{fetch_allowed, fetch_signer},
-        note::{announce_activity_json, create_activity_json, load_note_context, note_json},
+        note::{
+            Booster, announce_activity_json, create_activity_json, load_note_context, note_json,
+        },
         vocab::AS_PUBLIC,
     },
     models::{
         activity::{self, LocalActivity, LocalActivityKind},
+        activitypub_actor,
         status::{self, Status},
         user::get_by_id,
     },
@@ -166,9 +169,16 @@ async fn announce_document(
     let Some(original_author_ap_id) = resolved.target_ap_id.as_deref() else {
         return Err(AppError::RouteNotFound);
     };
+    let followers_url = activitypub_actor::get(&state.db, author.id)
+        .await?
+        .and_then(|row| row.followers_url);
+    let booster = Booster {
+        account: &author,
+        followers_url: followers_url.as_deref(),
+    };
     announce_activity_json(
         stored,
-        &author,
+        booster,
         &resolved.object_ap_id,
         original_author_ap_id,
         &state.config,
