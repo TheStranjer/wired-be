@@ -35,6 +35,15 @@
 //! the JSON string of the field map — and `reason` is stored in
 //! `users.registration_reason` for the approval flow.
 //!
+//! The optional `wired_identifiers` object (`{"<protocol id>": "<ID>"}`, in
+//! a JSON body or as `wired_identifiers[<protocol id>]=<ID>` in a form) asks
+//! for a chosen ID on a protocol; it fills `RegisterParams::identifiers` and
+//! [`create_local_user`] claims it with the rules of the late claim, so a
+//! taken or invalid ID fails the whole registration and creates no user. A
+//! key that is not the id of an enabled protocol is the 422 field error
+//! under `wired_identifiers`. Without the field the registration is
+//! unchanged.
+//!
 //! What a success then answers is decided by the two registration modes,
 //! read back off the finished row: with
 //! `REGISTRATIONS_APPROVAL_REQUIRED` the account awaits staff approval and
@@ -132,8 +141,9 @@ const AGREEMENT_REQUIRED: &str = "You have to accept the terms to sign up";
 /// or while registrations are closed without invites;
 /// [`AppError::BadRequest`] from [`load_invite`] for a refused invite;
 /// [`AppError::Unprocessable`] when `agreement` is absent (the
-/// extractor's) or not true, and [`create_local_user`]'s field-map 422s
-/// for every invalid parameter. Any database or key-generation failure
+/// extractor's) or not true, the field-map 422 for a `wired_identifiers`
+/// key that names no enabled protocol, and [`create_local_user`]'s field-map
+/// 422s for every invalid parameter. Any database or key-generation failure
 /// arrives through `?` as [`AppError::Database`] or [`AppError::Internal`].
 pub(super) async fn create_account(
     State(state): State<AppState>,
@@ -145,7 +155,13 @@ pub(super) async fn create_account(
     if !params.agreement {
         return Err(AppError::Unprocessable(AGREEMENT_REQUIRED.to_owned()));
     }
-    let user = create_local_user(&state, params.into_register_params(), invite.as_ref()).await?;
+    let identifiers = params.requested_identifiers(&state.config)?;
+    let user = create_local_user(
+        &state,
+        params.into_register_params(identifiers),
+        invite.as_ref(),
+    )
+    .await?;
     let answer = if let Some(message) = RegistrationMessage::for_user(&user) {
         RegistrationAnswer::Pending(message)
     } else {

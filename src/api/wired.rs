@@ -24,15 +24,41 @@
 //!
 //! The route needs a user token with the `read:accounts` scope, like
 //! `verify_credentials`.
+//!
+//! # Claiming an identity
+//!
+//! `POST /api/v1/wired/protocols/{protocol}/claim` gets an account onto a
+//! protocol it is not on yet: the late enrolment of an account that
+//! registered before the operator enabled the protocol. The body is
+//! `{"identifier": "optional"}`. A blank or missing `identifier` takes the
+//! ID [`suggest_identifier`] finds free; a given one is checked by the
+//! protocol's [`validate_identifier`](ProtocolAdapter::validate_identifier).
+//! The claim is [`claim_identity`], the operation registration also uses for
+//! `wired_identifiers`, so both paths judge an ID the same way.
+//!
+//! - 200 with the [`ProtocolEntry`] `GET /api/v1/wired/protocols` gives for
+//!   that protocol, now `active`;
+//! - 404 for a protocol id that is unknown or not enabled;
+//! - 422 for an account already on the protocol, an invalid ID or a taken
+//!   one, in the field-error shape of a failed registration, under the
+//!   protocol's [`identifier_field`](ProtocolAdapter::identifier_field).
+//!
+//! It needs a user token with the `write:accounts` scope.
 
-use axum::{Json, Router, extract::State, routing::get};
-use serde::Serialize;
+use axum::{
+    Json, Router,
+    extract::{Path, State},
+    routing::{get, post},
+};
+use serde::{Deserialize, Serialize};
 
 use crate::{
     auth::AuthUser,
-    error::AppResult,
-    models::user::User,
-    oauth::scopes::READ_ACCOUNTS,
+    config::Config,
+    error::{AppError, AppResult},
+    extract::ApiBody,
+    models::user::{User, register::claim_identity},
+    oauth::scopes::{READ_ACCOUNTS, WRITE_ACCOUNTS},
     protocols::{
         adapter::ProtocolAdapter,
         identity::{IdentityStatus, suggest_identifier},
@@ -78,9 +104,19 @@ pub struct ProtocolEntry {
     pub suggestion: Option<String>,
 }
 
+/// The body of `POST /api/v1/wired/protocols/{protocol}/claim`.
+#[derive(Debug, Deserialize)]
+struct ClaimParams {
+    /// The ID the account asks for; blank or missing asks for the suggestion.
+    #[serde(default)]
+    identifier: Option<String>,
+}
+
 /// The `/api/v1/wired` router, nested into [`crate::api::v1`].
 pub fn router() -> Router<AppState> {
-    Router::new().route("/protocols", get(protocols))
+    Router::new()
+        .route("/protocols", get(protocols))
+        .route("/protocols/{protocol}/claim", post(claim))
 }
 
 /// `GET /api/v1/wired/protocols` — the caller's identity on each enabled protocol.
@@ -101,6 +137,33 @@ async fn protocols(
         entries.push(entry_for(adapter, &state, &auth.0).await?);
     }
     Ok(Json(entries))
+}
+
+/// `POST /api/v1/wired/protocols/{protocol}/claim` — gets the caller onto `protocol`.
+///
+/// # Errors
+///
+/// [`Unauthorized`](AppError::Unauthorized) /
+/// [`Forbidden`](AppError::Forbidden) from [`AuthUser`] and the `write:accounts`
+/// check; [`NotFound`](AppError::NotFound) for a protocol that is not enabled;
+/// [`Unprocessable`](AppError::Unprocessable) from [`claim_identity`] when the
+/// account is already on the protocol or the ID is invalid or taken; any
+/// database failure.
+async fn claim(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path(protocol): Path<String>,
+    ApiBody(params): ApiBody<ClaimParams>,
+) -> AppResult<Json<ProtocolEntry>> {
+    auth.require(WRITE_ACCOUNTS)?;
+    let adapter = enabled_adapter(&state.config, &protocol).ok_or(AppError::NotFound)?;
+    claim_identity(&state, adapter, &auth.0, params.identifier.as_deref()).await?;
+    Ok(Json(entry_for(adapter, &state, &auth.0).await?))
+}
+
+/// The adapter of the enabled protocol whose id string is `protocol`, if there is one.
+fn enabled_adapter(config: &Config, protocol: &str) -> Option<&'static dyn ProtocolAdapter> {
+    registry::enabled(config).find(|adapter| adapter.id().as_str() == protocol)
 }
 
 /// `user`'s standing on `adapter`'s protocol.

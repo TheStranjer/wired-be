@@ -14,4 +14,9 @@ pub(super) const ROWS: &[RouteSpec] = &[
         path: "/api/v1/wired/protocols",
         auth: AuthClass::User,
     },
+    RouteSpec {
+        method: "POST",
+        path: "/api/v1/wired/protocols/:protocol/claim",
+        auth: AuthClass::User,
+    },
 ];

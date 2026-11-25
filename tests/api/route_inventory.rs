@@ -47,7 +47,7 @@ const UUID_PARAMS: [&str; 7] = [
 /// `method` is `totp` because that MFA route is registered per method rather
 /// than with a wildcard (the only method Wired implements); `name` is a
 /// document name, which `/api/v1/pleroma/admin/instance_document/:name` reads.
-const FIXED_PARAMS: [(&str, &str); 18] = [
+const FIXED_PARAMS: [(&str, &str); 19] = [
     ("nickname", "alice"),
     ("instance", "remote.example"),
     ("tag", "wired"),
@@ -69,6 +69,7 @@ const FIXED_PARAMS: [(&str, &str); 18] = [
     ("key", "2026/01/02/media.png"),
     ("pack", "test-pack"),
     ("file", "emoji.png"),
+    ("protocol", "activitypub"),
 ];
 
 /// `path` with every `:name` parameter replaced by a concrete segment, so the
