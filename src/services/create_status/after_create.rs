@@ -53,6 +53,7 @@ use crate::{
 /// locality, never the author's.
 pub(crate) async fn after_status_created(state: &AppState, status: &status::Status) {
     notify::on_mention(state, status).await;
+    notify::on_quote(state, status).await;
     notify::on_subscribed_status(state, status).await;
     streaming::status_created(state, status).await;
     crate::jobs::rich_media::schedule_fetch(state, status).await;

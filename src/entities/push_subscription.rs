@@ -17,11 +17,12 @@ use crate::models::web_push_subscription::WebPushSubscription;
 /// Every notification type the push `alerts` object knows, in the order
 /// the ticket lists.
 ///
-/// Mastodon's eight subscription alert types beside its two `admin.`
-/// ones and Pleroma's two `pleroma:` chat and reaction types. An alert
-/// named here may be turned on or off; anything else a client sends is
-/// ignored, Pleroma's `Map.take` of its supported list.
-pub const ALERT_TYPES: [&str; 12] = [
+/// Mastodon's ten subscription alert types (the 4.5 `quote` and
+/// `quoted_update` among them) beside its two `admin.` ones and
+/// Pleroma's two `pleroma:` chat and reaction types. An alert named here
+/// may be turned on or off; anything else a client sends is ignored,
+/// Pleroma's `Map.take` of its supported list.
+pub const ALERT_TYPES: [&str; 14] = [
     "follow",
     "favourite",
     "reblog",
@@ -29,6 +30,8 @@ pub const ALERT_TYPES: [&str; 12] = [
     "poll",
     "status",
     "update",
+    "quote",
+    "quoted_update",
     "follow_request",
     "pleroma:chat_mention",
     "pleroma:emoji_reaction",

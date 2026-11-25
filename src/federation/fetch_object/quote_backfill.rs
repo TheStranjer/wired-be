@@ -12,6 +12,7 @@ use crate::{
     federation::dispatch::FederationError,
     jobs::{AttemptInfo, HandlerFuture, JobError},
     models::status,
+    services::notify,
     state::AppState,
 };
 
@@ -83,6 +84,7 @@ async fn link_quote(state: &AppState, quoting_id: Uuid) -> Result<(), JobError> 
         .map_err(|err| retry("the quote link write", &err))?;
     if linked {
         debug!(status = %quoting_id, quoted = %quoted.id, "a backfilled quote linked");
+        notify::on_quote_linked(state, quoting_id).await;
     }
     Ok(())
 }

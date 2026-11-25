@@ -276,10 +276,15 @@ fn edit_refusal(caller_id: Uuid, row: &StatusRow) -> Option<AppError> {
 /// computation, so the answer is the row the write stored however the
 /// body rewrote the text.
 ///
+/// The local author of a post this one quotes is told `quoted_update` by
+/// [`notify::on_quoted_update`], from either door alike.
+///
 /// [`notify::on_status_edited`]: crate::services::notify::on_status_edited
+/// [`notify::on_quoted_update`]: crate::services::notify::on_quoted_update
 /// [`streaming::status_edited`]: crate::services::streaming::status_edited
 pub(crate) async fn after_status_edited(state: &AppState, row: &StatusRow) {
     notify::on_status_edited(state, row).await;
+    notify::on_quoted_update(state, row).await;
     federation_out::after_status_edited(state, row).await;
     streaming::status_edited(state, row).await;
 }

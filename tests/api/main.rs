@@ -438,6 +438,9 @@ mod note_edits;
 /// favourite actions and the recipient's `GET /api/v1/notifications`.
 mod notification_generation;
 
+/// The `quote` and `quoted_update` notifications of a quoted post's author.
+mod notification_quotes;
+
 /// Pleroma's notification settings (`PUT /api/pleroma/notification_settings`)
 /// and the owner-only render of the flags.
 mod notification_settings;

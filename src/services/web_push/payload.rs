@@ -24,6 +24,11 @@ const VERBS: &[(&str, &str)] = &[
     (notification::TYPE_EMOJI_REACTION, "reacted to your post"),
     ("status", "posted"),
     ("update", "edited a post"),
+    (notification::TYPE_QUOTE, "quoted your post"),
+    (
+        notification::TYPE_QUOTED_UPDATE,
+        "edited a post that quotes yours",
+    ),
     ("poll", "ended a poll"),
     ("pleroma:chat_mention", "sent you a chat message"),
     ("admin.sign_up", "signed up"),
@@ -155,6 +160,11 @@ mod tests {
         );
         assert_eq!(verb_for("status"), "posted", "a followed account posted");
         assert_eq!(verb_for("update"), "edited a post");
+        assert_eq!(verb_for(notification::TYPE_QUOTE), "quoted your post");
+        assert_eq!(
+            verb_for(notification::TYPE_QUOTED_UPDATE),
+            "edited a post that quotes yours"
+        );
         assert_eq!(verb_for("poll"), "ended a poll");
         assert_eq!(verb_for("pleroma:chat_mention"), "sent you a chat message");
         assert_eq!(verb_for("admin.sign_up"), "signed up");
