@@ -16,7 +16,7 @@ use crate::{
     federation::fetch_actor::{get_or_fetch_by_acct, get_or_fetch_by_ap_id},
     models::user::{self, User, get_by_ap_id},
     oauth::scopes::{READ_ACCOUNTS, WRITE_ACCOUNTS},
-    services::federation_out,
+    protocols::events::{AccountEvent, dispatch},
     state::AppState,
 };
 
@@ -109,7 +109,7 @@ pub(super) async fn add_alias(
 /// Any database failure arrives through `?` as [`AppError::Database`].
 async fn announce_aliases(state: &AppState, account_id: Uuid) -> AppResult<()> {
     if let Some(updated) = user::get_by_id(&state.db, account_id).await? {
-        federation_out::after_profile_updated(state, &updated).await;
+        dispatch(state, &updated, AccountEvent::ProfileChanged).await;
     }
     Ok(())
 }

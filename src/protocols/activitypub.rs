@@ -43,6 +43,7 @@ use crate::{
     protocols::{
         ProtocolId,
         adapter::ProtocolAdapter,
+        events::AccountEvent,
         identity::{ClaimOutcome, Identity, IdentityStatus},
     },
     services,
@@ -174,6 +175,33 @@ impl ProtocolAdapter for ActivityPub {
                     ActorStatus::Active => IdentityStatus::Active,
                 },
             }))
+        })
+    }
+
+    /// Federates a profile `Update`; every other event is a no-op for now.
+    ///
+    /// The match has no wildcard, so a new [`AccountEvent`] forces a decision here.
+    fn on_account_event<'a>(
+        &'a self,
+        state: &'a AppState,
+        user: &'a User,
+        event: AccountEvent,
+    ) -> BoxFuture<'a, AppResult<()>> {
+        Box::pin(async move {
+            match event {
+                AccountEvent::ProfileChanged => {
+                    services::federation_out::after_profile_updated(state, user).await;
+                }
+                // Nothing yet: a later ticket fills in each of these, where it is needed.
+                AccountEvent::Registered
+                | AccountEvent::PasswordChanged
+                | AccountEvent::Suspended
+                | AccountEvent::Unsuspended
+                | AccountEvent::Deactivated
+                | AccountEvent::Reactivated
+                | AccountEvent::Deleted => {}
+            }
+            Ok(())
         })
     }
 

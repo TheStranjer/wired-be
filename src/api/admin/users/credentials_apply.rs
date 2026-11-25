@@ -6,13 +6,13 @@ use tracing::debug;
 use super::credentials::{CredentialsParams, CredentialsPatch};
 use super::{CANNOT_BE_BLANK, DOES_NOT_MATCH, HAS_ALREADY_TAKEN, HAS_INVALID_FORMAT, refused};
 use crate::{
-    api::accounts::after_profile_updated,
     config::Config,
     error::{AppError, AppResult},
     models::{
         oauth_token,
         user::{self, User, register},
     },
+    protocols::events::{AccountEvent, dispatch},
     state::AppState,
     util::password::hash_password,
 };
@@ -108,7 +108,7 @@ pub(super) async fn apply_credentials(
         let updated = user::update_profile(&state.db, current.id, profile)
             .await?
             .ok_or_else(|| AppError::Internal("credentials update matched no row".to_owned()))?;
-        after_profile_updated(state, &updated).await;
+        dispatch(state, &updated, AccountEvent::ProfileChanged).await;
     }
     if let Some(email) = patch.email.as_deref() {
         user::set_email(&state.db, current.id, email, current.email_confirmed.get()).await?;

@@ -3,14 +3,15 @@
 //! their follow went, and the profile `Update` of the re-read row, so the
 //! document peers hold grows its `movedTo`.
 //!
-//! The second half is [`super::profile`]'s hook, run here off the freshest
-//! row; the followers address and the publisher hand are the root's.
+//! The second half is the [`AccountEvent::ProfileChanged`] event, fired here
+//! off the freshest row; the followers address and the publisher hand are the
+//! root's.
 
-use super::after_profile_updated;
 use super::{load_collections, load_user, queue_activity};
 use crate::{
     federation::activities::{TargetedActivityContext, move_json},
     models::user::User,
+    protocols::events::{AccountEvent, dispatch},
     state::AppState,
     util::id::new_id,
 };
@@ -27,10 +28,10 @@ use crate::{
 ///   publisher's follower expansion is exactly the audience Pleroma's
 ///   `ActivityPub.move` delivers to. Its id is a fresh
 ///   `{BASE_URL}/activities/{uuid}` (decision 6);
-/// - a profile `Update` — [`after_profile_updated`] run off the re-read
-///   row, so the actor document it embeds carries the
+/// - a profile `Update` — [`AccountEvent::ProfileChanged`] dispatched off the
+///   re-read row, so the actor document it embeds carries the
 ///   `movedTo` the account just acquired (and its `alsoKnownAs` aliases).
-///   The per-account debounce key of that hook is shared here by design:
+///   The per-account debounce key of that `Update` is shared here by design:
 ///   a move straight after a burst of profile edits is one announcement
 ///   of the freshest document.
 ///
@@ -63,7 +64,7 @@ pub async fn after_account_moved(state: &AppState, old: &User, new: &User) {
         published: &now,
     });
     queue_activity(state, &moved, &document, "account move").await;
-    after_profile_updated(state, &moved).await;
+    dispatch(state, &moved, AccountEvent::ProfileChanged).await;
 }
 
 #[cfg(test)]

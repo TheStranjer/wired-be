@@ -65,7 +65,7 @@ use self::{
 
 pub(crate) use self::{
     follow::after_follow_changed,
-    profile_text::{after_profile_updated, render_note, sanitized_name, stored_fields},
+    profile_text::{render_note, sanitized_name, stored_fields},
 };
 
 mod account_statuses;

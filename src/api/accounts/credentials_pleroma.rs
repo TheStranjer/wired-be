@@ -30,8 +30,8 @@
 //! The answer
 //! is a 200 [`Account::for_owner`] render — the owner view with its
 //! `source` block, the same one `verify_credentials` answers — and every
-//! accepted request runs the `after_profile_updated` hook, which the
-//! later ticket that federates the actor's `Update` fills in.
+//! accepted request fires `AccountEvent::ProfileChanged`, which
+//! `ActivityPub` answers with the actor's `Update`.
 //!
 
 use chrono::NaiveDate;

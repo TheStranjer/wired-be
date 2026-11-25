@@ -98,13 +98,14 @@ use crate::{
         user::{self, User},
     },
     oauth::scopes::{READ_ACCOUNTS, WRITE_ACCOUNTS},
+    protocols::events::{AccountEvent, dispatch},
     services::account_emojis::AccountEmojis,
     state::AppState,
 };
 
 use super::{
     credentials_merge::profile_fields, profile_image_store::delete_replaced_files,
-    profile_images::resolve_images, profile_text::after_profile_updated,
+    profile_images::resolve_images,
 };
 
 /// `GET /api/v1/accounts/verify_credentials` — the caller's own account,
@@ -394,7 +395,7 @@ pub(super) async fn update_credentials(
         .await?
         .ok_or_else(|| AppError::Internal("profile update matched no row".to_owned()))?;
     delete_replaced_files(&state, applied.replaced).await;
-    after_profile_updated(&state, &updated).await;
+    dispatch(&state, &updated, AccountEvent::ProfileChanged).await;
     owner_view(&state, &updated).await
 }
 

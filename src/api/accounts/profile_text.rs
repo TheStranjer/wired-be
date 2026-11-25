@@ -1,9 +1,6 @@
 //! The text of the profile write: the `fields_attributes` pair
 //! (`stored_fields`), the display name (`sanitized_name`) and the note
 //! render (`render_note`).
-//!
-//! The module also holds the `after_profile_updated` hook every
-//! accepted profile write runs.
 
 use std::collections::HashMap;
 
@@ -14,8 +11,7 @@ use crate::{
     config::Config,
     error::{AppError, AppResult},
     extract::index_map_to_vec,
-    models::user::{self, User},
-    services::federation_out,
+    models::user,
     state::AppState,
     util::{
         entities::{MentionRef, extract_mentions, linkify_entities},
@@ -140,7 +136,7 @@ pub(crate) async fn render_note(state: &AppState, raw: &str) -> AppResult<String
 
 /// The profile URLs of every mention [`extract_mentions`] finds in
 /// `text` that names a local user, keyed by [`MentionRef::key`]. Lookups are
-/// citext, so `@ALICE` finds `alice`; the [`local`](User::local) flag is
+/// citext, so `@ALICE` finds `alice`; the [`local`](user::User::local) flag is
 /// the guard that keeps a remote mirror out of the table whatever its
 /// stored nickname looks like.
 async fn local_mention_urls(
@@ -161,19 +157,6 @@ async fn local_mention_urls(
         }
     }
     Ok(urls)
-}
-
-/// Post-update hook of [`update_credentials`], run once per accepted
-/// profile write with the updated row: hands the change to
-/// [`crate::services::federation_out`], which answers it with an `Update`
-/// of the actor document — the actor is [`User::ap_id`], and the queueing
-/// happens through `state` (decision 11).
-///
-/// The service debounces a burst of edits into one queued activity, so this
-/// hook is cheap to fire from every accepted write; it never fails the
-/// request.
-pub(crate) async fn after_profile_updated(state: &AppState, user: &User) {
-    federation_out::after_profile_updated(state, user).await;
 }
 
 #[cfg(test)]

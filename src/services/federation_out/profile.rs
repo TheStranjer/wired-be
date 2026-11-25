@@ -44,7 +44,11 @@ use crate::{
 /// dedup drops a repeat while an earlier one is still live — so a client
 /// `PATCH`ing five fields in five requests pays for exactly one activity.
 ///
+/// Its one non-test caller is `ActivityPub`'s adapter, which runs it on
+/// [`AccountEvent::ProfileChanged`]; core code fires that event instead of calling this.
+///
 /// [`job::enqueue`]: crate::models::job::enqueue
+/// [`AccountEvent::ProfileChanged`]: crate::protocols::events::AccountEvent::ProfileChanged
 pub async fn after_profile_updated(state: &AppState, account: &User) {
     if !state.config.federation_enabled.get() {
         return;
