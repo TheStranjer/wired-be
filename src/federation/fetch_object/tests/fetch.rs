@@ -429,3 +429,30 @@ async fn an_object_of_an_allowed_host_is_fetched() {
         server.abort();
     }
 }
+
+#[tokio::test]
+async fn nul_characters_in_a_fetched_object_are_stripped() {
+    let db = crate::test_db::test_db().await.expect("test database slot");
+    let state = test_state(db.pool().clone());
+    let listener = bind().await;
+    let base = origin(&listener);
+    let url = object_url(&base, "nul");
+    let document = json!({
+        "id": url,
+        "type": "Note",
+        "content": "nul \u{0} here",
+        "summary\u{0}": ["cw\u{0}"],
+    });
+    let server = spawn(listener, fixed_app("/objects/nul", document));
+
+    let fetched = fetch_object_json(&state, &url)
+        .await
+        .expect("a document with NULs still dereferences");
+
+    assert_eq!(
+        fetched,
+        json!({"id": url, "type": "Note", "content": "nul  here", "summary": ["cw"]}),
+        "no NUL survives into the document the ingest stores"
+    );
+    server.abort();
+}

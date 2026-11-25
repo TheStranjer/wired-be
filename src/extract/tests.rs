@@ -8,6 +8,7 @@ use axum::{
     response::IntoResponse as _,
 };
 use serde::Deserialize;
+use serde_json::json;
 
 use super::*;
 
@@ -362,4 +363,26 @@ async fn a_too_deeply_nested_form_body_key_is_a_400() {
         StatusCode::BAD_REQUEST,
         "400 through ApiBody"
     );
+}
+
+#[tokio::test]
+async fn nul_characters_are_stripped_from_json_form_and_query_values() {
+    let from_json: Named = body_of(Some(JSON_MIME), r#"{"name":"nul \u0000 local"}"#)
+        .await
+        .unwrap();
+    assert_eq!(from_json.name, "nul  local", "JSON escape stripped");
+
+    let from_form: Named = body_of(Some(FORM_MIME), "name=a%00b").await.unwrap();
+    assert_eq!(
+        from_form.name, "ab",
+        "percent-encoded NUL stripped from a form"
+    );
+
+    let from_query: Named = params_of("/x?name=c%00d", None, "").await.unwrap();
+    assert_eq!(from_query.name, "cd", "and from the query string");
+
+    let nested: Value = body_of(Some(JSON_MIME), r#"{"a":{"k\u0000":["\u0000x"]}}"#)
+        .await
+        .unwrap();
+    assert_eq!(nested, json!({"a": {"k": ["x"]}}), "nested values and keys");
 }

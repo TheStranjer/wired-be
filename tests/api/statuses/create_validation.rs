@@ -229,3 +229,30 @@ async fn a_form_body_posts_like_the_json_one() {
         "`0` is the flag off, whatever the account defaults to"
     );
 }
+
+/// U+0000 anywhere in a text parameter is removed before anything is
+/// stored (`PostgreSQL` cannot hold it), so the post answers 200 with the
+/// cleaned text instead of a 500.
+#[tokio::test]
+async fn a_nul_in_the_status_or_spoiler_is_stripped_not_a_server_error() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let (_alice, token) = user_with_token(&pool, "alice", WRITE).await;
+    let app = common::test_app(pool.clone());
+
+    let value = posted(
+        &app,
+        &token,
+        json!({"status": "nul \u{0} local", "spoiler_text": "cw\u{0}"}),
+    )
+    .await;
+
+    assert_eq!(
+        value["pleroma"]["content"],
+        json!({ "text/plain": "nul  local" }),
+        "the stored source text has no NUL"
+    );
+    assert_eq!(value["spoiler_text"], "cw", "nor has the spoiler");
+    let row = created_row(&pool, &value).await;
+    assert_eq!(row.raw_text, "nul  local", "the row holds the cleaned text");
+}

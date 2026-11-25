@@ -67,6 +67,7 @@ use crate::{
     },
     models::user::User,
     state::AppState,
+    util::nul::strip_nul_json,
 };
 
 mod body;
@@ -189,7 +190,10 @@ async fn authenticate(
     if !declares_json_type(&parts.headers) {
         return Err(InboxAuthError::wrong_type());
     }
-    let json = parse_json_body(&body)?;
+    let mut json = parse_json_body(&body)?;
+    // The digest below covers the original bytes; only the parsed copy is
+    // cleaned, since the database cannot store U+0000 in the queued job.
+    strip_nul_json(&mut json);
     let parsed = present_signature(&parts.headers)?;
     require_unblocked(state, &parsed.key_id).await?;
     verify_digest(&parts.headers, &body).map_err(|_err| InboxAuthError::invalid_digest())?;
@@ -272,6 +276,50 @@ mod tests {
         .await;
         assert_eq!(mirror_reply.status, StatusCode::OK, "the second delivery");
         assert_eq!(hits.load(Ordering::SeqCst), 1, "answered from the mirror");
+        server.abort();
+    }
+
+    /// A signed activity with U+0000 in its JSON authenticates against the
+    /// original bytes, and the extractor hands over the cleaned document.
+    #[tokio::test]
+    async fn nul_in_a_signed_activity_is_stripped_after_the_digest_check() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let listener = bind().await;
+        let base = origin(&listener);
+        let ap_id = format!("{base}/users/alice");
+        let server = spawn(
+            listener,
+            peer_app(peer(base.clone(), FIXTURE_PUBLIC_PKCS1_PEM.to_owned())),
+        );
+        let app = inbox_app(test_state(pool.clone()));
+
+        let body = serde_json::json!({
+            "type": "Create",
+            "actor": ap_id,
+            "object": {"type": "Note", "content": "nul \u{0} end", "to\u{0}": "x"},
+        })
+        .to_string()
+        .into_bytes();
+        assert!(
+            body.windows(6).any(|window| window == b"\\u0000"),
+            "the wire body carries the NUL escape"
+        );
+        let answer = send(
+            &app,
+            &deliver(
+                &format!("{ap_id}#main-key"),
+                FIXTURE_PRIVATE_PKCS1_PEM,
+                &body,
+            ),
+        )
+        .await;
+        assert_eq!(answer.status, StatusCode::OK, "authenticated, not a 500");
+        assert_eq!(
+            answer.json.pointer("/document/object"),
+            Some(&serde_json::json!({"type": "Note", "content": "nul  end", "to": "x"})),
+            "the handed-over document has no NUL in values or keys"
+        );
         server.abort();
     }
 

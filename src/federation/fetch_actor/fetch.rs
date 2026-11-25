@@ -18,7 +18,7 @@ use crate::{
     http_client::HttpClient,
     models::user::{User, get_by_ap_id},
     state::AppState,
-    util::url::same_origin,
+    util::{nul::strip_nul_json, url::same_origin},
 };
 
 use super::{
@@ -182,9 +182,10 @@ async fn fetch_document(
             "the response from `{url}` does not declare an ActivityPub content type"
         )));
     }
-    let document: Value = response.json().map_err(|err| {
+    let mut document: Value = response.json().map_err(|err| {
         FetchError::Invalid(format!("the body of `{url}` is not parseable JSON: {err}"))
     })?;
+    strip_nul_json(&mut document);
     Ok((document, response.url))
 }
 
