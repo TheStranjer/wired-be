@@ -5,6 +5,13 @@
 //! `src/api/activitypub*` (the HTTP routes and handlers); every hook of
 //! [`ProtocolAdapter`] implemented here only delegates to those modules.
 //!
+//! # Client API
+//!
+//! [`client_api_router`](ProtocolAdapter::client_api_router) returns
+//! [`crate::api::activitypub_client_router`]: the statuses, timelines,
+//! relationships and other `ActivityPub`-backed routes of the Mastodon/Pleroma
+//! client API. The core client routes are not here; they are always mounted.
+//!
 //! # Job kinds
 //!
 //! A job kind belongs to `ActivityPub` when its handler lives under
@@ -117,6 +124,11 @@ impl ProtocolAdapter for ActivityPub {
     /// The routes of [`crate::api::activitypub`]: actors, objects, inboxes, outboxes.
     fn router(&self, state: &AppState) -> Router<AppState> {
         crate::api::activitypub::router(&state.config)
+    }
+
+    /// The `ActivityPub`-backed client routes of [`crate::api::activitypub_client_router`].
+    fn client_api_router(&self, state: &AppState) -> Router<AppState> {
+        crate::api::activitypub_client_router(state)
     }
 
     /// The federation job kinds listed in the module docs.

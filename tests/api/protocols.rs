@@ -266,3 +266,100 @@ async fn update_credentials_without_activitypub_records_the_event_only() {
     .expect("the job count reads");
     assert_eq!(deliveries, 0, "no ActivityPub job of any kind");
 }
+
+/// Core client routes answer, and `ActivityPub`-backed ones do not, with only `fixture` enabled.
+#[tokio::test]
+async fn a_fixture_only_instance_keeps_the_core_client_api_and_drops_the_activitypub_half() {
+    let db = common::test_db().await;
+    let app = common::test_app_with_config(db.pool().clone(), config_with_protocols("fixture"));
+
+    let timeline = common::TestRequest::get("/api/v1/timelines/public")
+        .send(&app)
+        .await;
+    assert_eq!(
+        timeline.status,
+        StatusCode::NOT_FOUND,
+        "the timeline is ActivityPub-backed"
+    );
+    assert_eq!(
+        timeline.header("x-wired-fallback"),
+        Some("1"),
+        "the fallback answers the timeline"
+    );
+
+    let instance = common::TestRequest::get("/api/v1/instance")
+        .send(&app)
+        .await;
+    common::assert_answer(&instance, StatusCode::OK, "instance info is core");
+
+    let registered = common::TestRequest::post("/api/v1/apps")
+        .json(&serde_json::json!({
+            "client_name": "Fixture Client",
+            "redirect_uris": "urn:ietf:wg:oauth:2.0:oob",
+        }))
+        .send(&app)
+        .await;
+    common::assert_answer(&registered, StatusCode::OK, "app registration is core");
+}
+
+/// Every `ActivityPub`-backed prefix is unmounted with only `fixture`, and mounted by default.
+#[tokio::test]
+async fn activitypub_backed_client_routes_follow_the_activitypub_toggle() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let fixture_app = common::test_app_with_config(pool.clone(), config_with_protocols("fixture"));
+    let default_app = common::test_app(pool);
+    let activitypub_backed = [
+        "/api/v1/timelines/public",
+        "/api/v2/filters",
+        "/api/v2/search",
+        "/api/v1/pleroma/chats",
+    ];
+
+    for path in activitypub_backed {
+        let without = common::TestRequest::get(path).send(&fixture_app).await;
+        assert_eq!(
+            without.header("x-wired-fallback"),
+            Some("1"),
+            "{path} is the fallback without ActivityPub"
+        );
+        let with = common::TestRequest::get(path).send(&default_app).await;
+        assert_eq!(
+            with.header("x-wired-fallback"),
+            None,
+            "{path} is a route with ActivityPub"
+        );
+    }
+    let core = common::TestRequest::get("/api/v1/pleroma/emoji/packs")
+        .send(&fixture_app)
+        .await;
+    assert_eq!(
+        core.header("x-wired-fallback"),
+        None,
+        "the emoji packs route is core"
+    );
+}
+
+/// The fixture's `client_api_router` hook is mounted only while the fixture is enabled.
+#[tokio::test]
+async fn the_fixture_client_api_route_is_mounted_only_when_the_fixture_is_enabled() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let fixture_app = common::test_app_with_config(pool.clone(), config_with_protocols("fixture"));
+    let activitypub_app = common::test_app_with_config(pool, config_with_protocols("activitypub"));
+
+    let served = common::TestRequest::get("/api/v1/fixture/ping")
+        .send(&fixture_app)
+        .await;
+    assert_eq!(served.status, StatusCode::NO_CONTENT, "the fixture answers");
+
+    let absent = common::TestRequest::get("/api/v1/fixture/ping")
+        .send(&activitypub_app)
+        .await;
+    assert_eq!(absent.status, StatusCode::NOT_FOUND, "no owner, no route");
+    assert_eq!(
+        absent.header("x-wired-fallback"),
+        Some("1"),
+        "the fallback answers"
+    );
+}
