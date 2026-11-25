@@ -67,6 +67,7 @@ mod cast_vote;
 mod create;
 mod ending;
 mod reads;
+mod replace;
 mod votes;
 
 #[cfg(test)]
@@ -76,6 +77,7 @@ pub use cast_vote::cast_vote;
 pub use create::{RemoteTotals, create, record_remote_totals};
 pub use ending::{fetch_ended_unnotified, mark_ended_notified, voter_ids};
 pub use reads::{for_statuses, get_by_id, get_for_status, options, options_for_statuses};
+pub use replace::{delete_for_status, replace_remote_poll};
 pub use votes::{has_voted, voted_option_positions, votes_by_status};
 
 /// The `polls` columns [`Poll`] decodes, in the one spelling every statement

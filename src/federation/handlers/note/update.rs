@@ -8,7 +8,9 @@ use serde_json::Value;
 use tracing::debug;
 use uuid::Uuid;
 
-use super::media_poll::{MediaPlan, plan_media, refresh_poll, replace_media, stored_media};
+use super::media_poll::{
+    MediaPlan, plan_media, refresh_poll, remove_poll, replace_media, stored_media,
+};
 #[cfg(doc)]
 use super::update_note;
 use crate::{
@@ -147,6 +149,7 @@ async fn fold_edit(
         replace_media(state, stored.id, &old_ids, &parsed.attachments).await?;
     }
     refresh_poll(state, stored.id, parsed.poll.as_ref()).await?;
+    remove_poll(state, stored.id, parsed.poll.as_ref()).await?;
     if !text_unchanged || media_plan.changes_media() {
         after_status_edited(state, stored).await;
     }
