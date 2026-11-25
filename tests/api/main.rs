@@ -497,6 +497,9 @@ mod pleroma_settings;
 /// Pinned statuses (`/api/v1/statuses/{id}/pin` and its `…/unpin` twin).
 mod pins;
 
+/// The protocol adapters `app()` mounts under each `PROTOCOLS` value.
+mod protocols;
+
 /// Poll parameters on `POST /api/v1/statuses`: the `CommonAPI` poll rules,
 /// the empty-text skip, the form nesting, and the storage wiring — poll
 /// and option rows committed with the status, rendered in the entity,

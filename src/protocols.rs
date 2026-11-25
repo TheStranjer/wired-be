@@ -21,8 +21,27 @@
 //!
 //! # Where later pieces live
 //!
-//! The registry, the per-protocol adapters, discovery, identities and events
-//! live under `src/protocols/`. This file only names the protocols.
+//! Under `src/protocols/`:
+//!
+//! - [`adapter`] holds [`ProtocolAdapter`](adapter::ProtocolAdapter), the one
+//!   trait every protocol implements; required methods are decisions every
+//!   protocol makes, methods with a default are optional hooks.
+//! - [`registry`] maps each [`ProtocolId`] to its adapter
+//!   ([`registry::adapter`]) and lists the ones an instance runs
+//!   ([`registry::enabled`]); [`crate::app`] mounts exactly those.
+//! - [`activitypub`] is `ActivityPub`'s adapter, a thin façade over the code in
+//!   `src/federation/` and `src/api/activitypub*`.
+//! - `fixture` (test builds only) is the minimal adapter, the template to copy
+//!   for a new protocol.
+//!
+//! Discovery, identities and events will live here too. This file only names
+//! the protocols and declares the submodules.
+
+pub mod activitypub;
+pub mod adapter;
+#[cfg(any(test, feature = "integration-tests"))]
+pub mod fixture;
+pub mod registry;
 
 #[cfg(not(any(feature = "activitypub")))]
 compile_error!("WiredBE needs at least one protocol feature: activitypub");
