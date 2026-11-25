@@ -2,6 +2,7 @@
 //! rewritten, and the remote poll totals written over the mirrored ones.
 
 use sqlx::PgPool;
+use tracing::debug;
 use uuid::Uuid;
 
 use super::whole;
@@ -14,7 +15,7 @@ use crate::{
         note_parser::{ParsedAttachment, ParsedPoll},
     },
     models::{
-        poll::{self, RemoteTotals},
+        poll::{self, PollOption, RemoteTotals},
         status_edit::media_attributes::MediaRefresh,
     },
     services::ingest,
@@ -182,9 +183,11 @@ pub(super) async fn replace_media(
 /// The poll arm of [`fold_edit`]: a `Question` whose update restates its
 /// poll has the remote's numbers written over the mirrored ones — options,
 /// voter count, total and deadline — and a `Question` that arrived without
-/// a poll grows one exactly the create path would have grown it. A document
-/// carrying no poll moves nothing; the stored poll's own votes, cast here,
-/// are nobody's to overwrite from there.
+/// a poll grows one exactly the create path would have grown it. A poll
+/// whose option titles or choice mode changed is replaced outright (the
+/// remote reset its votes), see [`poll::replace_remote_poll`]. A document
+/// carrying no poll moves nothing here; [`remove_poll`] is the caller's
+/// separate answer for a full edit of a non-`Question`.
 pub(super) async fn refresh_poll(
     state: &AppState,
     status_id: Uuid,
@@ -198,6 +201,14 @@ pub(super) async fn refresh_poll(
         .map_err(|err| FederationError::transient("the stored poll read failed", &err))?;
     if let Some(poll) = stored {
         let totals = remote_totals(poll_data);
+        let held = poll::options(&state.db, poll.id)
+            .await
+            .map_err(|err| FederationError::transient("the stored options read failed", &err))?;
+        if options_differ(&held, poll.multiple, poll_data) {
+            return poll::replace_remote_poll(&state.db, poll.id, poll_data.multiple, &totals)
+                .await
+                .map_err(|err| FederationError::transient("the poll replacement failed", &err));
+        }
         return poll::record_remote_totals(&state.db, poll.id, &totals)
             .await
             .map_err(|err| FederationError::transient("the remote poll totals failed", &err));
@@ -212,6 +223,36 @@ pub(super) async fn refresh_poll(
         .await
         .map_err(|err| FederationError::transient("the poll insert commit failed", &err))?;
     Ok(())
+}
+
+/// Deletes the stored poll of a post whose edit no longer carries one: the
+/// `Update` is not a `Question` (a `Note` without `oneOf`/`anyOf`).
+pub(super) async fn remove_poll(
+    state: &AppState,
+    status_id: Uuid,
+    question: Option<&ParsedPoll>,
+) -> Result<(), FederationError> {
+    if question.is_some() {
+        return Ok(());
+    }
+    let removed = poll::delete_for_status(&state.db, status_id)
+        .await
+        .map_err(|err| FederationError::transient("the poll removal failed", &err))?;
+    if removed {
+        debug!(status = %status_id, "an Update dropped the poll; deleted it");
+    }
+    Ok(())
+}
+
+/// Whether the document's options differ from the stored ones — the titles
+/// compared in order — or its choice mode from `multiple`.
+fn options_differ(held: &[PollOption], multiple: bool, poll_data: &ParsedPoll) -> bool {
+    multiple != poll_data.multiple
+        || held.len() != poll_data.options.len()
+        || held
+            .iter()
+            .zip(&poll_data.options)
+            .any(|(row, option)| row.title != option.title)
 }
 
 /// The remote's report as [`RemoteTotals`]: each option its stated count,
@@ -498,5 +539,202 @@ mod tests {
             .expect("the update's poll landed");
         assert_eq!(stand.voters_count, 42, "as a mirrored create's would");
         assert_eq!(poll::options(&pool, stand.id).await.unwrap().len(), 2);
+    }
+
+    /// A mirrored poll post at `uri` holding the fixture's `Tea`/`Coffee`
+    /// poll, on which `voter` has voted for `Tea`: the status id and the poll.
+    async fn mirrored_poll_voted_on(pool: &PgPool, uri: &str) -> (Uuid, Uuid, Uuid) {
+        let author = author(pool).await;
+        let row = mirrored(pool, &author, uri, "tea or coffee?").await;
+        let mut tx = pool.begin().await.expect("the poll fixture opens");
+        ingest::insert_poll(&mut tx, row.id, Some(&json_parsed_poll(18, end_time())))
+            .await
+            .expect("the poll fixture lands");
+        tx.commit().await.expect("the poll fixture commits");
+        let stand = poll::get_for_status(pool, row.id)
+            .await
+            .expect("the poll read")
+            .expect("the poll is stored");
+        let voter = crate::test_fixtures::local_user(pool, "poll_voter").await;
+        let held = poll::options(pool, stand.id).await.expect("the options");
+        let cast = poll::cast_vote(pool, stand.id, voter.id, &[held[0].id])
+            .await
+            .expect("the local vote casts");
+        assert!(cast, "the fixture vote lands");
+        (row.id, stand.id, voter.id)
+    }
+
+    /// The `Question` update of `uri` offering `titles` (one vote apiece),
+    /// as `oneOf` or, when `multiple`, `anyOf`.
+    fn question_with(uri: &str, titles: &[&str], multiple: bool) -> ActivityView {
+        let entries: Vec<serde_json::Value> = titles
+            .iter()
+            .map(|title| {
+                json!({
+                    "type": "Note",
+                    "name": title,
+                    "replies": { "type": "Collection", "totalItems": 0 },
+                })
+            })
+            .collect();
+        let key = if multiple { "anyOf" } else { "oneOf" };
+        view_of(
+            "Update",
+            note(
+                uri,
+                json!({
+                    "type": "Question",
+                    "updated": EDITED,
+                    "votersCount": 0,
+                    key: entries,
+                }),
+            ),
+            None,
+        )
+    }
+
+    #[tokio::test]
+    async fn new_option_titles_replace_the_poll_and_reset_local_votes() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let state = app_state(&pool);
+        let uri = "https://remote.example/users/bob/statuses/poll-new";
+        let (status_id, poll_id, voter) = mirrored_poll_voted_on(&pool, uri).await;
+
+        let outcome = update_note(
+            state,
+            question_with(uri, &["new1", "new2", "new3"], false),
+            author_again(&pool).await,
+        )
+        .await
+        .expect("the fold completes");
+
+        assert_eq!(outcome, Outcome::Handled, "the edit is folded");
+        let stand = poll::get_for_status(&pool, status_id)
+            .await
+            .expect("the poll read")
+            .expect("the poll is stored");
+        assert_eq!(stand.id, poll_id, "the same poll row");
+        let fresh = poll::options(&pool, poll_id).await.expect("the options");
+        let titles: Vec<&str> = fresh.iter().map(|o| o.title.as_str()).collect();
+        assert_eq!(titles, vec!["new1", "new2", "new3"], "the new options");
+        assert!(
+            fresh.iter().all(|o| o.votes_count == 0),
+            "the remote's zero counts"
+        );
+        assert_eq!(stand.votes_count, 0, "the remote's total");
+        assert!(
+            !poll::has_voted(&pool, poll_id, voter)
+                .await
+                .expect("the ballot read"),
+            "the local voter's ballot is gone"
+        );
+        assert!(
+            poll::voted_option_positions(&pool, poll_id, voter)
+                .await
+                .expect("the positions read")
+                .is_empty(),
+            "so voted renders false and own_votes is empty"
+        );
+
+        let again = poll::cast_vote(&pool, poll_id, voter, &[fresh[1].id])
+            .await
+            .expect("the new vote casts");
+        assert!(again, "the voter can vote on the new option");
+    }
+
+    #[tokio::test]
+    async fn a_choice_mode_change_alone_updates_multiple() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let state = app_state(&pool);
+        let uri = "https://remote.example/users/bob/statuses/poll-mode";
+        let (status_id, poll_id, voter) = mirrored_poll_voted_on(&pool, uri).await;
+
+        let outcome = update_note(
+            state,
+            question_with(uri, &["Tea", "Coffee"], true),
+            author_again(&pool).await,
+        )
+        .await
+        .expect("the fold completes");
+
+        assert_eq!(outcome, Outcome::Handled, "the edit is folded");
+        let stand = poll::get_for_status(&pool, status_id)
+            .await
+            .expect("the poll read")
+            .expect("the poll is stored");
+        assert!(stand.multiple, "single became multiple choice");
+        assert!(
+            !poll::has_voted(&pool, poll_id, voter)
+                .await
+                .expect("the ballot read"),
+            "a changed poll starts over"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_same_titles_keep_local_votes_and_refresh_counts_only() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let state = app_state(&pool);
+        let uri = "https://remote.example/users/bob/statuses/poll-same";
+        let (_status_id, poll_id, voter) = mirrored_poll_voted_on(&pool, uri).await;
+
+        let outcome = update_note(
+            state,
+            view_of("Update", question_update(uri), None),
+            author_again(&pool).await,
+        )
+        .await
+        .expect("the fold completes");
+
+        assert_eq!(outcome, Outcome::Handled, "the edit is folded");
+        assert!(
+            poll::has_voted(&pool, poll_id, voter)
+                .await
+                .expect("the ballot read"),
+            "the ballot survives a counts-only update"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_update_without_options_removes_the_poll() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let state = app_state(&pool);
+        let uri = "https://remote.example/users/bob/statuses/poll-gone";
+        let (status_id, poll_id, _voter) = mirrored_poll_voted_on(&pool, uri).await;
+
+        let outcome = update_note(
+            state,
+            view_of(
+                "Update",
+                note(
+                    uri,
+                    json!({ "updated": EDITED, "content": "<p>plain now</p>" }),
+                ),
+                None,
+            ),
+            author_again(&pool).await,
+        )
+        .await
+        .expect("the fold completes");
+
+        assert_eq!(outcome, Outcome::Handled, "the edit is folded");
+        assert!(
+            poll::get_for_status(&pool, status_id)
+                .await
+                .expect("the poll read")
+                .is_none(),
+            "the poll is deleted"
+        );
+        assert!(
+            poll::options(&pool, poll_id)
+                .await
+                .expect("the options read")
+                .is_empty(),
+            "with its options"
+        );
     }
 }

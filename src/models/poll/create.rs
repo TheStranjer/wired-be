@@ -37,7 +37,7 @@ static INSERT_POLL_SQL: LazyLock<String> = LazyLock::new(|| {
 /// goes in one statement and a poll's options appear all at once with it.
 ///
 /// [`WITH ORDINALITY`]: https://www.postgresql.org/docs/current/functions-array.html
-const INSERT_OPTIONS_SQL: &str =
+pub(super) const INSERT_OPTIONS_SQL: &str =
     "INSERT INTO poll_options (id, poll_id, position, title, votes_count)
      SELECT o.id, $1, (o.ord - 1)::integer, o.title, o.votes
        FROM unnest($2::uuid[], $3::text[], $4::integer[])
@@ -102,8 +102,10 @@ pub async fn create(
 #[derive(Clone, Debug, Default)]
 pub struct RemoteTotals {
     /// Each stored option's title with the vote count the remote gives it.
-    /// A title that matches no stored option writes nothing — the options
-    /// of a running poll are not the update's to replace.
+    /// For [`record_remote_totals`] a title that matches no stored option
+    /// writes nothing; an update that changes the titles goes through
+    /// [`replace_remote_poll`](super::replace_remote_poll) instead, which
+    /// inserts these options fresh.
     pub options: Vec<(String, i32)>,
     /// The remote's distinct-voter count for the poll.
     pub voters_count: i32,
