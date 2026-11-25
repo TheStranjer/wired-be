@@ -333,6 +333,37 @@ mod tests {
         server.abort();
     }
 
+    /// A trailing-dot or Unicode/punycode spelling of a rejected host in the
+    /// `keyId` is refused at the door, before any key fetch: no peer is
+    /// listening, so a delivery that got past the gate would answer 401.
+    #[tokio::test]
+    async fn a_respelled_rejected_host_is_refused_without_a_fetch() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        block_domain(&pool, "evil.example").await;
+        set_mrf_lists(&pool, &json!({"reject": ["Bücher.Example."]})).await;
+        let app = inbox_app(test_state(pool.clone()));
+
+        for key_id in [
+            "https://evil.example./users/alice#main-key",
+            "https://EVIL.example./users/alice#main-key",
+            "https://sub.evil.example./users/alice#main-key",
+            "https://xn--bcher-kva.example/users/alice#main-key",
+            "https://xn--bcher-kva.example./users/alice#main-key",
+        ] {
+            let actor = key_id.trim_end_matches("#main-key");
+            let body = activity(actor, "https://test.example/users/bob");
+            let answer = send(&app, &deliver(key_id, FIXTURE_PRIVATE_PKCS1_PEM, &body)).await;
+            assert_eq!(
+                answer.status,
+                StatusCode::FORBIDDEN,
+                "`{key_id}` is a rejected host: {}",
+                answer.error
+            );
+            assert_eq!(answer.error, REJECTED, "with the ticket wording");
+        }
+    }
+
     /// The MRF domain lists are the same gate at the same step: a host the
     /// configured `simple` policy rejects is refused with the very 403, and
     /// a host its allowlist does not name is refused with it too — the

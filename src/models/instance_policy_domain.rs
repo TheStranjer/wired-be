@@ -13,7 +13,7 @@
 use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 
-use crate::error::AppResult;
+use crate::{error::AppResult, util::url::canonical_host};
 
 /// [`list`]: every policy domain, alphabetically by host, so two reads of
 /// an unchanged table answer the same array. The primary key's index
@@ -60,7 +60,7 @@ pub async fn list(pool: &PgPool) -> AppResult<Vec<InstancePolicyDomain>> {
 /// needs no `LIKE` escaping, and `notevil.example` never yields
 /// `evil.example`.
 fn host_and_parents(host: &str) -> Vec<String> {
-    let host = host.to_ascii_lowercase();
+    let host = canonical_host(host);
     let mut names = Vec::new();
     let mut rest = host.as_str();
     loop {
@@ -171,9 +171,40 @@ mod tests {
         assert_eq!(host_and_parents(""), vec![""], "empty stays one empty name");
         assert_eq!(
             host_and_parents("a."),
-            vec!["a."],
-            "a trailing dot adds no empty parent"
+            vec!["a"],
+            "a trailing dot is dropped"
         );
+        assert_eq!(
+            host_and_parents("Evil.Example."),
+            vec!["evil.example", "example"],
+            "the dotted spelling walks the same names"
+        );
+        assert_eq!(
+            host_and_parents("bücher.example"),
+            vec!["xn--bcher-kva.example", "example"],
+            "a Unicode host walks punycode names"
+        );
+    }
+
+    /// A dotted or Unicode spelling of a rejected host is still rejected.
+    #[tokio::test]
+    async fn alternate_spellings_of_a_rejected_host_are_rejected() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        insert(&pool, "evil.example", "reject", "").await;
+        insert(&pool, "xn--bcher-kva.example", "reject", "").await;
+        for host in [
+            "evil.example.",
+            "Evil.Example.",
+            "a.evil.example.",
+            "bücher.example",
+            "xn--bcher-kva.example.",
+        ] {
+            assert!(
+                is_rejected(&pool, host).await.unwrap(),
+                "`{host}` is covered by a reject row"
+            );
+        }
     }
 
     /// A `reject` row for a domain covers every host beneath it.

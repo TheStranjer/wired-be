@@ -23,7 +23,7 @@ use crate::{
         user::User,
     },
     state::AppState,
-    util::url::parse_http_url,
+    util::url::{canonical_host, parse_http_url},
 };
 
 /// The inbox to deliver to `actor`: their shared (instance-wide) inbox when
@@ -91,8 +91,8 @@ pub async fn enqueue_delivery(
         debug!(inbox, "delivery skipped: the inbox is this instance's own");
         return Ok(());
     }
-    let host = target.host_str().unwrap_or_default();
-    if host_refused(state, host).await? {
+    let host = canonical_host(target.host_str().unwrap_or_default());
+    if host_refused(state, &host).await? {
         debug!(inbox, "delivery refused: instance policy rejects {host}");
         return Ok(());
     }

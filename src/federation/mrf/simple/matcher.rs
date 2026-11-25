@@ -6,7 +6,7 @@
 use serde_json::Value;
 use tracing::warn;
 
-use crate::federation::mrf::Transparency;
+use crate::{federation::mrf::Transparency, util::url::canonical_host};
 
 use super::lists::{Entry, List, Reason};
 
@@ -29,7 +29,8 @@ pub(super) struct Rule {
     /// entry compares against, and what transparency reports.
     pub(super) pattern: String,
     /// The domain the rule stands for — the pattern itself, or the part a
-    /// `*.` wildcard covers.
+    /// `*.` wildcard covers — in the canonical host spelling (punycode,
+    /// no trailing dot) that hosts are compared in.
     pub(super) stem: String,
     /// Whether the pattern is the `*.domain` wildcard form.
     pub(super) wildcard: bool,
@@ -38,14 +39,14 @@ pub(super) struct Rule {
 }
 
 impl Rule {
-    /// Whether `host` — already lowercased by [`DomainMatcher::matches`] —
-    /// is this rule's host: the exact pattern, or, under a wildcard, that
+    /// Whether `host` — already canonical, as [`DomainMatcher::matches`]
+    /// makes it — is this rule's host: the exact pattern, or, under a wildcard, that
     /// domain itself or any domain strictly below it. A look-alike tail
     /// (`evil-example.com` under `*.example.com`) is not below anything:
     /// the boundary has to be a dot.
     fn matches(&self, host: &str) -> bool {
         if !self.wildcard {
-            return host == self.pattern;
+            return host == self.stem;
         }
         host == self.stem || is_below(host, &self.stem)
     }
@@ -81,7 +82,7 @@ impl DomainMatcher {
     /// `*.example.com` entry covers `example.com` and everything below it.
     #[must_use]
     pub fn matches(&self, host: &str) -> Option<&Reason> {
-        let host = host.to_ascii_lowercase();
+        let host = canonical_host(host);
         self.rules
             .iter()
             .find(|rule| rule.matches(&host))
@@ -165,6 +166,34 @@ mod tests {
         ] {
             assert!(!matcher.contains(host), "`{host}` is not the entry's host");
         }
+    }
+
+    /// [`DomainMatcher`]: a trailing dot or a Unicode/punycode spelling on
+    /// either side names the same host.
+    #[test]
+    fn spellings_of_one_host_meet() {
+        let exact = DomainMatcher::new(&[Entry::new("evil.example", None)]);
+        let dotted = DomainMatcher::new(&[Entry::new("Evil.Example.", None)]);
+        let unicode = DomainMatcher::new(&[Entry::new("Bücher.example", None)]);
+        let wildcard = DomainMatcher::new(&[Entry::new("*.bücher.example", None)]);
+        for matcher in [&exact, &dotted] {
+            for host in ["evil.example", "evil.example.", "EVIL.Example."] {
+                assert!(matcher.contains(host), "`{host}` is evil.example");
+            }
+        }
+        for matcher in [&unicode, &wildcard] {
+            for host in [
+                "bücher.example",
+                "xn--bcher-kva.example",
+                "xn--bcher-kva.example.",
+            ] {
+                assert!(matcher.contains(host), "`{host}` is the bücher host");
+            }
+        }
+        assert!(
+            wildcard.contains("a.xn--bcher-kva.example."),
+            "a wildcard covers a dotted punycode subdomain"
+        );
     }
 
     /// [`DomainMatcher`]: a `*.` entry covers its own domain and every

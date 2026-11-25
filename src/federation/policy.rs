@@ -10,7 +10,10 @@
 use sqlx::PgPool;
 use url::Url;
 
-use crate::{error::AppResult, federation::mrf, models::instance_policy_domain, state::AppState};
+use crate::{
+    error::AppResult, federation::mrf, models::instance_policy_domain, state::AppState,
+    util::url::canonical_host,
+};
 
 /// Whether `host` is on a reject list: the instance-policy table (a row for
 /// the host or any parent domain), or the domain lists of the [`mrf`]
@@ -49,16 +52,17 @@ pub(crate) async fn host_refused_with(
     instance_policy_domain::is_rejected(pool, host).await
 }
 
-/// The host of a signer's key URL, lowercase and without the port.
+/// The canonical host of a signer's key URL, without the port.
 ///
 /// It is the authority of its `keyId` (or, equivalently, of the actor URL
-/// it points at) — the canonical spelling `instance_policy_domains` rows
-/// keep. `None` when the URL cannot be parsed.
+/// it points at) in the [`canonical_host`] spelling `instance_policy_domains`
+/// rows keep: lowercase, punycode, no trailing dot. `None` when the URL
+/// cannot be parsed.
 #[must_use]
 pub fn signer_host(key_id: &str) -> Option<String> {
     let parsed = Url::parse(key_id).ok()?;
-    let host = parsed.host_str()?;
-    (!host.is_empty()).then(|| host.to_ascii_lowercase())
+    let host = canonical_host(parsed.host_str()?);
+    (!host.is_empty()).then_some(host)
 }
 
 #[cfg(test)]
@@ -176,5 +180,63 @@ mod tests {
             None,
             "an unparsable keyId names no host"
         );
+    }
+
+    /// A trailing dot and Unicode/punycode spellings reach one host.
+    #[test]
+    fn signer_host_canonicalizes_trailing_dots_and_idna() {
+        for key_id in [
+            "https://evil.example./users/x#main-key",
+            "https://EVIL.example./users/x#main-key",
+            "https://evil.example.:8443/users/x#main-key",
+        ] {
+            assert_eq!(
+                signer_host(key_id).as_deref(),
+                Some("evil.example"),
+                "`{key_id}` is on evil.example"
+            );
+        }
+        for key_id in [
+            "https://bücher.example/users/x#main-key",
+            "https://xn--bcher-kva.example./users/x#main-key",
+        ] {
+            assert_eq!(
+                signer_host(key_id).as_deref(),
+                Some("xn--bcher-kva.example"),
+                "`{key_id}` is the punycode host"
+            );
+        }
+    }
+
+    /// A dotted or punycode spelling of a listed host is still refused,
+    /// by the table and by the MRF list.
+    #[tokio::test]
+    async fn alternate_spellings_of_a_rejected_host_are_refused() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        table_row(&pool, "evil.example", "reject").await;
+        mrf_rejects(&pool, &["mrf.example", "Bücher.Example"]).await;
+        let state = AppState::for_tests(pool.clone(), Config::for_tests());
+        let config = mrf::load_config(&state).await;
+
+        for host in [
+            "evil.example.",
+            "a.evil.example.",
+            "EVIL.example",
+            "bücher.example",
+            "mrf.example.",
+            "xn--bcher-kva.example",
+        ] {
+            assert!(
+                host_refused(&state, host).await.unwrap(),
+                "`{host}` is refused through the state"
+            );
+            assert!(
+                host_refused_with(&pool, config.as_ref(), host)
+                    .await
+                    .unwrap(),
+                "`{host}` is refused over a preloaded config"
+            );
+        }
     }
 }

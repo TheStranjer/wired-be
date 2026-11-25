@@ -9,6 +9,7 @@ use serde_json::Value;
 use tracing::warn;
 
 use super::{WILDCARD_PREFIX, matcher::Rule};
+use crate::util::url::canonical_host;
 
 /// One of the policy's domain lists, named by its configuration key.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -187,10 +188,7 @@ impl Entry {
             return None;
         }
         let wildcard = pattern.starts_with(WILDCARD_PREFIX);
-        let stem = pattern
-            .strip_prefix(WILDCARD_PREFIX)
-            .unwrap_or(&pattern)
-            .to_owned();
+        let stem = canonical_host(pattern.strip_prefix(WILDCARD_PREFIX).unwrap_or(&pattern));
         if stem.is_empty() {
             warn!(
                 pattern = %self.pattern,

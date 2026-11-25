@@ -6,7 +6,7 @@
 //! a host" and of how a host is spelled: [`Url`] lowercases hosts, and every
 //! caller compares what these helpers return.
 
-use url::Url;
+use url::{Host, Url};
 
 use crate::config::Config;
 
@@ -26,13 +26,30 @@ pub fn is_http_url(text: &str) -> bool {
     parse_http_url(text).is_some()
 }
 
-/// The host of an absolute `http(s)` URL, `None` for anything else.
+/// The canonical spelling of a host name.
 ///
-/// URL parsing lowercases the host, so hosts compare case-insensitively. The
-/// port is not part of it.
+/// It is the one every reject list and host comparison uses. Trailing dots (the DNS root label, which names the same zone) are
+/// dropped, the name is lowercased and Unicode labels become punycode, so
+/// `Evil.Example.`, `evil.example` and `bücher.example` / `xn--bcher-kva.example`
+/// each meet one spelling. Text the URL host parser rejects (a wildcard
+/// stem, say) falls back to its trimmed lowercase form.
+#[must_use]
+pub fn canonical_host(host: &str) -> String {
+    let trimmed = host.trim().trim_end_matches('.');
+    Host::parse(trimmed).map_or_else(
+        |_| trimmed.to_ascii_lowercase(),
+        |parsed| parsed.to_string().trim_end_matches('.').to_owned(),
+    )
+}
+
+/// The canonical host of an absolute `http(s)` URL, `None` for anything else.
+///
+/// URL parsing lowercases the host and maps it to ASCII; a trailing dot is
+/// dropped too, so `evil.example.` is `evil.example`. The port is not part
+/// of it.
 #[must_use]
 pub fn http_host(text: &str) -> Option<String> {
-    parse_http_url(text)?.host_str().map(str::to_owned)
+    parse_http_url(text)?.host_str().map(canonical_host)
 }
 
 /// The URL's host, plus `:port` only when the URL spells out a non-default
@@ -218,5 +235,55 @@ mod tests {
         );
         assert_eq!(spell("https://h:8443"), "h:8443");
         assert_eq!(spell("http://h:80/x"), "h");
+    }
+
+    /// A trailing dot, case and a port all vanish from a URL's host.
+    #[test]
+    fn http_host_drops_trailing_dots_case_and_port() {
+        for text in [
+            "https://evil.example/users/x",
+            "https://evil.example./users/x",
+            "https://EVIL.Example./users/x",
+            "https://evil.example.:8443/users/x",
+        ] {
+            assert_eq!(
+                http_host(text).as_deref(),
+                Some("evil.example"),
+                "`{text}` is on evil.example"
+            );
+        }
+        assert_eq!(
+            http_host("http://[::1]:4000/a").as_deref(),
+            Some("[::1]"),
+            "an IPv6 literal keeps its brackets"
+        );
+    }
+
+    /// Unicode and punycode spellings of a host meet one string.
+    #[test]
+    fn http_host_maps_unicode_hosts_to_punycode() {
+        assert_eq!(
+            http_host("https://bücher.example/a").as_deref(),
+            Some("xn--bcher-kva.example")
+        );
+        assert_eq!(
+            http_host("https://xn--bcher-kva.example./a").as_deref(),
+            Some("xn--bcher-kva.example")
+        );
+    }
+
+    /// `canonical_host` folds list text the same way.
+    #[test]
+    fn canonical_host_folds_dots_case_and_unicode() {
+        assert_eq!(canonical_host("Evil.Example."), "evil.example");
+        assert_eq!(canonical_host(" evil.example "), "evil.example");
+        assert_eq!(canonical_host("Bücher.Example"), "xn--bcher-kva.example");
+        assert_eq!(
+            canonical_host("xn--bcher-kva.example"),
+            "xn--bcher-kva.example"
+        );
+        assert_eq!(canonical_host(""), "");
+        assert_eq!(canonical_host("."), "");
+        assert_eq!(canonical_host("solo"), "solo");
     }
 }
