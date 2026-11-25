@@ -12,7 +12,7 @@ use crate::{
     error::AppResult,
     federation::{delivery::is_local_inbox, mrf, policy::host_refused_with},
     models::{instance, user::User},
-    util::url::parse_http_url,
+    util::url::{canonical_host, parse_http_url},
 };
 
 /// The final target set: candidates deduplicated by URL, each kept only
@@ -70,7 +70,7 @@ pub(super) fn unreachable_grace(secs: usize) -> chrono::Duration {
 fn deliverable_host(inbox: &str, actor_ap_id: &str) -> Option<String> {
     parse_http_url(inbox)
         .filter(|parsed| !is_local_inbox(parsed, actor_ap_id))
-        .and_then(|parsed| parsed.host_str().map(str::to_owned))
+        .and_then(|parsed| parsed.host_str().map(canonical_host))
 }
 
 #[cfg(test)]
@@ -107,6 +107,11 @@ mod tests {
                 "`{own}` is this instance's own origin"
             );
         }
+        assert_eq!(
+            deliverable_host("https://Peer.Example./inbox", alice).as_deref(),
+            Some("peer.example"),
+            "a trailing dot and case are folded away"
+        );
         for undeliverable in ["ftp://peer.example/inbox", "not a url", ""] {
             assert_eq!(
                 deliverable_host(undeliverable, alice),
