@@ -7,7 +7,7 @@ use axum::http::StatusCode;
 use serde_json::json;
 use sqlx::PgPool;
 use wired_be::models::{
-    filter::{self, NewFilter},
+    filter::{self, phrase::NewPhrase},
     status::Visibility,
     user::User,
 };
@@ -22,14 +22,14 @@ async fn make_filter(
     contexts: &[&str],
     irreversible: bool,
 ) -> filter::Filter {
-    filter::create(
+    filter::phrase::create_phrase(
         pool,
         owner.id,
-        &NewFilter {
+        &NewPhrase {
             phrase: "spoiler".to_owned(),
             context: contexts.iter().map(|name| (*name).to_owned()).collect(),
             irreversible,
-            ..NewFilter::default()
+            ..NewPhrase::default()
         },
     )
     .await

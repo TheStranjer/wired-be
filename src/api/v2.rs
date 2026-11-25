@@ -4,7 +4,9 @@
 use axum::Router;
 
 use crate::{
-    api::{account_lists, chats, instance, mastodon_admin, media, notifications_v2, search},
+    api::{
+        account_lists, chats, filters, instance, mastodon_admin, media, notifications_v2, search,
+    },
     state::AppState,
 };
 
@@ -17,7 +19,9 @@ use crate::{
 /// contributes `GET /api/v2/instance`, the reshaped instance document; its
 /// `/instance` sub-resources stay v1-only.
 /// [`account_lists::v2_router`] contributes `GET /api/v2/suggestions`, the
-/// source-wrapped twin of that area's v1 listing. [`search::v2_router`]
+/// source-wrapped twin of that area's v1 listing. [`filters::v2::router`]
+/// contributes the v2 filter API: `/api/v2/filters` with its keyword and
+/// status sub-resources, over the storage the v1 filter routes read too. [`search::v2_router`]
 /// contributes `GET /api/v2/search`, the combined search whose hashtag
 /// arm renders tag entities where v1 spells plain names.
 /// [`notifications_v2::router`] contributes the grouped notification API:
@@ -40,6 +44,7 @@ use crate::{
 pub fn router(state: &AppState) -> Router<AppState> {
     Router::new()
         .merge(account_lists::v2_router())
+        .merge(filters::v2::router())
         .merge(instance::v2_router())
         .merge(media::router(&state.config))
         .merge(notifications_v2::router())
