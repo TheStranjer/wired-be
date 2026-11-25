@@ -1,0 +1,163 @@
+//! `GET /api/v1/wired/protocols`: the account's identity on each protocol.
+//!
+//! A Wired extension (`docs/ARCHITECTURE.md` decision 17), advertised by the
+//! `wired:protocols` feature flag. It is core: it works with `ActivityPub`
+//! disabled, because it asks every enabled protocol, not `ActivityPub`
+//! alone. `WiredFE` reads it to offer "Would you like to get on `<protocol>`?".
+//!
+//! The answer is one [`ProtocolEntry`] per enabled protocol, in registry
+//! order:
+//!
+//! ```json
+//! {"protocol": "activitypub", "status": "active", "identifier": "bob",
+//!  "uri": "https://example.com/users/bob", "suggestion": null}
+//! {"protocol": "fixture", "status": "unclaimed", "identifier": null,
+//!  "uri": null, "suggestion": "bob"}
+//! ```
+//!
+//! - `status` is `active` or `pending` as the adapter's
+//!   [`identity`](ProtocolAdapter::identity) reports it, and `unclaimed` when
+//!   the account is not on the protocol.
+//! - `identifier` and `uri` are the identity's, and `null` while `unclaimed`.
+//! - `suggestion` is set only while `unclaimed`: the ID
+//!   [`suggest_identifier`] finds free for the account's nickname.
+//!
+//! The route needs a user token with the `read:accounts` scope, like
+//! `verify_credentials`.
+
+use axum::{Json, Router, extract::State, routing::get};
+use serde::Serialize;
+
+use crate::{
+    auth::AuthUser,
+    error::AppResult,
+    models::user::User,
+    oauth::scopes::READ_ACCOUNTS,
+    protocols::{
+        adapter::ProtocolAdapter,
+        identity::{IdentityStatus, suggest_identifier},
+        registry,
+    },
+    state::AppState,
+};
+
+/// Whether the account is on a protocol, as the client sees it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EntryStatus {
+    /// The identity is claimed and in use.
+    Active,
+    /// The identity exists but is awaiting setup.
+    Pending,
+    /// The account has no identity on the protocol.
+    Unclaimed,
+}
+
+impl From<IdentityStatus> for EntryStatus {
+    /// The identity's status, under the name the client sees.
+    fn from(status: IdentityStatus) -> Self {
+        match status {
+            IdentityStatus::Active => Self::Active,
+            IdentityStatus::Pending => Self::Pending,
+        }
+    }
+}
+
+/// The account's standing on one protocol: one element of the answer.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ProtocolEntry {
+    /// The protocol's id string, [`ProtocolId::as_str`](crate::protocols::ProtocolId::as_str).
+    pub protocol: &'static str,
+    /// Whether the account is on the protocol.
+    pub status: EntryStatus,
+    /// The account's ID on the protocol; `None` while unclaimed.
+    pub identifier: Option<String>,
+    /// The ID as a URI; `None` while unclaimed.
+    pub uri: Option<String>,
+    /// A free ID to claim; set only while unclaimed.
+    pub suggestion: Option<String>,
+}
+
+/// The `/api/v1/wired` router, nested into [`crate::api::v1`].
+pub fn router() -> Router<AppState> {
+    Router::new().route("/protocols", get(protocols))
+}
+
+/// `GET /api/v1/wired/protocols` — the caller's identity on each enabled protocol.
+///
+/// # Errors
+///
+/// [`Unauthorized`](crate::error::AppError::Unauthorized) /
+/// [`Forbidden`](crate::error::AppError::Forbidden) from [`AuthUser`] and the
+/// `read:accounts` check; [`Conflict`](crate::error::AppError::Conflict) when
+/// an unclaimed protocol has no free ID to suggest; any database failure.
+async fn protocols(
+    State(state): State<AppState>,
+    auth: AuthUser,
+) -> AppResult<Json<Vec<ProtocolEntry>>> {
+    auth.require(READ_ACCOUNTS)?;
+    let mut entries = Vec::new();
+    for adapter in registry::enabled(&state.config) {
+        entries.push(entry_for(adapter, &state, &auth.0).await?);
+    }
+    Ok(Json(entries))
+}
+
+/// `user`'s standing on `adapter`'s protocol.
+///
+/// # Errors
+///
+/// Any database failure, or [`Conflict`](crate::error::AppError::Conflict)
+/// when an unclaimed protocol has no free ID to suggest.
+async fn entry_for(
+    adapter: &dyn ProtocolAdapter,
+    state: &AppState,
+    user: &User,
+) -> AppResult<ProtocolEntry> {
+    let protocol = adapter.id().as_str();
+    if let Some(identity) = adapter.identity(state, user).await? {
+        return Ok(ProtocolEntry {
+            protocol,
+            status: identity.status.into(),
+            identifier: Some(identity.identifier),
+            uri: Some(identity.uri),
+            suggestion: None,
+        });
+    }
+    let mut conn = state.db.acquire().await?;
+    let suggestion = suggest_identifier(adapter, &mut conn, &user.nickname, &state.config).await?;
+    Ok(ProtocolEntry {
+        protocol,
+        status: EntryStatus::Unclaimed,
+        identifier: None,
+        uri: None,
+        suggestion: Some(suggestion),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The statuses serialise as the lowercase words the client reads.
+    #[test]
+    fn statuses_serialise_in_lowercase() {
+        let json = |status| serde_json::to_value(status).expect("a status serialises");
+        assert_eq!(json(EntryStatus::Active), "active");
+        assert_eq!(json(EntryStatus::Pending), "pending");
+        assert_eq!(json(EntryStatus::Unclaimed), "unclaimed");
+    }
+
+    /// An identity's status maps onto the entry status of the same name.
+    #[test]
+    fn identity_statuses_map_to_entry_statuses() {
+        assert_eq!(
+            EntryStatus::from(IdentityStatus::Active),
+            EntryStatus::Active
+        );
+        assert_eq!(
+            EntryStatus::from(IdentityStatus::Pending),
+            EntryStatus::Pending
+        );
+    }
+}

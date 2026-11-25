@@ -648,3 +648,7 @@ mod webhooks;
 
 /// WebFinger and host-meta (`/.well-known/webfinger`, `/.well-known/host-meta`).
 mod well_known;
+
+/// `GET /api/v1/wired/protocols` (WBE-856): the account's identity on each
+/// enabled protocol, with a suggested ID where it has none.
+mod wired;
