@@ -592,6 +592,52 @@ async fn pleroma_statuses_omit_a_status_whose_author_blocked_the_viewer() {
     );
 }
 
+/// `PATCH` refuses an account that never authored nor was mentioned in
+/// the thread: the 404, the stored list untouched, and the entity never
+/// renders the stranger as a participant.
+#[tokio::test]
+async fn pleroma_update_refuses_an_account_outside_the_thread() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let (alice, alice_token) = actor(&pool, "alice", BOTH).await;
+    let (bob, _) = actor(&pool, "bob", BOTH).await;
+    let (dave, _) = actor(&pool, "dave", BOTH).await;
+    let app = common::test_app(pool.clone());
+    let post = dm(&pool, &alice, &[&bob], "@bob psst").await;
+    let row_id = participation_for(&pool, &alice, &post).await;
+    let mine = Uuid::parse_str(&row_id).expect("fixture id");
+
+    let stranger = request("PATCH", &format!("/api/v1/pleroma/conversations/{row_id}"))
+        .bearer(&alice_token)
+        .json(&json!({"recipients": [bob.id.to_string(), dave.id.to_string()]}))
+        .send(&app)
+        .await;
+    common::assert_all_refused(
+        &[stranger],
+        StatusCode::NOT_FOUND,
+        UNKNOWN,
+        "an account that never took part in the thread",
+    );
+    assert_eq!(
+        conversation::recipients(&pool, mine)
+            .await
+            .expect("the list reads"),
+        vec![bob.id],
+        "the refused rewrite stored nothing"
+    );
+    let shown = pleroma_get(&app, &alice_token, &format!("/{row_id}")).await;
+    assert_eq!(
+        shown.json_value()["accounts"]
+            .as_array()
+            .expect("accounts")
+            .iter()
+            .map(|account| account["id"].as_str().expect("an id"))
+            .collect::<Vec<_>>(),
+        vec![bob.id.to_string()],
+        "the stranger never renders as a participant"
+    );
+}
+
 /// `PATCH` replaces the participation's whole recipient list with the
 /// body's accounts — the viewer dropped automatically, a repeat folded to
 /// one, the form spelling accepted — and answers the rewritten entity. An

@@ -74,14 +74,15 @@ async fn a_rewrite_of_exactly_the_cap_succeeds() {
     let db = common::test_db().await;
     let pool = db.pool().clone();
     let (alice, alice_token) = actor(&pool, "alice", BOTH).await;
-    let (bob, _) = actor(&pool, "bob", BOTH).await;
-    let mut named = Vec::with_capacity(MAX_BATCH_IDS);
+    let mut members = Vec::with_capacity(MAX_BATCH_IDS);
     for n in 0..MAX_BATCH_IDS {
         let (recipient, _) = actor(&pool, &format!("batch{n}"), BOTH).await;
-        named.push(recipient.id);
+        members.push(recipient);
     }
+    let mut named: Vec<Uuid> = members.iter().map(|member| member.id).collect();
     let app = common::test_app(pool.clone());
-    let post = dm(&pool, &alice, &[&bob], "@bob psst").await;
+    let mentioned: Vec<&User> = members.iter().collect();
+    let post = dm(&pool, &alice, &mentioned, "@everyone psst").await;
     let row_id = participation_for(&pool, &alice, &post).await;
     let mine = Uuid::parse_str(&row_id).expect("fixture id");
 
