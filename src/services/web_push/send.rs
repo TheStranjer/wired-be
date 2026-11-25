@@ -9,7 +9,7 @@ use uuid::Uuid;
 
 use crate::{
     error::{AppError, AppResult},
-    http_client::HttpClient,
+    http_client::{HttpClient, HttpError},
     models::web_push_subscription::{self, WebPushSubscription},
 };
 
@@ -26,17 +26,18 @@ const PUSH_RESPONSE_BYTES: usize = 64 * 1024;
 /// `Content-Type: application/octet-stream`, `TTL: ` [`TTL_HEADER`],
 /// `Urgency: ` [`URGENCY_HEADER`] and the pre-signed `Authorization` header
 /// ([`vapid_headers`](super::vapid_headers) signs per delivery; [`send`]
-/// just carries the text). A 2xx answer is `Ok`. A 404 or 410 — or stored
-/// keys that cannot encrypt at all — is [`PushError::Gone`]: the
-/// subscription will never receive anything again and its caller deletes
-/// it. A 429, a 5xx or a transport failure is [`PushError::Retryable`]; so
+/// just carries the text). A 2xx answer is `Ok`. A 404 or 410 — stored
+/// keys that cannot encrypt at all — or an endpoint the SSRF guard blocks
+/// is [`PushError::Gone`]: the subscription will never receive anything
+/// again and its caller deletes it. A 429, a 5xx or a transport failure is [`PushError::Retryable`]; so
 /// is any other status, which the ticket leaves on the safe side of a
 /// retry rather than a deletion.
 ///
 /// # Errors
 ///
 /// [`PushError`] per the mapping above: [`Gone`](PushError::Gone) for
-/// 404/410 and unusable subscription keys, [`Retryable`](PushError::Retryable)
+/// 404/410, unusable subscription keys and guard-blocked endpoints,
+/// [`Retryable`](PushError::Retryable)
 /// for every other failure.
 pub async fn send(
     http: &HttpClient,
@@ -71,8 +72,25 @@ pub async fn send(
             PUSH_RESPONSE_BYTES,
         )
         .await
-        .map_err(|err| PushError::Retryable(err.to_string()))?;
+        .map_err(|err| classify_transport(subscription.id, &err))?;
     classify_status(response.status)
+}
+
+/// Sorts one transport failure into gone or retryable.
+///
+/// A target the SSRF guard blocks will be blocked on every retry, so it
+/// retires the subscription like a 410; any other failure may pass.
+fn classify_transport(subscription_id: Uuid, err: &HttpError) -> PushError {
+    if let HttpError::Blocked(reason) = err {
+        debug!(
+            subscription = %subscription_id,
+            reason,
+            "push endpoint refused by the SSRF guard"
+        );
+        PushError::Gone
+    } else {
+        PushError::Retryable(err.to_string())
+    }
 }
 
 /// Sorts one push-service answer into delivered, gone or retryable.
@@ -240,6 +258,52 @@ mod tests {
                 other => panic!("status {status} must be retryable, got {other:?}"),
             }
             server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn an_endpoint_the_ssrf_guard_blocks_is_gone_not_retryable() {
+        let (p256dh, auth, _private) = client_keys();
+        let guarded = HttpClient::new("Wired (https://wired.test)");
+        for endpoint in [
+            "http://127.0.0.1:8080/push",
+            "http://10.0.0.5/push",
+            "https://192.168.1.1/push",
+            "http://[::1]/push",
+        ] {
+            let outcome = send(
+                &guarded,
+                &subscription(endpoint, &p256dh, &auth),
+                r#"{"title":"Alice followed you"}"#,
+                "vapid t=jwt, k=key",
+            )
+            .await;
+            assert_eq!(
+                outcome,
+                Err(PushError::Gone),
+                "a guard block on {endpoint} retires the subscription"
+            );
+        }
+    }
+
+    #[test]
+    fn only_a_guard_block_is_gone_among_transport_failures() {
+        let id = Uuid::now_v7();
+        assert_eq!(
+            classify_transport(id, &HttpError::Blocked("private".to_owned())),
+            PushError::Gone,
+            "Blocked"
+        );
+        for err in [
+            HttpError::Timeout,
+            HttpError::Connect("refused".to_owned()),
+            HttpError::TooLarge,
+        ] {
+            assert_eq!(
+                classify_transport(id, &err),
+                PushError::Retryable(err.to_string()),
+                "{err} may pass later"
+            );
         }
     }
 

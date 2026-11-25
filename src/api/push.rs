@@ -16,16 +16,18 @@
 //! validation.
 //!
 //! - `POST /api/v1/push/subscription` registers `subscription[endpoint]`
-//!   (an `http`/`https` URL of at most 2048 characters — Pleroma stores
-//!   the endpoint verbatim and demands only that it is there, and this
-//!   gate follows it: a push service's own address is whatever the browser
-//!   was configured with, loopback test services included) with
+//!   (an `http`/`https` URL of at most 2048 characters whose host the
+//!   outbound SSRF guard would let a delivery reach: a loopback, private
+//!   or otherwise reserved address is refused, since every delivery to it
+//!   would be blocked and a subscription is attacker-chosen input; only
+//!   an instance that runs with `HTTP_ALLOW_PRIVATE_HOSTS` — the
+//!   deliberate local-delivery mode — accepts such endpoints) with
 //!   `subscription[keys][p256dh]` and `subscription[keys][auth]` (stored
 //!   base64url-normalised, Pleroma's `ensure_base64_urlsafe`), plus the
 //!   optional `data[alerts][…]` preferences and `data[policy]`. It
 //!   replaces any subscription the token already had; a missing endpoint
-//!   or key, an unusable or overlong endpoint and an unknown policy are
-//!   422 `{"error":"Validation failed: …"}`.
+//!   or key, an unusable, overlong or blocked endpoint and an unknown
+//!   policy are 422 `{"error":"Validation failed: …"}`.
 //! - `GET /api/v1/push/subscription` answers the token's subscription or
 //!   404 `{"error":"Record not found"}`.
 //! - `PUT /api/v1/push/subscription` updates `data[alerts][…]` (a named
@@ -47,6 +49,7 @@ use crate::{
     entities::push_subscription::{PushSubscription, merge_alerts},
     error::{AppError, AppResult},
     extract::{ApiBody, flex},
+    http_client::{HttpClient, HttpError},
     models::web_push_subscription::{self, DEFAULT_POLICY, NewSubscription},
     oauth::scopes::PUSH,
     services::vapid,
@@ -102,6 +105,7 @@ async fn create_subscription(
         alerts: merge_alerts(&Value::Null, &params.given_alerts()),
         policy: valid_policy(params.data_policy())?.unwrap_or_else(|| DEFAULT_POLICY.to_owned()),
     };
+    refuse_blocked_endpoint(&state.http_client, &registered.endpoint).await?;
     let row = web_push_subscription::create(&state.db, &registered).await?;
     debug!(
         subscription = %row.id,
@@ -389,12 +393,9 @@ impl SubscriptionParams {
 }
 
 /// The validated `subscription[endpoint]`: required, at most
-/// [`MAX_ENDPOINT_CHARS`] characters and an `http` or `https` URL. Pleroma
-/// stores the endpoint verbatim (its `Subscription.create` validates only
-/// presence); the one rule the delivery pipeline cannot survive without
-/// is a scheme the outbound client can actually call, so `http`/`https`
-/// it is — including a plain-`http` loopback service, which is what a
-/// local push endpoint is.
+/// [`MAX_ENDPOINT_CHARS`] characters and an `http` or `https` URL. The
+/// scheme is what the outbound client can call; whether the host is one
+/// the SSRF guard allows is [`refuse_blocked_endpoint`]'s question.
 ///
 /// # Errors
 ///
@@ -418,6 +419,29 @@ fn valid_endpoint(params: &SubscriptionParams) -> AppResult<String> {
         return Err(validation_failed("Endpoint must be a valid URL"));
     }
     Ok(endpoint.to_owned())
+}
+
+/// Refuses an `endpoint` whose host the outbound client's SSRF guard
+/// would block at delivery time.
+///
+/// Literal IPs are judged directly and hostnames by their resolved
+/// addresses, exactly as [`HttpClient::check_target`] does; with the guard
+/// off (`HTTP_ALLOW_PRIVATE_HOSTS`) every endpoint passes. Without this a
+/// subscription to a private address would queue a delivery job per
+/// notification that can only be blocked.
+///
+/// # Errors
+///
+/// [`AppError::Unprocessable`] naming the endpoint when the guard blocks
+/// it, or when it is not an `http`/`https` URL.
+async fn refuse_blocked_endpoint(http: &HttpClient, endpoint: &str) -> AppResult<()> {
+    match http.check_target(endpoint).await {
+        Ok(()) => Ok(()),
+        Err(HttpError::Blocked(_)) => Err(validation_failed(
+            "Endpoint must not be a loopback, private, or otherwise reserved address",
+        )),
+        Err(_) => Err(validation_failed("Endpoint must be a valid URL")),
+    }
 }
 
 /// The validated `subscription[keys]` member `attribute` (`P256dh key` or
@@ -582,7 +606,7 @@ mod tests {
             ))
             .unwrap(),
             "http://127.0.0.1:9/push",
-            "a plain-http endpoint is stored verbatim, as Pleroma stores any"
+            "the shape check passes a plain-http loopback; the guard check refuses it"
         );
         for (body, message) in [
             (json!({}), "Validation failed: Endpoint can't be blank"),
@@ -605,10 +629,62 @@ mod tests {
         ] {
             let err = valid_endpoint(&params(body)).expect_err("the endpoint is refused");
             assert_eq!(err.to_string(), message, "wording of the refusal");
-            let AppError::Unprocessable(_) = err else {
-                panic!("a validation refusal is a 422, got {err}");
-            };
+            assert!(
+                matches!(err, AppError::Unprocessable(_)),
+                "a validation refusal is a 422, got {err}"
+            );
         }
+    }
+
+    #[tokio::test]
+    async fn the_guard_refuses_private_endpoints_unless_it_is_off() {
+        let guarded = HttpClient::new("Wired (https://wired.test)");
+        for endpoint in [
+            "http://127.0.0.1:8080/push",
+            "http://10.1.2.3/push",
+            "https://192.168.0.9/push",
+            "http://[::1]/push",
+            "http://169.254.169.254/latest/meta-data",
+        ] {
+            let err = refuse_blocked_endpoint(&guarded, endpoint)
+                .await
+                .expect_err("a reserved address is refused");
+            assert_eq!(
+                err.to_string(),
+                "Validation failed: Endpoint must not be a loopback, private, or otherwise reserved address",
+                "wording for {endpoint}"
+            );
+            assert!(
+                matches!(err, AppError::Unprocessable(_)),
+                "a refusal is a 422, got {err}"
+            );
+        }
+        assert!(
+            refuse_blocked_endpoint(&guarded, "https://8.8.8.8/push")
+                .await
+                .is_ok(),
+            "a public address passes"
+        );
+        let open = HttpClient::new_for_tests("Wired (https://wired.test)");
+        assert!(
+            refuse_blocked_endpoint(&open, "http://127.0.0.1:8080/push")
+                .await
+                .is_ok(),
+            "with the guard off a loopback endpoint is accepted"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_non_http_endpoint_is_an_invalid_url_to_the_guard_check() {
+        let guarded = HttpClient::new("Wired (https://wired.test)");
+        let err = refuse_blocked_endpoint(&guarded, "ftp://push.example/1")
+            .await
+            .expect_err("a foreign scheme is refused");
+        assert_eq!(
+            err.to_string(),
+            "Validation failed: Endpoint must be a valid URL",
+            "the scheme wording"
+        );
     }
 
     #[test]

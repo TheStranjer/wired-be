@@ -382,9 +382,10 @@ async fn update_moves_only_the_named_preferences() {
 /// A create that misses the endpoint or a key, sends an endpoint that is
 /// no URL or is overlong, or names a policy outside the four, is the 422
 /// with Mastodon's changeset wording. A plain-`http` endpoint is not among
-/// the refusals: Pleroma stores whatever it is given, and the delivery
-/// pipeline calls any `http`/`https` address (`e2e_realtime.rs` wakes a
-/// loopback mock push service over exactly such an endpoint).
+/// the refusals; a private one is refused only while the SSRF guard is on
+/// (`private_endpoints_are_refused_while_the_ssrf_guard_is_on`), and
+/// `e2e_realtime.rs` wakes a loopback mock push service on a
+/// private-hosts instance.
 #[tokio::test]
 async fn create_validates_the_endpoint_keys_and_policy() {
     let db = common::test_db().await;
@@ -454,6 +455,77 @@ async fn create_validates_the_endpoint_keys_and_policy() {
         .send(&app)
         .await;
     common::assert_answer(&ok, StatusCode::OK, "the good body after the refusals");
+}
+
+/// A [`Config`](wired_be::config::Config) with the SSRF guard on, the
+/// production default, and the limiter off.
+fn guarded_config() -> wired_be::config::Config {
+    wired_be::config::Config::from_lookup(|key| match key {
+        DATABASE_URL_VAR => Some(TEST_DATABASE_URL.to_owned()),
+        BASE_URL_VAR => Some(TEST_BASE_URL.to_owned()),
+        HTTP_ALLOW_PRIVATE_HOSTS_VAR | RATE_LIMITS_ENABLED_VAR => Some("false".to_owned()),
+        _ => None,
+    })
+    .expect("the fixed guarded config is valid")
+}
+
+/// With the SSRF guard on, an endpoint at a loopback, private, link-local
+/// or otherwise reserved address is the 422 and writes nothing; a public
+/// one registers.
+#[tokio::test]
+async fn private_endpoints_are_refused_while_the_ssrf_guard_is_on() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let app = common::test_app_with_config(pool.clone(), guarded_config());
+    let bearer = push_token(&pool, "push-guarded").await;
+
+    for endpoint in [
+        "http://127.0.0.1:8080/push",
+        "http://10.0.0.5/push",
+        "https://192.168.1.1/push",
+        "http://172.16.0.9/push",
+        "http://169.254.169.254/latest/meta-data",
+        "http://[::1]/push",
+    ] {
+        let response = common::TestRequest::post("/api/v1/push/subscription")
+            .bearer(&bearer)
+            .json(&subscription_json(endpoint))
+            .send(&app)
+            .await;
+        common::assert_answer(&response, StatusCode::UNPROCESSABLE_ENTITY, endpoint);
+        common::assert_error(
+            &response,
+            "Validation failed: Endpoint must not be a loopback, private, or otherwise reserved address",
+            endpoint,
+        );
+    }
+    assert_eq!(subscription_count(&pool).await, 0, "no refusal wrote a row");
+
+    let public = common::TestRequest::post("/api/v1/push/subscription")
+        .bearer(&bearer)
+        .json(&subscription_json(ENDPOINT))
+        .send(&app)
+        .await;
+    common::assert_answer(&public, StatusCode::OK, "a public endpoint registers");
+    assert_eq!(subscription_count(&pool).await, 1, "and is stored");
+}
+
+/// The deliberate local-delivery mode (`HTTP_ALLOW_PRIVATE_HOSTS`) keeps
+/// accepting a loopback endpoint.
+#[tokio::test]
+async fn private_endpoints_register_when_private_hosts_are_allowed() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let app = common::test_app(pool.clone());
+    let bearer = push_token(&pool, "push-open").await;
+
+    let response = common::TestRequest::post("/api/v1/push/subscription")
+        .bearer(&bearer)
+        .json(&subscription_json("http://127.0.0.1:8080/push"))
+        .send(&app)
+        .await;
+    common::assert_answer(&response, StatusCode::OK, "loopback with the guard off");
+    assert_eq!(subscription_count(&pool).await, 1, "the row is stored");
 }
 
 /// Two tokens of one account hold two subscriptions: registering for
