@@ -8,7 +8,7 @@ use super::{FetchBudget, FetchError, fetch::fetch_contained};
 use crate::{
     config::Config,
     federation::{
-        dispatch::FederationError,
+        dispatch::{FederationError, TransientExt as _},
         fetch_actor::{get_or_fetch_by_ap_id, is_local_ap_id},
         json,
         note_parser::OBJECT_TYPES,
@@ -142,14 +142,14 @@ async fn resolve_uri(
 ) -> Result<Option<Status>, FederationError> {
     let stored = status::get_by_uri(&state.db, uri)
         .await
-        .map_err(|err| FederationError::transient("the status uri read failed", &err))?;
+        .transient("the status uri read failed")?;
     if let Some(row) = stored {
         return Ok(live_or_deleted(row));
     }
     if let Some(alias) = local_object_uri(&state.config, uri) {
         let aliased = status::get_by_uri(&state.db, &alias)
             .await
-            .map_err(|err| FederationError::transient("the status object-id read failed", &err))?;
+            .transient("the status object-id read failed")?;
         if let Some(row) = aliased {
             return Ok(live_or_deleted(row));
         }

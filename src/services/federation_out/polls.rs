@@ -26,7 +26,7 @@ use crate::{
         note,
         publisher::{self, PublishOpts},
     },
-    jobs::{AttemptInfo, HandlerFuture, JobError, QUEUE_FEDERATOR_OUTGOING},
+    jobs::{AttemptInfo, HandlerFuture, JobError, JobErrorExt as _, QUEUE_FEDERATOR_OUTGOING},
     models::{
         job::{NewJob, enqueue},
         poll::{self, Poll as PollRow, PollOption},
@@ -125,7 +125,7 @@ pub fn handle_publish_update(state: AppState, _attempt: AttemptInfo, args: Value
 /// Renders and publishes the `Update` of the status `args` names.
 async fn run_publish_update(state: &AppState, args: Value) -> Result<(), JobError> {
     let args = serde_json::from_value::<UpdateArgs>(args)
-        .map_err(|err| JobError::Discard(format!("malformed poll update arguments: {err}")))?;
+        .job_discard("malformed poll update arguments")?;
     if !state.config.federation_enabled.get() {
         return Ok(());
     }
@@ -145,7 +145,7 @@ async fn run_publish_update(state: &AppState, args: Value) -> Result<(), JobErro
     publisher::publish(state, &author, &document, opts)
         .await
         .map(drop)
-        .map_err(|err| JobError::Retry(format!("could not publish a poll Update: {err}")))
+        .job_retry("could not publish a poll Update")
 }
 
 /// The parts one federated answer document of a remote poll is built from:

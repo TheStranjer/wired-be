@@ -36,7 +36,9 @@ use tracing::debug;
 
 use crate::{
     federation::{
-        dispatch::{ActivityView, FederationError, Handlers, ObjectRef, Outcome},
+        dispatch::{
+            ActivityView, FederationError, Handlers, ObjectRef, Outcome, TransientExt as _,
+        },
         fetch_object::fetch_object_json,
         json, note_parser,
     },
@@ -103,7 +105,7 @@ async fn apply_undo(
     };
     let deleted = scrobble::delete_by_ap_id(&state.db, signer.id, id)
         .await
-        .map_err(|err| FederationError::transient("the scrobble delete failed", &err))?;
+        .transient("the scrobble delete failed")?;
     if deleted == 0 {
         return Ok(Outcome::Ignored("no stored scrobble of that Listen"));
     }
@@ -134,7 +136,7 @@ async fn apply_listen(
     let listened_at = json::clamped_time(published, now).unwrap_or(now);
     let stored = scrobble::insert_remote(&state.db, signer.id, &view.id, &parsed, listened_at)
         .await
-        .map_err(|err| FederationError::transient("the scrobble write failed", &err))?;
+        .transient("the scrobble write failed")?;
     let Some(row) = stored else {
         return Ok(Outcome::Ignored("a Listen already stored"));
     };

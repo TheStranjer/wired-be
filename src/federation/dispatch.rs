@@ -82,7 +82,7 @@ mod routing;
 mod test_support;
 mod types;
 
-pub use error::FederationError;
+pub use error::{FederationError, TransientExt};
 pub use handlers::Handlers;
 pub use identity::dedupe_key;
 pub use types::{ActivityView, CreatePreCheck, HandlerFn, ObjectRef, Outcome, UndoFn};

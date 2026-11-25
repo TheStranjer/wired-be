@@ -8,7 +8,7 @@ use uuid::Uuid;
 use super::{PASS_JOB, text::body_text};
 use crate::{
     entities::account::{DEFAULT_AVATAR_PATH, plain_display_name, profile_image},
-    jobs::{JobError, retry},
+    jobs::{JobError, JobErrorExt as _, retry},
     models::{
         follow,
         notification::{self, Notification},
@@ -218,7 +218,7 @@ async fn vapid_authorization(state: &AppState, endpoint: &str) -> Result<String,
         &web_push::vapid_subject(&state.config),
     )
     .map(|(authorization, _expires_at)| authorization)
-    .map_err(|err| JobError::Discard(format!("the VAPID JWT could not be signed: {err}")))
+    .job_discard("the VAPID JWT could not be signed")
 }
 
 #[cfg(test)]

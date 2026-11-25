@@ -43,7 +43,7 @@ use tracing::{debug, warn};
 use uuid::Uuid;
 
 use crate::{
-    jobs::{JobError, QUEUE_DEFAULT},
+    jobs::{JobError, JobErrorExt as _, QUEUE_DEFAULT},
     models::{
         job::{NewJob, enqueue},
         webhook::{self, Webhook},
@@ -178,7 +178,7 @@ fn job_args(webhook_id: Uuid, event: &str, event_id: Uuid, data: &Value) -> Valu
 /// cannot deserialize are permanent — the job is discarded.
 fn parse_args(args: &Value) -> Result<DeliverArgs, JobError> {
     serde_json::from_value::<DeliverArgs>(args.clone())
-        .map_err(|err| JobError::Discard(format!("webhook job arguments are unusable: {err}")))
+        .job_discard("webhook job arguments are unusable")
 }
 
 #[cfg(test)]

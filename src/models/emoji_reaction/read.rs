@@ -15,6 +15,7 @@ use crate::{
     util::{
         collections::group_pairs,
         emoji::{canonical, display_name},
+        numbers::saturating_i32_from_usize,
     },
 };
 
@@ -111,7 +112,7 @@ pub async fn for_statuses(
     let rows = sqlx::query_as::<_, SummaryRow>(FOR_STATUSES_SQL)
         .bind(status_ids)
         .bind(viewer_id)
-        .bind(i32::try_from(MAX_SUMMARY_REACTORS).unwrap_or(i32::MAX))
+        .bind(saturating_i32_from_usize(MAX_SUMMARY_REACTORS))
         .fetch_all(pool)
         .await?;
     Ok(group_pairs(

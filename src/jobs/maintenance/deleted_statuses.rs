@@ -16,6 +16,7 @@ use super::run_sweep;
 use crate::{
     jobs::{AttemptInfo, HandlerFuture},
     state::AppState,
+    util::numbers::saturating_i32_from_usize,
 };
 
 /// The job kind of the deleted-local-status purge, run from the
@@ -73,7 +74,7 @@ pub fn handle_purge_deleted_statuses(
     _args: Value,
 ) -> HandlerFuture {
     Box::pin(async move {
-        let age_days = i32::try_from(state.config.purge_deleted_statuses_days).unwrap_or(i32::MAX);
+        let age_days = saturating_i32_from_usize(state.config.purge_deleted_statuses_days);
         if age_days == 0 {
             info!(deleted = 0, "deleted-status purge disabled");
             return Ok(());

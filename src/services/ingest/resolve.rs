@@ -17,7 +17,7 @@ use uuid::Uuid;
 
 use crate::{
     federation::{
-        dispatch::FederationError,
+        dispatch::{FederationError, TransientExt as _},
         fetch_actor::get_or_fetch_by_ap_id,
         note_parser::{ParsedNote, RemoteEmoji},
     },
@@ -43,7 +43,7 @@ pub(super) async fn resolve_reply(
     };
     let parent = status::get_by_uri(&state.db, parent_uri)
         .await
-        .map_err(|err| FederationError::transient("the reply parent read failed", &err))?;
+        .transient("the reply parent read failed")?;
     if parent.is_some() {
         return Ok(ReplyLink {
             parent,
@@ -81,7 +81,7 @@ pub(super) async fn resolve_quote(
     };
     let found = status::get_by_uri(&state.db, uri)
         .await
-        .map_err(|err| FederationError::transient("the quote uri read failed", &err))?;
+        .transient("the quote uri read failed")?;
     Ok(found
         .filter(|row| row.deleted_at.is_none())
         .map(|row| row.id))
@@ -116,7 +116,7 @@ pub(crate) async fn resolve_mentions(
     for href in unique {
         let stored = user::get_by_ap_id(&state.db, href)
             .await
-            .map_err(|err| FederationError::transient("the mention read failed", &err))?;
+            .transient("the mention read failed")?;
         match stored {
             Some(account) => found.push(account),
             None if unknown.len() < MAX_MENTION_LOOKUPS => unknown.push(href),
@@ -158,7 +158,7 @@ pub(crate) async fn resolve_local_audience(
     for ap_id in audience {
         let stored = user::get_by_ap_id(&state.db, ap_id)
             .await
-            .map_err(|err| FederationError::transient("the audience read failed", &err))?;
+            .transient("the audience read failed")?;
         if let Some(account) = stored
             && account.local.get()
             && mentioned.iter().all(|seen| seen.id != account.id)
@@ -210,7 +210,7 @@ pub(crate) async fn upsert_emojis(
             &emoji.url,
         )
         .await
-        .map_err(|err| FederationError::transient("the custom emoji upsert failed", &err))?;
+        .transient("the custom emoji upsert failed")?;
     }
     Ok(())
 }

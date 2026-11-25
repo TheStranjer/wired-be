@@ -13,7 +13,7 @@ use uuid::Uuid;
 use crate::{
     error::AppError,
     federation::{
-        dispatch::FederationError,
+        dispatch::{FederationError, TransientExt as _},
         note_parser::{ParsedAttachment, ParsedNote, ParsedPoll},
     },
     models::{
@@ -23,9 +23,10 @@ use crate::{
         user::User,
     },
     state::AppState,
+    util::numbers::{saturating_i32, saturating_i32_from_usize},
 };
 
-use super::{ReplyLink, whole};
+use super::ReplyLink;
 
 /// Steps 4 to 8 as data: the [`NewStatus`] the parsed document plus the
 /// resolved references describe.
@@ -92,13 +93,13 @@ pub(super) async fn write_ingested(
         .db
         .begin()
         .await
-        .map_err(|err| FederationError::transient("the ingest transaction failed", &err))?;
+        .transient("the ingest transaction failed")?;
     let mut row = match status::insert_conn(&mut tx, &state.config.base_url, new).await {
         Ok(row) => row,
         Err(conflict) if is_uri_conflict(&conflict) => {
             tx.rollback()
                 .await
-                .map_err(|err| FederationError::transient("the ingest rollback failed", &err))?;
+                .transient("the ingest rollback failed")?;
             return Ok(Written::Raced);
         }
         Err(err) => return Err(FederationError::transient("the status insert failed", &err)),
@@ -107,13 +108,11 @@ pub(super) async fn write_ingested(
     insert_poll(&mut tx, row.id, parsed.poll.as_ref()).await?;
     let waiting = status::link_waiting_quotes(&mut tx, row.id, &row.uri)
         .await
-        .map_err(|err| FederationError::transient("the waiting quote link failed", &err))?;
+        .transient("the waiting quote link failed")?;
     row.quotes_count = row
         .quotes_count
-        .saturating_add(i32::try_from(waiting.len()).unwrap_or(i32::MAX));
-    tx.commit()
-        .await
-        .map_err(|err| FederationError::transient("the ingest commit failed", &err))?;
+        .saturating_add(saturating_i32_from_usize(waiting.len()));
+    tx.commit().await.transient("the ingest commit failed")?;
     Ok(Written::Created(Box::new(row), waiting))
 }
 
@@ -157,11 +156,10 @@ pub(crate) async fn insert_media(
     attachments: &[ParsedAttachment],
 ) -> Result<(), FederationError> {
     for (index, media) in attachments.iter().enumerate() {
-        let position = i32::try_from(index).unwrap_or(i32::MAX);
         let new = NewMediaAttachment {
             user_id: None,
             status_id: Some(status_id),
-            position,
+            position: saturating_i32_from_usize(index),
             remote_url: Some(media.url.clone()),
             url: media.url.clone(),
             content_type: media.content_type.clone(),
@@ -176,7 +174,7 @@ pub(crate) async fn insert_media(
         media_attachment::insert(&mut *conn, &new)
             .await
             .map(drop)
-            .map_err(|err| FederationError::transient("the media insert failed", &err))?;
+            .transient("the media insert failed")?;
     }
     Ok(())
 }
@@ -202,7 +200,7 @@ pub(crate) async fn insert_poll(
     let option_votes: Vec<i32> = poll_data
         .options
         .iter()
-        .map(|option| whole(option.votes_count))
+        .map(|option| saturating_i32(option.votes_count))
         .collect();
     let total = option_votes
         .iter()
@@ -216,13 +214,13 @@ pub(crate) async fn insert_poll(
         expires_at: poll_data.expires_at,
         multiple: poll_data.multiple,
         option_votes,
-        voters_count: poll_data.voters_count.map_or(0, whole),
-        votes_count: whole(total),
+        voters_count: poll_data.voters_count.map_or(0, saturating_i32),
+        votes_count: saturating_i32(total),
         ..PollParams::default()
     };
     poll::create(conn, status_id, &params)
         .await
-        .map_err(|err| FederationError::transient("the poll insert failed", &err))
+        .transient("the poll insert failed")
         .map(drop)
 }
 

@@ -33,7 +33,7 @@ use serde_json::Value;
 use tracing::{info, warn};
 
 use crate::{
-    jobs::{AttemptInfo, HandlerFuture, JobError},
+    jobs::{AttemptInfo, HandlerFuture, JobError, JobErrorExt as _},
     models::instance,
     state::AppState,
 };
@@ -128,7 +128,7 @@ pub(crate) async fn probe_unreachable(
 ) -> Result<(), JobError> {
     let ledger = instance::list_unreachable(&state.db)
         .await
-        .map_err(|err| JobError::Retry(format!("unreachable-host ledger read failed: {err}")))?;
+        .job_retry("unreachable-host ledger read failed")?;
     let cutoff = Utc::now() - PROBE_AFTER;
     let mut eligible: Vec<(&str, DateTime<Utc>)> = ledger
         .iter()

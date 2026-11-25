@@ -7,7 +7,7 @@ use tracing::debug;
 use super::delete_note;
 use crate::{
     federation::{
-        dispatch::{ActivityView, FederationError, Outcome},
+        dispatch::{ActivityView, FederationError, Outcome, TransientExt as _},
         handlers::{actor, chat::withdraw_chat_message, quote_answers},
         json,
     },
@@ -41,13 +41,13 @@ pub(super) async fn apply_delete(
     }
     let chat_message = chat::message_by_ap_id(&state.db, object_id)
         .await
-        .map_err(|err| FederationError::transient("the chat message read failed", &err))?;
+        .transient("the chat message read failed")?;
     if let Some(message) = chat_message {
         return withdraw_chat_message(&state, &message, &signer).await;
     }
     let stored = status::get_by_uri(&state.db, object_id)
         .await
-        .map_err(|err| FederationError::transient("the status uri read failed", &err))?;
+        .transient("the status uri read failed")?;
     withdraw(&state, &signer, object_id, stored).await
 }
 
@@ -77,7 +77,7 @@ async fn withdraw(
         Some(row) => {
             let deleted = delete_status::delete_status(state, &row)
                 .await
-                .map_err(|err| FederationError::transient("the status delete failed", &err))?;
+                .transient("the status delete failed")?;
             if deleted {
                 debug!(status = %row.id, "a Delete folded a remote status withdrawal");
                 Ok(Outcome::Handled)
