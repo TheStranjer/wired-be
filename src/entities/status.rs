@@ -104,6 +104,9 @@
 //! The bare quoted status also lands in `pleroma.quote` beside its
 //! `quote_visible` flag, false unless the state is `accepted`. `quote_id`
 //! names the quoted row either way.
+//! `quote_approval` is Mastodon 4.5's `{automatic, manual, current_user}`
+//! object, always present: who may quote the status and whether this viewer
+//! may (see [`QuoteApproval`], which lives in `quote_approval`).
 //!
 //! This module is a tree. [`StatusSource`] — the batch a render consumes —
 //! lives in `source`; the [`PleromaMetadata`] extension block, the viewer
@@ -123,6 +126,7 @@ use crate::entities::poll::Poll;
 
 mod entity;
 mod pleroma;
+mod quote_approval;
 mod source;
 
 #[cfg(test)]
@@ -133,6 +137,7 @@ mod test_support;
 pub use self::{
     entity::{QuoteEntity, QuoteRef, Status, StatusQuote},
     pleroma::PleromaMetadata,
+    quote_approval::QuoteApproval,
     source::{QuoteSlot, StatusSource},
 };
 

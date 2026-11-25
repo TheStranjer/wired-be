@@ -4,7 +4,7 @@
 //! mention and hashtag links, and the counters the fresh row feeds.
 
 use chrono::{DateTime, Utc};
-use sqlx::{PgConnection, PgPool};
+use sqlx::{PgConnection, PgPool, types::Json};
 use uuid::Uuid;
 
 use crate::{
@@ -14,8 +14,8 @@ use crate::{
 };
 
 use super::{
-    DEFAULT_CONTENT_TYPE, Status, Visibility, counters::count_new_post, reads::notice_url,
-    reads::object_uri,
+    DEFAULT_CONTENT_TYPE, QuotePolicy, Status, Visibility, counters::count_new_post,
+    reads::notice_url, reads::object_uri,
 };
 
 /// What to insert: every `statuses` column a caller can decide up front.
@@ -82,6 +82,9 @@ pub struct NewStatus {
     /// [`link_quotes_of`](super::link_quotes_of)); `None` for local
     /// statuses and statuses that quote nothing.
     pub quote_uri: Option<String>,
+    /// The `interactionPolicy.canQuote` a remote note advertised; `None`
+    /// for a note that advertised nothing and for every local status.
+    pub quote_policy: Option<QuotePolicy>,
     /// Accounts this status @-mentions, in mention order: [`insert`] links
     /// them to the new row in its transaction (see
     /// [`crate::models::mention`]); empty in the default.
@@ -147,6 +150,7 @@ impl Default for NewStatus {
             reblog_of_id: None,
             quote_of_id: None,
             quote_uri: None,
+            quote_policy: None,
             mentioned_user_ids: Vec::new(),
             hashtags: Vec::new(),
             media_ids: Vec::new(),
@@ -200,10 +204,10 @@ const INSERT_SQL: &str = "INSERT INTO statuses (
      in_reply_to_account_id, in_reply_to_ap_id, conversation_id,
      direct_conversation_id, reblog_of_id, quote_of_id, local,
      application_name, application_website, edited_at, expires_at,
-     ap_context, inserted_at, quote_uri
+     ap_context, inserted_at, quote_uri, quote_policy
 ) VALUES (
      $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
-     $17, $18, $19, $20, $21, $22, $23, $24, COALESCE($25, now()), $26
+     $17, $18, $19, $20, $21, $22, $23, $24, COALESCE($25, now()), $26, $27
 ) RETURNING *";
 
 /// The conversation the status being replied to belongs to, read from the
@@ -378,6 +382,7 @@ async fn write_status(
         .bind(new_status.ap_context.as_deref())
         .bind(new_status.inserted_at)
         .bind(new_status.quote_uri.as_deref())
+        .bind(new_status.quote_policy.clone().map(Json))
         .fetch_one(conn)
         .await?;
     Ok(status)

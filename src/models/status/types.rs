@@ -5,8 +5,10 @@
 use std::{fmt, str::FromStr};
 
 use chrono::{DateTime, Utc};
+use sqlx::types::Json;
 use uuid::Uuid;
 
+use super::QuotePolicy;
 use crate::models::user::User;
 
 /// The `text/plain` value of [`content_type`](super::NewStatus::content_type), which
@@ -170,6 +172,10 @@ pub struct Status {
     pub reblog_of_id: Option<Uuid>,
     /// Original this status quotes; `None` for anything but a quote.
     pub quote_of_id: Option<Uuid>,
+    /// The `interactionPolicy.canQuote` a remote note advertised; `None`
+    /// when it advertised nothing, and for every local status (whose policy
+    /// follows from its visibility).
+    pub quote_policy: Option<Json<QuotePolicy>>,
     /// Whether this instance owns the post.
     pub local: bool,
     /// Name of the client that posted this status, if it reported one.

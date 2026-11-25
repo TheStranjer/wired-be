@@ -65,6 +65,7 @@ mod delete;
 mod new_status;
 mod pages;
 mod quote_links;
+mod quote_policy;
 mod quoting;
 mod reads;
 mod reblogs;
@@ -86,6 +87,7 @@ pub use pages::{
     backup_page, outbox_page, public_replies_count, public_replies_page, status_visibility_counts,
 };
 pub use quote_links::{link_backfilled_quote, link_quotes_of, pending_quote_uri};
+pub use quote_policy::{QuotePolicy, set_quote_policy};
 pub use quoting::quoting_page;
 pub use reads::{
     conversation_id_for_context, get_by_id, get_by_id_including_deleted, get_by_uri, get_many,

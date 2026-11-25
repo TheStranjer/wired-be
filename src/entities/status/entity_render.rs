@@ -461,3 +461,29 @@ fn the_batch_found_emojis_render_as_custom_emoji_entities() {
         "filling the slot leaves the entity's key set alone"
     );
 }
+
+#[test]
+fn quote_approval_renders_an_object_and_a_reblog_carries_its_originals() {
+    let alice = base_user("alice");
+    let bob = other_user("bob", "01934567-89ab-7cde-f012-3456789abcdf");
+
+    let plain = render(&base_row(), &Parts::of(&alice), None);
+    assert_eq!(
+        plain["quote_approval"],
+        json!({"automatic": ["public"], "manual": [], "current_user": "unknown"}),
+        "a public local post, for a viewer nobody can tell"
+    );
+
+    let mut original = base_row();
+    original.user_id = bob.id;
+    original.visibility = crate::models::status::Visibility::Direct;
+    let nested = render_nested(&original, &bob);
+    let mut reblog = base_row();
+    reblog.reblog_of_id = Some(original.id);
+    let boosted = render(&reblog, &Parts::of(&alice), Some(nested));
+    assert_eq!(
+        boosted["quote_approval"],
+        json!({"automatic": [], "manual": [], "current_user": "unknown"}),
+        "the boost answers for the original, which nobody may quote"
+    );
+}
