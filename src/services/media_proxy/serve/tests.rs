@@ -47,6 +47,47 @@ fn only_media_top_level_types_are_served() {
 }
 
 #[test]
+fn active_content_masquerading_as_media_is_refused() {
+    for content_type in [
+        "image/svg+xml",
+        "IMAGE/SVG+XML; charset=utf-8",
+        "image/svg",
+        "image/html",
+        "image/json",
+        "image/xml",
+        "image/x-unknown",
+        "video/svg+xml",
+        "audio/html",
+        "video/",
+        "image/",
+    ] {
+        assert!(!is_media_type(content_type), "{content_type:?} refused");
+    }
+    for content_type in ["image/jpeg", "IMAGE/WEBP", "image/gif; x=y", "audio/mpeg"] {
+        assert!(is_media_type(content_type), "{content_type:?} served");
+    }
+}
+
+#[test]
+fn svg_upstreams_are_never_served_inline() {
+    let up = upstream(
+        200,
+        &[("content-type", "image/svg+xml")],
+        b"<svg xmlns='http://www.w3.org/2000/svg'><script>alert(1)</script></svg>",
+    );
+    let err = media_response(&up).unwrap_err();
+    assert!(
+        matches!(err, AppError::FailedDependency(_)),
+        "svg is refused, got {err:?}"
+    );
+    assert_eq!(
+        render(err).status(),
+        StatusCode::FAILED_DEPENDENCY,
+        "svg answers 424"
+    );
+}
+
+#[test]
 fn media_response_forces_inline_and_the_safety_headers() {
     let up = upstream(
         200,
