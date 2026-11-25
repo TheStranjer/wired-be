@@ -365,7 +365,14 @@ mod tests {
         assert_eq!(media.len(), 1, "still one attachment");
         assert_eq!(media[0].id, media_id, "the same row, not a new one");
         assert_eq!(media[0].description.as_deref(), Some("B"), "the new alt");
-        assert_eq!(revisions(&pool, status_id).await.len(), 1, "a revision");
+        let history = revisions(&pool, status_id).await;
+        assert_eq!(history.len(), 1, "a revision");
+        assert_eq!(history[0].media_ids, vec![media_id], "the media it wore");
+        assert_eq!(
+            history[0].media_descriptions,
+            Some(vec![Some("A".to_owned())]),
+            "the revision keeps the alt text of its own version"
+        );
     }
 
     #[tokio::test]
@@ -395,6 +402,13 @@ mod tests {
             (media[0].focus_x, media[0].focus_y),
             (Some(0.5), Some(-0.5)),
             "the focal point moved"
+        );
+        let history = revisions(&pool, status_id).await;
+        assert_eq!(history.len(), 1, "a focal-point change is a revision");
+        assert_eq!(
+            (&history[0].media_focus_x, &history[0].media_focus_y),
+            (&Some(vec![Some(0.0)]), &Some(vec![Some(0.0)])),
+            "the revision keeps the focal point of its own version"
         );
     }
 

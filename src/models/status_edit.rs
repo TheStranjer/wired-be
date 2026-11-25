@@ -8,7 +8,8 @@
 //! the current version, and `GET /api/v1/statuses/{id}/history` renders it
 //! as its last element. So a row of `status_edits` is always a revision a
 //! later edit superseded: the content, source text, warning, sensitive flag
-//! and media ids the post carried at the time, plus the account that wrote
+//! and media ids the post carried at the time (with each attachment's alt
+//! text and focal point), plus the account that wrote
 //! it and the moment that version was authored
 //! ([`record_revision`]'s timestamp rule).
 //!
@@ -38,6 +39,7 @@ use crate::{
 };
 
 pub mod media_attributes;
+mod media_snapshot;
 
 /// The live row [`update_status`] edits, locked: `FOR UPDATE` serializes two
 /// concurrent edits of one status, so each transaction snapshots exactly
@@ -52,16 +54,16 @@ const LIVE_FOR_UPDATE_SQL: &str = "SELECT * FROM statuses
 /// time, or its creation before any edit — and `account_id` its author.
 const RECORD_SQL: &str = "INSERT INTO status_edits (
      id, status_id, content, raw_text, spoiler_text, sensitive,
-     media_ids, created_at, account_id
+     media_ids, created_at, account_id,
+     media_descriptions, media_focus_x, media_focus_y
 ) VALUES (
-     $1, $2, $3, $4, $5, $6, $7, $8, $9
+     $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12
 )";
 
-/// The media ids to snapshot with a revision: the status's attachments in
-/// render order (the same `position, id` order
+/// The media ids of the live post: the status's attachments in render
+/// order (the same `position, id` order
 /// [`media_attachment::for_statuses`](crate::models::media_attachment::for_statuses)
-/// answers), so the history entry names its media the way the live row
-/// would have.
+/// answers).
 const MEDIA_IDS_SQL: &str = "SELECT id FROM media_attachments
      WHERE status_id = $1
   ORDER BY position, id";
@@ -135,7 +137,7 @@ const MEDIA_ATTACH_SQL: &str = "UPDATE media_attachments m
     WHERE m.id = v.id";
 
 /// One row of `status_edits`: one superseded version of a status.
-#[derive(Clone, Debug, PartialEq, Eq, sqlx::FromRow)]
+#[derive(Clone, Debug, PartialEq, sqlx::FromRow)]
 pub struct StatusEdit {
     /// `UUIDv7` primary key, minted by [`record_revision`] (decision 4).
     pub id: Uuid,
@@ -157,6 +159,14 @@ pub struct StatusEdit {
     /// The account that wrote that version (the status's author at the
     /// time of the snapshot).
     pub account_id: Uuid,
+    /// The alt text each of [`media_ids`](Self::media_ids) carried in that
+    /// version, aligned with it; `None` for a revision recorded before the
+    /// snapshot existed (see [`StatusEdit::dress`]).
+    pub media_descriptions: Option<Vec<Option<String>>>,
+    /// The horizontal focal axis each attachment carried, aligned likewise.
+    pub media_focus_x: Option<Vec<Option<f32>>>,
+    /// The vertical focal axis each attachment carried, aligned likewise.
+    pub media_focus_y: Option<Vec<Option<f32>>>,
 }
 
 /// The whole new state one edit writes onto a status.
@@ -217,15 +227,16 @@ pub struct EditParams {
 /// the write that supersedes it commit together. The revision's
 /// `created_at` is when the snapshotted version was authored — the row's
 /// `edited_at` if it had been edited before, its `inserted_at` until. The
-/// media ids come off `media_attachments` on the same connection: the
-/// attachments the post carries right now, in render order.
+/// media ids, alt texts and focal points come off `media_attachments` on the
+/// same connection: the attachments the post carries right now, in render
+/// order, before the edit that supersedes this version rewrites them.
 ///
 /// # Errors
 ///
 /// Any database failure (connection, encoding) arrives as
 /// [`AppError::Database`](crate::error::AppError).
 pub async fn record_revision(conn: &mut PgConnection, status: &Status) -> AppResult<()> {
-    let media_ids = media_ids_of(conn, status.id).await?;
+    let media = media_snapshot::load(conn, status.id).await?;
     sqlx::query(RECORD_SQL)
         .bind(new_id())
         .bind(status.id)
@@ -233,9 +244,12 @@ pub async fn record_revision(conn: &mut PgConnection, status: &Status) -> AppRes
         .bind(&status.raw_text)
         .bind(&status.spoiler_text)
         .bind(status.sensitive)
-        .bind(&media_ids)
+        .bind(&media.ids)
         .bind(status.edited_at.unwrap_or(status.inserted_at))
         .bind(status.user_id)
+        .bind(&media.descriptions)
+        .bind(&media.focus_x)
+        .bind(&media.focus_y)
         .execute(&mut *conn)
         .await
         .map(drop)?;
@@ -925,5 +939,11 @@ mod tests {
         );
         assert!(revision.sensitive);
         assert_eq!(revision.media_ids, vec![picture], "with the media it wore");
+        assert_eq!(
+            revision.media_descriptions,
+            Some(vec![None]),
+            "and one (here empty) alt text per attachment, aligned with the ids"
+        );
+        assert_eq!(revision.media_focus_x, Some(vec![None]), "and its focus");
     }
 }
