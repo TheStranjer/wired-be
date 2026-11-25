@@ -31,9 +31,10 @@ use crate::{
 /// - A method **with a default** that does nothing is an *optional hook*: a
 ///   protocol overrides it only when it has something to contribute.
 ///
-/// Later tickets add hooks by following this rule. Every hook added here must
-/// also be implemented by the fixture adapter (`protocols::fixture`, in test
-/// builds) and tested through it.
+/// A new hook follows this rule. Every hook added here must also be
+/// implemented by the fixture adapter (`protocols::fixture`, in test builds)
+/// and tested through it. `docs/ADDING_A_PROTOCOL.md` says which step of
+/// adding a protocol fills in which method.
 pub trait ProtocolAdapter: Sync {
     /// The protocol this adapter speaks.
     fn id(&self) -> ProtocolId;

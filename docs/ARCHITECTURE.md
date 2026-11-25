@@ -161,6 +161,83 @@ cite these decisions by number.
     accepts `wired_identifiers` to claim IDs at sign-up; both use
     `claim_identity`'s rules.
 
+18. **Protocols are adapters**: wired-be speaks more than one wire protocol,
+    and each one plugs in through one trait. Core never names a protocol.
+    `docs/ADDING_A_PROTOCOL.md` is the ordered playbook for adding one; this
+    decision is the why.
+    - **Identity of a protocol.** `ProtocolId` (`src/protocols.rs`) names it.
+      Each protocol has exactly one id string, used for the `PROTOCOLS` env
+      value (`src/config/protocols.rs`), the Cargo feature, the module
+      `src/protocols/<id>.rs` and the table prefix `<id>_`. A build needs at
+      least one protocol feature: a `compile_error!` in `src/protocols.rs`
+      lists them, and `ProtocolId::is_compiled` follows the feature. An
+      instance runs the compiled protocols `PROTOCOLS` names (default
+      `activitypub`), always in `ProtocolId::ALL` order.
+    - **`ProtocolAdapter`** (`src/protocols/adapter.rs`) is the trait.
+      A *required* method is something every protocol must decide (its id,
+      `router`, the identifier scheme, `identity`, `claim`), so a new protocol
+      cannot compile until it answers. A method *with a default* is an
+      optional hook that does nothing (client API routes, jobs, discovery
+      contributions, event reactions); a protocol overrides it only when it
+      has something to add. A new hook must also be implemented by the
+      fixture adapter and tested through it.
+    - **The registry** (`src/protocols/registry.rs`) maps each `ProtocolId`
+      to its adapter and lists the enabled ones. Every `match` on `ProtocolId`
+      (`as_str`, `is_compiled`, `registry::adapter`, and the `match` on
+      `AccountEvent` inside an adapter) lists every variant with no wildcard
+      arm, so adding a variant makes the compiler name each site to fix.
+    - **The main table is the identity record.** A protocol's own data lives in
+      `<id>_...` tables keyed by `user_id` (decision 7). Its main table,
+      `<id>_<noun>` (`activitypub_actors` for ActivityPub), holds one row per
+      account on the protocol with a unique identifier and a `status`
+      (`pending` or `active`). No row means not enrolled. There is no central
+      identities table; `ProtocolAdapter::identity` reads the protocol's own.
+    - **Identifier schemes and claiming** (`src/protocols/identity.rs`). Each
+      protocol supplies a validator, a converter from any nickname to a valid
+      ID, a taken check and a URI form of the ID; `suggest_identifier` makes a
+      derived ID unique. `claim` writes the identity row inside the caller's
+      transaction and lets the unique constraint answer `Taken`. A batch is
+      all or nothing: registration claims every enabled protocol in the
+      transaction that inserts the user, and any invalid or taken ID rolls
+      back the whole registration. Late enrolment (`claim_identity` in
+      `src/models/user/register/claims.rs`) runs the same operation for one
+      protocol.
+    - **Account events** (`src/protocols/events.rs`). Core fires one
+      `AccountEvent` and every enabled protocol decides what it means.
+      `on_account_event` runs *after commit* through `dispatch`: the change is
+      done, a failing hook is logged and cannot undo it, and network work
+      goes into a job. `on_password_change_in_tx` runs *inside the
+      transaction* because only then the plaintext password exists; its
+      failure rolls the password change back, and the plaintext is never
+      stored or logged.
+    - **Discovery** (`src/discovery.rs`). A `/.well-known` path is either
+      *owned* by one protocol (`well_known_routes`, mounted only while it is
+      enabled, never claimed twice) or a *shared document* core serves
+      whatever `PROTOCOLS` says and every protocol contributes to: WebFinger
+      (`webfinger`; its aliases are where cross-protocol identity URIs go),
+      host-meta (`host_meta_links`) and NodeInfo (`nodeinfo_protocol`, from
+      NodeInfo's fixed vocabulary). `oauth-authorization-server` will be a
+      shared document too; see the open questions in the playbook.
+    - **Core versus protocol-backed client routes** (`src/api.rs`). A client
+      route that works for a local account with no protocol data (login,
+      credentials, settings, instance info, `/api/v1/wired`) is core and
+      always mounted by `api::core_router`. A route that reads or writes a
+      protocol's data comes from that adapter's `client_api_router` and exists
+      only while the protocol is enabled; otherwise the app-wide fallback
+      answers it. A route is in exactly one of the two.
+    - **The `users` rule.** `users` holds what every protocol shares.
+      A protocol never adds its own columns to it; they go in its `<id>_...`
+      tables (decision 7).
+    - **Wired extensions** (decision 17) tell clients what is enabled and let
+      an account get onto a protocol: `wired.protocols` on the instance
+      documents, `GET /api/v1/wired/protocols`,
+      `POST /api/v1/wired/protocols/{protocol}/claim` and `wired_identifiers`
+      on `POST /api/v1/accounts`, all behind the `wired:protocols` flag.
+    - **Templates.** `src/protocols/fixture.rs` (test builds only) is the
+      minimal adapter every new protocol copies, and its tests model the
+      tests a protocol needs. `src/protocols/activitypub.rs` is the worked
+      example of a façade over a large existing implementation.
+
 ## Writing tests
 
 `tests/api/common.rs` holds the HTTP test harness (decision 13). It is

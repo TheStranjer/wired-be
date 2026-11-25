@@ -136,6 +136,7 @@ These are community conventions, not compiler rules. Follow them anyway.
 - Unit tests go at the bottom of the file they test, in `#[cfg(test)] mod tests { use super::*; ... }`.
 - Integration tests (exercise the whole router over HTTP) live in one test crate: `tests/api/main.rs` is its root and declares one `mod <area>;` per area file `tests/api/<area>.rs`; shared test helpers go in `tests/api/common.rs`. Cargo compiles every *top-level* `tests/*.rs` file as its own test binary that statically links the whole crate and all dependencies, so each extra top-level file costs a full relink on every `src/` change and a private copy of the debuginfo. One crate means one binary and one link. Add a new area as a module of `tests/api/` (and a `mod` line in `tests/api/main.rs`); never as a new top-level `tests/*.rs`.
 - Commit `Cargo.lock` (this is an application).
+- Any work that adds or changes a protocol starts with `docs/ADDING_A_PROTOCOL.md` (and decision 18 of `docs/ARCHITECTURE.md`).
 
 Target layout as the project grows:
 

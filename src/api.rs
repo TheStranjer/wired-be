@@ -21,6 +21,10 @@
 //!   from [`client_api_router`], so it is mounted only while `ActivityPub` is
 //!   enabled; otherwise the app-wide fallback answers it.
 //!
+//! This is the split of decision 18 (`docs/ARCHITECTURE.md`): another
+//! protocol's client routes are not listed here, they come from its own
+//! adapter's `client_api_router` (`docs/ADDING_A_PROTOCOL.md`, step 6).
+//!
 //! A whole area module is classified at once, and each route belongs to
 //! exactly one of the two routers, so merging them never meets the same
 //! method and path twice. [`v1`], [`v2`] and [`pleroma`] each expose a

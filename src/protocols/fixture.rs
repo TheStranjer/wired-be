@@ -7,7 +7,12 @@
 //! set of things a protocol decides.
 //!
 //! `protocols::activitypub` is the other worked example, a façade over a
-//! large existing implementation.
+//! large existing implementation. The ordered steps for a new protocol are in
+//! `docs/ADDING_A_PROTOCOL.md`; its tests below are the ones to model.
+//!
+//! Its state is in-memory statics standing in for the table a real protocol
+//! creates (the `<id>_<noun>` main table of that playbook), so the fixture
+//! needs no migration.
 
 use std::{
     collections::{HashMap, HashSet},
