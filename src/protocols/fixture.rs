@@ -9,7 +9,7 @@
 //! `protocols::activitypub` is the other worked example, a façade over a
 //! large existing implementation.
 
-use axum::{Router, http::StatusCode, routing::get};
+use axum::{Json, Router, http::StatusCode, routing::MethodRouter, routing::get};
 
 use crate::{
     jobs::{AttemptInfo, HandlerFn, HandlerFuture, JobError},
@@ -45,9 +45,17 @@ const FIXTURE_JOB_HANDLERS: &[(&str, HandlerFn)] = &[(KIND_NOOP, handle_noop)];
 /// The queues the fixture declares.
 const FIXTURE_JOB_QUEUES: &[&str] = &[QUEUE_FIXTURE];
 
+/// The `/.well-known` path only the fixture serves.
+pub const WELL_KNOWN_PATH: &str = "/.well-known/fixture";
+
 /// `GET /fixture/ping`: answers 204 No Content.
 async fn ping() -> StatusCode {
     StatusCode::NO_CONTENT
+}
+
+/// `GET /.well-known/fixture`: answers a small JSON object.
+async fn well_known_document() -> Json<serde_json::Value> {
+    Json(serde_json::json!({ "protocol": "fixture" }))
 }
 
 impl ProtocolAdapter for Fixture {
@@ -69,5 +77,10 @@ impl ProtocolAdapter for Fixture {
     /// One queue, [`QUEUE_FIXTURE`].
     fn job_queues(&self) -> &'static [&'static str] {
         FIXTURE_JOB_QUEUES
+    }
+
+    /// One owned path, `GET /.well-known/fixture`.
+    fn well_known_routes(&self) -> Vec<(&'static str, MethodRouter<AppState>)> {
+        vec![(WELL_KNOWN_PATH, get(well_known_document))]
     }
 }

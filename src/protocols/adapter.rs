@@ -1,6 +1,6 @@
 //! The trait every protocol implements to plug into the application.
 
-use axum::Router;
+use axum::{Router, routing::MethodRouter};
 
 use crate::{jobs::HandlerFn, protocols::ProtocolId, state::AppState};
 
@@ -45,5 +45,15 @@ pub trait ProtocolAdapter: Sync {
     /// worker never drains it. The default is no queues.
     fn job_queues(&self) -> &'static [&'static str] {
         &[]
+    }
+
+    /// The `/.well-known` paths this protocol alone serves, each with its handler.
+    ///
+    /// [`crate::discovery::router`] mounts them only while the protocol is
+    /// enabled. Every path must start with `/.well-known/` and must not be
+    /// claimed by core or another protocol; a document several protocols
+    /// contribute to is core's, not an owned path. The default is no paths.
+    fn well_known_routes(&self) -> Vec<(&'static str, MethodRouter<AppState>)> {
+        Vec::new()
     }
 }

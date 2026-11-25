@@ -34,7 +34,11 @@
 //! - `fixture` (test builds only) is the minimal adapter, the template to copy
 //!   for a new protocol.
 //!
-//! Discovery, identities and events will live here too. This file only names
+//! Owned `/.well-known` paths come from
+//! [`ProtocolAdapter::well_known_routes`](adapter::ProtocolAdapter::well_known_routes)
+//! and are mounted by [`crate::discovery`].
+//!
+//! Identities and events will live here too. This file only names
 //! the protocols and declares the submodules.
 
 pub mod activitypub;

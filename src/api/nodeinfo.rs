@@ -1,8 +1,9 @@
 //! `NodeInfo`: the `/.well-known/nodeinfo` discovery document and the
 //! `/nodeinfo/{version}` statistics (`docs/ARCHITECTURE.md` decision 1).
 //!
-//! This router is merged at the top level of [`crate::app`], not under
-//! `/api`: both addresses are fixed by the `NodeInfo` specification
+//! The routers are mounted at the top level, not under `/api`
+//! (`/.well-known/nodeinfo` by [`crate::discovery`], `/nodeinfo/{version}`
+//! by [`crate::app`]): both addresses are fixed by the `NodeInfo` specification
 //! (<https://nodeinfo.diaspora.software>). Pleroma serves them from
 //! `lib/pleroma/web/nodeinfo/nodeinfo_controller.ex` and builds the
 //! document in `lib/pleroma/web/nodeinfo/nodeinfo.ex`; its
@@ -76,17 +77,25 @@ const CONTENT_TYPE_21: &str =
 /// The only protocol this server federates with.
 const PROTOCOLS: [&str; 1] = ["activitypub"];
 
-/// The top-level `NodeInfo` router, merged by [`crate::app`].
+/// The path of the `NodeInfo` discovery document.
+pub const DISCOVERY_PATH: &str = "/.well-known/nodeinfo";
+
+/// The `/nodeinfo/{version}` router, merged by [`crate::app`].
 ///
-/// Both mount points live outside `/api`: `/.well-known/nodeinfo` is the
-/// discovery address the `NodeInfo` spec fixes, and `/nodeinfo/{version}` is
-/// the address the discovery document hands out (all four spellings the
-/// spec and Pleroma's links use — `2.0`, `2.0.json`, `2.1`, `2.1.json` —
-/// arrive at the one route).
+/// The address lives outside `/api` and outside `/.well-known`: it is the one
+/// the discovery document hands out (all four spellings the spec and
+/// Pleroma's links use — `2.0`, `2.0.json`, `2.1`, `2.1.json` — arrive at the
+/// one route). The `/.well-known/nodeinfo` document is in
+/// [`well_known_router`].
 pub fn router() -> Router<AppState> {
-    Router::new()
-        .route("/.well-known/nodeinfo", get(schemas))
-        .route("/nodeinfo/{version}", get(nodeinfo))
+    Router::new().route("/nodeinfo/{version}", get(nodeinfo))
+}
+
+/// The `/.well-known/nodeinfo` route, mounted by [`crate::discovery::router`].
+///
+/// It is the discovery address the `NodeInfo` spec fixes.
+pub fn well_known_router() -> Router<AppState> {
+    Router::new().route(DISCOVERY_PATH, get(schemas))
 }
 
 /// `GET /.well-known/nodeinfo` — the discovery document: the two schema
