@@ -144,7 +144,7 @@ pub(crate) use self::{
 };
 use self::{
     resolve::{resolve_quote, resolve_reply},
-    write::{build_new_status, write_ingested},
+    write::{Written, build_new_status, write_ingested},
 };
 
 /// The time one unknown-mention actor fetch may take before the mention is
@@ -339,7 +339,10 @@ async fn ingest_note_inner(
     }
     upsert_emojis(state, &parsed.emojis).await?;
     let new = build_new_status(&parsed, &reply, quote_of_id, &mentioned);
-    let row = write_ingested(state, &new, &parsed).await?;
+    let row = match write_ingested(state, &new, &parsed).await? {
+        Written::Created(row) => *row,
+        Written::Raced => return raced_outcome(state, uri).await,
+    };
     after_status_created(state, &row).await;
     enqueue_backfill(state, &row, depth.backfill).await;
     if depth.follow_quotes {
@@ -444,6 +447,17 @@ async fn seen_before(
             IngestOutcome::Existing(row)
         }
     }))
+}
+
+/// What a lost insert race on `uri` answers: the winner's row, read back.
+///
+/// The concurrent job that stored the object owns its hooks and backfills,
+/// so this attempt runs none and the caller carries on with the stored row
+/// in the same attempt, exactly as for a redelivery.
+async fn raced_outcome(state: &AppState, uri: &str) -> Result<IngestOutcome, FederationError> {
+    seen_before(state, uri).await?.ok_or_else(|| {
+        FederationError::Transient("the raced status vanished before it was read back".to_owned())
+    })
 }
 
 /// Step 10: whether the `ACCEPT_UNSOLICITED_PUBLIC` gate drops this post.

@@ -294,3 +294,73 @@ async fn the_advertised_quote_policy_lands_with_the_status() {
         "a note without interactionPolicy stores none"
     );
 }
+
+#[tokio::test]
+async fn a_lost_uri_race_reports_raced_and_writes_nothing() {
+    let db = crate::test_db::test_db().await.expect("test database slot");
+    let pool = db.pool().clone();
+    let state = app_state(&pool);
+    let bob = author(&pool).await;
+    let object = satellites_object();
+    let parsed = crate::federation::note_parser::parse_note(&object, &bob, chrono::Utc::now())
+        .expect("the note parses");
+    let new = build_new_status(&parsed, &ReplyLink::default(), None, &[]);
+
+    let first = write_ingested(&state, &new, &parsed)
+        .await
+        .expect("the first write lands");
+    let Written::Created(winner) = first else {
+        panic!("the first write creates, got {first:?}");
+    };
+    let second = write_ingested(&state, &new, &parsed)
+        .await
+        .expect("a duplicate uri is no error");
+
+    assert!(
+        matches!(second, Written::Raced),
+        "the second write loses the race, got {second:?}"
+    );
+    let rows = sqlx::query_scalar::<_, i64>("SELECT count(*) FROM statuses WHERE uri = $1")
+        .bind(&winner.uri)
+        .fetch_one(&pool)
+        .await
+        .expect("the rows count");
+    assert_eq!(rows, 1, "still one status for the uri");
+    let media = media_attachment::for_statuses(&pool, &[winner.id])
+        .await
+        .expect("the media reads")
+        .remove(&winner.id)
+        .expect("the winner keeps its media");
+    assert_eq!(media.len(), 2, "the loser added no media");
+}
+
+#[tokio::test]
+async fn concurrent_ingests_of_one_object_agree_on_one_status() {
+    let db = crate::test_db::test_db().await.expect("test database slot");
+    let pool = db.pool().clone();
+    let state = app_state(&pool);
+    let bob = author(&pool).await;
+    let object = satellites_object();
+
+    let (left, right) = tokio::join!(
+        ingest_note(&state, &bob, &object),
+        ingest_note(&state, &bob, &object),
+    );
+    let left_id = stored_id(left.expect("the first ingest does not error"));
+    let right_id = stored_id(right.expect("the second ingest does not error"));
+
+    assert_eq!(left_id, right_id, "both calls answer the same status");
+    let rows = sqlx::query_scalar::<_, i64>("SELECT count(*) FROM statuses")
+        .fetch_one(&pool)
+        .await
+        .expect("the rows count");
+    assert_eq!(rows, 1, "one row stored");
+}
+
+/// The id of the status an ingest outcome stored or found.
+fn stored_id(outcome: IngestOutcome) -> Uuid {
+    match outcome {
+        IngestOutcome::Created(row) | IngestOutcome::Existing(row) => row.id,
+        IngestOutcome::Ignored(reason) => panic!("ignored: {reason}"),
+    }
+}
