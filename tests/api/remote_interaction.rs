@@ -113,6 +113,78 @@ async fn remote_interaction_refuses_an_unresolvable_profile() {
     }
 }
 
+/// The anonymous endpoint counts into the `remote_interaction` bucket
+/// (WBE-814): the limited config decorates answers with `x-ratelimit-*`
+/// headers and refuses over the budget with 429, per client address.
+#[tokio::test]
+async fn remote_interaction_is_throttled_per_client() {
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    let db = common::test_db().await;
+    let config = common::test_config_with_rate_limits("remote_interaction=2:600");
+    let app = common::test_app_with_config(db.pool().clone(), config);
+    let peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 9)), 40_009);
+    let other = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10)), 40_010);
+
+    let first = common::TestRequest::post(ROUTE)
+        .form(&[("ap_id", AP_ID), ("profile", UNRESOLVABLE)])
+        .peer(peer)
+        .send(&app)
+        .await;
+    common::assert_answer(&first, StatusCode::BAD_REQUEST, "the counted request");
+    assert_eq!(first.header("x-ratelimit-limit"), Some("2"), "the budget");
+    assert_eq!(
+        first.header("x-ratelimit-remaining"),
+        Some("1"),
+        "one request spent of two"
+    );
+    let _second = common::TestRequest::post(ROUTE)
+        .form(&[("ap_id", AP_ID), ("profile", UNRESOLVABLE)])
+        .peer(peer)
+        .send(&app)
+        .await;
+    let third = common::TestRequest::post(ROUTE)
+        .form(&[("ap_id", AP_ID), ("profile", UNRESOLVABLE)])
+        .peer(peer)
+        .send(&app)
+        .await;
+    common::assert_answer(&third, StatusCode::TOO_MANY_REQUESTS, "over the budget");
+    common::assert_error(&third, "Throttled", "the throttle body");
+
+    let elsewhere = common::TestRequest::post(ROUTE)
+        .form(&[("ap_id", AP_ID), ("profile", UNRESOLVABLE)])
+        .peer(other)
+        .send(&app)
+        .await;
+    common::assert_answer(
+        &elsewhere,
+        StatusCode::BAD_REQUEST,
+        "another client has its own window",
+    );
+}
+
+/// A `profile` naming a non-standard port is refused as an unknown
+/// profile by default (WBE-814), before any lookup is made.
+#[tokio::test]
+async fn remote_interaction_refuses_a_handle_naming_a_non_standard_port() {
+    let db = common::test_db().await;
+    let config = common::test_config_with_rate_limits("remote_interaction=100:60");
+    let app = common::test_app_with_config(db.pool().clone(), config);
+
+    for profile in ["bob@remote.example:8080", "bob@203.0.113.9:6379"] {
+        let response = common::TestRequest::post(ROUTE)
+            .json(&json!({"ap_id": AP_ID, "profile": profile}))
+            .send(&app)
+            .await;
+        common::assert_answer(&response, StatusCode::BAD_REQUEST, "a ported handle");
+        assert_eq!(
+            response.text(),
+            COULD_NOT_FIND_USER,
+            "{profile}: refused like an unknown profile"
+        );
+    }
+}
+
 /// `POST /ostatus_subscribe` is not routed (WBE-741): even a local user's
 /// correct password follows nobody — the fallback answers 404 and no
 /// `follows` row is written, so no unauthenticated route takes a password.

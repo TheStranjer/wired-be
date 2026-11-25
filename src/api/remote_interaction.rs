@@ -26,6 +26,12 @@
 //!   is asked to carry back, and Pleroma substitutes whatever it is
 //!   given.
 //!
+//!   The route is anonymous but makes this server `WebFinger` a
+//!   caller-named host, so it counts into the `remote_interaction` rate-limit
+//!   bucket (WBE-814), and a `profile` naming a port other than 80 or 443
+//!   is the same 400 `Couldn't find user` with no request made, unless
+//!   `HTTP_ALLOW_PRIVATE_HOSTS` (the development and test switch) is on.
+//!
 //! The subscribe lookup reads the full `WebFinger` answer through the
 //! client's whole-document reader (see
 //! [`crate::federation::webfinger_client`]), the same URL, host-meta
@@ -50,6 +56,10 @@ mod interaction;
 #[cfg(test)]
 mod test_support;
 
+/// The rate-limit bucket of the endpoint (see [`crate::rate_limit`]).
+const RATE_LIMIT_BUCKET: &str = "remote_interaction";
+/// The ports a user-triggered lookup may name in a `profile` handle.
+const ALLOWED_PORTS: [&str; 2] = ["80", "443"];
 /// The `rel` naming an instance's remote-follow (subscribe) endpoint.
 const SUBSCRIBE_REL: &str = "http://ostatus.org/schema/1.0/subscribe";
 /// The 400 body message of the JSON endpoint, Pleroma's wording.
@@ -62,8 +72,15 @@ const MISSING_PROFILE: &str = "Missing parameter: profile";
 
 /// The `/api/v1/pleroma` fragment of this feature, merged by
 /// [`crate::api::v1`]: `POST /remote_interaction`.
-pub fn pleroma_router() -> Router<AppState> {
-    Router::new().route("/pleroma/remote_interaction", post(remote_interaction))
+///
+/// The route counts into the `remote_interaction` bucket of
+/// [`crate::rate_limit`]: it is anonymous and makes this server `WebFinger`
+/// a caller-named host, so it must not be an unmetered outbound trigger.
+pub fn pleroma_router(state: &AppState) -> Router<AppState> {
+    Router::new().route(
+        "/pleroma/remote_interaction",
+        post(remote_interaction).layer(crate::rate_limit::rate_limit(state, RATE_LIMIT_BUCKET)),
+    )
 }
 
 /// The parameters of `POST /api/v1/pleroma/remote_interaction`: both are
@@ -95,10 +112,11 @@ mod tests {
     use super::*;
 
     /// The router mounts the documented path.
-    #[test]
-    fn the_router_carries_the_route() {
+    #[tokio::test]
+    async fn the_router_carries_the_route() {
         // Building it proves the path is axum-legal; the handler is
         // exercised over HTTP by the integration suite.
-        let _api: Router<AppState> = pleroma_router();
+        let state = test_support::client_state();
+        let _api: Router<AppState> = pleroma_router(&state);
     }
 }

@@ -10,14 +10,14 @@ use url::form_urlencoded;
 use crate::{
     error::{AppError, AppResult},
     extract::ApiBody,
-    federation::webfinger_client::{URI_MACRO, URI_MACRO_ENCODED, finger_with_base},
+    federation::webfinger_client::{URI_MACRO, URI_MACRO_ENCODED, finger_with_base, split_acct},
     http_client::HttpClient,
     state::AppState,
 };
 
 use super::{
-    COULD_NOT_FIND_USER, InteractionParams, InteractionReply, MISSING_AP_ID, MISSING_PROFILE,
-    SUBSCRIBE_REL,
+    ALLOWED_PORTS, COULD_NOT_FIND_USER, InteractionParams, InteractionReply, MISSING_AP_ID,
+    MISSING_PROFILE, SUBSCRIBE_REL,
 };
 
 /// `POST /api/v1/pleroma/remote_interaction` (Pleroma's
@@ -29,7 +29,8 @@ use super::{
 /// [`AppError::BadRequest`] with [`MISSING_AP_ID`] or [`MISSING_PROFILE`]
 /// for an absent or blank parameter, and with [`COULD_NOT_FIND_USER`]
 /// when `profile` resolves through `WebFinger` to no usable subscribe
-/// template.
+/// template, and likewise when `profile` names a port other than 80 or
+/// 443 (see [`port_allowed`]).
 pub(super) async fn remote_interaction(
     State(state): State<AppState>,
     ApiBody(params): ApiBody<InteractionParams>,
@@ -53,10 +54,32 @@ pub(super) async fn interaction_answer(
     let Some(profile) = required(params.profile.as_deref()) else {
         return Err(AppError::BadRequest(MISSING_PROFILE.to_owned()));
     };
+    if !port_allowed(profile, state.config.fetch.http_allow_private_hosts) {
+        debug!(profile, "remote interaction refused a handle naming a port");
+        return Err(AppError::BadRequest(COULD_NOT_FIND_USER.to_owned()));
+    }
     let url = subscribe_url_for(&state.http_client, ap_id, profile, webfinger_base)
         .await
         .ok_or_else(|| AppError::BadRequest(COULD_NOT_FIND_USER.to_owned()))?;
     Ok(Json(InteractionReply { url }))
+}
+
+/// Whether a user-triggered lookup may finger `profile`: a handle naming no
+/// port, or the standard `80` or `443`, always; any other port only with
+/// `allow_ported` (`HTTP_ALLOW_PRIVATE_HOSTS`, the development and test
+/// switch), so an anonymous caller cannot aim this server at arbitrary
+/// `host:port` pairs. An unusable handle passes: the lookup refuses it
+/// before any request.
+fn port_allowed(profile: &str, allow_ported: bool) -> bool {
+    if allow_ported {
+        return true;
+    }
+    let Some((_nickname, domain)) = split_acct(profile) else {
+        return true;
+    };
+    domain
+        .rsplit_once(':')
+        .is_none_or(|(_host, port)| ALLOWED_PORTS.contains(&port))
 }
 
 /// The whole subscribe lookup of the JSON endpoint: `WebFinger`s `profile` and expands `target` into
@@ -136,6 +159,8 @@ fn required(value: Option<&str>) -> Option<&str> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use axum::{
         http::{StatusCode, header},
         response::IntoResponse as _,
@@ -149,6 +174,7 @@ mod tests {
             JRD_NO_TEMPLATE, JRD_SUBSCRIBE, PROFILE, WANT_URL, XRD_SUBSCRIBE, body_of, client,
             client_state, serve, status_route, url_against, webfinger_route,
         },
+        config::Config,
         federation::webfinger_client::{JRD_JSON, XRD_XML},
     };
 
@@ -242,6 +268,77 @@ mod tests {
             assert!(matches!(err, AppError::BadRequest(_)), "{why} is a 400");
             assert_eq!(err.to_string(), want, "{why}: the exact message");
         }
+    }
+
+    /// A state whose SSRF guard is on, as production runs: ported
+    /// handles are refused. No request leaves it.
+    fn guarded_state() -> AppState {
+        let mut config = Config::for_tests();
+        config.fetch.http_allow_private_hosts = false;
+        AppState {
+            config: Arc::new(config),
+            ..client_state()
+        }
+    }
+
+    #[test]
+    fn only_standard_ports_pass_without_the_development_switch() {
+        for (profile, allowed, why) in [
+            ("bob@remote.example", true, "no port"),
+            ("bob@remote.example:443", true, "the https port"),
+            ("@bob@remote.example:80", true, "the http port"),
+            ("acct:bob@Remote.Example:443", true, "a prefixed handle"),
+            ("bob@remote.example:8080", false, "an alternate web port"),
+            ("bob@remote.example:22", false, "a port that is no web port"),
+            ("bob@203.0.113.9:6379", false, "an IP with a service port"),
+            ("bob@remote.example:0443", false, "a padded port"),
+            (
+                "bob@remote.example:4430",
+                false,
+                "a port that only starts 443",
+            ),
+            ("bob@invalid", true, "an unusable handle fails later"),
+        ] {
+            assert_eq!(port_allowed(profile, false), allowed, "{why}");
+        }
+        assert!(
+            port_allowed("bob@remote.example:8080", true),
+            "the development switch allows any port"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_json_endpoint_refuses_a_non_standard_port_by_default() {
+        let state = guarded_state();
+        for profile in ["bob@remote.example:8080", "bob@203.0.113.9:25"] {
+            let params = InteractionParams {
+                ap_id: Some(AP_ID.to_owned()),
+                profile: Some(profile.to_owned()),
+            };
+            let err = interaction_answer(&state, params, None)
+                .await
+                .expect_err("a ported handle is refused");
+            assert!(matches!(err, AppError::BadRequest(_)), "{profile}: a 400");
+            assert_eq!(
+                err.to_string(),
+                COULD_NOT_FIND_USER,
+                "{profile}: the same refusal as an unknown profile"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_json_endpoint_still_fingers_the_https_port() {
+        let (server, base) = serve(webfinger_route(JRD_JSON, JRD_SUBSCRIBE)).await;
+        let params = InteractionParams {
+            ap_id: Some(AP_ID.to_owned()),
+            profile: Some("bob@remote.example:443".to_owned()),
+        };
+        let reply = interaction_answer(&guarded_state(), params, Some(&base))
+            .await
+            .expect("port 443 is a standard port");
+        server.abort();
+        assert_eq!(reply.0.url, WANT_URL, "the lookup went through");
     }
 
     #[tokio::test]

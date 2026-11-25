@@ -40,7 +40,9 @@
 //! a plain pass-through: no counting, no headers.
 //!
 //! WBE-504 mounts `imports` on the three CSV import routes (see
-//! [`crate::api::pleroma_import`]).
+//! [`crate::api::pleroma_import`]); WBE-814 mounts `remote_interaction` on
+//! the anonymous `POST /api/v1/pleroma/remote_interaction` (see
+//! [`crate::api::remote_interaction`]).
 //!
 //! Three tickets have mounted buckets so far: WBE-56 the ones whose routes
 //! already existed — `authentication` on `POST /oauth/token` and
@@ -93,13 +95,18 @@ pub use middleware::{RateLimitLayer, RateLimited, rate_limit};
 /// 30 per 60 s. `imports` (1 per 3600 s) is this server's own: the CSV
 /// follow, block and mute imports (WBE-504) each fan out to thousands of
 /// outbound fetches, so a user gets one import per hour across the three.
-pub const DEFAULT_LIMITS: [(&str, u64, u64); 10] = [
+/// `remote_interaction` (5 per 60 s) is its own too: the anonymous
+/// `POST /api/v1/pleroma/remote_interaction` makes this server `WebFinger`
+/// a caller-named host (WBE-814), so one client address gets five lookups
+/// a minute.
+pub const DEFAULT_LIMITS: [(&str, u64, u64); 11] = [
     ("account_confirmation_resend", 5, 8_600),
     ("app_account_creation", 5, 1_800),
     ("authentication", 20, 5),
     ("imports", 1, 3_600),
     ("password_reset", 5, 1_800),
     ("relation_id_action", 2, 60),
+    ("remote_interaction", 5, 60),
     ("relations_actions", 10, 10),
     ("search", 30, 60),
     ("status_id_action", 2, 60),
@@ -187,11 +194,12 @@ pub fn parse_limits(text: &str) -> Result<BTreeMap<String, RateLimit>, String> {
 mod tests {
     use super::*;
 
-    /// The ten buckets and their budgets, as the tickets fix them.
+    /// The eleven buckets and their budgets, as the tickets fix them.
     #[test]
     fn default_limits_carry_the_pleroma_buckets() {
         let limits = default_limits();
-        let want: [(&str, u64, u64); 10] = [
+        let want: [(&str, u64, u64); 11] = [
+            ("remote_interaction", 5, 60),
             ("imports", 1, 3_600),
             ("authentication", 20, 5),
             ("app_account_creation", 5, 1_800),
@@ -203,7 +211,7 @@ mod tests {
             ("account_confirmation_resend", 5, 8_600),
             ("search", 30, 60),
         ];
-        assert_eq!(limits.len(), want.len(), "exactly the ten buckets");
+        assert_eq!(limits.len(), want.len(), "exactly the eleven buckets");
         for (name, max, secs) in want {
             let limit = limits
                 .get(name)
