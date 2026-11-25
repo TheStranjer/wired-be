@@ -134,11 +134,17 @@ pub(crate) async fn resolve_mentions(
 }
 
 /// The local accounts a note addresses in `to`/`cc` (its
-/// [`ParsedNote::audience`]), in document order, each once.
+/// [`ParsedNote::audience`]) without mentioning them, in document order,
+/// each once.
 ///
-/// A silent mention in Mastodon's sense: only stored rows count, and only
-/// `local` ones — an unknown or remote id is skipped and never fetched, as
-/// a remote recipient needs no access grant here.
+/// A silent mention in Mastodon's sense: the accounts keep access to the
+/// status (a direct post's thread, a private audience) but are not
+/// mentioned — no notification, and no standing with the unsolicited-post
+/// gate, because any remote actor can address any local account. Only
+/// stored rows count, and only `local` ones — an unknown or remote id is
+/// skipped and never fetched, as a remote recipient needs no access grant
+/// here. An account already in `mentioned` is left out: its real mention
+/// stands.
 ///
 /// # Errors
 ///
@@ -146,6 +152,7 @@ pub(crate) async fn resolve_mentions(
 pub(crate) async fn resolve_local_audience(
     state: &AppState,
     audience: &[String],
+    mentioned: &[User],
 ) -> Result<Vec<User>, FederationError> {
     let mut found: Vec<User> = Vec::new();
     for ap_id in audience {
@@ -154,22 +161,13 @@ pub(crate) async fn resolve_local_audience(
             .map_err(|err| FederationError::transient("the audience read failed", &err))?;
         if let Some(account) = stored
             && account.local.get()
+            && mentioned.iter().all(|seen| seen.id != account.id)
             && found.iter().all(|seen| seen.id != account.id)
         {
             found.push(account);
         }
     }
     Ok(found)
-}
-
-/// Appends each of `extra` to `mentioned` unless an account with its id is
-/// already there.
-pub(crate) fn merge_accounts(mentioned: &mut Vec<User>, extra: Vec<User>) {
-    for account in extra {
-        if mentioned.iter().all(|seen| seen.id != account.id) {
-            mentioned.push(account);
-        }
-    }
 }
 
 /// One unknown mention's capped fetch: the [`User`] when the actor answers

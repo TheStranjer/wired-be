@@ -233,6 +233,7 @@ pub async fn edit_status(
         sensitive: checked.sensitive,
         language: checked.language.map(str::to_owned),
         mentioned_user_ids: fields.mentioned_user_ids,
+        silent_user_ids: Vec::new(),
         hashtags: fields.hashtags,
         media_ids: media.ids,
         edited_at: None,

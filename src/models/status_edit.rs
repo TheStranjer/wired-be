@@ -198,6 +198,10 @@ pub struct EditParams {
     /// [`update_status`] replaces the post's whole link set with these
     /// (see [`crate::models::mention`]).
     pub mentioned_user_ids: Vec<Uuid>,
+    /// The accounts the new addressing names without mentioning them,
+    /// linked silently after [`mentioned_user_ids`](Self::mentioned_user_ids)
+    /// (see `mention::link_silent_conn`).
+    pub silent_user_ids: Vec<Uuid>,
     /// The hashtags the new text carries (see [`crate::models::hashtag`]),
     /// likewise replacing the post's whole tag set.
     pub hashtags: Vec<String>,
@@ -356,6 +360,7 @@ pub async fn update_status(
         return Ok(None);
     };
     mention::replace_conn(&mut tx, status_id, &params.mentioned_user_ids).await?;
+    mention::link_silent_conn(&mut tx, status_id, &params.silent_user_ids).await?;
     hashtag::replace_names_conn(&mut tx, status_id, &params.hashtags).await?;
     if let Some(kept) = &new_media {
         replace_media(&mut tx, status_id, kept).await?;
@@ -563,6 +568,7 @@ mod tests {
             sensitive: false,
             language: None,
             mentioned_user_ids: Vec::new(),
+            silent_user_ids: Vec::new(),
             hashtags: Vec::new(),
             media_ids: None,
             edited_at: None,
