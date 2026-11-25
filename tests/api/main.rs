@@ -503,6 +503,10 @@ mod pins;
 /// The protocol adapters `app()` mounts under each `PROTOCOLS` value.
 mod protocols;
 
+/// The admin routes split into core and `ActivityPub`-backed halves under
+/// each `PROTOCOLS` value.
+mod protocols_admin;
+
 /// Poll parameters on `POST /api/v1/statuses`: the `CommonAPI` poll rules,
 /// the empty-text skip, the form nesting, and the storage wiring — poll
 /// and option rows committed with the status, rendered in the entity,

@@ -5,6 +5,12 @@
 //! the account lifecycle: create, delete, activate, deactivate, toggle and
 //! approve.
 //!
+//! Every route is core ([`router`]) except the forced `POST /users/follow` and
+//! `POST /users/unfollow`, which write follows and so are `ActivityPub`-backed
+//! ([`activitypub_router`]). `GET /users` and `GET /users/{nickname}` can
+//! reach remote mirror accounts, but they only read the accounts table, so
+//! they stay core and answer when `ActivityPub` is off.
+//!
 //! The reference is Pleroma's `AdminAPI.UserController`
 //! (`lib/pleroma/web/admin_api/controllers/user_controller.ex`), `index`
 //! and `show`, and its `AdminAPIController`
@@ -265,7 +271,10 @@ const SELF_REVOKE: &str = "You can't revoke your own admin status.";
 /// ticket pins; a bigger one is refused whole, before anything is created.
 const MAX_CREATE_USERS: usize = 50;
 
-/// The user routes of the admin API, merged into [`super`].
+/// The core user routes of the admin API, merged into [`super::core_router`].
+///
+/// Every route here manages one local account or a batch of them. The forced
+/// follow pair is the one exception, [`activitypub_router`].
 ///
 /// `/users/{nickname}` is the show route of the same prefix the invite
 /// actions (`/users/invites` and friends, [`super::invites`]) live under;
@@ -305,8 +314,6 @@ pub fn router() -> Router<AppState> {
             patch(resend_confirmation_email),
         )
         .route("/users/disable_mfa", put(disable_mfa))
-        .route("/users/follow", post(follow_users))
-        .route("/users/unfollow", post(unfollow_users))
         .route("/users/tag", put(tag_users).delete(untag_users))
         .route(
             "/users/{nickname}/permission_group",
@@ -331,6 +338,18 @@ pub fn router() -> Router<AppState> {
             "/users/{nickname}/toggle_activation",
             patch(toggle_activation),
         )
+}
+
+/// The forced follow and unfollow, `ActivityPub`-backed: they write follows,
+/// so [`super::activitypub_router`] merges them rather than the core router.
+///
+/// `/users/follow` and `/users/unfollow` are static segments beside the core
+/// router's `/users/{nickname}` parameter, which the router resolves the same
+/// way when both halves are merged.
+pub fn activitypub_router() -> Router<AppState> {
+    Router::new()
+        .route("/users/follow", post(follow_users))
+        .route("/users/unfollow", post(unfollow_users))
 }
 
 /// The batch create.

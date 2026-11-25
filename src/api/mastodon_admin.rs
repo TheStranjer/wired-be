@@ -1,6 +1,16 @@
 //! The Mastodon admin API's account endpoints over HTTP: three reads
 //! (WBE-210) and five moderation writes (WBE-213).
 //!
+//! Every route here is core: it manages local accounts and needs no
+//! `ActivityPub` data, so [`crate::api::v1::core_router`] and
+//! [`crate::api::v2::core_router`] mount it whatever `PROTOCOLS` enables. The
+//! listings can include remote mirror accounts and `action` can close a
+//! report through `report_id`, so these routes are mixed in themselves; they
+//! stay core because they read and write the accounts and reports tables
+//! directly, with no `ActivityPub` machinery, and so still answer when
+//! `ActivityPub` is off. The report queue is the `ActivityPub`-backed sibling,
+//! [`crate::api::mastodon_admin_reports`].
+//!
 //! The reads are `GET /api/v1/admin/accounts`,
 //! `GET /api/v1/admin/accounts/{id}` and `GET /api/v2/admin/accounts`; the
 //! writes are `DELETE /api/v1/admin/accounts/{id}` and its `enable`,
