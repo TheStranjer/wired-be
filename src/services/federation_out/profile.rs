@@ -21,7 +21,7 @@ use crate::{
         vocab::AS_PUBLIC,
     },
     models::{
-        activitypub_actor,
+        activitypub_actor::{self, ActivityPubActor},
         custom_emoji::CustomEmoji,
         follow, relay,
         user::{self, User},
@@ -67,9 +67,6 @@ pub async fn after_profile_updated(state: &AppState, account: &User) {
     else {
         return; // an actor with no followers collection has nobody to tell
     };
-    // From here `account` carries the actor row's key and inbox, which the
-    // document names.
-    let account = &activitypub_actor::apply_row(account.clone(), row);
     let emojis = match profile_emojis(&state.db, account).await {
         Ok(emojis) => emojis,
         Err(err) => {
@@ -77,13 +74,7 @@ pub async fn after_profile_updated(state: &AppState, account: &User) {
             return;
         }
     };
-    let document = update_document(
-        state,
-        account,
-        &followers_collection,
-        account.public_key.as_deref(),
-        &emojis,
-    );
+    let document = update_document(state, account, &followers_collection, row.as_ref(), &emojis);
     let unique_key = format!("profile-update:{}", account.id);
     match publisher::publish_in_background(state, account.id, &document, &[], Some(&unique_key))
         .await
@@ -95,13 +86,14 @@ pub async fn after_profile_updated(state: &AppState, account: &User) {
 
 /// The actor document for the profile in `account`, as an `Update` activity
 /// addressed to the public and to the account's followers collection;
-/// `public_key` is the account's key as `activitypub_actors` stores it and
-/// `emojis` are the custom emojis the profile uses, tagged on the actor.
+/// `actor` is the account's `activitypub_actors` row, which the document's
+/// key and inbox come from, and `emojis` are the custom emojis the profile
+/// uses, tagged on the actor.
 fn update_document(
     state: &AppState,
     account: &User,
     followers_collection: &str,
-    public_key: Option<&str>,
+    actor: Option<&ActivityPubActor>,
     emojis: &[CustomEmoji],
 ) -> Value {
     json!({
@@ -109,7 +101,7 @@ fn update_document(
         "id": activity_id(&state.config, new_id()),
         "type": "Update",
         "actor": account.ap_id,
-        "object": actor_json(account, public_key, &state.config, emojis),
+        "object": actor_json(account, actor, &state.config, emojis),
         "to": [AS_PUBLIC],
         "cc": [followers_collection],
     })
@@ -228,13 +220,15 @@ mod tests {
     use crate::{
         config::TEST_BASE_URL,
         models::{
+            activitypub_actor::ActivityPubActorWrite,
             custom_emoji::{self, NewCustomEmoji},
-            user::{Flag, NewUser, insert},
+            user::{Flag, NewUser, followers, insert},
         },
         services::federation_out::test_support::{
             accepted_follow, app_state, delivered_inboxes, delivery_jobs, job_count, local,
             publish_jobs, remote, run_publishes,
         },
+        test_fixtures::write_actor,
     };
 
     /// A profile edit publishes an `Update` of the actor document, to the
@@ -269,7 +263,7 @@ mod tests {
         assert_eq!(activity["actor"], alice.ap_id);
         assert_eq!(activity["object"]["id"], alice.ap_id);
         assert_eq!(activity["to"][0], AS_PUBLIC);
-        assert_eq!(activity["cc"][0], alice.followers_url.unwrap());
+        assert_eq!(activity["cc"][0], followers(&alice.ap_id));
     }
 
     /// The queued `Update` carries the `Emoji` tags of the local emojis the
@@ -461,20 +455,28 @@ mod tests {
 
     /// A remote mirror on `host` with a shared inbox and no relationship.
     async fn mirror_on(pool: &sqlx::PgPool, name: &str, host: &str) -> User {
-        insert(
+        let mirror = insert(
             pool,
             &NewUser {
                 nickname: format!("{name}@{host}"),
                 ap_id: format!("https://{host}/users/{name}"),
                 local: Flag::new(false),
                 domain: Some(host.to_owned()),
-                inbox: Some(format!("https://{host}/users/{name}/inbox")),
-                shared_inbox: Some(format!("https://{host}/inbox")),
                 ..NewUser::default()
             },
         )
         .await
-        .expect("the mirror fixture inserts")
+        .expect("the mirror fixture inserts");
+        let _row = write_actor(
+            pool,
+            &ActivityPubActorWrite {
+                inbox: Some(format!("https://{host}/users/{name}/inbox")),
+                shared_inbox: Some(format!("https://{host}/inbox")),
+                ..ActivityPubActorWrite::bare(mirror.id)
+            },
+        )
+        .await;
+        mirror
     }
 
     /// The `extra_inboxes` of one queued publish job, sorted.
@@ -578,12 +580,19 @@ mod tests {
                 ap_id: "https://other.example/users/solo".to_owned(),
                 local: Flag::new(false),
                 domain: Some("other.example".to_owned()),
-                inbox: Some("https://other.example/users/solo/inbox".to_owned()),
                 ..NewUser::default()
             },
         )
         .await
         .expect("the personal-inbox fixture inserts");
+        let _row = write_actor(
+            &pool,
+            &ActivityPubActorWrite {
+                inbox: Some("https://other.example/users/solo/inbox".to_owned()),
+                ..ActivityPubActorWrite::bare(personal.id)
+            },
+        )
+        .await;
         let headless = insert(
             &pool,
             &NewUser {

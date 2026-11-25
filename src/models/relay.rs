@@ -578,7 +578,6 @@ mod tests {
                 ap_id: ap_id.to_owned(),
                 domain: Some(host.to_owned()),
                 actor_type: "Application".to_owned(),
-                inbox: Some(format!("{ap_id}/inbox")),
                 ..NewUser::default()
             },
         )

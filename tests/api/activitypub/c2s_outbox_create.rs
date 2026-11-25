@@ -8,8 +8,7 @@ use serde_json::json;
 use tempfile::TempDir;
 use uuid::Uuid;
 use wired_be::models::{
-    status::Visibility,
-    user::{NewUser, followers},
+    activitypub_actor::ActivityPubActorWrite, status::Visibility, user::followers,
 };
 
 use super::support::{
@@ -146,10 +145,14 @@ async fn the_c2s_outbox_create_reads_visibility_from_the_audience() {
     let db = common::test_db().await;
     let pool = db.pool().clone();
     let app = common::test_app(pool.clone());
-    let alice = common::create_local_user_with(&pool, "c2s-out-visibility", |new| NewUser {
-        followers_url: Some(followers(&new.ap_id)),
-        ..new
-    })
+    let alice = common::create_local_user(&pool, "c2s-out-visibility").await;
+    let _row = common::write_actor(
+        &pool,
+        &ActivityPubActorWrite {
+            followers_url: Some(followers(&alice.ap_id)),
+            ..ActivityPubActorWrite::bare(alice.id)
+        },
+    )
     .await;
     let token = common::create_app_and_token(&pool, &alice, "read write").await;
     let followers = followers(&alice.ap_id);

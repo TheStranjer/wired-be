@@ -118,11 +118,7 @@ pub(super) fn assert_delivered(
         delivery.digest_matches(),
         "the Digest describes the bytes that arrived"
     );
-    let pem = expected
-        .actor
-        .public_key
-        .as_deref()
-        .expect("the fixture actor publishes its key");
+    let pem = remote::local_keys().public_pem.as_str();
     assert!(
         delivery.signature_verifies(pem),
         "and the Signature verifies against that key"

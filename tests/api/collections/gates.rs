@@ -213,6 +213,10 @@ async fn authorized_fetch_gates_every_collection_route() {
         .await
         .expect("the instance actor is provisioned");
     let key_id = format!("{}#main-key", actor.ap_id);
+    let private_pem = common::actor_of(&pool, &actor)
+        .await
+        .private_key
+        .expect("the provisioned actor holds its private key");
     let opened = [
         "/users/alice/outbox?page=true".to_owned(),
         "/users/alice/collections/featured".to_owned(),
@@ -225,10 +229,7 @@ async fn authorized_fetch_gates_every_collection_route() {
             None,
             &SigningKey {
                 key_id: &key_id,
-                private_pem: actor
-                    .private_key
-                    .as_deref()
-                    .expect("the provisioned actor holds its private key"),
+                private_pem: &private_pem,
             },
             Utc::now(),
         )

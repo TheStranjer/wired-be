@@ -88,6 +88,7 @@ pub async fn preview_status(
         StatusSource {
             row: &row,
             author: user,
+            author_actor: None,
             reply_author: reply_author.as_ref(),
             media: &[],
             mentions: &mentioned,

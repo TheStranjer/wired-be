@@ -1,33 +1,35 @@
 //! [`upsert_remote_user`]: storing a parsed actor as the instance's mirror
 //! row.
 
+use chrono::Utc;
 use sqlx::PgPool;
 
 use super::{ActorError, NewRemoteUser};
 use crate::{
     federation::json::http_host,
-    models::{activitypub_actor, custom_emoji, instance, user::User},
+    models::{
+        activitypub_actor::{self, ActivityPubActorWrite},
+        custom_emoji, instance,
+        user::User,
+    },
     util::id::new_id,
 };
 
-/// The upsert behind [`upsert_remote_user`]: insert keyed by a fresh
+/// The `users` upsert behind [`upsert_remote_user`]: insert keyed by a fresh
 /// `UUIDv7`, or, when `ap_id` already has a row, overwrite exactly the
-/// profile, key, endpoint, `alsoKnownAs`, `bot` and birthday columns the actor
-/// document describes plus
-/// `last_fetched_at` and `updated_at`. `local`, the login columns,
-/// the moderation roles and the denormalised counters are deliberately not
-/// touched: re-fetching a remote actor must not undo anything this instance
-/// knows beyond the document itself.
+/// profile, `alsoKnownAs`, `bot` and birthday columns the actor document
+/// describes plus `updated_at`. `local`, the login columns, the moderation
+/// roles and the denormalised counters are deliberately not touched:
+/// re-fetching a remote actor must not undo anything this instance knows
+/// beyond the document itself. The endpoints and keys go to the
+/// `activitypub_actors` row, written by [`upsert_remote_user`] beside this.
 const UPSERT_SQL: &str = "INSERT INTO users (
      id, nickname, ap_id, local, domain, actor_type, name, bio, raw_bio,
      avatar_url, banner_url, profile_url, locked, discoverable, fields,
-     inbox, shared_inbox, outbox, followers_url, following_url,
-     featured_url, public_key, also_known_as, public_key_id, bot,
-     birthday, show_birthday, last_fetched_at
+     also_known_as, bot, birthday, show_birthday
  ) VALUES (
      $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15,
-     $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26::date, $26::date IS NOT NULL,
-     now()
+     $16, $17, $18::date, $18::date IS NOT NULL
  ) ON CONFLICT (ap_id) DO UPDATE SET
      birthday = EXCLUDED.birthday,
      show_birthday = EXCLUDED.show_birthday,
@@ -44,16 +46,7 @@ const UPSERT_SQL: &str = "INSERT INTO users (
      locked = EXCLUDED.locked,
      discoverable = EXCLUDED.discoverable,
      fields = EXCLUDED.fields,
-     inbox = EXCLUDED.inbox,
-     shared_inbox = EXCLUDED.shared_inbox,
-     outbox = EXCLUDED.outbox,
-     followers_url = EXCLUDED.followers_url,
-     following_url = EXCLUDED.following_url,
-     featured_url = EXCLUDED.featured_url,
-     public_key = EXCLUDED.public_key,
      also_known_as = EXCLUDED.also_known_as,
-     public_key_id = EXCLUDED.public_key_id,
-     last_fetched_at = now(),
      updated_at = now()
  RETURNING *";
 
@@ -75,21 +68,14 @@ const RENAME_HOLDER_SQL: &str = "UPDATE users
      SET nickname = (id::text || '.' || nickname::text)::citext, updated_at = now()
      WHERE ap_id = $1";
 
-/// Frees a key id another row holds before this actor claims it.
+/// Frees a key id another actor holds before this actor claims it.
 ///
-/// The unique index on `public_key_id` would otherwise fail the whole upsert
-/// when a host re-homes a key id onto a different actor. The latest document
-/// wins; the loser's next fetch stores its own id again.
-const RELEASE_KEY_ID_SQL: &str =
-    "UPDATE users SET public_key_id = NULL WHERE public_key_id = $1 AND ap_id <> $2";
-
-/// [`RELEASE_KEY_ID_SQL`] for the `activitypub_actors` row that holds the key id.
-///
-/// That table has the same unique index, so the key id is freed there too
-/// (part of the temporary dual write, see
-/// [`activitypub_actor`](crate::models::activitypub_actor)). The keeper is
-/// named by `ap_id` because its id is not known before the first insert.
-const RELEASE_ACTOR_KEY_ID_SQL: &str = "UPDATE activitypub_actors SET public_key_id = NULL
+/// The unique index on `activitypub_actors.public_key_id` would otherwise
+/// fail the whole upsert when a host re-homes a key id onto a different
+/// actor. The latest document wins; the loser's next fetch stores its own id
+/// again. The keeper is named by `ap_id` because its id is not known before
+/// the first insert.
+const RELEASE_KEY_ID_SQL: &str = "UPDATE activitypub_actors SET public_key_id = NULL
      WHERE public_key_id = $1
        AND user_id NOT IN (SELECT id FROM users WHERE ap_id = $2)";
 
@@ -98,8 +84,9 @@ const RELEASE_ACTOR_KEY_ID_SQL: &str = "UPDATE activitypub_actors SET public_key
 ///
 /// The first fetch inserts a row with a fresh `UUIDv7` (decision 4); later
 /// fetches apply to the row with the same `ap_id`, updating the profile
-/// fields, keys and inbox endpoints in place and stamping
-/// `last_fetched_at = now()`.
+/// fields in place. The actor's keys and endpoints are written to its
+/// `activitypub_actors` row in the same transaction, stamped
+/// `last_fetched_at` with the time of the fetch.
 ///
 /// Before writing, the probe `NICKNAME_HOLDER_SQL` checks who owns the
 /// nickname. A remote row of the same `domain` under a different `ap_id` is
@@ -152,11 +139,6 @@ pub async fn upsert_remote_user(pool: &PgPool, new: NewRemoteUser) -> Result<Use
             .bind(new.ap_id.as_str())
             .execute(&mut *tx)
             .await?;
-        let _released_actor = sqlx::query(RELEASE_ACTOR_KEY_ID_SQL)
-            .bind(key_id)
-            .bind(new.ap_id.as_str())
-            .execute(&mut *tx)
-            .await?;
     }
     let user = sqlx::query_as::<_, User>(UPSERT_SQL)
         .bind(new_id())
@@ -174,20 +156,24 @@ pub async fn upsert_remote_user(pool: &PgPool, new: NewRemoteUser) -> Result<Use
         .bind(new.locked)
         .bind(new.discoverable)
         .bind(new.fields)
-        .bind(new.inbox.as_str())
-        .bind(new.shared_inbox.as_deref())
-        .bind(new.outbox.as_deref())
-        .bind(new.followers_url.as_deref())
-        .bind(new.following_url.as_deref())
-        .bind(new.featured_url.as_deref())
-        .bind(new.public_key.as_str())
         .bind(&new.also_known_as)
-        .bind(new.public_key_id.as_deref())
         .bind(new.bot)
         .bind(new.birthday)
         .fetch_one(&mut *tx)
         .await?;
-    activitypub_actor::upsert_from_user(&mut *tx, &user, new.public_key_id.as_deref())
+    let identity = ActivityPubActorWrite {
+        inbox: Some(new.inbox),
+        shared_inbox: new.shared_inbox,
+        outbox: new.outbox,
+        followers_url: new.followers_url,
+        following_url: new.following_url,
+        featured_url: new.featured_url,
+        public_key: Some(new.public_key),
+        public_key_id: new.public_key_id,
+        last_fetched_at: Some(Utc::now()),
+        ..ActivityPubActorWrite::bare(user.id)
+    };
+    activitypub_actor::upsert(&mut *tx, &identity)
         .await
         .map(drop)?;
     tx.commit().await?;
@@ -208,6 +194,7 @@ pub async fn upsert_remote_user(pool: &PgPool, new: NewRemoteUser) -> Result<Use
 mod tests {
     use chrono::{DateTime, TimeDelta, Utc};
     use serde_json::{Value, json};
+    use uuid::Uuid;
 
     use super::*;
     use crate::{
@@ -216,19 +203,26 @@ mod tests {
             test_support::{MASTODON, PLEROMA, fixture},
         },
         models::{
-            activitypub_actor::ActorStatus,
+            activitypub_actor::{ActivityPubActor, ActorStatus},
             user::{
                 CountDelta, Flag, NewUser, get_by_ap_id, get_by_id, get_by_nickname,
                 get_by_public_key_id, insert, update_counts,
             },
         },
-        test_fixtures::assert_actor_in_step,
     };
 
-    /// The mirror row the first fetch of a Mastodon actor stores: every
-    /// column read off the document, and none of the secrets a local account
-    /// has.
-    fn assert_mirror_of(first: &User, document: &Value) {
+    /// The `activitypub_actors` row of `user_id`, which the upsert wrote.
+    async fn actor_row(pool: &PgPool, user_id: Uuid) -> ActivityPubActor {
+        activitypub_actor::get(pool, user_id)
+            .await
+            .unwrap()
+            .expect("the upsert wrote the actor row")
+    }
+
+    /// The mirror the first fetch of a Mastodon actor stores: the profile
+    /// read off the document on `users`, the keys and endpoints on its actor
+    /// row, and none of the secrets a local account has.
+    fn assert_mirror_of(first: &User, actor: &ActivityPubActor, document: &Value) {
         assert_eq!(
             first.nickname, "alice@mastodon.example",
             "the parsed handle"
@@ -244,25 +238,25 @@ mod tests {
             "the host"
         );
         assert!(
-            first.private_key.is_none() && first.email.is_none() && first.password_hash.is_none(),
+            actor.private_key.is_none() && first.email.is_none() && first.password_hash.is_none(),
             "a remote row carries no local secrets"
         );
         assert_eq!(
-            first.public_key.as_deref(),
+            actor.public_key.as_deref(),
             document["publicKey"]["publicKeyPem"].as_str(),
             "the key is stored"
         );
         assert_eq!(
-            first.inbox.as_deref(),
+            actor.inbox.as_deref(),
             Some("https://mastodon.example/users/alice/inbox"),
             "the inbox endpoint"
         );
         assert_eq!(
-            first.shared_inbox.as_deref(),
+            actor.shared_inbox.as_deref(),
             Some("https://mastodon.example/inbox"),
             "the shared inbox endpoint"
         );
-        assert!(first.last_fetched_at.is_some(), "the fetch is stamped");
+        assert!(actor.last_fetched_at.is_some(), "the fetch is stamped");
         assert!(
             first.discoverable.get() && !first.locked.get(),
             "the flags moved"
@@ -277,7 +271,7 @@ mod tests {
         let first = upsert_remote_user(&pool, parse_actor(&document).unwrap())
             .await
             .unwrap();
-        assert_mirror_of(&first, &document);
+        assert_mirror_of(&first, &actor_row(&pool, first.id).await, &document);
 
         // Counters move through update_counts only: a re-fetch must not
         // reset them (nor touch the login/role columns, absent here).
@@ -352,12 +346,12 @@ mod tests {
             .expect("the key id still resolves");
         assert_eq!(moved.id, carol.id, "the latest document holds the key id");
 
-        let alice_actor = assert_actor_in_step(&pool, alice.id).await;
+        let alice_actor = actor_row(&pool, alice.id).await;
         assert!(
             alice_actor.public_key_id.is_none(),
-            "the actor row lost the key id too"
+            "the previous holder lost the key id"
         );
-        let carol_actor = assert_actor_in_step(&pool, carol.id).await;
+        let carol_actor = actor_row(&pool, carol.id).await;
         assert_eq!(
             carol_actor.public_key_id.as_deref(),
             Some("https://mastodon.example/users/alice#main-key"),
@@ -365,10 +359,10 @@ mod tests {
         );
     }
 
-    /// Both tables hold the same moved columns after the first fetch and
-    /// after a re-fetch that changes them, and the actor row is `active`.
+    /// The actor row holds the endpoints and key after the first fetch and
+    /// after a re-fetch that changes them, and is `active`.
     #[tokio::test]
-    async fn an_upsert_writes_both_tables_alike() {
+    async fn an_upsert_writes_the_actor_row() {
         let db = crate::test_db::test_db().await.expect("test database slot");
         let pool = db.pool().clone();
         let mut document = fixture(MASTODON);
@@ -376,7 +370,7 @@ mod tests {
             .await
             .unwrap();
 
-        let stored = assert_actor_in_step(&pool, first.id).await;
+        let stored = actor_row(&pool, first.id).await;
         assert_eq!(
             stored.status,
             ActorStatus::Active,
@@ -401,7 +395,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(second.id, first.id, "the same account is re-fetched");
-        let refreshed = assert_actor_in_step(&pool, first.id).await;
+        let refreshed = actor_row(&pool, first.id).await;
         assert_eq!(
             refreshed.inbox.as_deref(),
             Some("https://mastodon.example/users/alice/new-inbox"),
@@ -412,8 +406,9 @@ mod tests {
             "the new key replaced the old"
         );
         assert_eq!(
-            refreshed.public_key, second.public_key,
-            "and is the one the user row stores"
+            refreshed.public_key.as_deref(),
+            Some("-----BEGIN PUBLIC KEY-----\nNEW\n"),
+            "and is the one the document carries"
         );
         let rows: (i64,) = sqlx::query_as("SELECT count(*) FROM activitypub_actors")
             .fetch_one(&pool)
@@ -447,7 +442,7 @@ mod tests {
             .fetch_one(&pool)
             .await
             .unwrap();
-        assert_eq!(rows.0, 1, "only the squatter's own row exists");
+        assert_eq!(rows.0, 0, "the refused actor left no row behind");
     }
 
     #[tokio::test]

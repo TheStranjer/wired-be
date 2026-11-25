@@ -15,8 +15,6 @@ pub(super) use crate::test_fixtures::local_new;
 pub(super) const BASE: &str = "https://test.example";
 /// A password hash that must never surface in `Debug` output.
 pub(super) const SECRET_HASH: &str = "$argon2id$v=19$secret-digest";
-/// Private key material that must never surface in `Debug` output.
-pub(super) const SECRET_KEY: &str = "BEGIN RSA PRIVATE KEY secret END";
 /// A TOTP secret (inside `mfa_settings`) that must never surface in
 /// `Debug` output.
 pub(super) const SECRET_TOTP: &str = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ";

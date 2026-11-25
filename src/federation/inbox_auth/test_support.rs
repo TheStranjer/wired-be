@@ -30,7 +30,10 @@ pub(super) use crate::test_server::{bind, origin, spawn};
 use crate::{
     config::Config,
     federation::signature::{SigningKey, sign_request},
-    models::user::{NewUser, User, insert},
+    models::{
+        activitypub_actor::{self, ActivityPubActorWrite},
+        user::{NewUser, User, insert},
+    },
     services::runtime_config,
     state::AppState,
 };
@@ -269,11 +272,19 @@ pub(super) async fn seed_remote_user(pool: &PgPool, ap_id: &str, public_pem: &st
         ap_id: ap_id.to_owned(),
         domain: Some("127.0.0.1".to_owned()),
         name: "Alice".to_owned(),
-        inbox: Some(format!("{ap_id}/inbox")),
-        public_key: Some(public_pem.to_owned()),
         ..NewUser::default()
     };
-    let _seeded: User = insert(pool, &new).await.unwrap();
+    let seeded: User = insert(pool, &new).await.unwrap();
+    let _row = activitypub_actor::upsert(
+        pool,
+        &ActivityPubActorWrite {
+            inbox: Some(format!("{ap_id}/inbox")),
+            public_key: Some(public_pem.to_owned()),
+            ..ActivityPubActorWrite::bare(seeded.id)
+        },
+    )
+    .await
+    .unwrap();
 }
 
 /// A delivering peer's `POST`: the body and every header the fediverse

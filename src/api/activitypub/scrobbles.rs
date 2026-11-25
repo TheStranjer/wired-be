@@ -16,6 +16,7 @@ use crate::{
     error::{AppError, AppResult},
     federation::activities::{audio_json, listen_json},
     models::{
+        activitypub_actor,
         scrobble::{self, Scrobble},
         status::Visibility,
         user::{User, get_by_id},
@@ -49,7 +50,8 @@ pub(super) async fn audio_response(state: &AppState, id: Uuid) -> AppResult<Resp
     let Some((row, listener)) = served(state, id).await? else {
         return Err(AppError::RouteNotFound);
     };
-    let document = audio_json(&row, &listener, &state.config);
+    let followers = activitypub_actor::account_followers(&state.db, &listener).await?;
+    let document = audio_json(&row, &listener, &followers, &state.config);
     Ok(document_response(&document))
 }
 
@@ -63,6 +65,7 @@ pub(super) async fn listen_response(state: &AppState, id: Uuid) -> AppResult<Res
     let Some((row, listener)) = served(state, id).await? else {
         return Err(AppError::RouteNotFound);
     };
-    let document = listen_json(&row, &listener, &state.config);
+    let followers = activitypub_actor::account_followers(&state.db, &listener).await?;
+    let document = listen_json(&row, &listener, &followers, &state.config);
     Ok(document_response(&document))
 }

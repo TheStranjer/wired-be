@@ -44,13 +44,17 @@ async fn signed_as_instance_actor(pool: &sqlx::PgPool, config: &Config) -> Signe
         .await
         .expect("the instance actor is provisioned");
     let key_id = format!("{}#main-key", actor.ap_id);
+    let private_pem = common::actor_of(pool, &actor)
+        .await
+        .private_key
+        .expect("the provisioned actor holds its private key");
     sign_request(
         "GET",
         "https://test.example/users/alice",
         None,
         &SigningKey {
             key_id: &key_id,
-            private_pem: actor.private_key.as_deref().expect("it has a private key"),
+            private_pem: &private_pem,
         },
         Utc::now(),
     )

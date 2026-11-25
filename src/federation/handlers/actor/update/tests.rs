@@ -57,31 +57,24 @@ async fn an_update_folds_the_new_profile_into_the_mirror() {
         json!([{"name": "Site", "value": "https://new.example"}]),
         "the profile fields moved"
     );
+    let actor = crate::models::activitypub_actor::get(&pool, alice_id)
+        .await
+        .expect("the actor row reads")
+        .expect("the mirror has an actor row");
     assert_eq!(
-        stored.inbox.as_deref(),
+        actor.inbox.as_deref(),
         Some("https://peer.example/users/alice/inbox2"),
         "the inbox endpoint moved"
     );
     assert_eq!(
-        stored.shared_inbox.as_deref(),
+        actor.shared_inbox.as_deref(),
         Some("https://peer.example/inbox"),
         "and the shared inbox arrived"
     );
     assert_eq!(
-        stored.public_key.as_deref(),
-        Some(NEW_PEM),
-        "and so did the signing key"
-    );
-
-    let actor = crate::test_fixtures::assert_actor_in_step(&pool, alice_id).await;
-    assert_eq!(
-        actor.inbox, stored.inbox,
-        "the actor row follows the inbox move"
-    );
-    assert_eq!(
         actor.public_key.as_deref(),
         Some(NEW_PEM),
-        "and the new signing key"
+        "and so did the signing key"
     );
 }
 
@@ -192,8 +185,12 @@ async fn two_updates_inside_ten_seconds_both_apply() {
         .expect("the mirror fixture stores");
     let alice_id = upserted.id;
     let just_fetched = stored_as_of(&pool, alice_id, "2026-01-01T00:00:00Z").await;
+    let fetched_actor = crate::models::activitypub_actor::get(&pool, alice_id)
+        .await
+        .expect("the actor row reads")
+        .expect("the fetch wrote an actor row");
     assert!(
-        just_fetched.last_fetched_at.is_some(),
+        fetched_actor.last_fetched_at.is_some(),
         "the fetch stamped the mirror a moment ago"
     );
 

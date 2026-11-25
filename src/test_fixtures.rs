@@ -7,18 +7,23 @@
 use serde_json::Value;
 
 #[cfg(test)]
+use chrono::Utc;
+#[cfg(test)]
 use sqlx::PgPool;
 #[cfg(test)]
 use uuid::Uuid;
 
-#[cfg(test)]
-use crate::models::{
-    activitypub_actor::{self, ActivityPubActor},
-    user::{User, get_by_id, insert},
-};
 use crate::{
     config::TEST_BASE_URL,
     models::user::{NewUser, local_ap_id},
+};
+#[cfg(test)]
+use crate::{
+    models::{
+        activitypub_actor::{self, ActivityPubActor, ActivityPubActorWrite},
+        user::{User, insert},
+    },
+    util::keys::KeyPair,
 };
 
 /// The host the remote fixtures mirror their actors from.
@@ -77,74 +82,87 @@ pub async fn remote_user(pool: &PgPool, nickname: &str) -> User {
         .expect("the remote fixture inserts")
 }
 
-/// Asserts an account's actor row holds the moved columns of its `users` row.
+/// Writes `write` as the account's `activitypub_actors` row, for a test that needs the identity.
 ///
-/// Returns the actor row. The check behind every test of the temporary dual write (see
-/// [`crate::models::activitypub_actor`]): `inbox`, `shared_inbox`, `outbox`,
-/// `followers_url`, `following_url`, `featured_url`, `public_key`,
-/// `private_key`, `public_key_id` and `last_fetched_at` compare equal.
+/// Only the crate's own unit tests compile it, like [`local_user`].
 ///
 /// # Panics
 ///
-/// Panics when either row is missing or any column differs.
+/// Panics if the write fails, as a fixture's failure fails its test.
 #[cfg(test)]
-pub async fn assert_actor_in_step(pool: &PgPool, user_id: Uuid) -> ActivityPubActor {
-    let user = get_by_id(pool, user_id)
+pub async fn write_actor(pool: &PgPool, write: &ActivityPubActorWrite) -> ActivityPubActor {
+    activitypub_actor::upsert(pool, write)
         .await
-        .expect("the user reads")
-        .expect("the user exists");
-    let key_id =
-        sqlx::query_scalar::<_, Option<String>>("SELECT public_key_id FROM users WHERE id = $1")
-            .bind(user_id)
-            .fetch_one(pool)
-            .await
-            .expect("the key id reads");
-    let actor = activitypub_actor::get(pool, user_id)
-        .await
-        .expect("the actor row reads")
-        .expect("the account has an actor row");
-    assert_eq!(actor.inbox, user.inbox, "inbox");
-    assert_eq!(actor.shared_inbox, user.shared_inbox, "shared_inbox");
-    assert_eq!(actor.outbox, user.outbox, "outbox");
-    assert_eq!(actor.followers_url, user.followers_url, "followers_url");
-    assert_eq!(actor.following_url, user.following_url, "following_url");
-    assert_eq!(actor.featured_url, user.featured_url, "featured_url");
-    assert_eq!(actor.public_key, user.public_key, "public_key");
-    assert_eq!(actor.private_key, user.private_key, "private_key");
-    assert_eq!(actor.public_key_id, key_id, "public_key_id");
-    assert_eq!(
-        actor.last_fetched_at, user.last_fetched_at,
-        "last_fetched_at"
-    );
-    actor
+        .expect("the actor row writes")
 }
 
-/// Copies the moved columns of a `users` row onto its `activitypub_actors` row.
+/// Gives the account an `activitypub_actors` row stamped as fetched a moment ago.
 ///
-/// For a fixture that sets those columns with a raw `UPDATE users`, so the
-/// two tables stay in step the way the writers keep them.
+/// The state a lookup serves from the database without the network.
+///
+/// Only the crate's own unit tests compile it, like [`local_user`].
 ///
 /// # Panics
 ///
-/// Panics when the account has no actor row to update.
+/// Panics if the write fails, as a fixture's failure fails its test.
 #[cfg(test)]
-pub async fn resync_actor(pool: &PgPool, user_id: Uuid) {
-    let copied = sqlx::query(
-        "UPDATE activitypub_actors AS a
-            SET inbox = u.inbox, shared_inbox = u.shared_inbox, outbox = u.outbox,
-                followers_url = u.followers_url, following_url = u.following_url,
-                featured_url = u.featured_url, public_key = u.public_key,
-                private_key = u.private_key, public_key_id = u.public_key_id,
-                last_fetched_at = u.last_fetched_at
-           FROM users AS u
-          WHERE u.id = a.user_id AND u.id = $1",
+pub async fn fetched_just_now(pool: &PgPool, user_id: Uuid) -> ActivityPubActor {
+    write_actor(
+        pool,
+        &ActivityPubActorWrite {
+            last_fetched_at: Some(Utc::now()),
+            ..ActivityPubActorWrite::bare(user_id)
+        },
     )
-    .bind(user_id)
-    .execute(pool)
     .await
-    .expect("the actor row updates")
-    .rows_affected();
-    assert_eq!(copied, 1, "the account has one actor row to update");
+}
+
+/// Inserts a mirror of the remote actor `nickname` with the inboxes and key a fetched actor has.
+///
+/// The `activitypub_actors` row names the personal inbox
+/// `https://remote.example/users/{nickname}/inbox`, the shared inbox
+/// `https://remote.example/inbox` and the public key `PUB`.
+///
+/// # Panics
+///
+/// Panics if either insert fails, as a fixture's failure fails its test.
+#[cfg(test)]
+pub async fn federating_remote(pool: &PgPool, nickname: &str) -> User {
+    let user = remote_user(pool, nickname).await;
+    let _row = write_actor(
+        pool,
+        &ActivityPubActorWrite {
+            inbox: Some(format!("https://{REMOTE_HOST}/users/{nickname}/inbox")),
+            shared_inbox: Some(format!("https://{REMOTE_HOST}/inbox")),
+            public_key: Some("PUB".to_owned()),
+            ..ActivityPubActorWrite::bare(user.id)
+        },
+    )
+    .await;
+    user
+}
+
+/// Inserts a local user named `nickname` with the signing keys and endpoints a federating account has.
+///
+/// The `activitypub_actors` row carries a placeholder key pair and the endpoints a registration derives
+/// (see [`ActivityPubActorWrite::for_local_account`]).
+///
+/// # Panics
+///
+/// Panics if either insert fails, as a fixture's failure fails its test.
+#[cfg(test)]
+pub async fn federating_user(pool: &PgPool, nickname: &str) -> User {
+    let user = local_user(pool, nickname).await;
+    let keys = KeyPair {
+        private_pem: "PEM".to_owned(),
+        public_pem: "PUB".to_owned(),
+    };
+    let _row = write_actor(
+        pool,
+        &ActivityPubActorWrite::for_local_account(&user, TEST_BASE_URL, keys),
+    )
+    .await;
+    user
 }
 
 /// The keys of the JSON object `value`, sorted: the exact key-set

@@ -50,6 +50,10 @@ async fn a_move_to_a_remote_account_delivers_a_follow_per_follower() {
     let pool = db.pool().clone();
     let (origin, token) = fixture(&pool, "alice", "write:accounts").await;
     let target = remote_target(&pool, &origin).await;
+    let target_inbox = common::actor_of(&pool, &target)
+        .await
+        .inbox
+        .expect("an inbox");
     let carol = common::create_local_user(&pool, "carol").await;
     let dave = common::create_local_user(&pool, "dave").await;
     for follower in [&carol, &dave] {
@@ -78,7 +82,7 @@ async fn a_move_to_a_remote_account_delivers_a_follow_per_follower() {
             .find(|job| job["body"]["actor"] == json!(follower.ap_id))
             .expect("the follower's Follow was queued");
         assert_eq!(job["body"]["object"], json!(target.ap_id));
-        assert_eq!(job["inbox"], json!(target.inbox.clone().expect("an inbox")));
+        assert_eq!(job["inbox"], json!(target_inbox));
         assert_eq!(
             Some(job["body"]["id"].as_str().expect("an id")),
             row.ap_id.as_deref(),

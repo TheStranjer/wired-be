@@ -12,12 +12,13 @@ use zip::ZipArchive;
 
 use super::*;
 use crate::{
-    federation::actor::stored_public_key,
     jobs::backups::test_support::{like, mark, post, user},
     models::{
+        activitypub_actor::ActivityPubActorWrite,
         backup::file_name,
         status::{Visibility, soft_delete},
     },
+    test_fixtures::write_actor,
     test_support::app_state,
 };
 
@@ -147,12 +148,12 @@ async fn the_archive_holds_the_four_entries_and_owns_its_temp_file() {
             "{name} parses as a JSON object"
         );
     }
-    let public_key = stored_public_key(&pool, &alice)
+    let actor = activitypub_actor::get(&pool, alice.id)
         .await
-        .expect("the key reads");
+        .expect("the actor row reads");
     assert_eq!(
         entry_json(&archive, ACTOR_ENTRY),
-        actor_json(&alice, public_key.as_deref(), &state.config, &[]),
+        actor_json(&alice, actor.as_ref(), &state.config, &[]),
         "actor.json is the federation actor verbatim"
     );
 
@@ -176,15 +177,14 @@ async fn the_actor_entry_carries_the_key_of_the_actor_row() {
     let pool = db.pool().clone();
     let state = app_state(&pool);
     let alice = user(&pool, "alice").await;
-    let changed = sqlx::query(
-        "UPDATE activitypub_actors SET public_key = 'actor-row-key' WHERE user_id = $1",
+    let _row = write_actor(
+        &pool,
+        &ActivityPubActorWrite {
+            public_key: Some("actor-row-key".to_owned()),
+            ..ActivityPubActorWrite::bare(alice.id)
+        },
     )
-    .bind(alice.id)
-    .execute(&pool)
-    .await
-    .expect("the actor row updates")
-    .rows_affected();
-    assert_eq!(changed, 1, "the account has one actor row");
+    .await;
 
     let archive = build_for(&state, &alice).await;
 

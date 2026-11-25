@@ -57,23 +57,6 @@ pub struct User {
     /// Profile metadata as its source text: JSON array of `{name, value}`
     /// objects, the same entries [`fields`](Self::fields) renders.
     pub raw_fields: Value,
-    /// `ActivityPub` inbox endpoint, if known.
-    pub inbox: Option<String>,
-    /// Shared inbox endpoint, if known.
-    pub shared_inbox: Option<String>,
-    /// `ActivityPub` outbox collection id, if known.
-    pub outbox: Option<String>,
-    /// Followers collection id, if known.
-    pub followers_url: Option<String>,
-    /// Following collection id, if known.
-    pub following_url: Option<String>,
-    /// Featured (pinned) collection id, if known.
-    pub featured_url: Option<String>,
-    /// Actor public signing key (PEM), if known.
-    pub public_key: Option<String>,
-    /// Actor private signing key; local users only. Never in `Debug`
-    /// output.
-    pub private_key: Option<String>,
     /// Whether the account has the admin role.
     pub is_admin: Flag,
     /// Whether the account has the moderator role.
@@ -168,8 +151,6 @@ pub struct User {
     pub statuses_count: i32,
     /// Insert time of the newest status this user posted.
     pub last_status_at: Option<DateTime<Utc>>,
-    /// When a remote actor was last fetched.
-    pub last_fetched_at: Option<DateTime<Utc>>,
     /// When the row was inserted.
     pub inserted_at: DateTime<Utc>,
     /// When the row last changed; refreshed by every update here.
@@ -202,9 +183,8 @@ pub struct User {
     pub deleted_at: Option<DateTime<Utc>>,
 }
 
-/// [`password_hash`](Self::password_hash), [`private_key`](Self::private_key)
-/// and [`mfa_settings`](Self::mfa_settings) are secrets and render as
-/// `<redacted>`; everything else shows.
+/// [`password_hash`](Self::password_hash) and [`mfa_settings`](Self::mfa_settings)
+/// are secrets and render as `<redacted>`; everything else shows.
 impl fmt::Debug for User {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("User")
@@ -227,14 +207,6 @@ impl fmt::Debug for User {
             .field("discoverable", &self.discoverable)
             .field("fields", &self.fields)
             .field("raw_fields", &self.raw_fields)
-            .field("inbox", &self.inbox)
-            .field("shared_inbox", &self.shared_inbox)
-            .field("outbox", &self.outbox)
-            .field("followers_url", &self.followers_url)
-            .field("following_url", &self.following_url)
-            .field("featured_url", &self.featured_url)
-            .field("public_key", &self.public_key)
-            .field("private_key", &"<redacted>")
             .field("is_admin", &self.is_admin)
             .field("is_moderator", &self.is_moderator)
             .field("is_active", &self.is_active)
@@ -270,7 +242,6 @@ impl fmt::Debug for User {
             .field("following_count", &self.following_count)
             .field("statuses_count", &self.statuses_count)
             .field("last_status_at", &self.last_status_at)
-            .field("last_fetched_at", &self.last_fetched_at)
             .field("inserted_at", &self.inserted_at)
             .field("updated_at", &self.updated_at)
             .field("mfa_settings", &"<redacted>")
@@ -343,10 +314,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::models::user::{
-        NewUser, featured, followers, following, get_by_nickname, inbox, insert, outbox,
-        test_support::*,
-    };
+    use crate::models::user::{NewUser, get_by_nickname, insert, test_support::*};
 
     #[tokio::test]
     async fn password_matches_accepts_only_the_stored_password() {
@@ -411,18 +379,10 @@ mod tests {
             ap_id: ap_id.to_owned(),
             domain: Some("remote.example".to_owned()),
             name: "Bob".to_owned(),
-            inbox: Some(inbox(ap_id)),
-            shared_inbox: Some("https://remote.example/inbox".to_owned()),
-            outbox: Some(outbox(ap_id)),
-            followers_url: Some(followers(ap_id)),
-            following_url: Some(following(ap_id)),
-            featured_url: Some(featured(ap_id)),
-            public_key: Some("REMOTE-PEM".to_owned()),
             discoverable: Flag::new(true),
             followers_count: 12,
             following_count: 3,
             statuses_count: 48,
-            last_fetched_at: Some(Utc::now()),
             ..NewUser::default()
         };
         let user = insert(&pool, &new).await.unwrap();
@@ -432,36 +392,6 @@ mod tests {
             "the user@host handle round trips"
         );
         assert_eq!(user.domain.as_deref(), Some("remote.example"), "domain");
-        assert_eq!(user.inbox.as_deref(), Some(inbox(ap_id).as_str()), "inbox");
-        assert_eq!(
-            user.shared_inbox.as_deref(),
-            Some("https://remote.example/inbox"),
-            "shared inbox"
-        );
-        assert_eq!(
-            user.outbox.as_deref(),
-            Some(outbox(ap_id).as_str()),
-            "outbox"
-        );
-        assert_eq!(
-            user.followers_url.as_deref(),
-            Some(followers(ap_id).as_str()),
-            "followers collection"
-        );
-        assert_eq!(
-            user.following_url.as_deref(),
-            Some(following(ap_id).as_str()),
-            "following collection"
-        );
-        assert_eq!(
-            user.featured_url.as_deref(),
-            Some(featured(ap_id).as_str()),
-            "featured collection"
-        );
-        assert!(
-            user.private_key.is_none(),
-            "remote users keep no private key"
-        );
         assert!(user.email.is_none(), "remote users keep no email");
         assert!(user.discoverable.get(), "flags round trip");
         assert_eq!(
@@ -510,7 +440,6 @@ mod tests {
             &pool,
             &NewUser {
                 password_hash: Some(SECRET_HASH.to_owned()),
-                private_key: Some(SECRET_KEY.to_owned()),
                 confirmation_token: Some(SECRET_CONFIRMATION.to_owned()),
                 mfa_settings: json!({
                     "enabled": true,
@@ -527,7 +456,6 @@ mod tests {
             !debug.contains(SECRET_HASH),
             "the password hash must not leak"
         );
-        assert!(!debug.contains(SECRET_KEY), "the private key must not leak");
         assert!(
             !debug.contains(SECRET_TOTP),
             "the TOTP secret inside mfa_settings must not leak"
@@ -538,10 +466,6 @@ mod tests {
         );
         assert!(
             debug.contains(r#"password_hash: "<redacted>""#),
-            "the redaction marker names the field"
-        );
-        assert!(
-            debug.contains(r#"private_key: "<redacted>""#),
             "the redaction marker names the field"
         );
         assert!(
@@ -556,7 +480,6 @@ mod tests {
 
         let new = NewUser {
             password_hash: Some(SECRET_HASH.to_owned()),
-            private_key: Some(SECRET_KEY.to_owned()),
             confirmation_token: Some(SECRET_CONFIRMATION.to_owned()),
             mfa_settings: json!({
                 "enabled": true,
@@ -568,7 +491,6 @@ mod tests {
         let new_debug = format!("{new:?}");
         assert!(
             !new_debug.contains(SECRET_HASH)
-                && !new_debug.contains(SECRET_KEY)
                 && !new_debug.contains(SECRET_TOTP)
                 && !new_debug.contains(SECRET_CONFIRMATION),
             "NewUser redacts the same secrets"

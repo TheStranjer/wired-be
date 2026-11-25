@@ -3,10 +3,7 @@
 
 use wired_be::{
     federation::publisher,
-    models::{
-        follow::{self, FollowState},
-        user,
-    },
+    models::follow::{self, FollowState},
 };
 
 use super::*;
@@ -53,16 +50,7 @@ async fn an_edit_changes_the_alt_text_and_federates_it() {
     let db = common::test_db().await;
     let pool = db.pool().clone();
     let app = common::test_app(pool.clone());
-    let ap_id = format!("{TEST_BASE_URL}/users/alt-editor");
-    let created = common::create_local_user_with(&pool, "alt-editor", |mut new| {
-        new.ap_id = ap_id.clone();
-        new.inbox = Some(user::inbox(&ap_id));
-        new.followers_url = Some(user::followers(&ap_id));
-        new.private_key = Some("PEM".to_owned());
-        new.public_key = Some("PUB".to_owned());
-        new
-    })
-    .await;
+    let created = common::create_federating_user_with(&pool, "alt-editor", |new| new).await;
     let token = common::create_app_and_token(&pool, &created, "write:statuses read:statuses").await;
     let carol = common::create_remote_user(&pool, "carol", "peer.example").await;
     let followed = follow::follow(&pool, TEST_BASE_URL, &carol, &created)

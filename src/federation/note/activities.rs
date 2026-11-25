@@ -589,22 +589,6 @@ mod tests {
     }
 
     #[test]
-    fn an_announce_ignores_the_users_followers_url() {
-        let reblog = base_status(Visibility::Private);
-        let config = Config::for_tests();
-        let mut account = author();
-        account.followers_url = Some("https://test.example/old/followers".to_owned());
-        let activity =
-            announce_activity_json(&reblog, booster_of(&account), PARENT_URI, BOB_AP, &config)
-                .expect("a private announce renders");
-        assert_eq!(
-            activity["to"],
-            json!([format!("{AUTHOR_AP}/followers")]),
-            "the `users` column no longer names the collection"
-        );
-    }
-
-    #[test]
     fn boost_addressing_follows_the_boosts_visibility() {
         let followers = "https://test.example/users/alice/followers";
         let owned = |lines: &[&str]| {

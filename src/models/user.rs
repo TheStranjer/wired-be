@@ -12,9 +12,10 @@
 //! and its endpoints come from [`local_ap_id`] and the helpers beside it,
 //! so federation and the API build them the same way.
 //!
-//! `password_hash`, `private_key` and `mfa_settings` (which holds the TOTP
-//! secret) are secrets: the manual `Debug` impls in this module redact
-//! them, so they can never reach a log line.
+//! `password_hash` and `mfa_settings` (which holds the TOTP secret) are
+//! secrets: the manual `Debug` impls in this module redact them, so they can
+//! never reach a log line. The `ActivityPub` plumbing (endpoints, keys) is not
+//! on this table: it lives in [`crate::models::activitypub_actor`].
 //!
 //! Registration and password login live in [`register`]; the MFA column's
 //! shape and updates live in [`mfa`]; the email-confirmation token, its
@@ -182,28 +183,13 @@ pub fn followers(ap_id: &str) -> String {
     format!("{ap_id}/followers")
 }
 
-/// The address naming `user`'s followers collection.
-///
-/// It is the stored `followers_url` (what the publisher expands, and what a
-/// peer's own documents name), with the [`followers`] construction behind a
-/// row that carries none.
-///
-/// This reads the `User`'s own column, for code under `federation`. Outside
-/// it, [`activitypub_actor::followers_address`] reads the actor row.
-///
-/// [`activitypub_actor::followers_address`]: crate::models::activitypub_actor::followers_address
-#[must_use]
-pub fn followers_address(user: &User) -> String {
-    followers_address_of(&user.ap_id, user.followers_url.as_deref())
-}
-
 /// The address naming the followers collection of actor `ap_id`, whose
 /// stored collection id is `stored`.
 ///
-/// [`followers_address`] for a caller that read the stored id from the
-/// account's `activitypub_actors` row rather than from [`User`]: `stored`
-/// when the row carries one, the [`followers`] construction when it does not
-/// (or when the account has no row).
+/// `stored` is the id read from the account's `activitypub_actors` row (what
+/// the publisher expands, and what a peer's own documents name): it wins when
+/// the row carries one, and the [`followers`] construction answers when it
+/// does not (or when the account has no row).
 #[must_use]
 pub fn followers_address_of(ap_id: &str, stored: Option<&str>) -> String {
     stored.map_or_else(|| followers(ap_id), str::to_owned)

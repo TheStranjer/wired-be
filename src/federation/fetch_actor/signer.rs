@@ -269,6 +269,11 @@ mod tests {
             .await
             .unwrap()
             .expect("the signed fetch provisioned the instance actor");
+        let public_pem = activitypub_actor::get(&state.db, actor.id)
+            .await
+            .unwrap()
+            .and_then(|row| row.public_key)
+            .expect("the instance actor's row holds its public key");
         let raw = BASE64
             .decode(signature_param(&signature, "signature"))
             .unwrap();
@@ -290,11 +295,7 @@ mod tests {
             ),
         ]);
         assert!(
-            verify_sha256(
-                actor.public_key.as_deref().unwrap(),
-                signing_text.as_bytes(),
-                &raw
-            ),
+            verify_sha256(&public_pem, signing_text.as_bytes(), &raw),
             "the peer verifies us with the key our document advertises"
         );
     }
@@ -356,9 +357,13 @@ mod tests {
             .await
             .unwrap()
             .expect("asking for the signer provisions the actor");
+        let stored = activitypub_actor::get(&state.db, actor.id)
+            .await
+            .unwrap()
+            .and_then(|row| row.private_key);
         assert_eq!(
-            signer.private_pem,
-            actor.private_key.unwrap(),
+            Some(&signer.private_pem),
+            stored.as_ref(),
             "the signer carries the stored private key"
         );
         let debug = format!("{signer:?}");

@@ -48,6 +48,7 @@ use crate::{
     },
     services,
     state::AppState,
+    util::keys::generate_keypair_async,
 };
 
 /// The `ActivityPub` adapter.
@@ -208,17 +209,20 @@ impl ProtocolAdapter for ActivityPub {
     /// Writes the account's active `activitypub_actors` row: keys, inbox URLs and so on.
     ///
     /// The actor URL is built from the nickname, so `identifier` is not
-    /// stored: the row copies the endpoints and keys registration put on the
-    /// `users` row. `Taken` when the account already has a row.
+    /// stored: the row holds the endpoints derived from the account's actor
+    /// id and a key pair generated here. `Taken` when the account already has
+    /// a row.
     fn claim<'a>(
         &'a self,
         conn: &'a mut PgConnection,
         user: &'a User,
         _identifier: &'a str,
-        _state: &'a AppState,
+        state: &'a AppState,
     ) -> BoxFuture<'a, AppResult<ClaimOutcome>> {
         Box::pin(async move {
-            let write = ActivityPubActorWrite::for_user(user, None);
+            let keys = generate_keypair_async().await?;
+            let write =
+                ActivityPubActorWrite::for_local_account(user, &state.config.base_url, keys);
             let inserted = activitypub_actor::insert_new(conn, &write).await?;
             Ok(if inserted {
                 ClaimOutcome::Claimed
@@ -233,7 +237,8 @@ impl ProtocolAdapter for ActivityPub {
 mod tests {
     use super::*;
     use crate::{
-        test_fixtures::{local_user, remote_user},
+        models::user::inbox,
+        test_fixtures::{federating_user, local_user, remote_user, write_actor},
         test_support::app_state,
     };
 
@@ -322,7 +327,7 @@ mod tests {
     async fn local_user_identity_is_active_at_the_actor_url() {
         let db = crate::test_db::test_db().await.expect("test database slot");
         let state = app_state(db.pool());
-        let user = local_user(db.pool(), "identity_user").await;
+        let user = federating_user(db.pool(), "identity_user").await;
 
         let identity = ActivityPub.identity(&state, &user).await;
 
@@ -337,19 +342,12 @@ mod tests {
         );
     }
 
-    /// Claiming writes an active row copied from the account, once.
+    /// Claiming writes an active row with the account's endpoints and a fresh key pair, once.
     #[tokio::test]
     async fn claim_writes_the_active_actor_row_once() {
         let db = crate::test_db::test_db().await.expect("test database slot");
         let state = app_state(db.pool());
         let user = local_user(db.pool(), "claim_user").await;
-        let deleted = sqlx::query("DELETE FROM activitypub_actors WHERE user_id = $1")
-            .bind(user.id)
-            .execute(db.pool())
-            .await
-            .expect("the row is removed")
-            .rows_affected();
-        assert_eq!(deleted, 1, "the fixture user had a row");
         let mut conn = db.pool().acquire().await.expect("a connection");
 
         let first = ActivityPub
@@ -366,8 +364,20 @@ mod tests {
             .expect("the row reads")
             .expect("the row exists");
         assert_eq!(row.status, ActorStatus::Active, "status");
-        assert_eq!(row.inbox, user.inbox, "inbox copied from the account");
-        assert_eq!(row.private_key, user.private_key, "keys copied");
+        assert_eq!(
+            row.inbox,
+            Some(inbox(&user.ap_id)),
+            "inbox derived from the account"
+        );
+        assert_eq!(
+            row.shared_inbox,
+            Some(format!("{}/inbox", state.config.base_url)),
+            "the instance-wide shared inbox"
+        );
+        assert!(
+            row.public_key.is_some() && row.private_key.is_some(),
+            "a key pair was generated"
+        );
     }
 
     /// A pending actor row is a pending identity.
@@ -375,7 +385,7 @@ mod tests {
     async fn pending_actor_is_a_pending_identity() {
         let db = crate::test_db::test_db().await.expect("test database slot");
         let state = app_state(db.pool());
-        let user = local_user(db.pool(), "pending_user").await;
+        let user = federating_user(db.pool(), "pending_user").await;
         let updated =
             sqlx::query("UPDATE activitypub_actors SET status = 'pending' WHERE user_id = $1")
                 .bind(user.id)
@@ -397,13 +407,6 @@ mod tests {
         let db = crate::test_db::test_db().await.expect("test database slot");
         let state = app_state(db.pool());
         let user = local_user(db.pool(), "unenrolled_user").await;
-        let deleted = sqlx::query("DELETE FROM activitypub_actors WHERE user_id = $1")
-            .bind(user.id)
-            .execute(db.pool())
-            .await
-            .expect("the row is removed")
-            .rows_affected();
-        assert_eq!(deleted, 1, "one actor row is removed");
 
         let identity = ActivityPub.identity(&state, &user).await;
 
@@ -416,6 +419,7 @@ mod tests {
         let db = crate::test_db::test_db().await.expect("test database slot");
         let state = app_state(db.pool());
         let user = remote_user(db.pool(), "far_away").await;
+        let _row = write_actor(db.pool(), &ActivityPubActorWrite::bare(user.id)).await;
 
         let identity = ActivityPub.identity(&state, &user).await;
 

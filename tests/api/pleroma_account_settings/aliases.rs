@@ -150,11 +150,7 @@ async fn an_alias_body_without_the_parameter_is_unprocessable() {
 /// Alice's local row with a followers collection, so her profile `Update`
 /// has an audience and is queued.
 async fn publishing_alice(pool: &PgPool) -> User {
-    common::create_local_user_with(pool, "alice", |mut new| {
-        new.followers_url = Some(format!("{}/followers", new.ap_id));
-        new
-    })
-    .await
+    common::create_federating_user_with(pool, "alice", |new| new).await
 }
 
 /// The `alsoKnownAs` of every queued profile `Update`, oldest first.

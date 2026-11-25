@@ -252,14 +252,15 @@ pub async fn active_local_ids(pool: &PgPool) -> AppResult<Vec<Uuid>> {
 
 #[cfg(test)]
 mod tests {
-    use chrono::{SubsecRound as _, Utc};
     use serde_json::json;
 
     use super::*;
     use crate::{
-        models::user::{
-            DEFAULT_ACTOR_TYPE, NewUser, inbox, insert, local_ap_id, set_activation,
-            test_support::*,
+        models::{
+            activitypub_actor::ActivityPubActorWrite,
+            user::{
+                DEFAULT_ACTOR_TYPE, NewUser, insert, local_ap_id, set_activation, test_support::*,
+            },
         },
         util::id::new_id,
     };
@@ -313,17 +314,6 @@ mod tests {
             user.raw_fields,
             json!([{"name": "site", "value": "https://alice.example"}]),
             "raw fields round trip through jsonb"
-        );
-        assert_eq!(
-            user.inbox.as_deref(),
-            Some("https://test.example/users/alice/inbox"),
-            "inbox column"
-        );
-        assert_eq!(user.public_key.as_deref(), Some("PUBLIC-PEM"), "public key");
-        assert_eq!(
-            user.private_key.as_deref(),
-            Some(SECRET_KEY),
-            "private key is stored even though Debug redacts it"
         );
         assert!(
             !user.is_admin.get() && !user.is_moderator.get(),
@@ -407,7 +397,6 @@ mod tests {
     /// The local-user fixture of these tests: every column the model can
     /// write, set to something distinct.
     async fn inserted_alice(pool: &PgPool) -> User {
-        let fetched_at = Utc::now().trunc_subsecs(6);
         let new = NewUser {
             email: Some("alice@example.org".to_owned()),
             password_hash: Some(SECRET_HASH.to_owned()),
@@ -419,20 +408,10 @@ mod tests {
             profile_url: Some(local_ap_id(BASE, "alice")),
             fields: json!([{"name": "site", "value": "<a href=\"https://alice.example\">alice.example</a>"}]),
             raw_fields: json!([{"name": "site", "value": "https://alice.example"}]),
-            inbox: Some(inbox(&local_ap_id(BASE, "alice"))),
-            public_key: Some("PUBLIC-PEM".to_owned()),
-            private_key: Some(SECRET_KEY.to_owned()),
-            last_fetched_at: Some(fetched_at),
             ..local_new("alice")
         };
         let user = insert(pool, &new).await.unwrap();
-        assert_eq!(
-            user.last_fetched_at,
-            Some(fetched_at),
-            "timestamptz round trips"
-        );
         assert!(user.domain.is_none(), "local users carry no domain");
-        assert!(user.shared_inbox.is_none(), "unset endpoints stay NULL");
         assert!(user.last_status_at.is_none(), "no statuses yet");
         user
     }
@@ -510,13 +489,14 @@ mod tests {
             "an unknown key id finds nobody"
         );
 
-        let _stored = sqlx::query("UPDATE users SET public_key_id = $1 WHERE id = $2")
-            .bind(key_id)
-            .bind(mirror.id)
-            .execute(&pool)
-            .await
-            .unwrap();
-        crate::test_fixtures::resync_actor(&pool, mirror.id).await;
+        let _stored = crate::test_fixtures::write_actor(
+            &pool,
+            &ActivityPubActorWrite {
+                public_key_id: Some(key_id.to_owned()),
+                ..ActivityPubActorWrite::bare(mirror.id)
+            },
+        )
+        .await;
         let found = get_by_public_key_id(&pool, key_id)
             .await
             .unwrap()

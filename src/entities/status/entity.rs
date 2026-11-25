@@ -201,6 +201,7 @@ impl Status {
         let StatusSource {
             row,
             author,
+            author_actor,
             reply_author,
             media,
             mentions,
@@ -221,7 +222,7 @@ impl Status {
             parent_visible,
         } = source;
         let quote_approval = reblog.as_ref().map_or_else(
-            || QuoteApproval::for_row(row, author, viewer, relationships),
+            || QuoteApproval::for_row(row, author, author_actor, viewer, relationships),
             |original| original.quote_approval.clone(),
         );
         Self {

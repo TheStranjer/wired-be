@@ -18,10 +18,10 @@ use crate::{
         poll::{self, Poll as PollRow, PollParams},
         report::{self, Report as ReportRow},
         status::{self, NewStatus, Status, Visibility},
-        user::{NewUser, User, insert, local_ap_id},
+        user::User,
     },
     state::AppState,
-    test_fixtures::remote_new,
+    test_fixtures::{federating_remote, federating_user},
 };
 use serde_json::Value;
 
@@ -43,34 +43,12 @@ pub(super) fn unfederated() -> Config {
 /// A registered-looking local actor: keys, inbox, followers collection,
 /// exactly the row `create_local_user` writes.
 pub(super) async fn local(pool: &PgPool, nickname: &str) -> User {
-    let ap_id = local_ap_id(TEST_BASE_URL, nickname);
-    insert(
-        pool,
-        &NewUser {
-            private_key: Some("PEM".to_owned()),
-            public_key: Some("PUB".to_owned()),
-            inbox: Some(format!("{ap_id}/inbox")),
-            followers_url: Some(format!("{ap_id}/followers")),
-            ..NewUser::local(nickname, &ap_id)
-        },
-    )
-    .await
-    .expect("the local fixture inserts")
+    federating_user(pool, nickname).await
 }
 
 /// A remote mirror `nickname@remote.example`, shared inbox included.
 pub(super) async fn remote(pool: &PgPool, nickname: &str) -> User {
-    insert(
-        pool,
-        &NewUser {
-            inbox: Some(format!("https://remote.example/users/{nickname}/inbox")),
-            shared_inbox: Some("https://remote.example/inbox".to_owned()),
-            public_key: Some("PUB".to_owned()),
-            ..remote_new(nickname)
-        },
-    )
-    .await
-    .expect("the remote fixture inserts")
+    federating_remote(pool, nickname).await
 }
 
 /// `follower` follows `target` with an accepted relationship: a local

@@ -24,7 +24,7 @@ use crate::{
         vocab::AS_VOCABULARY,
     },
     models::{
-        activitypub_actor::with_plumbing,
+        activitypub_actor::{self, ActivityPubActor},
         bookmark,
         custom_emoji::CustomEmoji,
         favourite,
@@ -113,15 +113,9 @@ pub async fn build(state: &AppState, user: &User, file_name: &str) -> AppResult<
             .try_clone()
             .map_err(|err| archive_error("open temp file", &err))?,
     );
-    let actor = with_plumbing(&state.db, user.clone()).await?;
-    let emojis = profile_emojis(&state.db, &actor).await?;
-    write_actor(
-        &mut zip,
-        &actor,
-        actor.public_key.as_deref(),
-        &state.config,
-        &emojis,
-    )?;
+    let actor = activitypub_actor::get(&state.db, user.id).await?;
+    let emojis = profile_emojis(&state.db, user).await?;
+    write_actor(&mut zip, user, actor.as_ref(), &state.config, &emojis)?;
     let outbox_items = write_outbox(&mut zip, state, user).await?;
     let like_items = write_uris(&mut zip, state, user.id, LIKES_ENTRY, UriTable::Likes).await?;
     let bookmark_items = write_uris(
@@ -187,16 +181,16 @@ fn start_entry(zip: &mut ZipWriter<File>, name: &str) -> AppResult<()> {
 
 /// Writes `actor.json`: this instance's actor document for `user`,
 /// verbatim — no relative-path key merge, the archive carries the same
-/// absolute document the fediverse already sees. `public_key` is the PEM
-/// stored for `user` in `activitypub_actors`.
+/// absolute document the fediverse already sees. `actor` is the row stored
+/// for `user` in `activitypub_actors`.
 fn write_actor(
     zip: &mut ZipWriter<File>,
     user: &User,
-    public_key: Option<&str>,
+    actor: Option<&ActivityPubActor>,
     config: &Config,
     emojis: &[CustomEmoji],
 ) -> AppResult<()> {
-    let bytes = encode(&actor_json(user, public_key, config, emojis))?;
+    let bytes = encode(&actor_json(user, actor, config, emojis))?;
     start_entry(zip, ACTOR_ENTRY)?;
     zip.write_all(&bytes)
         .map_err(|err| archive_error("write actor", &err))?;

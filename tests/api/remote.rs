@@ -57,6 +57,6 @@
 mod support;
 
 pub use self::support::{
-    Delivery, INBOX, KEY_OWNER, MockPeer, PUBLIC, app_and_state, keyed_local_user,
-    keyed_local_user_with, local_keys,
+    Delivery, INBOX, KEY_OWNER, MockPeer, PUBLIC, app_and_state, keyed_instance_actor,
+    keyed_local_user, keyed_local_user_with, local_keys,
 };

@@ -306,6 +306,7 @@ pub(in crate::entities::status) fn render(
     let source = StatusSource {
         row,
         author: parts.author,
+        author_actor: None,
         reply_author: parts.reply_author,
         media: &parts.media,
         mentions: &parts.mentions,
@@ -336,6 +337,7 @@ pub(in crate::entities::status) fn render_nested(row: &StatusRow, author: &User)
         StatusSource {
             row,
             author,
+            author_actor: None,
             reply_author: None,
             media: &[],
             mentions: &[],

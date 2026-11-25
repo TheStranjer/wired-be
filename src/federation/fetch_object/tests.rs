@@ -33,11 +33,13 @@ use crate::{
     http_client::HttpClient,
     jobs::JobError,
     models::{
+        activitypub_actor::ActivityPubActorWrite,
         status::{self, NewStatus},
         user::{self, Flag, NewUser, User},
     },
     services::ingest::{self, IngestOutcome},
     state::AppState,
+    test_fixtures::write_actor,
 };
 
 /// `User-Agent` for the test clients.
@@ -290,19 +292,27 @@ async fn pending_backfill(pool: &PgPool, status_id: Uuid) -> Option<(Value, i32)
 /// the direct-ingest fixtures are written under.
 async fn mirror_user(pool: &PgPool, name: &str, base: &str) -> User {
     let host = base.strip_prefix("http://").unwrap_or(base).to_owned();
-    user::insert(
+    let stored = user::insert(
         pool,
         &NewUser {
             nickname: format!("{name}@{host}"),
             ap_id: format!("{base}/users/{name}"),
             local: Flag::new(false),
             domain: Some(host),
-            followers_url: Some(format!("{base}/users/{name}/followers")),
             ..NewUser::default()
         },
     )
     .await
-    .expect("the mirror fixture inserts")
+    .expect("the mirror fixture inserts");
+    let _row = write_actor(
+        pool,
+        &ActivityPubActorWrite {
+            followers_url: Some(format!("{base}/users/{name}/followers")),
+            ..ActivityPubActorWrite::bare(stored.id)
+        },
+    )
+    .await;
+    stored
 }
 
 /// The stored mirror of `alice@peer`.

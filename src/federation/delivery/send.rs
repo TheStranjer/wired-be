@@ -504,10 +504,6 @@ mod tests {
         let db = crate::test_db::test_db().await.expect("test database slot");
         let pool = db.pool().clone();
         let alice = actor(&pool).await;
-        assert!(
-            alice.private_key.is_some(),
-            "the `users` row still holds the key"
-        );
         let cleared =
             sqlx::query("UPDATE activitypub_actors SET private_key = NULL WHERE user_id = $1")
                 .bind(alice.id)

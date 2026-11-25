@@ -15,9 +15,10 @@ use super::Status;
 use crate::{
     entities::{account::JsonBool, poll::Poll},
     models::{
-        custom_emoji::CustomEmoji as EmojiRow, emoji_reaction::ReactionSummary as SummaryRow,
-        hashtag::Hashtag, link_card::LinkCard, media_attachment::MediaAttachment as AttachmentRow,
-        status::Status as StatusRow, user::User,
+        activitypub_actor::ActivityPubActor, custom_emoji::CustomEmoji as EmojiRow,
+        emoji_reaction::ReactionSummary as SummaryRow, hashtag::Hashtag, link_card::LinkCard,
+        media_attachment::MediaAttachment as AttachmentRow, status::Status as StatusRow,
+        user::User,
     },
 };
 
@@ -88,6 +89,11 @@ pub struct StatusSource<'a> {
     pub row: &'a StatusRow,
     /// [`row`](Self::row)'s author; becomes the entity's `account`.
     pub author: &'a User,
+    /// [`author`](Self::author)'s `activitypub_actors` row, when the author
+    /// is remote and the row was loaded: the collections a remote quote
+    /// policy names. `None` for a local author, whose policy comes from the
+    /// row's visibility.
+    pub author_actor: Option<&'a ActivityPubActor>,
     /// The author of the status this one replies to, when
     /// [`in_reply_to_account_id`](StatusRow::in_reply_to_account_id)
     /// names a stored account; feeds `pleroma.in_reply_to_account_acct`.

@@ -18,7 +18,7 @@ use crate::{
         actor::{actor_json, instance_actor_json, profile_emojis},
         vocab::{ACTIVITY_JSON, AP_MEDIA_TYPES},
     },
-    models::{activitypub_actor::with_plumbing, user::User},
+    models::{activitypub_actor, user::User},
     state::AppState,
 };
 
@@ -80,11 +80,11 @@ pub(super) fn frontend_redirect(config: &Config, path: &str) -> AppResult<Respon
 ///
 /// Any database failure of the row or emoji lookup.
 pub(super) async fn actor_response(state: &AppState, user: &User) -> AppResult<Response> {
-    let user = with_plumbing(&state.db, user.clone()).await?;
-    let emojis = profile_emojis(&state.db, &user).await?;
+    let actor = activitypub_actor::get(&state.db, user.id).await?;
+    let emojis = profile_emojis(&state.db, user).await?;
     Ok(document_response(&actor_json(
-        &user,
-        user.public_key.as_deref(),
+        user,
+        actor.as_ref(),
         &state.config,
         &emojis,
     )))
@@ -97,11 +97,11 @@ pub(super) async fn actor_response(state: &AppState, user: &User) -> AppResult<R
 ///
 /// Any database failure of the row or emoji lookup.
 pub(super) async fn instance_actor_response(state: &AppState, user: &User) -> AppResult<Response> {
-    let user = with_plumbing(&state.db, user.clone()).await?;
-    let emojis = profile_emojis(&state.db, &user).await?;
+    let actor = activitypub_actor::get(&state.db, user.id).await?;
+    let emojis = profile_emojis(&state.db, user).await?;
     Ok(document_response(&instance_actor_json(
-        &user,
-        user.public_key.as_deref(),
+        user,
+        actor.as_ref(),
         &state.config,
         &emojis,
     )))

@@ -348,14 +348,7 @@ async fn publish_jobs(pool: &PgPool) -> Vec<(Value, Option<String>)> {
 async fn profile_writes_publish_one_debounced_update() {
     let db = common::test_db().await;
     let pool = db.pool().clone();
-    let alice = common::create_local_user_with(&pool, "alice", |mut new| {
-        new.followers_url = Some(format!("{BASE}/users/alice/followers"));
-        new.inbox = Some(format!("{BASE}/users/alice/inbox"));
-        new.private_key = Some("PEM-PRIV".to_owned());
-        new.public_key = Some("PEM-PUB".to_owned());
-        new
-    })
-    .await;
+    let alice = common::create_federating_user_with(&pool, "alice", |new| new).await;
     let token = common::create_app_and_token(&pool, &alice, "write:accounts").await;
     let app = common::test_app(pool.clone());
 

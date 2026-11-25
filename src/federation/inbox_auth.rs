@@ -355,11 +355,14 @@ mod tests {
             StatusCode::OK,
             "the delivery is authenticated, not 401"
         );
-        let stored: String = sqlx::query_scalar("SELECT public_key FROM users WHERE ap_id = $1")
-            .bind(&ap_id)
-            .fetch_one(&pool)
-            .await
-            .expect("the mirror row");
+        let stored: String = sqlx::query_scalar(
+            "SELECT a.public_key FROM activitypub_actors a JOIN users u ON u.id = a.user_id \
+             WHERE u.ap_id = $1",
+        )
+        .bind(&ap_id)
+        .fetch_one(&pool)
+        .await
+        .expect("the mirror's actor row");
         assert_eq!(
             stored, FIXTURE_PUBLIC_PKCS1_PEM,
             "the mirror stores the key with exactly one trailing newline"

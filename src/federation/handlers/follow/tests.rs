@@ -11,8 +11,11 @@ use uuid::Uuid;
 use super::*;
 use crate::{
     config::TEST_BASE_URL,
-    models::user::{NewUser, insert},
-    test_fixtures::local_user as local,
+    models::{
+        activitypub_actor::ActivityPubActorWrite,
+        user::{NewUser, insert},
+    },
+    test_fixtures::{federating_user, local_user as local, write_actor},
     test_support::{app_state, broken_state},
 };
 

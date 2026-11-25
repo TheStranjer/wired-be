@@ -16,7 +16,6 @@ use wired_be::{
         job::Job,
         user::{NewUser, User},
     },
-    services::instance_actor::ensure_instance_actor,
     state::AppState,
     util::password::hash_password,
 };
@@ -66,11 +65,10 @@ pub(super) async fn keyed_with_password(pool: &PgPool, nickname: &str, password:
     .await
 }
 
-/// This instance's own actor: the signer of a forwarded `Flag`.
+/// This instance's own actor, signing with [`remote::local_keys`]: the signer
+/// of a forwarded `Flag`. Call it before the delivery it signs.
 pub(super) async fn instance_actor(state: &AppState) -> User {
-    ensure_instance_actor(&state.db, &common::test_config())
-        .await
-        .expect("the instance actor stands")
+    remote::keyed_instance_actor(&state.db).await
 }
 
 /// The followers-collection address a delivered document names for `actor`.

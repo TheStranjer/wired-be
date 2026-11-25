@@ -22,21 +22,15 @@ use crate::{
     error::AppError,
     models::{
         invite_token::{self, INVALID_INVITE_MESSAGE, InviteToken},
-        user::{
-            Flag, NewUser, User, featured, followers, following, get_by_email, inbox, insert_row,
-            local_ap_id, nickname_taken, outbox,
-        },
+        user::{Flag, NewUser, User, get_by_email, insert_row, local_ap_id, nickname_taken},
     },
     protocols::ProtocolId,
     state::AppState,
-    util::{
-        format::text_to_html, keys::generate_keypair_async, password::hash_password,
-        sanitize::sanitize_display_name,
-    },
+    util::{format::text_to_html, password::hash_password, sanitize::sanitize_display_name},
 };
 
 /// The registration's second half, reached only once every rule passed:
-/// hash the password, generate the keys, assemble the [`NewUser`] and
+/// hash the password, assemble the [`NewUser`] and
 /// store it in one transaction (see [`store_account`] and
 /// [`create_local_user`]).
 ///
@@ -59,9 +53,7 @@ pub(super) async fn build_and_insert(
     invite: Option<&InviteToken>,
 ) -> Result<User, RegisterError> {
     let password_hash = hash_password(&params.password)?;
-    let keys = generate_keypair_async().await?;
     let ap_id = local_ap_id(&state.config.base_url, nickname);
-    let shared_inbox = format!("{}/inbox", state.config.base_url);
     let raw_bio = params.bio.clone().unwrap_or_default();
     let bio = if raw_bio.is_empty() {
         String::new()
@@ -80,14 +72,6 @@ pub(super) async fn build_and_insert(
         registration_reason: params.reason.clone(),
         approval_pending: registration_waits_for_approval(state, invite),
         email_confirmed: Flag::new(!activation_required),
-        inbox: Some(inbox(&ap_id)),
-        shared_inbox: Some(shared_inbox),
-        outbox: Some(outbox(&ap_id)),
-        followers_url: Some(followers(&ap_id)),
-        following_url: Some(following(&ap_id)),
-        featured_url: Some(featured(&ap_id)),
-        public_key: Some(keys.public_pem),
-        private_key: Some(keys.private_pem),
         ..NewUser::local(nickname, &ap_id)
     };
     store_account(state, &new_user, &params.identifiers, invite).await

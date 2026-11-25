@@ -18,8 +18,7 @@ use crate::{
         json as ap_json,
     },
     models::{
-        activitypub_actor::with_plumbing,
-        media_attachment,
+        activitypub_actor, media_attachment,
         status::{self, Status},
         status_visibility,
         user::{self, User, get_by_id},
@@ -43,11 +42,12 @@ use super::negotiation::document_response;
 /// and the `read` check.
 pub(super) async fn whoami(State(state): State<AppState>, auth: AuthUser) -> AppResult<Response> {
     auth.require(READ)?;
-    let account = with_plumbing(&state.db, auth.0.clone()).await?;
-    let emojis = profile_emojis(&state.db, &account).await?;
+    let account = &auth.0;
+    let actor = activitypub_actor::get(&state.db, account.id).await?;
+    let emojis = profile_emojis(&state.db, account).await?;
     Ok(document_response(&actor_json(
-        &account,
-        account.public_key.as_deref(),
+        account,
+        actor.as_ref(),
         &state.config,
         &emojis,
     )))

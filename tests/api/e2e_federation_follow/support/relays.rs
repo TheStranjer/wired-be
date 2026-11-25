@@ -11,6 +11,7 @@ async fn following_a_relay_runs_the_handshake_over_http() {
     let pool = db.pool().clone();
     let (app, state) = remote::app_and_state(pool.clone());
     let peer = remote::MockPeer::start().await;
+    let instance = instance_actor(&state).await;
 
     let subscription = follow_relay(&state, &peer.relay())
         .await
@@ -29,7 +30,6 @@ async fn following_a_relay_runs_the_handshake_over_http() {
 
     let follows = peer.delivered("Follow");
     assert_eq!(follows.len(), 1, "the relay's inbox recorded the Follow");
-    let instance = instance_actor(&state).await;
     assert_outbound(&follows[0], &instance, remote::INBOX, "Follow");
     let body = follows[0].activity();
     let follow_id = body["id"].as_str().expect("the Follow carries its id");
@@ -148,6 +148,7 @@ async fn unfollowing_a_relay_sends_the_undo_and_stops_the_fan_out() {
     let pool = db.pool().clone();
     let (app, state) = remote::app_and_state(pool.clone());
     let peer = remote::MockPeer::start().await;
+    let instance = instance_actor(&state).await;
     let (_alice, alice_token) = local(&pool, "ef-relay-undo-alice").await;
     let follow_id = relay_accepted(&app, &state, &peer).await;
 
@@ -164,7 +165,6 @@ async fn unfollowing_a_relay_sends_the_undo_and_stops_the_fan_out() {
         .expect("the withdrawal runs");
     let _withdrawal = common::run_all_jobs(&state).await;
 
-    let instance = instance_actor(&state).await;
     let undos = peer.delivered("Undo");
     assert_eq!(undos.len(), 1, "the relay's inbox recorded the Undo");
     assert_outbound(&undos[0], &instance, remote::INBOX, "Undo");

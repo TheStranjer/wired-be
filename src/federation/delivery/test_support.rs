@@ -34,6 +34,7 @@ use crate::{
     http_client::HttpClient,
     jobs::{AttemptInfo, JobError, QUEUE_FEDERATOR_OUTGOING},
     models::{
+        activitypub_actor::{self, ActivityPubActorWrite},
         job::Job,
         user::{NewUser, User, insert, local_ap_id},
     },
@@ -139,17 +140,21 @@ pub(super) async fn verifying_inbox() -> (String, Seen, JoinHandle<()>) {
 /// test origin, holding the key pair the mock inbox verifies against.
 pub(super) async fn actor(pool: &PgPool) -> User {
     let ap_id = local_ap_id(TEST_BASE_URL, "alice");
-    insert(
+    let user = insert(pool, &NewUser::local("alice", &ap_id))
+        .await
+        .unwrap();
+    let _row = activitypub_actor::upsert(
         pool,
-        &NewUser {
+        &ActivityPubActorWrite {
             inbox: Some(format!("{ap_id}/inbox")),
             public_key: Some(FIXTURE_PUBLIC_PKCS1_PEM.to_owned()),
             private_key: Some(FIXTURE_PRIVATE_PKCS1_PEM.to_owned()),
-            ..NewUser::local("alice", &ap_id)
+            ..ActivityPubActorWrite::bare(user.id)
         },
     )
     .await
-    .unwrap()
+    .unwrap();
+    user
 }
 
 /// What a mock inbox saw, shared with the test that asserts on it.
@@ -352,17 +357,26 @@ pub(super) async fn mirror(
     inbox: Option<&str>,
     shared: Option<&str>,
 ) -> User {
-    insert(
+    let user = insert(
         pool,
         &NewUser {
             nickname: format!("{nickname}@peer.example"),
             ap_id: format!("https://peer.example/users/{nickname}"),
             domain: Some("peer.example".to_owned()),
-            inbox: inbox.map(str::to_owned),
-            shared_inbox: shared.map(str::to_owned),
             ..NewUser::default()
         },
     )
     .await
-    .unwrap()
+    .unwrap();
+    let _row = activitypub_actor::upsert(
+        pool,
+        &ActivityPubActorWrite {
+            inbox: inbox.map(str::to_owned),
+            shared_inbox: shared.map(str::to_owned),
+            ..ActivityPubActorWrite::bare(user.id)
+        },
+    )
+    .await
+    .unwrap();
+    user
 }

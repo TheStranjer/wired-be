@@ -11,7 +11,7 @@ use sqlx::PgPool;
 use wired_be::models::{
     featured_tag,
     status::Visibility,
-    user::{NewUser, User, followers, local_ap_id},
+    user::{User, local_ap_id},
 };
 
 use crate::common;
@@ -361,11 +361,7 @@ async fn changing_the_set_queues_one_profile_update() {
     let pool = db.pool().clone();
     let app = common::test_app(pool.clone());
     let ap_id = local_ap_id("https://test.example", "alice");
-    let alice = common::create_local_user_with(&pool, "alice", |new| NewUser {
-        followers_url: Some(followers(&ap_id)),
-        ..new
-    })
-    .await;
+    let alice = common::create_federating_user_with(&pool, "alice", |new| new).await;
     let token = common::create_app_and_token(&pool, &alice, "read write").await;
 
     let created = feature(&app, &token, "rust").await;
