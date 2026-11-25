@@ -2,7 +2,7 @@
 
 use axum::Router;
 
-use crate::{protocols::ProtocolId, state::AppState};
+use crate::{jobs::HandlerFn, protocols::ProtocolId, state::AppState};
 
 /// One protocol's entry point into the application.
 ///
@@ -29,4 +29,21 @@ pub trait ProtocolAdapter: Sync {
     /// The routes are merged at the top level of the application router, so
     /// they must carry their full paths.
     fn router(&self, state: &AppState) -> Router<AppState>;
+
+    /// The background job kinds this protocol handles, each with its handler.
+    ///
+    /// [`crate::job_registry`] registers them only while the protocol is
+    /// enabled, so a disabled protocol has no handlers. A kind must not repeat
+    /// one of core's or another protocol's. The default is no job kinds.
+    fn job_handlers(&self) -> &'static [(&'static str, HandlerFn)] {
+        &[]
+    }
+
+    /// The job queues this protocol enqueues onto.
+    ///
+    /// Each one must be in [`crate::jobs::DEFAULT_JOB_QUEUES`], or the default
+    /// worker never drains it. The default is no queues.
+    fn job_queues(&self) -> &'static [&'static str] {
+        &[]
+    }
 }

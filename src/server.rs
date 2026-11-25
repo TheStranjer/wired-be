@@ -120,7 +120,7 @@ pub async fn serve(config: Config) -> Result<(), Box<dyn Error + Send + Sync>> {
     info!(addr = %state.config.bind_addr, "listening");
     let worker = Worker::new(
         state.clone(),
-        Arc::new(job_registry()),
+        Arc::new(job_registry(&state.config)),
         state.config.job_queues.clone(),
         state.config.job_concurrency,
     );

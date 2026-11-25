@@ -623,7 +623,7 @@ async fn an_unreachable_database_retries_the_job() {
 async fn the_kinds_are_registered() {
     let db = crate::test_db::test_db().await.expect("test database slot");
     let pool = db.pool().clone();
-    let registry = crate::job_registry();
+    let registry = crate::job_registry(&crate::config::Config::for_tests());
     let alice = local_user(&pool, "alice").await;
     let args = job_args(alice.id, &[], &[]);
     for kind in [KIND_FOLLOWS, KIND_BLOCKS, KIND_MUTES] {

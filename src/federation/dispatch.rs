@@ -205,7 +205,7 @@ mod tests {
 
     #[test]
     fn both_kinds_are_registered_with_their_handlers() {
-        let registry = crate::job_registry();
+        let registry = crate::job_registry(&crate::config::Config::for_tests());
         assert!(
             registry.get(KIND_INCOMING).is_some(),
             "the incoming kind is registered"

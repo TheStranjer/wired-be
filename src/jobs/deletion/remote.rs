@@ -322,7 +322,7 @@ mod tests {
     /// behind it is this module's remote sweep.
     #[tokio::test]
     async fn the_remote_kind_is_registered_to_this_handler() {
-        let registry = crate::job_registry();
+        let registry = crate::job_registry(&crate::config::Config::for_tests());
         let handler = registry
             .get(KIND_DELETE_REMOTE)
             .expect("the remote delete kind is registered");

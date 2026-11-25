@@ -800,7 +800,7 @@ mod tests {
     /// The kind is wired into the registry the worker runs.
     #[test]
     fn the_kind_is_registered() {
-        let registry = crate::job_registry();
+        let registry = crate::job_registry(&crate::config::Config::for_tests());
         assert!(
             registry.get(KIND_FETCH).is_some(),
             "the worker knows `{KIND_FETCH}`"

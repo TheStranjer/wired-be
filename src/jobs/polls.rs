@@ -379,7 +379,7 @@ mod tests {
     /// minute.
     #[test]
     fn the_kind_is_registered_and_scheduled() {
-        let registry = crate::job_registry();
+        let registry = crate::job_registry(&crate::config::Config::for_tests());
         assert!(
             registry.get(KIND_END_NOTIFY).is_some(),
             "the worker knows `{KIND_END_NOTIFY}`"

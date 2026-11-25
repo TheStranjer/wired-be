@@ -311,7 +311,7 @@ async fn an_unreachable_database_retries_the_token_sweep() {
 /// maintenance queue once an hour.
 #[test]
 fn the_token_kind_is_registered_and_scheduled() {
-    let registry = crate::job_registry();
+    let registry = crate::job_registry(&Config::for_tests());
     assert!(
         registry.get(KIND_TOKENS).is_some(),
         "the worker knows `{KIND_TOKENS}`"
@@ -336,7 +336,7 @@ async fn the_registered_token_handler_is_this_sweep() {
     let client = register_app(&pool, "Client").await;
     let expired = oauth_token_expiring_in(&pool, &alice, &client, -8 * DAY).await;
     let live = authorization_row(&pool, &alice, &client, 600, false).await;
-    let registry = crate::job_registry();
+    let registry = crate::job_registry(&Config::for_tests());
     let handler = registry
         .get(KIND_TOKENS)
         .expect("the sweep's kind is registered");

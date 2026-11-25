@@ -98,7 +98,7 @@ async fn the_purge_sweeps_expired_rows_their_files_and_abandoned_requests() {
 
     // Through the registry's binding: this module's sweep stands
     // behind the kind the scheduler enqueues.
-    let handler = crate::job_registry()
+    let handler = crate::job_registry(&Config::for_tests())
         .get(KIND_PURGE)
         .expect("the purge kind is registered");
     handler(state.clone(), FIRST_ATTEMPT, json!({}))

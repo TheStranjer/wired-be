@@ -77,7 +77,7 @@ async fn the_run_handler_stores_the_archive_and_marks_the_row() {
 
     // Through the registry's binding, so the pass also proves that the
     // kind the endpoint enqueues stands behind this module's handler.
-    let handler = crate::job_registry()
+    let handler = crate::job_registry(&crate::config::Config::for_tests())
         .get(crate::api::backups::KIND_RUN)
         .expect("the run kind is registered");
     handler(
@@ -236,7 +236,7 @@ fn the_kinds_are_registered_and_the_purge_is_scheduled_daily() {
     );
     assert_eq!(KIND_PURGE, "backups.purge", "the ticket's purge kind");
 
-    let registry = crate::job_registry();
+    let registry = crate::job_registry(&crate::config::Config::for_tests());
     assert!(
         registry.get(crate::api::backups::KIND_RUN).is_some(),
         "the worker knows the run kind"

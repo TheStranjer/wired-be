@@ -130,7 +130,7 @@ async fn an_unreachable_database_retries_the_sweep() {
 /// once a day.
 #[test]
 fn the_kind_is_registered_and_scheduled() {
-    let registry = crate::job_registry();
+    let registry = crate::job_registry(&crate::config::Config::for_tests());
     assert!(
         registry.get(KIND_NOTIFICATIONS).is_some(),
         "the worker knows `{KIND_NOTIFICATIONS}`"
@@ -154,7 +154,7 @@ async fn the_registered_handler_is_this_sweep() {
     let alice = user(&pool, "alice").await;
     let bob = user(&pool, "bob").await;
     let stale = dismissed_ago(&pool, &alice, &bob, 31 * DAY).await;
-    let registry = crate::job_registry();
+    let registry = crate::job_registry(&crate::config::Config::for_tests());
     let handler = registry
         .get(KIND_NOTIFICATIONS)
         .expect("the sweep's kind is registered");

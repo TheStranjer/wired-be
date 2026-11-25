@@ -161,7 +161,7 @@ mod tests {
     /// ten minutes.
     #[test]
     fn the_kind_is_registered_and_scheduled() {
-        let registry = crate::job_registry();
+        let registry = crate::job_registry(&crate::config::Config::for_tests());
         assert!(
             registry.get(KIND_EXPIRE).is_some(),
             "the worker knows `{KIND_EXPIRE}`"
@@ -185,7 +185,7 @@ mod tests {
         let alice = user(&pool, "alice").await;
         let bob = user(&pool, "bob").await;
         mute_expiring_in(&pool, &alice, &bob, -60).await;
-        let registry = crate::job_registry();
+        let registry = crate::job_registry(&crate::config::Config::for_tests());
         let handler = registry
             .get(KIND_EXPIRE)
             .expect("the sweep's kind is registered");

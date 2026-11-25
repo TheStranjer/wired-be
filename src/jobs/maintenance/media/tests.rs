@@ -316,7 +316,7 @@ async fn the_media_sweep_walks_more_than_one_batch_in_one_run() {
 /// maintenance queue every six hours.
 #[test]
 fn the_media_kind_is_registered_and_scheduled() {
-    let registry = crate::job_registry();
+    let registry = crate::job_registry(&Config::for_tests());
     assert!(
         registry.get(KIND_MEDIA).is_some(),
         "the worker knows `{KIND_MEDIA}`"
@@ -341,7 +341,7 @@ async fn the_registered_media_handler_is_this_sweep() {
     let alice = user(&pool, "alice").await;
     let orphan = unposted_media_row(&pool, &alice, None, None, 49).await;
     let fresh = unposted_media_row(&pool, &alice, None, None, 47).await;
-    let registry = crate::job_registry();
+    let registry = crate::job_registry(&Config::for_tests());
     let handler = registry
         .get(KIND_MEDIA)
         .expect("the sweep's kind is registered");
