@@ -26,8 +26,11 @@
 use axum::Router;
 
 use crate::{
+    api::well_known::{self, WebfingerContribution},
+    config::Config,
     federation,
     jobs::{HandlerFn, QUEUE_FEDERATOR_INCOMING, QUEUE_FEDERATOR_OUTGOING},
+    models::user::User,
     protocols::{ProtocolId, adapter::ProtocolAdapter},
     services,
     state::AppState,
@@ -92,5 +95,10 @@ impl ProtocolAdapter for ActivityPub {
     /// The incoming and outgoing federator queues.
     fn job_queues(&self) -> &'static [&'static str] {
         ACTIVITYPUB_JOB_QUEUES
+    }
+
+    /// The actor id and profile aliases, and the profile-page, self and subscribe links.
+    fn webfinger(&self, config: &Config, user: &User) -> WebfingerContribution {
+        well_known::activitypub_contribution(user, config)
     }
 }

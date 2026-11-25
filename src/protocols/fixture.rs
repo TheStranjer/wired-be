@@ -12,7 +12,10 @@
 use axum::{Json, Router, http::StatusCode, routing::MethodRouter, routing::get};
 
 use crate::{
+    api::well_known::WebfingerContribution,
+    config::Config,
     jobs::{AttemptInfo, HandlerFn, HandlerFuture, JobError},
+    models::user::User,
     protocols::{ProtocolId, adapter::ProtocolAdapter},
     state::AppState,
 };
@@ -82,5 +85,13 @@ impl ProtocolAdapter for Fixture {
     /// One owned path, `GET /.well-known/fixture`.
     fn well_known_routes(&self) -> Vec<(&'static str, MethodRouter<AppState>)> {
         vec![(WELL_KNOWN_PATH, get(well_known_document))]
+    }
+
+    /// One alias, `fixture:<nickname>`, and no links.
+    fn webfinger(&self, _config: &Config, user: &User) -> WebfingerContribution {
+        WebfingerContribution {
+            aliases: vec![format!("fixture:{}", user.nickname)],
+            links: Vec::new(),
+        }
     }
 }
