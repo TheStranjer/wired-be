@@ -289,7 +289,7 @@ mod tests {
     use super::*;
     use crate::api::{
         oauth::authorize::AuthorizeReply,
-        oauth_external::test_support::{header_of, test_state},
+        oauth_external::test_support::{header_of, providers_state},
     };
 
     #[tokio::test]
@@ -306,7 +306,7 @@ mod tests {
             ),
         ] {
             let response = router()
-                .with_state(test_state(&["github"]))
+                .with_state(providers_state(&["github"]))
                 .oneshot(Request::get(uri).body(axum::body::Body::empty()).unwrap())
                 .await
                 .expect("the router answers in process");
@@ -322,7 +322,7 @@ mod tests {
     #[tokio::test]
     async fn a_request_without_a_provider_parameter_is_the_unknown_provider_404() {
         let response = router()
-            .with_state(test_state(&["github"]))
+            .with_state(providers_state(&["github"]))
             .oneshot(
                 Request::get("/oauth/prepare_request?response_type=code")
                     .body(axum::body::Body::empty())
@@ -346,7 +346,7 @@ mod tests {
             "/oauth/github/callback?code=c",
         ] {
             let response = router()
-                .with_state(test_state(&["github"]))
+                .with_state(providers_state(&["github"]))
                 .oneshot(Request::get(uri).body(axum::body::Body::empty()).unwrap())
                 .await
                 .expect("the router answers in process");
@@ -363,7 +363,7 @@ mod tests {
         // `/oauth/authorize` is the sibling router's static route; the
         // `{provider}` segment must not swallow it. Both refusals run
         // before any query, so the lazy pool stays untouched.
-        let state = test_state(&["github"]);
+        let state = providers_state(&["github"]);
         let app = crate::api::oauth::router(&state)
             .merge(router())
             .with_state(state);

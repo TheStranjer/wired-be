@@ -76,7 +76,7 @@ async fn the_relay_hook_adds_the_accepted_inboxes_to_the_fan_out() {
     let _subscription = relay::upsert(&pool, "https://relay.example/relay", RELAY_INBOX)
         .await
         .unwrap();
-    let state = test_state(&pool);
+    let state = app_state(&pool);
 
     // The relay stands subscribed but unaccepted: a public activity
     // reaches the follower alone until the relay's `Accept` folds.
@@ -139,7 +139,7 @@ async fn the_unreachable_hook_drops_and_restores_a_marked_host() {
     let alice = alice(&pool).await;
     let erin = mirror(&pool, "erin", "other.example", ERIN_INBOX, None).await;
     followed(&pool, &erin, &alice).await;
-    let state = test_state(&pool);
+    let state = app_state(&pool);
 
     let first_targets = publish_default(&state, &alice, &public_activity(&alice)).await;
     assert_eq!(first_targets, 1, "the follower's host is a target at first");
@@ -209,7 +209,7 @@ async fn a_followers_only_update_stays_off_the_relay() {
     let erin = mirror(&pool, "erin", "other.example", ERIN_INBOX, None).await;
     followed(&pool, &erin, &alice).await;
     accepted_relay(&pool).await;
-    let state = test_state(&pool);
+    let state = app_state(&pool);
     let update = json!({
         "id": ACTIVITY_ID,
         "type": "Update",
@@ -239,7 +239,7 @@ async fn an_undo_block_stays_off_the_relay() {
     let alice = alice(&pool).await;
     let erin = mirror(&pool, "erin", "other.example", ERIN_INBOX, None).await;
     accepted_relay(&pool).await;
-    let state = test_state(&pool);
+    let state = app_state(&pool);
     let undo = json!({
         "id": ACTIVITY_ID,
         "type": "Undo",
@@ -269,7 +269,7 @@ async fn an_undo_follow_with_only_to_stays_off_the_relay() {
     let alice = alice(&pool).await;
     let erin = mirror(&pool, "erin", "other.example", ERIN_INBOX, None).await;
     accepted_relay(&pool).await;
-    let state = test_state(&pool);
+    let state = app_state(&pool);
     let undo = json!({
         "id": ACTIVITY_ID,
         "type": "Undo",
@@ -303,7 +303,7 @@ async fn only_to_naming_the_public_still_skips_the_relay() {
     let alice = alice(&pool).await;
     let erin = mirror(&pool, "erin", "other.example", ERIN_INBOX, None).await;
     accepted_relay(&pool).await;
-    let state = test_state(&pool);
+    let state = app_state(&pool);
     let opts = PublishOpts {
         only_to: Some(vec![PUBLIC.to_owned(), erin.ap_id.clone()]),
         ..PublishOpts::default()
@@ -331,7 +331,7 @@ async fn a_public_delete_still_reaches_the_relay() {
     let erin = mirror(&pool, "erin", "other.example", ERIN_INBOX, None).await;
     followed(&pool, &erin, &alice).await;
     accepted_relay(&pool).await;
-    let state = test_state(&pool);
+    let state = app_state(&pool);
     let delete = json!({
         "id": ACTIVITY_ID,
         "type": "Delete",
@@ -361,7 +361,7 @@ async fn a_public_profile_update_still_reaches_the_relay() {
     let pool = db.pool().clone();
     let alice = alice(&pool).await;
     accepted_relay(&pool).await;
-    let state = test_state(&pool);
+    let state = app_state(&pool);
     let update = json!({
         "id": ACTIVITY_ID,
         "type": "Update",
@@ -393,7 +393,7 @@ async fn an_unlisted_create_stays_off_the_relay() {
     let erin = mirror(&pool, "erin", "other.example", ERIN_INBOX, None).await;
     followed(&pool, &erin, &alice).await;
     accepted_relay(&pool).await;
-    let state = test_state(&pool);
+    let state = app_state(&pool);
     let create = json!({
         "id": ACTIVITY_ID,
         "type": "Create",
@@ -422,7 +422,7 @@ async fn a_public_create_reaches_the_relay() {
     let pool = db.pool().clone();
     let alice = alice(&pool).await;
     accepted_relay(&pool).await;
-    let state = test_state(&pool);
+    let state = app_state(&pool);
     let create = json!({
         "id": ACTIVITY_ID,
         "type": "Create",
@@ -452,7 +452,7 @@ async fn a_public_like_stays_off_the_relay() {
     let alice = alice(&pool).await;
     let erin = mirror(&pool, "erin", "other.example", ERIN_INBOX, None).await;
     accepted_relay(&pool).await;
-    let state = test_state(&pool);
+    let state = app_state(&pool);
     let like = json!({
         "id": ACTIVITY_ID,
         "type": "Like",
@@ -482,7 +482,7 @@ async fn a_like_to_the_public_stays_off_the_relay() {
     let pool = db.pool().clone();
     let alice = alice(&pool).await;
     accepted_relay(&pool).await;
-    let state = test_state(&pool);
+    let state = app_state(&pool);
     let like = json!({
         "id": ACTIVITY_ID,
         "type": "Like",

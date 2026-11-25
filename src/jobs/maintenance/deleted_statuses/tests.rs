@@ -13,11 +13,12 @@ use crate::{
     jobs::{
         JobError, QUEUE_BACKGROUND,
         maintenance::test_support::{
-            DAY, EVERY, FIRST_ATTEMPT, app_state, broken_state, row_exists, state_with_config, user,
+            DAY, EVERY, FIRST_ATTEMPT, row_exists, state_with_config, user,
         },
         scheduler::periodic_jobs,
     },
     models::user::User,
+    test_support::{app_state, broken_state},
 };
 
 /// Inserts a live status — never deleted, owned by this instance when

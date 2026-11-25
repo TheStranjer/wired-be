@@ -464,6 +464,7 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
+    use crate::{test_fixtures::local_new, test_support::app_state};
 
     /// A stored-looking token row granting `scopes`, minted right now.
     fn token_with(scopes: &str) -> OauthToken {
@@ -548,11 +549,6 @@ mod tests {
             .expect("an app-only token names no user, so the gate does not bind");
     }
 
-    /// The [`AppState`] the credential lookups run on, over a slot's pool.
-    fn app_state(pool: &sqlx::PgPool) -> AppState {
-        AppState::for_tests(pool.clone(), crate::config::Config::for_tests())
-    }
-
     /// A fresh local user named `nickname`, active unless `active` says so.
     async fn reader(pool: &sqlx::PgPool, nickname: &str, active: bool) -> User {
         use crate::models::user::{Flag, NewUser, insert};
@@ -561,7 +557,7 @@ mod tests {
             pool,
             &NewUser {
                 is_active: Flag::new(active),
-                ..NewUser::local(nickname, &format!("https://test.example/users/{nickname}"))
+                ..local_new(nickname)
             },
         )
         .await

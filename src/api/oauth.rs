@@ -253,10 +253,10 @@ mod tests {
 
     use super::{
         grants::{MFA_REQUIRED, SUPPORTED_CHALLENGE_TYPES},
-        test_support::{test_state, token_row},
+        test_support::token_row,
         *,
     };
-    use crate::util::id::new_id;
+    use crate::{test_support::lazy_state, util::id::new_id};
 
     #[test]
     fn the_mfa_challenge_answer_is_a_403() {
@@ -283,7 +283,7 @@ mod tests {
     #[tokio::test]
     async fn the_route_answers_at_oauth_token() {
         use tower::ServiceExt as _;
-        let state = test_state();
+        let state = lazy_state();
         let app = router(&state).with_state(state);
         let request = Request::post("/oauth/token")
             .header("content-type", "application/json")
@@ -307,7 +307,7 @@ mod tests {
     #[tokio::test]
     async fn the_revoke_route_answers_at_oauth_revoke() {
         use tower::ServiceExt as _;
-        let state = test_state();
+        let state = lazy_state();
         let app = router(&state).with_state(state);
         let request = Request::post("/oauth/revoke")
             .header("content-type", "application/json")

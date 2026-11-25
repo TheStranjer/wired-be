@@ -30,7 +30,7 @@ pub(super) fn provider(name: &str) -> OauthProvider {
 
 /// The state the route-shaped tests need: config with one provider per
 /// name, and a lazy pool those gates never consult.
-pub(super) fn test_state(names: &[&str]) -> AppState {
+pub(super) fn providers_state(names: &[&str]) -> AppState {
     let mut config = Config::for_tests();
     config.oauth_providers = names.iter().map(|name| provider(name)).collect();
     AppState::lazy_for_tests(config)

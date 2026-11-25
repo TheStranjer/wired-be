@@ -82,10 +82,11 @@ async fn replied_to_is_followed(
 mod tests {
     use crate::{
         services::streaming::test_support::{
-            all_three_lists, app_state, follow_user, list_id_of, list_stream, local_user, post,
-            published, reply_to,
+            all_three_lists, follow_user, list_id_of, list_stream, local_user, post, published,
+            reply_to,
         },
         streaming::hub::Audience,
+        test_support::app_state,
     };
 
     use super::*;

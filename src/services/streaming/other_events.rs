@@ -225,9 +225,10 @@ mod tests {
             user::User,
         },
         services::streaming::test_support::{
-            app_state, assert_empty, canonical, direct_stream, emitted, inactive_user, local_user,
+            assert_empty, canonical, direct_stream, emitted, inactive_user, local_user,
             remote_user, sorted_ids, user_stream,
         },
+        test_support::app_state,
     };
 
     use super::*;

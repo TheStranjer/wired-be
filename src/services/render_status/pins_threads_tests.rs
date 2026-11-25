@@ -8,7 +8,7 @@ use uuid::Uuid;
 
 use super::{
     ViewerMode, render_statuses,
-    test_support::{BASE, post, test_state, user},
+    test_support::{BASE, app_state, post, user},
 };
 use crate::{
     entities::status::Status,
@@ -38,7 +38,7 @@ async fn pin_it(pool: &PgPool, who: &User, status_id: Uuid) {
 async fn the_pinned_flag_and_stamp_follow_one_batched_read() {
     let db = crate::test_db::test_db().await.expect("test database slot");
     let pool = db.pool().clone();
-    let state = test_state(&pool);
+    let state = app_state(&pool);
     let alice = user(&pool, "alice").await;
     let bob = user(&pool, "bob").await;
     let own = post(&pool, &alice, "alice's own").await;
@@ -129,7 +129,7 @@ async fn the_pinned_flag_and_stamp_follow_one_batched_read() {
 async fn the_thread_muted_flags_follow_one_batched_read() {
     let db = crate::test_db::test_db().await.expect("test database slot");
     let pool = db.pool().clone();
-    let state = test_state(&pool);
+    let state = app_state(&pool);
     let alice = user(&pool, "alice").await;
     let bob = user(&pool, "bob").await;
     let muted = post(&pool, &bob, "in a muted thread").await;
@@ -204,7 +204,7 @@ async fn the_thread_muted_flags_follow_one_batched_read() {
 async fn the_direct_conversation_id_follows_one_batched_read() {
     let db = crate::test_db::test_db().await.expect("test database slot");
     let pool = db.pool().clone();
-    let state = test_state(&pool);
+    let state = app_state(&pool);
     let alice = user(&pool, "alice").await;
     let bob = user(&pool, "bob").await;
     let carol = user(&pool, "carol").await;

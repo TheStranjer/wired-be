@@ -1,6 +1,6 @@
 //! The fixtures more than one `register` child's tests build on: the
 //! passwords the registrations submit, the [`AppState`] over a pool with
-//! the fixed test configuration, the valid [`RegisterParams`] for a
+//! a chosen configuration, the valid [`RegisterParams`] for a
 //! nickname, and the direct insert and reads the login and race tests need
 //! to set a row up without going through registration. Test-only.
 
@@ -19,11 +19,6 @@ pub(super) use crate::test_fixtures::local_new;
 pub(super) const PASSWORD: &str = "correct horse battery staple";
 /// One character short of the default 8-character minimum.
 pub(super) const SHORT_PASSWORD: &str = "short_7";
-
-/// An [`AppState`] over `pool` with the fixed test configuration.
-pub(super) fn test_state(pool: &PgPool) -> AppState {
-    test_state_with(pool, Config::for_tests())
-}
 
 /// An [`AppState`] over `pool` with `config`.
 pub(super) fn test_state_with(pool: &PgPool, config: Config) -> AppState {

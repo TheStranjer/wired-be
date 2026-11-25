@@ -122,12 +122,12 @@ mod tests {
     use super::super::{
         EVENT_REPORT_CREATED, job_args,
         test_support::{
-            FIRST_ATTEMPT, Seen, app_state, captured_body, discarded, expect_signature, fresh_id,
-            header, hook, mock_endpoint, retried, served,
+            FIRST_ATTEMPT, Seen, captured_body, discarded, expect_signature, fresh_id, header,
+            hook, mock_endpoint, retried, served,
         },
     };
     use super::*;
-    use crate::config::Config;
+    use crate::{config::Config, test_support::app_state};
 
     #[tokio::test]
     async fn a_delivery_posts_the_signed_labeled_envelope() {

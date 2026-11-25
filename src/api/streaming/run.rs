@@ -221,7 +221,7 @@ async fn write(socket: &mut WebSocket, message: Message) -> Flow {
 
 #[cfg(test)]
 mod tests {
-    use crate::api::streaming::test_support::{account, app_state_with, state, token_for};
+    use crate::api::streaming::test_support::{account, state, state_with_config, token_for};
     use crate::config::Config;
     use crate::{auth, oauth::scopes::READ};
 
@@ -359,12 +359,12 @@ mod tests {
         zero.streaming_ping_interval_secs = 0;
 
         assert_eq!(
-            heartbeat_period(&app_state_with(&pool, tuned)),
+            heartbeat_period(&state_with_config(&pool, tuned)),
             Duration::from_secs(3),
             "the configured span is what the socket pings on"
         );
         assert_eq!(
-            heartbeat_period(&app_state_with(&pool, zero)),
+            heartbeat_period(&state_with_config(&pool, zero)),
             Duration::from_secs(1),
             "a zero period would spin the socket loop, so it is read as one second"
         );

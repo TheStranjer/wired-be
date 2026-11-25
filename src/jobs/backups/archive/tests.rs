@@ -12,11 +12,12 @@ use zip::ZipArchive;
 
 use super::*;
 use crate::{
-    jobs::backups::test_support::{app_state, like, mark, post, user},
+    jobs::backups::test_support::{like, mark, post, user},
     models::{
         backup::file_name,
         status::{Visibility, soft_delete},
     },
+    test_support::app_state,
 };
 
 /// How many statuses the page-seam test seeds: just over one page.

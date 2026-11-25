@@ -3,34 +3,19 @@
 
 use serde_json::json;
 use sqlx::PgPool;
-use sqlx::postgres::PgPoolOptions;
 
 use super::*;
 use crate::{
-    config::{Config, TEST_BASE_URL},
+    config::TEST_BASE_URL,
     models::job::Job,
     models::user::{self, NewUser, insert},
     test_fixtures::local_user,
+    test_support::{app_state, broken_state},
 };
 
 /// A handle that neither the database nor a fast-failing `WebFinger`
 /// check can resolve (single-label domain), the skip case.
 const UNRESOLVABLE: &str = "ghost@invalid";
-
-/// Test state over `pool` with the fixed test config.
-fn app_state(pool: &PgPool) -> AppState {
-    AppState::for_tests(pool.clone(), Config::for_tests())
-}
-
-/// Test state over a pool that cannot answer: closed before it ever
-/// connected, which is how a handler sees a database that went away.
-async fn broken_state() -> AppState {
-    let pool = PgPoolOptions::new()
-        .connect_lazy("postgres://localhost/unused")
-        .expect("a lazy pool needs no database");
-    pool.close().await;
-    app_state(&pool)
-}
 
 /// Inserts a mirror of `nickname` on `host`: the shape of a remote
 /// account the fetch would store, so a handler entry resolves from the

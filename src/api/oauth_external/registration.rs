@@ -109,13 +109,13 @@ mod tests {
 
     use crate::api::oauth_external::{
         router,
-        test_support::{header_of, test_state},
+        test_support::{header_of, providers_state},
     };
 
     #[tokio::test]
     async fn the_registration_routes_refuse_a_stateless_request_as_json_400() {
         let get = router()
-            .with_state(test_state(&["github"]))
+            .with_state(providers_state(&["github"]))
             .oneshot(
                 Request::get("/oauth/registration_details")
                     .body(axum::body::Body::empty())
@@ -134,7 +134,7 @@ mod tests {
             "the refusal is JSON"
         );
         let post = router()
-            .with_state(test_state(&["github"]))
+            .with_state(providers_state(&["github"]))
             .oneshot(
                 Request::post("/oauth/register")
                     .header(

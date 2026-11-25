@@ -354,7 +354,7 @@ mod tests {
                 DIRECT, HASHTAG, PUBLIC, PUBLIC_MEDIA, PUBLIC_REMOTE, PUBLIC_REMOTE_MEDIA, USER,
                 USER_NOTIFICATION, USER_PLEROMA_CHAT,
             },
-            test_support::{account, app_state_with, query, state},
+            test_support::{account, query, state, state_with_config},
         },
         config::Config,
         models::list::NewList,
@@ -504,7 +504,7 @@ mod tests {
     ) -> Connection {
         let mut config = Config::for_tests();
         config.restrict_unauthenticated = std::iter::once(area.to_owned()).collect();
-        let mut connection = Connection::new(app_state_with(db.pool(), config), None)
+        let mut connection = Connection::new(state_with_config(db.pool(), config), None)
             .await
             .unwrap();
         connection.reader = reader;

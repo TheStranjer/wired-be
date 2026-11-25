@@ -7,12 +7,11 @@ use std::sync::Mutex;
 
 use futures::future::BoxFuture;
 use serde_json::{Value, json};
-use sqlx::{PgPool, postgres::PgPoolOptions};
+use sqlx::PgPool;
 use uuid::Uuid;
 
 use super::{ActivityView, FederationError, Handlers, Outcome, dispatch_activity};
 use crate::{
-    config::Config,
     federation::mrf,
     jobs::{AttemptInfo, JobError},
     models::user::{Flag, NewUser, User, insert},
@@ -21,6 +20,9 @@ use crate::{
 
 // The local account fixture, for the rows a remote actor's activity points at.
 pub(super) use crate::test_fixtures::local_user;
+// The test state over a live pool, and over a pool that cannot answer: the
+// database being unreachable, as the handlers see it.
+pub(super) use crate::test_support::{app_state, broken_state};
 
 /// Every `(label, activity id)` a fake handler ran for. Handlers are
 /// `fn` pointers that cannot capture a counter, so the fakes record
@@ -41,21 +43,6 @@ pub(super) fn seen(label: &str, ap_id: &str) -> usize {
         .iter()
         .filter(|(seen_label, seen_id)| seen_label == label && seen_id == ap_id)
         .count()
-}
-
-/// Test state over `pool`.
-pub(super) fn app_state(pool: &PgPool) -> AppState {
-    AppState::for_tests(pool.clone(), Config::for_tests())
-}
-
-/// Test state over a pool that cannot answer: the database being
-/// unreachable, as the handlers see it.
-pub(super) async fn broken_state() -> AppState {
-    let pool = PgPoolOptions::new()
-        .connect_lazy("postgres://localhost/unused")
-        .expect("a lazy pool needs no database");
-    pool.close().await;
-    app_state(&pool)
 }
 
 /// The signer fixture: a mirror of `alice` on `peer.example`.

@@ -15,7 +15,6 @@ use wired_be::{
     auth::{AppAuth, AuthContext, AuthUser, MaybeAuthUser},
     error::AppError,
     models::user::{Flag, NewUser},
-    state::AppState,
     util::token::sha256_hex,
 };
 
@@ -27,7 +26,7 @@ const TEST_CLIENT: &str = "Test Client";
 /// The router under test: each route runs one extractor (and, on the
 /// `/scope/…` routes, one scope guard) and reports what it resolved.
 fn auth_test_app(pool: PgPool) -> Router {
-    let state = AppState::for_tests(pool, common::test_config());
+    let state = common::test_app_state(pool, common::test_config());
     Router::new()
         .route("/auth-user", get(auth_user_view))
         .route("/maybe-auth-user", get(maybe_auth_user_view))

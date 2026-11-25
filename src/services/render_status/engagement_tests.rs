@@ -8,7 +8,7 @@ use uuid::Uuid;
 
 use super::{
     ViewerMode, render_statuses,
-    test_support::{BASE, post, test_state, user},
+    test_support::{BASE, app_state, post, user},
 };
 use crate::{
     entities::status::Status,
@@ -88,7 +88,7 @@ async fn bookmark_in(pool: &PgPool, who: &User, status_id: Uuid, folder: Uuid) {
 async fn the_reactions_roll_up_in_the_render_batch() {
     let db = crate::test_db::test_db().await.expect("test database slot");
     let pool = db.pool().clone();
-    let state = test_state(&pool);
+    let state = app_state(&pool);
     let alice = user(&pool, "alice").await;
     let bob = user(&pool, "bob").await;
     let first = post(&pool, &alice, "first").await;
@@ -166,7 +166,7 @@ async fn the_reactions_roll_up_in_the_render_batch() {
 async fn the_favourited_flag_follows_one_batched_read() {
     let db = crate::test_db::test_db().await.expect("test database slot");
     let pool = db.pool().clone();
-    let state = test_state(&pool);
+    let state = app_state(&pool);
     let alice = user(&pool, "alice").await;
     let bob = user(&pool, "bob").await;
     let liked = post(&pool, &bob, "liked").await;
@@ -238,7 +238,7 @@ async fn the_favourited_flag_follows_one_batched_read() {
 async fn the_reblogged_flag_follows_one_batched_read() {
     let db = crate::test_db::test_db().await.expect("test database slot");
     let pool = db.pool().clone();
-    let state = test_state(&pool);
+    let state = app_state(&pool);
     let alice = user(&pool, "alice").await;
     let bob = user(&pool, "bob").await;
     let boosted = post(&pool, &bob, "boosted").await;
@@ -310,7 +310,7 @@ async fn the_reblogged_flag_follows_one_batched_read() {
 async fn the_bookmarked_flag_follows_one_batched_read() {
     let db = crate::test_db::test_db().await.expect("test database slot");
     let pool = db.pool().clone();
-    let state = test_state(&pool);
+    let state = app_state(&pool);
     let alice = user(&pool, "alice").await;
     let bob = user(&pool, "bob").await;
     let saved = post(&pool, &bob, "saved").await;
@@ -382,7 +382,7 @@ async fn the_bookmarked_flag_follows_one_batched_read() {
 async fn the_bookmark_folder_rides_the_batched_bookmark_read() {
     let db = crate::test_db::test_db().await.expect("test database slot");
     let pool = db.pool().clone();
-    let state = test_state(&pool);
+    let state = app_state(&pool);
     let alice = user(&pool, "alice").await;
     let bob = user(&pool, "bob").await;
     let folder = bookmark_folder::create(&pool, alice.id, "shelved", None)

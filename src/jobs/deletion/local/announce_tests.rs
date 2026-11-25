@@ -2,10 +2,13 @@
 //! retries the job before any follow row is cleared.
 
 use super::super::test_support::{
-    accepted_follow, app_state, broken_state, count_where, follows, has_follow, local_user, run,
+    accepted_follow, count_where, follows, has_follow, local_user, run,
 };
 use super::*;
-use crate::models::user::{Flag, NewUser, insert};
+use crate::{
+    models::user::{Flag, NewUser, insert},
+    test_support::{app_state, broken_state},
+};
 
 /// A remote follower of `alice` with a shared inbox, accepted.
 async fn remote_fan_of(pool: &sqlx::PgPool, alice: &user::User) -> user::User {

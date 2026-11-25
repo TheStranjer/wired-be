@@ -9,7 +9,7 @@ use uuid::Uuid;
 
 use super::{
     ViewerMode, render_statuses,
-    test_support::{BASE, post, test_state, user},
+    test_support::{BASE, app_state, post, user},
 };
 use crate::{
     entities::status::Status,
@@ -135,7 +135,7 @@ fn expected_open_poll(open: &poll::Poll, voted: bool, own_votes: &[i32]) -> Valu
 async fn the_poll_embeds_in_the_render_batch() {
     let db = crate::test_db::test_db().await.expect("test database slot");
     let pool = db.pool().clone();
-    let state = test_state(&pool);
+    let state = app_state(&pool);
     let (alice, bob, polled, open) = open_poll_fixture(&pool).await;
     let plain = post(&pool, &alice, "nothing asked").await;
     let reblog = insert(
@@ -184,7 +184,7 @@ async fn the_poll_embeds_in_the_render_batch() {
 async fn an_anonymous_render_reports_the_page_poll_unvoted() {
     let db = crate::test_db::test_db().await.expect("test database slot");
     let pool = db.pool().clone();
-    let state = test_state(&pool);
+    let state = app_state(&pool);
     let (_alice, _bob, polled, open) = open_poll_fixture(&pool).await;
 
     let anonymous = render_statuses(&state, ViewerMode::ANONYMOUS, std::slice::from_ref(&polled))
@@ -206,7 +206,7 @@ async fn an_anonymous_render_reports_the_page_poll_unvoted() {
 async fn hide_totals_nulls_the_option_counts_while_the_poll_is_open() {
     let db = crate::test_db::test_db().await.expect("test database slot");
     let pool = db.pool().clone();
-    let state = test_state(&pool);
+    let state = app_state(&pool);
     let alice = user(&pool, "alice").await;
     let bob = user(&pool, "bob").await;
     let secret = post(&pool, &alice, "hush").await;
@@ -267,7 +267,7 @@ async fn hide_totals_nulls_the_option_counts_while_the_poll_is_open() {
 async fn the_card_follows_one_batched_read() {
     let db = crate::test_db::test_db().await.expect("test database slot");
     let pool = db.pool().clone();
-    let state = test_state(&pool);
+    let state = app_state(&pool);
     let alice = user(&pool, "alice").await;
     let bob = user(&pool, "bob").await;
     let original = post(&pool, &alice, "https://example.test/post").await;
@@ -351,7 +351,7 @@ async fn the_card_follows_one_batched_read() {
 async fn the_author_reads_her_own_poll_as_voted_without_marks() {
     let db = crate::test_db::test_db().await.expect("test database slot");
     let pool = db.pool().clone();
-    let state = test_state(&pool);
+    let state = app_state(&pool);
     let (alice, _bob, polled, open) = open_poll_fixture(&pool).await;
 
     let for_alice = render_statuses(

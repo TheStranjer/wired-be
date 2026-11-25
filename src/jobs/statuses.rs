@@ -241,7 +241,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        config::{Config, TEST_BASE_URL},
+        config::TEST_BASE_URL,
         jobs::QUEUE_BACKGROUND,
         models::{
             notification::{self, NewNotification},
@@ -249,12 +249,8 @@ mod tests {
             user::User,
         },
         test_fixtures::{local_user as user, remote_user},
+        test_support::app_state,
     };
-
-    /// Test state over `pool` with the fixed test config.
-    fn app_state(pool: &PgPool) -> AppState {
-        AppState::for_tests(pool.clone(), Config::for_tests())
-    }
 
     /// A public post by `author` that expires `secs` from now (negative:
     /// its moment has already run out), or never when `secs` is `None`.

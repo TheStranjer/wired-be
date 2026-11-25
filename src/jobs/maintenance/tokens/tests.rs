@@ -14,8 +14,7 @@ use crate::{
     jobs::{
         JobError, QUEUE_BACKGROUND,
         maintenance::test_support::{
-            DAY, FIRST_ATTEMPT, HOURLY, app_state, broken_state, row_exists, state_with_config,
-            user,
+            DAY, FIRST_ATTEMPT, HOURLY, row_exists, state_with_config, user,
         },
         scheduler::periodic_jobs,
     },
@@ -23,6 +22,7 @@ use crate::{
         oauth_app::{NewOauthApp, OauthApp, create as create_app},
         user::User,
     },
+    test_support::{app_state, broken_state},
 };
 
 /// Registers an OAuth app named `name`: the issuer the credential rows

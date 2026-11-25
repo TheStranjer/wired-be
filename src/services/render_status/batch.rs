@@ -463,7 +463,7 @@ mod tests {
         },
         services::render_status::{
             render_status, render_statuses,
-            test_support::{BASE, test_state, user},
+            test_support::{BASE, app_state, user},
         },
     };
 
@@ -541,7 +541,7 @@ mod tests {
     async fn the_batched_page_equals_row_by_row_rendering() {
         let db = crate::test_db::test_db().await.expect("test database slot");
         let pool = db.pool().clone();
-        let state = test_state(&pool);
+        let state = app_state(&pool);
         let (alice, page) = mixed_page(&pool).await;
 
         assert_page_equals_rows(&state, ViewerMode::ANONYMOUS, &page).await;

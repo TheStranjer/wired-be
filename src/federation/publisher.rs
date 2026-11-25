@@ -334,7 +334,7 @@ mod tests {
         )
         .await;
         followed(&pool, &erin, &alice).await;
-        let state = test_state(&pool);
+        let state = app_state(&pool);
 
         let count = publish_filtered(
             &state,
@@ -365,7 +365,7 @@ mod tests {
             None,
         )
         .await;
-        let state = test_state(&pool);
+        let state = app_state(&pool);
         let activity = json!({
             "id": ACTIVITY_ID,
             "type": "Create",
@@ -412,7 +412,7 @@ mod tests {
         )
         .await;
         followed(&pool, &erin, &alice).await;
-        let state = test_state(&pool);
+        let state = app_state(&pool);
 
         let count = publish_ok(
             &state,

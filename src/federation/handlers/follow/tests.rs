@@ -6,13 +6,14 @@ mod refusals;
 
 use serde_json::{Value, json};
 use sqlx::PgPool;
-use sqlx::postgres::PgPoolOptions;
 use uuid::Uuid;
 
 use super::*;
 use crate::{
-    config::{Config, TEST_BASE_URL},
+    config::TEST_BASE_URL,
     models::user::{NewUser, insert},
+    test_fixtures::local_user as local,
+    test_support::{app_state, broken_state},
 };
 
 /// The mirror every direct-call fixture here is sent by: alice on
@@ -20,31 +21,6 @@ use crate::{
 const ALICE: &str = "https://peer.example/users/alice";
 /// MALLORY, the other `peer.example` mirror — the wrong-actor fixture.
 const MALLORY: &str = "https://peer.example/users/mallory";
-
-/// Test state over `pool` with the fixed test config.
-fn app_state(pool: &PgPool) -> AppState {
-    AppState::for_tests(pool.clone(), Config::for_tests())
-}
-
-/// Test state over a pool that cannot answer: the database having gone
-/// away, as the handlers see it.
-async fn broken_state() -> AppState {
-    let pool = PgPoolOptions::new()
-        .connect_lazy("postgres://localhost/unused")
-        .expect("a lazy pool needs no database");
-    pool.close().await;
-    app_state(&pool)
-}
-
-/// A local account named `nickname`.
-async fn local(pool: &PgPool, nickname: &str) -> User {
-    insert(
-        pool,
-        &NewUser::local(nickname, &user::local_ap_id(TEST_BASE_URL, nickname)),
-    )
-    .await
-    .expect("the local fixture inserts")
-}
 
 /// The remote mirror fixture: `nickname` on `peer.example`.
 async fn mirror(pool: &PgPool, nickname: &str, ap_id: &str) -> User {

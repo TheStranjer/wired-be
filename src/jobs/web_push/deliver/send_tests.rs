@@ -7,8 +7,8 @@ use p256::ecdsa::{Signature, VerifyingKey, signature::Verifier as _};
 use serde_json::Value;
 
 use super::super::test_support::{
-    Setup, account, app_state_with, captured_body, client_keys, header, mock_push_service,
-    note_about, open_pref, run, served, setup, subscribe,
+    Setup, account, captured_body, client_keys, header, mock_push_service, note_about, open_pref,
+    run, served, setup, state_with_config, subscribe,
 };
 use super::*;
 use crate::{
@@ -64,7 +64,7 @@ async fn follow_payload(pool: &PgPool, config: Config, actor: &user::User) -> Va
         None,
     )
     .await;
-    run(&app_state_with(pool, config), note.id, subscription.id)
+    run(&state_with_config(pool, config), note.id, subscription.id)
         .await
         .expect("delivered");
     server.abort();

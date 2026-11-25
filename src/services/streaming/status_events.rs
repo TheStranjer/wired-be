@@ -108,11 +108,12 @@ mod tests {
     use crate::{
         models::status::Visibility,
         services::streaming::test_support::{
-            app_state, assert_empty, boost, canonical, direct_stream, emitted, follow_user,
-            inactive_user, list_of, list_stream, local_user, post, post_vis, remote_post,
-            remote_user, sorted_ids, user_stream,
+            assert_empty, boost, canonical, direct_stream, emitted, follow_user, inactive_user,
+            list_of, list_stream, local_user, post, post_vis, remote_post, remote_user, sorted_ids,
+            user_stream,
         },
         streaming::hub::Audience,
+        test_support::app_state,
     };
 
     use super::*;

@@ -5,25 +5,21 @@
 use sqlx::PgPool;
 
 use crate::{
-    config::{Config, TEST_BASE_URL},
+    config::TEST_BASE_URL,
     models::{
         status::{NewStatus, Status as StatusRow, insert},
         user::User,
     },
-    state::AppState,
 };
 
 // A local user named `nickname`.
 pub(super) use crate::test_fixtures::local_user as user;
+// The state under test: a slot's pool and the test config, with the
+// collaborators the renderer never touches.
+pub(super) use crate::test_support::app_state;
 
 /// The instance origin the fixtures post under.
 pub(super) const BASE: &str = TEST_BASE_URL;
-
-/// The state under test: `pool` and the test config, with the
-/// collaborators the renderer never touches.
-pub(super) fn test_state(pool: &PgPool) -> AppState {
-    AppState::for_tests(pool.clone(), Config::for_tests())
-}
 
 /// Inserts `text` as a local public status of `author`.
 pub(super) async fn post(pool: &PgPool, author: &User, text: &str) -> StatusRow {

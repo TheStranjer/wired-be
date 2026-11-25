@@ -12,11 +12,12 @@ use crate::{
     jobs::{
         QUEUE_DEFAULT,
         test_support::{
-            HANDLER_STARTED, TEST_IDLE_POLL, app_state, fetch, ok_handler, panicking_handler,
-            run_until_state, slow_handler, test_job, wait_for_state, worker_for,
+            HANDLER_STARTED, TEST_IDLE_POLL, fetch, ok_handler, panicking_handler, run_until_state,
+            slow_handler, test_job, wait_for_state, worker_for,
         },
     },
     models::job::{NewJob, enqueue},
+    test_support::app_state,
 };
 
 #[tokio::test]

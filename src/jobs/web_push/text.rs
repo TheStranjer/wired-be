@@ -62,14 +62,15 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::super::test_support::{
-        Pref, account, app_state, captured_body, client_keys, local, mock_push_service, note_about,
-        open_pref, run, subscribe,
+        Pref, account, captured_body, client_keys, local, mock_push_service, note_about, open_pref,
+        run, subscribe,
     };
     use super::*;
     use crate::{
         config::TEST_BASE_URL,
         models::{notification, user},
         services::web_push,
+        test_support::app_state,
     };
 
     #[tokio::test]

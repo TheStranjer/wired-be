@@ -16,11 +16,12 @@ use crate::{
     jobs::{
         JobError, QUEUE_BACKGROUND,
         maintenance::test_support::{
-            FIRST_ATTEMPT, SIX_HOURS, app_state, broken_state, row_exists, state_with_config, user,
+            FIRST_ATTEMPT, SIX_HOURS, row_exists, state_with_config, user,
         },
         scheduler::periodic_jobs,
     },
     models::user::User,
+    test_support::{app_state, broken_state},
     uploads::UploaderBackend,
 };
 

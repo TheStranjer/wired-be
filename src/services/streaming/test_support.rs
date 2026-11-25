@@ -15,7 +15,7 @@ use tokio::sync::broadcast;
 use uuid::Uuid;
 
 use crate::{
-    config::{Config, TEST_BASE_URL},
+    config::TEST_BASE_URL,
     models::{
         follow::{self, FollowToggles},
         list::{self, NewList},
@@ -32,11 +32,6 @@ use crate::{
 
 // The local and remote accounts the streaming tests seed.
 pub(super) use crate::test_fixtures::{local_user, remote_user};
-
-/// Test state over `pool` with the fixed test config.
-pub(super) fn app_state(pool: &PgPool) -> AppState {
-    AppState::for_tests(pool.clone(), Config::for_tests())
-}
 
 /// Inserts a local user named `nickname` whose account is deactivated.
 pub(super) async fn inactive_user(pool: &PgPool, nickname: &str) -> User {

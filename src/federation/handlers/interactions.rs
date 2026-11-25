@@ -231,13 +231,11 @@ mod tests {
         test_fixtures::local_user,
     };
 
+    // Test state: a slot's pool and the fixed test config, collaborators inert.
+    pub(super) use crate::test_support::app_state;
+
     /// The remote signer every direct-call fixture here delivers as.
     pub(super) const BOB: &str = "https://remote.example/users/bob";
-
-    /// Test state: `pool` and the fixed test config, collaborators inert.
-    pub(super) fn app_state(pool: &PgPool) -> AppState {
-        AppState::for_tests(pool.clone(), crate::config::Config::for_tests())
-    }
 
     /// The stored mirror of the fixture signer.
     pub(super) async fn signer(pool: &PgPool) -> User {

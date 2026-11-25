@@ -186,7 +186,10 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::federation::mrf::test_support::{follow_activity, set_mrf_entry, test_state};
+    use crate::{
+        federation::mrf::test_support::{follow_activity, set_mrf_entry},
+        test_support::app_state,
+    };
 
     /// The incoming filter runs the configured chain over the view's own
     /// document: names resolve, unknown ones vanish, and the document
@@ -198,7 +201,7 @@ mod tests {
         set_mrf_entry(&pool, ":mrf", &json!({"policies": ["ghost", "noop"]}))
             .await
             .expect("the setting writes");
-        let state = test_state(&pool);
+        let state = app_state(&pool);
         let activity = follow_activity();
         let view = ActivityView::parse(&activity).expect("the fixture parses");
 
@@ -215,7 +218,7 @@ mod tests {
     #[tokio::test]
     async fn the_outgoing_filter_accepts_an_unconfigured_chain() {
         let db = crate::test_db::test_db().await.expect("test database slot");
-        let state = test_state(db.pool());
+        let state = app_state(db.pool());
 
         let decision = filter_outgoing(&state, follow_activity()).await;
 
@@ -235,7 +238,7 @@ mod tests {
         set_mrf_entry(&pool, ":mrf", &json!({"noop": {"probe": true}}))
             .await
             .expect("the setting writes");
-        let state = test_state(&pool);
+        let state = app_state(&pool);
 
         let config = load_config(&state).await;
         let ctx = MrfContext {
@@ -333,17 +336,17 @@ mod tests {
         set_mrf_entry(&pool, ":mrf", &json!({"policies": []}))
             .await
             .expect("the setting writes");
-        let bare = activity_context(&test_state(&pool), &create).await;
+        let bare = activity_context(&app_state(&pool), &create).await;
         assert_eq!(bare.author_follower_count, None, "no policy, no counts");
         assert_eq!(bare.author_status_count, None, "nor their twin");
         assert!(bare.author_tags.is_empty(), "nor any tags");
-        let bare_follow = activity_context(&test_state(&pool), &follow).await;
+        let bare_follow = activity_context(&app_state(&pool), &follow).await;
         assert!(bare_follow.target_tags.is_empty(), "nor a Follow target's");
 
         set_mrf_entry(&pool, ":mrf", &json!({"policies": ["anti_link_spam"]}))
             .await
             .expect("the rewrite writes");
-        let counted = activity_context(&test_state(&pool), &create).await;
+        let counted = activity_context(&app_state(&pool), &create).await;
         assert_eq!(counted.author_follower_count, Some(7), "the counters load");
         assert_eq!(counted.author_status_count, Some(3), "and only they");
         assert!(counted.author_tags.is_empty(), "the tag facts stay unread");
@@ -351,7 +354,7 @@ mod tests {
         set_mrf_entry(&pool, ":mrf", &json!({"policies": ["tag"]}))
             .await
             .expect("the rewrite writes");
-        let tagged = activity_context(&test_state(&pool), &create).await;
+        let tagged = activity_context(&app_state(&pool), &create).await;
         assert_eq!(
             tagged.author_tags,
             vec!["mrf_tag:media-strip".to_owned()],
@@ -363,7 +366,7 @@ mod tests {
             "a `Create` addresses no `Follow` target"
         );
 
-        let following = activity_context(&test_state(&pool), &follow).await;
+        let following = activity_context(&app_state(&pool), &follow).await;
         assert_eq!(
             following.target_tags,
             vec!["mrf_tag:disable-any-subscription".to_owned()],
@@ -371,14 +374,14 @@ mod tests {
         );
 
         let remote_target =
-            activity_context(&test_state(&pool), &follow_of(&alice.ap_id, &alice.ap_id)).await;
+            activity_context(&app_state(&pool), &follow_of(&alice.ap_id, &alice.ap_id)).await;
         assert!(
             remote_target.target_tags.is_empty(),
             "a remote target is nobody's subscription subject: the local row is the only one read"
         );
 
         let stranger = activity_context(
-            &test_state(&pool),
+            &app_state(&pool),
             &create_note("https://nowhere.example/users/x"),
         )
         .await;
@@ -410,7 +413,7 @@ mod tests {
         )
         .await
         .expect("the newcomer fixture inserts");
-        let state = test_state(&pool);
+        let state = app_state(&pool);
 
         let spam = create_note(&newcomer.ap_id);
         let view = ActivityView::parse(&spam).expect("the fixture parses");
@@ -452,7 +455,7 @@ mod tests {
             .expect("the setting writes");
         let alice = preloaded_author(&pool).await;
         let carol = preloaded_target(&pool).await;
-        let state = test_state(&pool);
+        let state = app_state(&pool);
 
         let follow = follow_of(&alice.ap_id, &carol.ap_id);
         let view = ActivityView::parse(&follow).expect("the fixture parses");

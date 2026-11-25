@@ -34,18 +34,12 @@ use crate::{
         web_push_subscription::{self, NewSubscription, WebPushSubscription},
     },
     state::AppState,
+    test_support::app_state,
 };
 
-/// Test state over `pool` on the fixed test config, whose HTTP client
-/// reaches the loopback mocks the tests bind (decision 13's fixture is
-/// what the database-backed tests lease from).
-pub(super) fn app_state(pool: &PgPool) -> AppState {
-    app_state_with(pool, Config::for_tests())
-}
-
-/// [`app_state`] built on `config`, for the tests that read a setting
+/// Test state over `pool` on `config`, for the tests that read a setting
 /// away from its test default.
-pub(super) fn app_state_with(pool: &PgPool, config: Config) -> AppState {
+pub(super) fn state_with_config(pool: &PgPool, config: Config) -> AppState {
     AppState::for_tests(pool.clone(), config)
 }
 

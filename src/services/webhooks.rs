@@ -183,8 +183,9 @@ fn parse_args(args: &Value) -> Result<DeliverArgs, JobError> {
 
 #[cfg(test)]
 mod tests {
-    use super::test_support::{app_state, deliveries, fresh_id, hook};
+    use super::test_support::{deliveries, fresh_id, hook};
     use super::*;
+    use crate::test_support::app_state;
 
     #[test]
     fn the_job_shape_round_trips_and_bad_args_discard() {
