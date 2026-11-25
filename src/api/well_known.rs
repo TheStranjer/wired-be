@@ -1,6 +1,6 @@
 //! The `/.well-known` discovery routes (`docs/ARCHITECTURE.md` decision 3).
 //!
-//! This router is merged at the top level of [`crate::app`], not under
+//! This router is mounted by [`crate::discovery`], at the top level, not under
 //! `/api`: `/.well-known` is where federation and clients look accounts up,
 //! and those paths are fixed by RFC 7033 and the `OStatus` profile.
 //!
@@ -61,11 +61,16 @@ const TEXT_HTML: &str = "text/html";
 /// The 400 body message when the `resource` query parameter is absent.
 const MISSING_RESOURCE: &str = "Missing resource";
 
-/// The top-level `/.well-known` router, merged by [`crate::app`].
+/// The path of the `WebFinger` document.
+pub const WEBFINGER_PATH: &str = "/.well-known/webfinger";
+/// The path of the host-meta document.
+pub const HOST_META_PATH: &str = "/.well-known/host-meta";
+
+/// The `WebFinger` and host-meta routes, mounted by [`crate::discovery::router`].
 pub fn router() -> Router<AppState> {
     Router::new()
-        .route("/.well-known/webfinger", get(webfinger))
-        .route("/.well-known/host-meta", get(host_meta))
+        .route(WEBFINGER_PATH, get(webfinger))
+        .route(HOST_META_PATH, get(host_meta))
 }
 
 /// The query parameters of `/.well-known/webfinger`. An absent `resource`

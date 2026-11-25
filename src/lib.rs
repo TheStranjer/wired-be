@@ -10,6 +10,7 @@ pub mod auth;
 pub mod cli;
 pub mod config;
 pub mod default_assets;
+pub mod discovery;
 pub mod entities;
 pub mod error;
 pub mod extract;
@@ -56,8 +57,8 @@ use crate::{
 /// serve addresses outside `/api` fixed by their protocols, by stored URLs
 /// or by the clients that call them — `/media` ([`media_files`]), `/proxy`
 /// ([`media_proxy`]), `/emoji` ([`api::emoji_packs`]), `/.well-known`
-/// ([`api::well_known`]),
-/// `/.well-known/nodeinfo` and `/nodeinfo/{version}` ([`api::nodeinfo`]),
+/// `/.well-known` ([`discovery`], which serves core's documents and the paths
+/// each enabled protocol owns), `/nodeinfo/{version}` ([`api::nodeinfo`]),
 /// `/oauth` ([`api::oauth`]), the `/oauth` provider-login paths
 /// ([`api::oauth_external`]), `POST /auth/password` ([`api::password_reset`],
 /// Pleroma routes the reset request outside `/api`) — are merged at the
@@ -91,7 +92,7 @@ pub fn app(state: AppState) -> Router {
             .merge(api::oauth::router(&state))
             .merge(api::oauth_external::router())
             .merge(api::password_reset::auth_router(&state))
-            .merge(api::well_known::router())
+            .merge(discovery::router(&state))
             .merge(api::nodeinfo::router())
             .merge(media_files::router())
             .merge(media_proxy::router())

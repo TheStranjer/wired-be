@@ -134,3 +134,49 @@ async fn both_protocols_can_be_mounted_together() {
     let ping = common::TestRequest::get("/fixture/ping").send(&app).await;
     assert_eq!(ping.status, StatusCode::NO_CONTENT, "the fixture answers");
 }
+
+/// `/.well-known/fixture` is an owned path: served only while the fixture is enabled.
+#[tokio::test]
+async fn the_fixture_well_known_path_is_served_only_when_the_fixture_is_enabled() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let fixture_app = common::test_app_with_config(pool.clone(), config_with_protocols("fixture"));
+    let activitypub_app = common::test_app_with_config(pool, config_with_protocols("activitypub"));
+
+    let served = common::TestRequest::get("/.well-known/fixture")
+        .send(&fixture_app)
+        .await;
+    assert_eq!(served.status, StatusCode::OK, "the fixture owns the path");
+    assert_eq!(
+        served.json_value(),
+        serde_json::json!({ "protocol": "fixture" }),
+        "it answers its small JSON object"
+    );
+
+    let absent = common::TestRequest::get("/.well-known/fixture")
+        .send(&activitypub_app)
+        .await;
+    assert_eq!(absent.status, StatusCode::NOT_FOUND, "no owner, no path");
+    assert_eq!(
+        absent.header("x-wired-fallback"),
+        Some("1"),
+        "the fallback answers"
+    );
+}
+
+/// Core's shared documents are served whatever `PROTOCOLS` enables.
+#[tokio::test]
+async fn core_documents_are_served_without_activitypub() {
+    let db = common::test_db().await;
+    let app = common::test_app_with_config(db.pool().clone(), config_with_protocols("fixture"));
+
+    let nodeinfo = common::TestRequest::get("/.well-known/nodeinfo")
+        .send(&app)
+        .await;
+    assert_eq!(nodeinfo.status, StatusCode::OK, "NodeInfo is core's");
+
+    let host_meta = common::TestRequest::get("/.well-known/host-meta")
+        .send(&app)
+        .await;
+    assert_eq!(host_meta.status, StatusCode::OK, "host-meta is core's");
+}
