@@ -27,13 +27,19 @@
 //! to [`Status::poll`](crate::entities::status::Status), which renders it
 //! in its `poll` key (`null` for a status that carries none).
 
+use std::collections::HashSet;
+
 use chrono::{DateTime, Utc};
 use serde::Serialize;
-use serde_json::Value;
 
 use crate::{
-    entities::account::JsonBool,
-    models::poll::{Poll as PollRow, PollOption as PollOptionRow},
+    config::Config,
+    entities::{account::JsonBool, custom_emoji::CustomEmoji},
+    models::{
+        custom_emoji::CustomEmoji as EmojiRow,
+        poll::{Poll as PollRow, PollOption as PollOptionRow},
+    },
+    util::emoji::shortcodes_in,
 };
 
 /// One entry of a [`Poll`]'s `options` array: the choice's text and its
@@ -53,7 +59,7 @@ pub struct PollOption {
 /// ten keys of the [module docs](self). Presence: every key is always
 /// emitted — the nullable [`expires_at`](Self::expires_at) renders JSON
 /// `null` rather than disappearing, and [`emojis`](Self::emojis) the empty
-/// list. The three booleans ride the same [`JsonBool`] newtype
+/// list until [`Poll::with_emojis`] fills it. The three booleans ride the same [`JsonBool`] newtype
 /// [`Account`](crate::entities::account::Account)'s flags do, which keeps
 /// the wire value a plain `true`/`false` while the struct stays under the
 /// denied `struct_excessive_bools` threshold (`docs/ARCHITECTURE.md`
@@ -84,10 +90,9 @@ pub struct Poll {
     pub own_votes: Vec<i32>,
     /// The choices, in the order voters see them.
     pub options: Vec<PollOption>,
-    /// Custom emojis used in the poll; `[]`, the same always-empty
-    /// `Vec<serde_json::Value>` list [`Status::emojis`](crate::entities::status::Status)
-    /// renders — the poll's texts carry no stored emoji references.
-    pub emojis: Vec<Value>,
+    /// Custom emojis whose `:shortcode:` appears in an option title; `[]`
+    /// until [`Poll::with_emojis`] fills it.
+    pub emojis: Vec<CustomEmoji>,
 }
 
 impl Poll {
@@ -126,12 +131,35 @@ impl Poll {
             emojis: Vec::new(),
         }
     }
+
+    /// Fills [`emojis`](Self::emojis) from `emojis`, keeping only those
+    /// whose `:shortcode:` appears in an option title.
+    ///
+    /// `emojis` is any list that may be wider than the poll (a status's
+    /// whole emoji list); an emoji used only in the body or the content
+    /// warning is dropped, as Mastodon's `PollSerializer#emojis` does. The
+    /// kept ones keep the order `emojis` lists them in.
+    #[must_use]
+    pub fn with_emojis(mut self, emojis: &[EmojiRow], config: &Config) -> Self {
+        let used: HashSet<&str> = self
+            .options
+            .iter()
+            .flat_map(|option| shortcodes_in(&option.title))
+            .collect();
+        let kept: Vec<CustomEmoji> = emojis
+            .iter()
+            .filter(|emoji| used.contains(emoji.shortcode.as_str()))
+            .map(|emoji| CustomEmoji::from_model(emoji, config))
+            .collect();
+        self.emojis = kept;
+        self
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use chrono::{TimeDelta, TimeZone as _};
-    use serde_json::json;
+    use serde_json::{Value, json};
     use uuid::Uuid;
 
     use super::*;
@@ -306,6 +334,66 @@ mod tests {
         let past =
             serde_json::to_value(Poll::build(&row, &options(), &[], shift(deadline(), 1))).unwrap();
         assert_eq!(past["expired"], true, "one second past is");
+    }
+
+    /// A local enabled [`EmojiRow`] named `shortcode`, with a still url.
+    fn emoji_row(shortcode: &str) -> EmojiRow {
+        EmojiRow {
+            id: Uuid::now_v7(),
+            shortcode: shortcode.to_owned(),
+            domain: None,
+            image_url: format!("https://test.example/emoji/{shortcode}.gif"),
+            static_url: Some(format!("https://test.example/emoji/{shortcode}.png")),
+            category: None,
+            tags: Vec::new(),
+            visible_in_picker: true,
+            disabled: false,
+            inserted_at: now(),
+            updated_at: now(),
+        }
+    }
+
+    #[test]
+    fn an_emoji_used_in_an_option_title_renders_with_its_urls() {
+        let titles = [option_row(0, ":wiredcat: yes", 0), option_row(1, "no", 0)];
+        let poll = Poll::build(&poll_row(None, 0, 0), &titles, &[], now())
+            .with_emojis(&[emoji_row("wiredcat")], &Config::for_tests());
+        let value = serde_json::to_value(&poll).unwrap();
+        let emojis = value["emojis"].as_array().unwrap();
+        assert_eq!(emojis.len(), 1, "the one emoji the options use");
+        assert_eq!(emojis[0]["shortcode"], "wiredcat", "named by shortcode");
+        assert_eq!(
+            emojis[0]["url"], "https://test.example/emoji/wiredcat.gif",
+            "with its image url"
+        );
+        assert_eq!(
+            emojis[0]["static_url"], "https://test.example/emoji/wiredcat.png",
+            "and its still url"
+        );
+    }
+
+    #[test]
+    fn an_emoji_used_only_outside_the_options_is_left_out() {
+        let titles = [option_row(0, ":wiredcat: yes", 0), option_row(1, "no", 0)];
+        let poll = Poll::build(&poll_row(None, 0, 0), &titles, &[], now()).with_emojis(
+            &[emoji_row("blob"), emoji_row("wiredcat")],
+            &Config::for_tests(),
+        );
+        let value = serde_json::to_value(&poll).unwrap();
+        let codes: Vec<&str> = value["emojis"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|emoji| emoji["shortcode"].as_str())
+            .collect();
+        assert_eq!(codes, ["wiredcat"], "`blob` is only in the status body");
+    }
+
+    #[test]
+    fn options_without_shortcodes_keep_the_emojis_empty() {
+        let poll = Poll::build(&poll_row(None, 0, 0), &options(), &[], now())
+            .with_emojis(&[emoji_row("wiredcat")], &Config::for_tests());
+        assert!(poll.emojis.is_empty(), "no option names an emoji");
     }
 
     #[test]

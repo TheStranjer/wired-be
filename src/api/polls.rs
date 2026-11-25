@@ -95,13 +95,17 @@ use crate::{
     error::{AppError, AppResult},
     extract::{ApiBody, index_map_to_vec},
     models::{
+        custom_emoji::CustomEmoji as EmojiRow,
         poll::{self, Poll as PollRow, PollOption as PollOptionRow},
         status::{self, Status as StatusRow},
         status_visibility,
-        user::User,
+        user::{self, User},
     },
     oauth::scopes::{READ_STATUSES, WRITE_STATUSES},
-    services::{federation_out, notify},
+    services::{
+        federation_out, notify,
+        render_status::{EmojiText, load_emojis},
+    },
     state::AppState,
     util::id::parse_id,
 };
@@ -167,8 +171,8 @@ async fn show_poll(
 ) -> AppResult<Json<Poll>> {
     auth.require_user_scope(READ_STATUSES)?;
     let viewer = auth.0.as_ref();
-    let (poll, _posted) = poll_for_viewer_or_404(&state, viewer, &id).await?;
-    render_poll(&state, &poll, viewer).await.map(Json)
+    let (poll, posted) = poll_for_viewer_or_404(&state, viewer, &id).await?;
+    render_poll(&state, &poll, &posted, viewer).await.map(Json)
 }
 
 /// `POST /api/v1/polls/{id}/votes` — cast the ballot the body describes
@@ -223,7 +227,9 @@ async fn cast_poll_vote(
         .await?
         .ok_or(AppError::NotFound)?;
     after_vote_cast(&state, &updated, voter, &chosen).await;
-    render_poll(&state, &updated, Some(voter)).await.map(Json)
+    render_poll(&state, &updated, &posted, Some(voter))
+        .await
+        .map(Json)
 }
 
 /// Resolves the `{id}` segment of a poll route to its [`PollRow`] and the
@@ -276,13 +282,46 @@ async fn poll_for_viewer_or_404(
 /// # Errors
 ///
 /// Any database failure arrives through `?` as [`AppError::Database`].
-async fn render_poll(state: &AppState, poll: &PollRow, viewer: Option<&User>) -> AppResult<Poll> {
+async fn render_poll(
+    state: &AppState,
+    poll: &PollRow,
+    posted: &StatusRow,
+    viewer: Option<&User>,
+) -> AppResult<Poll> {
     let options = poll::options(&state.db, poll.id).await?;
     let own_votes = match viewer {
         Some(viewer) => poll::voted_option_positions(&state.db, poll.id, viewer.id).await?,
         None => Vec::new(),
     };
-    Ok(Poll::build(poll, &options, &own_votes, Utc::now()))
+    let emojis = option_emojis(state, posted, &options).await?;
+    Ok(Poll::build(poll, &options, &own_votes, Utc::now()).with_emojis(&emojis, &state.config))
+}
+
+/// The custom emojis the titles of `options` use, as the status `posted`'s
+/// author owns them (their domain's emoji, or the local pack for a local
+/// author).
+///
+/// Only the option titles are scanned, so an emoji used only in the body
+/// never loads. A status whose author row is gone has none.
+///
+/// # Errors
+///
+/// Any database failure arrives through `?` as [`AppError::Database`].
+async fn option_emojis(
+    state: &AppState,
+    posted: &StatusRow,
+    options: &[PollOptionRow],
+) -> AppResult<Vec<EmojiRow>> {
+    let Some(author) = user::get_by_id(&state.db, posted.user_id).await? else {
+        return Ok(Vec::new());
+    };
+    let wanted = [EmojiText {
+        key: posted.id,
+        domain: author.domain.as_deref(),
+        texts: options.iter().map(|option| option.title.as_str()).collect(),
+    }];
+    let mut found = load_emojis(&state.db, &wanted).await?;
+    Ok(found.remove(&posted.id).unwrap_or_default())
 }
 
 /// What the vote endpoint refuses before it writes anything, checked in
@@ -475,7 +514,7 @@ mod tests {
             hide_totals: false,
             voters_count: 0,
             votes_count: 0,
-            ended_notified: crate::models::user::Flag::default(),
+            ended_notified: user::Flag::default(),
         }
     }
 

@@ -54,6 +54,8 @@
 mod create;
 /// The create's refusals: every 422 the poll checks pin.
 mod create_refusals;
+/// `Poll.emojis`: the custom emoji option titles use.
+mod emojis;
 /// The read route: the entity, the shared 404 and the token gate.
 mod read;
 /// Shared consts and fixture helpers every submodule of this area draws on.
