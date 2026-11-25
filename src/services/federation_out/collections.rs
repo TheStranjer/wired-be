@@ -161,7 +161,7 @@ mod tests {
             "a fresh own-instance activity id: {id}"
         );
         assert_eq!(activity["published"], mastodon_time(&row.inserted_at));
-        let document = crate::federation::actor::actor_json(&alice, &state.config, &[]);
+        let document = crate::federation::actor::actor_json(&alice, None, &state.config, &[]);
         assert_eq!(
             activity["target"], document["featured"],
             "the target is the very collection the actor document advertises"

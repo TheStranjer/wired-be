@@ -20,7 +20,7 @@ use crate::{
         policy::{host_refused, signer_host},
         signature::verify::{SignedRequestParts, verify},
     },
-    models::user::User,
+    models::{activitypub_actor, user::User},
     state::AppState,
 };
 
@@ -58,8 +58,8 @@ pub async fn verify_with_refetch<F>(
 where
     F: Fn(&str) -> bool + Send,
 {
-    if let Some(pem) = signer.public_key.as_deref()
-        && check(pem)
+    if let Some(pem) = stored_public_key(state, &signer).await?
+        && check(&pem)
     {
         return Ok(signer);
     }
@@ -68,12 +68,31 @@ where
         return Err(RefetchOutcome::Invalid);
     }
     match refresh_user(state, &signer).await {
-        Ok(refreshed) => match refreshed.public_key.as_deref() {
-            Some(pem) if check(pem) => Ok(refreshed),
+        Ok(refreshed) => match stored_public_key(state, &refreshed).await? {
+            Some(pem) if check(&pem) => Ok(refreshed),
             Some(_) | None => Err(RefetchOutcome::Invalid),
         },
         Err(FetchError::Gone) => Err(RefetchOutcome::Gone),
         Err(_err) => Err(RefetchOutcome::Invalid),
+    }
+}
+
+/// The public key PEM stored for `signer`, from its `activitypub_actors`
+/// row.
+///
+/// A signer with no row, like one with no key, has nothing to verify with
+/// (`None`). A database failure leaves the signature unproven, so it is
+/// [`RefetchOutcome::Invalid`] too.
+async fn stored_public_key(
+    state: &AppState,
+    signer: &User,
+) -> Result<Option<String>, RefetchOutcome> {
+    match activitypub_actor::get(&state.db, signer.id).await {
+        Ok(actor) => Ok(actor.and_then(|row| row.public_key)),
+        Err(err) => {
+            debug!(%err, actor = %signer.ap_id, "could not read the signer's public key");
+            Err(RefetchOutcome::Invalid)
+        }
     }
 }
 
@@ -204,6 +223,44 @@ mod tests {
             "the mirror row now carries the rotated key"
         );
         server.abort();
+    }
+
+    /// The signer's key comes from `activitypub_actors`: `users` keeps a
+    /// stale key and no fetch stamp, the actor row alone holds the matching key
+    /// and a fresh stamp, and no peer is running to refetch from.
+    #[tokio::test]
+    async fn the_signers_key_is_read_from_the_actor_row() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let ap_id = "https://remote.example/users/alice";
+        seed_remote_user(&pool, ap_id, STALE_KEY_PEM).await;
+        let updated = sqlx::query(
+            "UPDATE activitypub_actors SET public_key = $2, last_fetched_at = now()
+              WHERE user_id = (SELECT id FROM users WHERE ap_id = $1)",
+        )
+        .bind(ap_id)
+        .bind(FIXTURE_PUBLIC_PKCS1_PEM)
+        .execute(&pool)
+        .await
+        .unwrap()
+        .rows_affected();
+        assert_eq!(updated, 1, "the seeded signer has one actor row");
+        let app = inbox_app(test_state(pool.clone()));
+
+        let body = activity(ap_id, "https://test.example/users/bob");
+        let signed = deliver(
+            &format!("{ap_id}#main-key"),
+            FIXTURE_PRIVATE_PKCS1_PEM,
+            &body,
+        );
+        let reply = send(&app, &signed).await;
+
+        assert_eq!(
+            reply.status,
+            StatusCode::OK,
+            "the actor row's key verifies the signature: {}",
+            reply.error
+        );
     }
 
     /// A signature no key can answer: the first delivery spends the

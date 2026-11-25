@@ -14,7 +14,7 @@ use crate::{
     error::{AppError, AppResult},
     extract::multipart::MultipartForm,
     federation::{
-        actor::{actor_json, profile_emojis},
+        actor::{actor_json, profile_emojis, stored_public_key},
         json as ap_json,
     },
     models::{
@@ -43,8 +43,10 @@ use super::negotiation::document_response;
 pub(super) async fn whoami(State(state): State<AppState>, auth: AuthUser) -> AppResult<Response> {
     auth.require(READ)?;
     let emojis = profile_emojis(&state.db, &auth.0).await?;
+    let public_key = stored_public_key(&state.db, &auth.0).await?;
     Ok(document_response(&actor_json(
         &auth.0,
+        public_key.as_deref(),
         &state.config,
         &emojis,
     )))

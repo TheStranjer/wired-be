@@ -15,7 +15,7 @@ use crate::{
     error::AppResult,
     federation::{
         activities::activity_id,
-        actor::{actor_json, profile_emojis},
+        actor::{actor_json, profile_emojis, stored_public_key},
         delivery::best_inbox,
         note, publisher,
         vocab::AS_PUBLIC,
@@ -61,7 +61,20 @@ pub async fn after_profile_updated(state: &AppState, account: &User) {
             return;
         }
     };
-    let document = update_document(state, account, followers_collection, &emojis);
+    let public_key = match stored_public_key(&state.db, account).await {
+        Ok(public_key) => public_key,
+        Err(err) => {
+            warn!(%err, actor = %account.ap_id, "could not load the public key for the Update");
+            return;
+        }
+    };
+    let document = update_document(
+        state,
+        account,
+        followers_collection,
+        public_key.as_deref(),
+        &emojis,
+    );
     let unique_key = format!("profile-update:{}", account.id);
     match publisher::publish_in_background(state, account.id, &document, &[], Some(&unique_key))
         .await
@@ -73,11 +86,13 @@ pub async fn after_profile_updated(state: &AppState, account: &User) {
 
 /// The actor document for the profile in `account`, as an `Update` activity
 /// addressed to the public and to the account's followers collection;
+/// `public_key` is the account's key as `activitypub_actors` stores it and
 /// `emojis` are the custom emojis the profile uses, tagged on the actor.
 fn update_document(
     state: &AppState,
     account: &User,
     followers_collection: &str,
+    public_key: Option<&str>,
     emojis: &[CustomEmoji],
 ) -> Value {
     json!({
@@ -85,7 +100,7 @@ fn update_document(
         "id": activity_id(&state.config, new_id()),
         "type": "Update",
         "actor": account.ap_id,
-        "object": actor_json(account, &state.config, emojis),
+        "object": actor_json(account, public_key, &state.config, emojis),
         "to": [AS_PUBLIC],
         "cc": [followers_collection],
     })

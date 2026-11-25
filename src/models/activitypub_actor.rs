@@ -12,7 +12,10 @@
 //! identity is claimed ([`ActorStatus::Active`]) or awaiting setup
 //! ([`ActorStatus::Pending`]).
 //!
-//! Nothing reads this table outside its own tests yet. The migration
+//! The readers are moving here one area at a time: the actor document's
+//! public key, the signature check's key lookup, the instance actor's
+//! signing key, the featured collection id and the remote mirror's fetch
+//! stamp already come from this table, not from `users`. The migration
 //! backfilled it from `users`, and every writer of the moved columns now
 //! writes both tables in one transaction ([`upsert_from_user`] is how):
 //! `models::user::insert` for every new local or remote account, and

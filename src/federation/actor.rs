@@ -8,8 +8,9 @@
 //! `endpoints` and `publicKey` objects, and the JSON-LD context.
 //!
 //! [`actor_json`] is pure (decision 3): every value comes from the [`User`]
-//! row, from the instance [`Config`], or from a documented constant, so a
-//! test needs no database. It renders the document of a *local* user: the
+//! row, from the instance [`Config`], from the public key its caller read
+//! from `activitypub_actors` ([`stored_public_key`]), or from a documented
+//! constant, so a test needs no database. It renders the document of a *local* user: the
 //! collections are derived from `ap_id` the way Pleroma derives them, not
 //! read back from the endpoint columns, and the endpoints themselves are
 //! this instance's, which only makes sense for an actor this instance owns.
@@ -38,6 +39,7 @@ use crate::{
         vocab::AS_VOCABULARY,
     },
     models::{
+        activitypub_actor,
         custom_emoji::{self, CustomEmoji},
         user::{User, featured, featured_tags, followers, following, inbox, outbox},
     },
@@ -67,10 +69,18 @@ const IMAGE_TYPE: &str = "Image";
 /// `emojis` is the pool of custom emojis the caller knows; the `tag` array
 /// holds an `Emoji` tag for each local, enabled one whose `:shortcode:` the
 /// profile text uses (see [`profile_emojis`]), once each, in `emojis` order.
+///
+/// `public_key` is the PEM the account's `activitypub_actors` row stores
+/// (see [`stored_public_key`]); `None` renders `publicKeyPem` as `null`.
 #[must_use]
-pub fn actor_json(user: &User, config: &Config, emojis: &[CustomEmoji]) -> Value {
+pub fn actor_json(
+    user: &User,
+    public_key: Option<&str>,
+    config: &Config,
+    emojis: &[CustomEmoji],
+) -> Value {
     Value::Object(
-        actor_fields(user, config, emojis)
+        actor_fields(user, public_key, config, emojis)
             .into_iter()
             .map(|(name, value)| (name.to_owned(), value))
             .collect(),
@@ -84,8 +94,13 @@ pub fn actor_json(user: &User, config: &Config, emojis: &[CustomEmoji]) -> Value
 /// advertising them only makes peers fetch a 404. Its `outbox`, `followers`
 /// and `following` stay, as the empty collections `/internal/fetch` serves.
 #[must_use]
-pub fn instance_actor_json(user: &User, config: &Config, emojis: &[CustomEmoji]) -> Value {
-    let mut document = actor_json(user, config, emojis);
+pub fn instance_actor_json(
+    user: &User,
+    public_key: Option<&str>,
+    config: &Config,
+    emojis: &[CustomEmoji],
+) -> Value {
+    let mut document = actor_json(user, public_key, config, emojis);
     if let Some(fields) = document.as_object_mut() {
         drop(fields.remove("featured"));
         drop(fields.remove("featuredTags"));
@@ -99,6 +114,7 @@ pub fn instance_actor_json(user: &User, config: &Config, emojis: &[CustomEmoji])
 /// move.
 fn actor_fields(
     user: &User,
+    stored_key: Option<&str>,
     config: &Config,
     emojis: &[CustomEmoji],
 ) -> Vec<(&'static str, Value)> {
@@ -118,7 +134,7 @@ fn actor_fields(
         ("featured", json!(featured(ap_id))),
         ("featuredTags", json!(featured_tags(ap_id))),
         ("endpoints", endpoints(config)),
-        ("publicKey", public_key(user)),
+        ("publicKey", public_key(user, stored_key)),
         ("manuallyApprovesFollowers", json!(user.locked.get())),
         ("discoverable", json!(user.discoverable.get())),
     ];
@@ -229,15 +245,27 @@ fn endpoints(config: &Config) -> Value {
 
 /// The `publicKey` object (Pleroma's `common_actor_fields`): the actor id
 /// with [`MAIN_KEY_FRAGMENT`] appended, the actor id as owner and the
-/// stored PEM. A row without key material renders `publicKeyPem` as JSON
-/// `null`; registration always generates a pair, so only a half-provisioned
-/// row looks like that.
-fn public_key(user: &User) -> Value {
+/// stored PEM (`pem`). An account without key material renders
+/// `publicKeyPem` as JSON `null`; registration always generates a pair, so
+/// only a half-provisioned account looks like that.
+fn public_key(user: &User, pem: Option<&str>) -> Value {
     json!({
         "id": format!("{}{MAIN_KEY_FRAGMENT}", user.ap_id),
         "owner": user.ap_id,
-        "publicKeyPem": user.public_key,
+        "publicKeyPem": pem,
     })
+}
+
+/// The public key PEM stored for `user`, from its `activitypub_actors` row.
+///
+/// An account with no row, like one with no key, has none (`None`).
+///
+/// # Errors
+///
+/// Any database failure arrives as [`AppError::Database`](crate::error::AppError).
+pub async fn stored_public_key(pool: &PgPool, user: &User) -> AppResult<Option<String>> {
+    let actor = activitypub_actor::get(pool, user.id).await?;
+    Ok(actor.and_then(|row| row.public_key))
 }
 
 /// The `attachment` array: the stored profile fields as `PropertyValue`
@@ -412,7 +440,7 @@ mod tests {
 
     /// The document `user` renders on the test instance.
     fn render(user: &User) -> Value {
-        actor_json(user, &Config::for_tests(), &[])
+        actor_json(user, None, &Config::for_tests(), &[])
     }
 
     /// A local, enabled emoji row named `shortcode`, its image under `BASE`.
@@ -457,14 +485,14 @@ mod tests {
         let mut user = base_user("internal.fetch", "https://test.example/internal/fetch");
         "Application".clone_into(&mut user.actor_type);
         let config = Config::for_tests();
-        let document = instance_actor_json(&user, &config, &[]);
+        let document = instance_actor_json(&user, None, &config, &[]);
         let expected: Vec<&str> = BASE_KEYS
             .iter()
             .copied()
             .filter(|key| !matches!(*key, "featured" | "featuredTags"))
             .collect();
         assert_eq!(json_keys(&document), expected, "every key but the two");
-        let mut with_featured = actor_json(&user, &config, &[]);
+        let mut with_featured = actor_json(&user, None, &config, &[]);
         for key in ["featured", "featuredTags"] {
             assert!(
                 with_featured
@@ -664,15 +692,15 @@ mod tests {
     #[test]
     fn the_public_key_is_the_actors_main_key() {
         let mut alice = local_alice();
-        alice.public_key = Some(PUBLIC_PEM.to_owned());
+        alice.public_key = Some("the old users column".to_owned());
         assert_eq!(
-            render(&alice)["publicKey"],
+            actor_json(&alice, Some(PUBLIC_PEM), &Config::for_tests(), &[])["publicKey"],
             json!({
                 "id": format!("{AP_ID}#main-key"),
                 "owner": AP_ID,
                 "publicKeyPem": PUBLIC_PEM,
             }),
-            "key id, owner and stored PEM"
+            "key id, owner and the PEM handed in, not the users column"
         );
 
         let document = render(&local_alice());
@@ -831,7 +859,7 @@ mod tests {
     #[test]
     fn used_emojis_render_once_each_in_the_given_order() {
         let emojis = [fixture_emoji("other"), fixture_emoji("wiredcat")];
-        let document = actor_json(&emoji_alice(), &Config::for_tests(), &emojis);
+        let document = actor_json(&emoji_alice(), None, &Config::for_tests(), &emojis);
         assert_eq!(
             document["tag"],
             json!([expected_tag("other"), expected_tag("wiredcat")]),
@@ -845,14 +873,14 @@ mod tests {
         alice.bio = "<p>:wiredcat:</p>".to_owned();
         let emojis = [fixture_emoji("wiredcat")];
         assert_eq!(
-            actor_json(&alice, &Config::for_tests(), &emojis)["tag"],
+            actor_json(&alice, None, &Config::for_tests(), &emojis)["tag"],
             json!([expected_tag("wiredcat")]),
             "the rendered bio counts"
         );
         let mut bob = local_alice();
         bob.raw_fields = json!([{"name": ":wiredcat:", "value": "x"}]);
         assert_eq!(
-            actor_json(&bob, &Config::for_tests(), &emojis)["tag"],
+            actor_json(&bob, None, &Config::for_tests(), &emojis)["tag"],
             json!([expected_tag("wiredcat")]),
             "a raw field name counts"
         );
@@ -861,14 +889,14 @@ mod tests {
     #[test]
     fn a_profile_without_emoji_renders_an_empty_tag_list() {
         let emojis = [fixture_emoji("wiredcat")];
-        let document = actor_json(&local_alice(), &Config::for_tests(), &emojis);
+        let document = actor_json(&local_alice(), None, &Config::for_tests(), &emojis);
         assert_eq!(document["tag"], json!([]), "known emojis the text skips");
     }
 
     #[test]
     fn a_shortcode_without_an_emoji_row_makes_no_tag() {
         let emojis = [fixture_emoji("wiredcat")];
-        let document = actor_json(&emoji_alice(), &Config::for_tests(), &emojis);
+        let document = actor_json(&emoji_alice(), None, &Config::for_tests(), &emojis);
         assert_eq!(
             document["tag"],
             json!([expected_tag("wiredcat")]),
@@ -880,8 +908,52 @@ mod tests {
     fn a_remote_emoji_makes_no_tag() {
         let mut remote = fixture_emoji("wiredcat");
         remote.domain = Some("remote.example".to_owned());
-        let document = actor_json(&emoji_alice(), &Config::for_tests(), &[remote]);
+        let document = actor_json(&emoji_alice(), None, &Config::for_tests(), &[remote]);
         assert_eq!(document["tag"], json!([]), "only local emojis federate");
+    }
+
+    /// The key of the document is the one in `activitypub_actors`: after only
+    /// that row changes, [`stored_public_key`] hands the new PEM to the
+    /// renderer, and an account with no row renders a null PEM.
+    #[tokio::test]
+    async fn the_document_key_is_read_from_the_actor_row() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = crate::models::user::insert(
+            &pool,
+            &crate::models::user::NewUser::local("alice", AP_ID),
+        )
+        .await
+        .unwrap();
+        let changed =
+            sqlx::query("UPDATE activitypub_actors SET public_key = $2 WHERE user_id = $1")
+                .bind(alice.id)
+                .bind(PUBLIC_PEM)
+                .execute(&pool)
+                .await
+                .unwrap()
+                .rows_affected();
+        assert_eq!(changed, 1, "registration wrote one actor row");
+
+        let key = stored_public_key(&pool, &alice).await.unwrap();
+        let document = actor_json(&alice, key.as_deref(), &Config::for_tests(), &[]);
+        assert_eq!(
+            document["publicKey"]["publicKeyPem"], PUBLIC_PEM,
+            "the actor row's key, though users holds another"
+        );
+
+        let removed = sqlx::query("DELETE FROM activitypub_actors WHERE user_id = $1")
+            .bind(alice.id)
+            .execute(&pool)
+            .await
+            .unwrap()
+            .rows_affected();
+        assert_eq!(removed, 1, "the actor row goes");
+        assert_eq!(
+            stored_public_key(&pool, &alice).await.unwrap(),
+            None,
+            "no row, no key"
+        );
     }
 
     #[tokio::test]
