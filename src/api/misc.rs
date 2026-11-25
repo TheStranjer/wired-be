@@ -20,6 +20,11 @@
 //! `Not found` (Pleroma: 503 "Healthcheck disabled").
 //!
 //! None of the endpoints authenticates: they serve public data.
+//!
+//! Every route here is core, by the rule in [`crate::api`]: the captcha
+//! handshake, the healthcheck and the frontend configuration describe this
+//! instance and read no `ActivityPub` data, so they answer whatever
+//! `PROTOCOLS` enables. There is no `ActivityPub`-backed half to split off.
 
 use std::time::Duration;
 

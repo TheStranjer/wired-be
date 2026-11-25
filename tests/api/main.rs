@@ -507,6 +507,10 @@ mod protocols;
 /// each `PROTOCOLS` value.
 mod protocols_admin;
 
+/// The account-settings and misc routes split into core and
+/// `ActivityPub`-backed halves under each `PROTOCOLS` value.
+mod protocols_account_settings;
+
 /// Poll parameters on `POST /api/v1/statuses`: the `CommonAPI` poll rules,
 /// the empty-text skip, the form nesting, and the storage wiring — poll
 /// and option rows committed with the status, rendered in the entity,
