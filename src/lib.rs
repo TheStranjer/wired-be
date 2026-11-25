@@ -55,14 +55,19 @@ use crate::{
 /// The [`api`] routers are merged under their prefixes; the routers that
 /// serve addresses outside `/api` fixed by their protocols, by stored URLs
 /// or by the clients that call them — `/media` ([`media_files`]), `/proxy`
-/// ([`media_proxy`]), `/emoji` ([`api::emoji_packs`]), `/users/{nickname}`
-/// and `/internal/fetch` ([`api::activitypub`]), `/.well-known`
+/// ([`media_proxy`]), `/emoji` ([`api::emoji_packs`]), `/.well-known`
 /// ([`api::well_known`]),
 /// `/.well-known/nodeinfo` and `/nodeinfo/{version}` ([`api::nodeinfo`]),
 /// `/oauth` ([`api::oauth`]), the `/oauth` provider-login paths
 /// ([`api::oauth_external`]), `POST /auth/password` ([`api::password_reset`],
 /// Pleroma routes the reset request outside `/api`) — are merged at the
 /// top level.
+///
+/// The routes of each protocol the operator enabled with `PROTOCOLS` come
+/// from its adapter ([`protocols::registry::enabled`]) and are merged at the
+/// top level too: `ActivityPub`'s `/users/{nickname}` and `/internal/fetch`
+/// ([`api::activitypub`]) are there only while `activitypub` is enabled.
+///
 /// Paths no route matches get the standard JSON error response (decision 8),
 /// marked with `x-wired-fallback: 1` so a test can tell the fallback's own
 /// 404 from a handler's.
@@ -74,11 +79,15 @@ use crate::{
 ///
 /// [`api::emoji_packs`]: crate::api::emoji_packs::files_router
 pub fn app(state: AppState) -> Router {
+    let protocol_routes = protocols::registry::enabled(&state.config)
+        .fold(Router::new(), |routes, adapter| {
+            routes.merge(adapter.router(&state))
+        });
     middleware::apply(
         Router::new()
             .route("/health", get(health))
             .merge(api::router(&state))
-            .merge(api::activitypub::router(&state.config))
+            .merge(protocol_routes)
             .merge(api::oauth::router(&state))
             .merge(api::oauth_external::router())
             .merge(api::password_reset::auth_router(&state))
