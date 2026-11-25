@@ -148,6 +148,7 @@ async fn a_local_user_is_served_as_its_actor_document() {
             "followers": format!("{BASE}/users/alice/followers"),
             "following": format!("{BASE}/users/alice/following"),
             "featured": format!("{BASE}/users/alice/collections/featured"),
+            "featuredTags": format!("{BASE}/users/alice/collections/tags"),
             "endpoints": {
                 "sharedInbox": format!("{BASE}/inbox"),
                 "oauthAuthorizationEndpoint": format!("{BASE}/oauth/authorize"),

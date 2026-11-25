@@ -7,7 +7,7 @@
 use sqlx::{PgConnection, PgPool};
 use uuid::Uuid;
 
-use crate::{error::AppResult, util::id::new_id};
+use crate::{error::AppResult, models::featured_tag, util::id::new_id};
 
 use super::{Status, counters::uncount_deleted};
 
@@ -72,6 +72,7 @@ pub async fn soft_delete(pool: &PgPool, id: Uuid) -> AppResult<Option<Status>> {
     };
     uncount_deleted(&mut tx, &tombstone).await?;
     clear_pins(&mut tx, id).await?;
+    featured_tag::refresh_conn(&mut tx, tombstone.user_id, Some(id)).await?;
     tx.commit().await?;
     Ok(Some(tombstone))
 }
@@ -114,6 +115,7 @@ pub async fn soft_delete_with_reblogs(
     };
     uncount_deleted(&mut tx, &tombstone).await?;
     clear_pins(&mut tx, id).await?;
+    featured_tag::refresh_conn(&mut tx, tombstone.user_id, Some(id)).await?;
     let reblogs = tombstone_reblogs(&mut tx, id).await?;
     for reblog in &reblogs {
         uncount_deleted(&mut tx, reblog).await?;

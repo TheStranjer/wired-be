@@ -177,9 +177,9 @@ use crate::{
 use self::{
     activities::{get_activity, get_notice_activity},
     actors::{
-        get_actor, get_featured, get_followers, get_following, get_instance_actor,
-        get_instance_followers, get_instance_following, get_instance_outbox, get_outbox, get_relay,
-        get_relay_followers, get_relay_following, litepub_schema,
+        get_actor, get_featured, get_featured_tags, get_followers, get_following,
+        get_instance_actor, get_instance_followers, get_instance_following, get_instance_outbox,
+        get_outbox, get_relay, get_relay_followers, get_relay_following, litepub_schema,
     },
     c2s_misc::{ap_upload_media, whoami},
     inbox::{inbox, read_inbox, user_inbox},
@@ -315,6 +315,7 @@ pub fn router(config: &Config) -> Router<AppState> {
         .route("/users/{nickname}/followers", get(get_followers))
         .route("/users/{nickname}/following", get(get_following))
         .route("/users/{nickname}/collections/featured", get(get_featured))
+        .route("/users/{nickname}/collections/tags", get(get_featured_tags))
         .route("/objects/{uuid}/replies", get(get_replies))
         .route("/internal/fetch", get(get_instance_actor))
         .route("/internal/fetch/outbox", get(get_instance_outbox))

@@ -7,7 +7,7 @@ use axum::Router;
 use crate::{
     api::{
         account_lists, accounts, admin, announcements, apps, backups, blocks, chats, conversations,
-        custom_emojis, domain_blocks, emoji_packs, emoji_reactions, endorsements,
+        custom_emojis, domain_blocks, emoji_packs, emoji_reactions, endorsements, featured_tags,
         federation_status, filters, follow_requests, instance, lists, markers, mastodon_admin,
         mastodon_admin_reports, media, misc, mutes, notifications, oauth_tokens, password_reset,
         pleroma_account_settings, pleroma_accounts, pleroma_bookmark_folders, pleroma_settings,
@@ -55,6 +55,7 @@ pub fn router(state: &AppState) -> Router<AppState> {
         .merge(domain_blocks::router())
         .merge(endorsements::router())
         .merge(endorsements::pleroma_router())
+        .merge(featured_tags::router())
         .merge(filters::router())
         .merge(follow_requests::router())
         .merge(instance::router())

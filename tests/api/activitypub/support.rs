@@ -30,7 +30,7 @@ pub(super) const HOST: &str = "test.example";
 pub(super) const PUBLIC_PEM: &str =
     "-----BEGIN PUBLIC KEY-----\nMIIB-FIXTURE\n-----END PUBLIC KEY-----\n";
 /// Every key of an actor document that carries neither avatar nor banner.
-pub(super) const ACTOR_KEYS: [&str; 21] = [
+pub(super) const ACTOR_KEYS: [&str; 22] = [
     "@context",
     "alsoKnownAs",
     "attachment",
@@ -38,6 +38,7 @@ pub(super) const ACTOR_KEYS: [&str; 21] = [
     "discoverable",
     "endpoints",
     "featured",
+    "featuredTags",
     "followers",
     "following",
     "id",

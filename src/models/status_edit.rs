@@ -34,7 +34,9 @@ use uuid::Uuid;
 
 use crate::{
     error::AppResult,
-    models::{hashtag, media_attachment::claimable_predicate, mention, poll, status::Status},
+    models::{
+        featured_tag, hashtag, media_attachment::claimable_predicate, mention, poll, status::Status,
+    },
     util::id::new_id,
 };
 
@@ -362,6 +364,7 @@ pub async fn update_status(
     mention::replace_conn(&mut tx, status_id, &params.mentioned_user_ids).await?;
     mention::link_silent_conn(&mut tx, status_id, &params.silent_user_ids).await?;
     hashtag::replace_names_conn(&mut tx, status_id, &params.hashtags).await?;
+    featured_tag::refresh_conn(&mut tx, row.user_id, None).await?;
     if let Some(kept) = &new_media {
         replace_media(&mut tx, status_id, kept).await?;
     }

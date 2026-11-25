@@ -44,6 +44,10 @@ pub struct Tag {
     /// is present (the anonymous render has no following to state).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub following: Option<bool>,
+    /// Whether the requesting user features this tag on their profile
+    /// (newer Mastodon's `featuring`); omitted when no viewer is present.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub featuring: Option<bool>,
 }
 
 /// One entry of a Tag's `history`: one UTC day of usage, all counts written
@@ -94,7 +98,16 @@ impl Tag {
             url: format!("{base_url}/tags/{name}"),
             history: None,
             following: None,
+            featuring: None,
         }
+    }
+
+    /// This tag with its `featuring` flag set: `Some` renders the key,
+    /// `None` leaves it out.
+    #[must_use]
+    pub const fn with_featuring(mut self, featuring: Option<bool>) -> Self {
+        self.featuring = featuring;
+        self
     }
 
     /// The full form a tag endpoint answers with: the two keys, the given
@@ -114,6 +127,7 @@ impl Tag {
             url: format!("{base_url}/tags/{name}"),
             history: Some(history),
             following,
+            featuring: None,
         }
     }
 }
@@ -197,6 +211,16 @@ mod tests {
             }),
             "every count is a string, and `following` rides with a viewer"
         );
+    }
+
+    #[test]
+    fn featuring_renders_only_when_set() {
+        let plain = serde_json::to_value(Tag::new(TEST_BASE_URL, "rust")).unwrap();
+        assert!(plain.get("featuring").is_none(), "no viewer, no key");
+        let featured =
+            serde_json::to_value(Tag::new(TEST_BASE_URL, "rust").with_featuring(Some(true)))
+                .unwrap();
+        assert_eq!(featured["featuring"], true, "a viewer's flag rides along");
     }
 
     #[test]

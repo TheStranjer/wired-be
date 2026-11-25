@@ -318,6 +318,10 @@ mod emoji_reactions;
 /// The endorsements endpoints (`/api/v1/endorsements`).
 mod endorsements;
 
+/// Featured hashtags (`/api/v1/featured_tags`, the account listing, the tag
+/// `feature` routes and the actor's `featuredTags` collection).
+mod featured_tags;
+
 /// Pleroma's federation status (`GET /api/v1/pleroma/federation_status`):
 /// the unreachable-host ledger, its empty shape, its per-host timestamps,
 /// its lack of any auth gate, and its database failure.

@@ -39,7 +39,7 @@ use crate::{
     },
     models::{
         custom_emoji::{self, CustomEmoji},
-        user::{User, featured, followers, following, inbox, outbox},
+        user::{User, featured, featured_tags, followers, following, inbox, outbox},
     },
     util::{emoji::shortcodes_in, time::mastodon_time},
 };
@@ -58,7 +58,7 @@ const IMAGE_TYPE: &str = "Image";
 /// The returned value is a JSON object whose keys are exactly the fediverse
 /// actor fields this instance federates: `@context`, `id`, `type`,
 /// `preferredUsername`, `name`, `summary`, `url`, the four collections,
-/// `featured`, `endpoints`, `publicKey`, `manuallyApprovesFollowers`,
+/// `featured`, `featuredTags`, `endpoints`, `publicKey`, `manuallyApprovesFollowers`,
 /// `discoverable`, `attachment`, `published`, `tag`, `alsoKnownAs` (the
 /// row's stored aliases) and `capabilities`, plus `icon` and `image` only
 /// when the row carries an avatar or a banner and `movedTo` only when the
@@ -79,15 +79,16 @@ pub fn actor_json(user: &User, config: &Config, emojis: &[CustomEmoji]) -> Value
 
 /// The `ActivityPub` document of the instance actor.
 ///
-/// It is [`actor_json`] without `featured`: the instance actor pins
-/// nothing and serves no such collection, so advertising one only makes
-/// peers fetch a 404. Its `outbox`, `followers` and `following` stay, as
-/// the empty collections `/internal/fetch` serves.
+/// It is [`actor_json`] without `featured` and `featuredTags`: the instance
+/// actor pins nothing, features no tags and serves neither collection, so
+/// advertising them only makes peers fetch a 404. Its `outbox`, `followers`
+/// and `following` stay, as the empty collections `/internal/fetch` serves.
 #[must_use]
 pub fn instance_actor_json(user: &User, config: &Config, emojis: &[CustomEmoji]) -> Value {
     let mut document = actor_json(user, config, emojis);
     if let Some(fields) = document.as_object_mut() {
         drop(fields.remove("featured"));
+        drop(fields.remove("featuredTags"));
     }
     document
 }
@@ -115,6 +116,7 @@ fn actor_fields(
         ("followers", json!(followers(ap_id))),
         ("following", json!(following(ap_id))),
         ("featured", json!(featured(ap_id))),
+        ("featuredTags", json!(featured_tags(ap_id))),
         ("endpoints", endpoints(config)),
         ("publicKey", public_key(user)),
         ("manuallyApprovesFollowers", json!(user.locked.get())),
@@ -300,7 +302,7 @@ mod tests {
     /// A public key PEM that stands in for registered key material.
     const PUBLIC_PEM: &str = "-----BEGIN PUBLIC KEY-----\nRSA-DATA\n-----END PUBLIC KEY-----\n";
     /// Every key of an actor document without avatar or banner, sorted.
-    const BASE_KEYS: [&str; 21] = [
+    const BASE_KEYS: [&str; 22] = [
         "@context",
         "alsoKnownAs",
         "attachment",
@@ -308,6 +310,7 @@ mod tests {
         "discoverable",
         "endpoints",
         "featured",
+        "featuredTags",
         "followers",
         "following",
         "id",
@@ -450,7 +453,7 @@ mod tests {
     }
 
     #[test]
-    fn the_instance_actor_document_omits_only_featured() {
+    fn the_instance_actor_document_omits_only_the_featured_collections() {
         let mut user = base_user("internal.fetch", "https://test.example/internal/fetch");
         "Application".clone_into(&mut user.actor_type);
         let config = Config::for_tests();
@@ -458,18 +461,30 @@ mod tests {
         let expected: Vec<&str> = BASE_KEYS
             .iter()
             .copied()
-            .filter(|key| *key != "featured")
+            .filter(|key| !matches!(*key, "featured" | "featuredTags"))
             .collect();
-        assert_eq!(json_keys(&document), expected, "every key but featured");
+        assert_eq!(json_keys(&document), expected, "every key but the two");
         let mut with_featured = actor_json(&user, &config, &[]);
-        assert!(
-            with_featured
-                .as_object_mut()
-                .and_then(|fields| fields.remove("featured"))
-                .is_some(),
-            "the shared renderer still emits featured"
-        );
+        for key in ["featured", "featuredTags"] {
+            assert!(
+                with_featured
+                    .as_object_mut()
+                    .and_then(|fields| fields.remove(key))
+                    .is_some(),
+                "the shared renderer still emits {key}"
+            );
+        }
         assert_eq!(document, with_featured, "nothing else differs");
+    }
+
+    #[test]
+    fn a_user_document_advertises_its_featured_tags_collection() {
+        let document = render(&local_alice());
+        assert_eq!(
+            document["featuredTags"],
+            format!("{AP_ID}/collections/tags"),
+            "Mastodon's featuredTags property"
+        );
     }
 
     #[test]
