@@ -3,11 +3,15 @@
 
 use serde_json::Value;
 use sha2::{Digest as _, Sha256};
+use url::Url;
 
 use crate::util::token::to_hex;
 
 /// The key a delivery is deduplicated under, `None` for a document with no
 /// string `id`.
+///
+/// The `id` is canonicalized first (lowercased, trailing host dot and empty
+/// query/fragment removed), so spellings of one id share a key.
 ///
 /// Plain activities dedupe on their `id`. An `Update` that embeds its
 /// object dedupes on `id` plus a SHA-256 of the object's canonical JSON:
@@ -16,7 +20,7 @@ use crate::util::token::to_hex;
 /// swallowed as a redelivery.
 #[must_use]
 pub fn dedupe_key(activity: &Value) -> Option<String> {
-    let id = activity.get("id").and_then(Value::as_str)?;
+    let id = canonical_id(activity.get("id").and_then(Value::as_str)?);
     let is_update = activity.get("type").is_some_and(|kind| match kind {
         Value::String(name) => name == "Update",
         Value::Array(names) => names.iter().any(|name| name.as_str() == Some("Update")),
@@ -32,8 +36,36 @@ pub fn dedupe_key(activity: &Value) -> Option<String> {
                 to_hex(&Sha256::digest(canonical.as_bytes()))
             )
         }
-        _ => id.to_owned(),
+        _ => id,
     })
+}
+
+/// The canonical spelling of an activity id: lowercase, no trailing dot on
+/// the host, no empty query or fragment.
+///
+/// A hostile peer can re-deliver one activity under many spellings of its id;
+/// the ledger must see them as one. An id that is not a url is only
+/// lowercased.
+fn canonical_id(id: &str) -> String {
+    let Ok(mut parsed) = Url::parse(id) else {
+        return id.to_lowercase();
+    };
+    if let Some(host) = parsed.host_str() {
+        let trimmed = host.trim_end_matches('.');
+        if !trimmed.is_empty() && trimmed.len() != host.len() {
+            let trimmed = trimmed.to_owned();
+            if parsed.set_host(Some(&trimmed)).is_err() {
+                return id.to_lowercase();
+            }
+        }
+    }
+    if parsed.query() == Some("") {
+        parsed.set_query(None);
+    }
+    if parsed.fragment() == Some("") {
+        parsed.set_fragment(None);
+    }
+    parsed.as_str().to_lowercase()
 }
 
 /// Appends `value` as JSON with every object's keys in sorted order, so two
@@ -131,6 +163,35 @@ mod tests {
             None,
             "no id, no key"
         );
+    }
+
+    /// Case, trailing-dot and empty query/fragment variants share a key.
+    #[test]
+    fn spellings_of_one_id_share_a_key() {
+        let key = |id: &str| dedupe_key(&json!({"id": id, "type": "Follow"}));
+        let base = key("https://peer.example/activities/replay-1");
+
+        for variant in [
+            "https://peer.example/activities/REPLAY-1",
+            "HTTPS://Peer.Example/activities/replay-1",
+            "https://peer.example./activities/replay-1",
+            "https://peer.example/activities/replay-1?",
+            "https://peer.example/activities/replay-1#",
+            "https://peer.example:443/activities/replay-1",
+        ] {
+            assert_eq!(key(variant), base, "{variant} is the same activity");
+        }
+        assert_ne!(
+            key("https://peer.example/activities/replay-1?x=1"),
+            base,
+            "a real query is a different id"
+        );
+        assert_ne!(
+            key("https://peer.example/activities/replay-1#a"),
+            base,
+            "a real fragment is a different id"
+        );
+        assert_eq!(key("not a url/ID").as_deref(), Some("not a url/id"));
     }
 
     /// An array `type` containing `Update` counts as an `Update`.
