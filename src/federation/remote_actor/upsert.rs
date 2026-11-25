@@ -6,7 +6,7 @@ use sqlx::PgPool;
 use super::{ActorError, NewRemoteUser};
 use crate::{
     federation::json::http_host,
-    models::{custom_emoji, instance, user::User},
+    models::{activitypub_actor, custom_emoji, instance, user::User},
     util::id::new_id,
 };
 
@@ -83,6 +83,16 @@ const RENAME_HOLDER_SQL: &str = "UPDATE users
 const RELEASE_KEY_ID_SQL: &str =
     "UPDATE users SET public_key_id = NULL WHERE public_key_id = $1 AND ap_id <> $2";
 
+/// [`RELEASE_KEY_ID_SQL`] for the `activitypub_actors` row that holds the key id.
+///
+/// That table has the same unique index, so the key id is freed there too
+/// (part of the temporary dual write, see
+/// [`activitypub_actor`](crate::models::activitypub_actor)). The keeper is
+/// named by `ap_id` because its id is not known before the first insert.
+const RELEASE_ACTOR_KEY_ID_SQL: &str = "UPDATE activitypub_actors SET public_key_id = NULL
+     WHERE public_key_id = $1
+       AND user_id NOT IN (SELECT id FROM users WHERE ap_id = $2)";
+
 /// Stores `new` as this instance's mirror of the actor, exactly once per
 /// actor id (decision 7).
 ///
@@ -142,6 +152,11 @@ pub async fn upsert_remote_user(pool: &PgPool, new: NewRemoteUser) -> Result<Use
             .bind(new.ap_id.as_str())
             .execute(&mut *tx)
             .await?;
+        let _released_actor = sqlx::query(RELEASE_ACTOR_KEY_ID_SQL)
+            .bind(key_id)
+            .bind(new.ap_id.as_str())
+            .execute(&mut *tx)
+            .await?;
     }
     let user = sqlx::query_as::<_, User>(UPSERT_SQL)
         .bind(new_id())
@@ -172,6 +187,9 @@ pub async fn upsert_remote_user(pool: &PgPool, new: NewRemoteUser) -> Result<Use
         .bind(new.birthday)
         .fetch_one(&mut *tx)
         .await?;
+    activitypub_actor::upsert_from_user(&mut *tx, &user, new.public_key_id.as_deref())
+        .await
+        .map(drop)?;
     tx.commit().await?;
     for emoji in &new.emojis {
         custom_emoji::upsert_remote(pool, &emoji.shortcode, emoji.domain.as_deref(), &emoji.url)
@@ -197,10 +215,14 @@ mod tests {
             parse_actor,
             test_support::{MASTODON, PLEROMA, fixture},
         },
-        models::user::{
-            CountDelta, Flag, NewUser, get_by_ap_id, get_by_id, get_by_nickname,
-            get_by_public_key_id, insert, update_counts,
+        models::{
+            activitypub_actor::ActorStatus,
+            user::{
+                CountDelta, Flag, NewUser, get_by_ap_id, get_by_id, get_by_nickname,
+                get_by_public_key_id, insert, update_counts,
+            },
         },
+        test_fixtures::assert_actor_in_step,
     };
 
     /// The mirror row the first fetch of a Mastodon actor stores: every
@@ -329,6 +351,103 @@ mod tests {
             .unwrap()
             .expect("the key id still resolves");
         assert_eq!(moved.id, carol.id, "the latest document holds the key id");
+
+        let alice_actor = assert_actor_in_step(&pool, alice.id).await;
+        assert!(
+            alice_actor.public_key_id.is_none(),
+            "the actor row lost the key id too"
+        );
+        let carol_actor = assert_actor_in_step(&pool, carol.id).await;
+        assert_eq!(
+            carol_actor.public_key_id.as_deref(),
+            Some("https://mastodon.example/users/alice#main-key"),
+            "and the new holder's actor row has it"
+        );
+    }
+
+    /// Both tables hold the same moved columns after the first fetch and
+    /// after a re-fetch that changes them, and the actor row is `active`.
+    #[tokio::test]
+    async fn an_upsert_writes_both_tables_alike() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let mut document = fixture(MASTODON);
+        let first = upsert_remote_user(&pool, parse_actor(&document).unwrap())
+            .await
+            .unwrap();
+
+        let stored = assert_actor_in_step(&pool, first.id).await;
+        assert_eq!(
+            stored.status,
+            ActorStatus::Active,
+            "a fetched actor is active"
+        );
+        assert_eq!(
+            stored.inbox.as_deref(),
+            Some("https://mastodon.example/users/alice/inbox"),
+            "the inbox landed"
+        );
+        assert_eq!(
+            stored.public_key_id.as_deref(),
+            Some("https://mastodon.example/users/alice#main-key"),
+            "the key id landed"
+        );
+        assert!(stored.last_fetched_at.is_some(), "the fetch is stamped");
+
+        document["inbox"] = json!("https://mastodon.example/users/alice/new-inbox");
+        document["publicKey"]["publicKeyPem"] = json!("-----BEGIN PUBLIC KEY-----\nNEW\n");
+        let second = upsert_remote_user(&pool, parse_actor(&document).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(second.id, first.id, "the same account is re-fetched");
+        let refreshed = assert_actor_in_step(&pool, first.id).await;
+        assert_eq!(
+            refreshed.inbox.as_deref(),
+            Some("https://mastodon.example/users/alice/new-inbox"),
+            "the new inbox replaced the old"
+        );
+        assert_ne!(
+            refreshed.public_key, stored.public_key,
+            "the new key replaced the old"
+        );
+        assert_eq!(
+            refreshed.public_key, second.public_key,
+            "and is the one the user row stores"
+        );
+        let rows: (i64,) = sqlx::query_as("SELECT count(*) FROM activitypub_actors")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(rows.0, 1, "one actor row, updated in place");
+    }
+
+    /// A conflict (a local holder of the handle) rolls the whole write back,
+    /// the actor table included.
+    #[tokio::test]
+    async fn a_refused_upsert_leaves_no_actor_row() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let _squatter = insert(
+            &pool,
+            &NewUser::local(
+                "alice@mastodon.example",
+                "https://other.example/users/alice",
+            ),
+        )
+        .await
+        .unwrap();
+
+        let error = upsert_remote_user(&pool, parse_actor(&fixture(MASTODON)).unwrap())
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, ActorError::NicknameConflict), "{error:?}");
+        let rows: (i64,) = sqlx::query_as("SELECT count(*) FROM activitypub_actors")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(rows.0, 1, "only the squatter's own row exists");
     }
 
     #[tokio::test]

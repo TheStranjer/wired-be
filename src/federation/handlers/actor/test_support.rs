@@ -95,6 +95,7 @@ pub(super) async fn ready_for_update(pool: &PgPool, id: Uuid) -> User {
             .execute(pool)
             .await
             .expect("the fixture ages the fetch");
+    crate::test_fixtures::resync_actor(pool, id).await;
     fresh_user(pool, id).await
 }
 

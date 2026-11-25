@@ -12,9 +12,17 @@
 //! identity is claimed ([`ActorStatus::Active`]) or awaiting setup
 //! ([`ActorStatus::Pending`]).
 //!
-//! Nothing writes or reads this table outside its own tests yet: the
-//! migration backfills it from `users`, and later tickets keep both in step
-//! before the old `users` columns go. Deleting the user deletes the row
+//! Nothing reads this table outside its own tests yet. The migration
+//! backfilled it from `users`, and every writer of the moved columns now
+//! writes both tables in one transaction ([`upsert_from_user`] is how):
+//! `models::user::insert` for every new local or remote account, and
+//! `federation::remote_actor::upsert_remote_user` for every fetch of a
+//! remote actor.
+//!
+//! **The dual write is temporary.** It keeps the two tables in step while
+//! the readers move over; the ticket that drops the moved columns from
+//! `users` removes it, and the callers of [`upsert_from_user`] then write
+//! [`ActivityPubActorWrite`] directly. Deleting the user deletes the row
 //! (the foreign key cascades).
 //!
 //! [`get`] and [`get_many`] read, [`get_many`] taking every id in one
@@ -28,7 +36,7 @@ use chrono::{DateTime, Utc};
 use sqlx::{Executor, Postgres};
 use uuid::Uuid;
 
-use crate::error::AppResult;
+use crate::{error::AppResult, models::user::User};
 
 /// [`get`]: one account's row, or none without an `ActivityPub` identity.
 const GET_SQL: &str = "SELECT user_id, status, inbox, shared_inbox, outbox, followers_url,
@@ -266,6 +274,44 @@ where
     Ok(row)
 }
 
+/// Mirrors the moved columns of `user` into the account's row.
+///
+/// Returns the row as stored. This is the temporary dual write: a writer of `users` calls it on the same
+/// transaction right after its own statement, passing the row that
+/// statement returned, so both tables hold the same values. `public_key_id`
+/// is not a field of [`User`], so the writer that sets it passes the value
+/// it stored. The status is [`ActorStatus::Active`], the column default,
+/// since `users` has no such notion. The ticket that drops the old `users`
+/// columns removes this function.
+///
+/// # Errors
+///
+/// As [`upsert`].
+pub async fn upsert_from_user<'e, E>(
+    executor: E,
+    user: &User,
+    public_key_id: Option<&str>,
+) -> AppResult<ActivityPubActor>
+where
+    E: Executor<'e, Database = Postgres>,
+{
+    let write = ActivityPubActorWrite {
+        user_id: user.id,
+        status: ActorStatus::Active,
+        inbox: user.inbox.clone(),
+        shared_inbox: user.shared_inbox.clone(),
+        outbox: user.outbox.clone(),
+        followers_url: user.followers_url.clone(),
+        following_url: user.following_url.clone(),
+        featured_url: user.featured_url.clone(),
+        public_key: user.public_key.clone(),
+        private_key: user.private_key.clone(),
+        public_key_id: public_key_id.map(str::to_owned),
+        last_fetched_at: user.last_fetched_at,
+    };
+    upsert(executor, &write).await
+}
+
 #[cfg(test)]
 mod tests {
     use sqlx::PgPool;
@@ -275,6 +321,17 @@ mod tests {
         error::AppError,
         test_fixtures::{local_user, remote_new, remote_user},
     };
+
+    /// Removes the row every insert of a fixture user wrote, for a test that
+    /// needs an account with no row (or that writes the row itself).
+    async fn drop_rows(pool: &PgPool) {
+        let removed = sqlx::query("DELETE FROM activitypub_actors")
+            .execute(pool)
+            .await
+            .expect("the rows delete")
+            .rows_affected();
+        assert!(removed > 0, "the fixture users came with rows to remove");
+    }
 
     /// The secret the redaction tests look for.
     const SECRET_KEY: &str = "-----BEGIN PRIVATE KEY-----secret";
@@ -350,6 +407,7 @@ FROM users";
         let db = crate::test_db::test_db().await.expect("test database slot");
         let pool = db.pool().clone();
         let user = remote_user(&pool, "a").await;
+        drop_rows(&pool).await;
         let write = full_write(user.id);
 
         let stored = upsert(&pool, &write).await.expect("the row writes");
@@ -384,6 +442,7 @@ FROM users";
         let db = crate::test_db::test_db().await.expect("test database slot");
         let pool = db.pool().clone();
         let user = local_user(&pool, "alice").await;
+        drop_rows(&pool).await;
 
         assert!(
             get(&pool, user.id).await.expect("the read works").is_none(),
@@ -427,6 +486,7 @@ FROM users";
         let bob = remote_user(&pool, "bob").await;
         let carol = remote_user(&pool, "carol").await;
         let dave = remote_user(&pool, "dave").await;
+        drop_rows(&pool).await;
         for user in [&alice, &bob, &carol] {
             let _row = upsert(&pool, &bare_write(user.id))
                 .await
@@ -504,6 +564,7 @@ FROM users";
         let db = crate::test_db::test_db().await.expect("test database slot");
         let pool = db.pool().clone();
         let user = local_user(&pool, "alice").await;
+        drop_rows(&pool).await;
 
         let refused =
             sqlx::query("INSERT INTO activitypub_actors (user_id, status) VALUES ($1, $2)")
@@ -577,7 +638,8 @@ FROM users";
         let alice = crate::models::user::insert(&pool, &local)
             .await
             .expect("the local user inserts");
-        assert_eq!(row_count(&pool).await, 0, "nothing wrote the table yet");
+        drop_rows(&pool).await;
+        assert_eq!(row_count(&pool).await, 0, "the table starts empty");
 
         let copied = sqlx::query(BACKFILL_SQL)
             .execute(&pool)

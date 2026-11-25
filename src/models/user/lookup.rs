@@ -489,6 +489,7 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
+        crate::test_fixtures::resync_actor(&pool, mirror.id).await;
         let found = get_by_public_key_id(&pool, key_id)
             .await
             .unwrap()

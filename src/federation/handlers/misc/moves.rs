@@ -228,6 +228,7 @@ mod tests {
             .execute(pool)
             .await
             .expect("the fixture stamps the fetch");
+        crate::test_fixtures::resync_actor(pool, stored.id).await;
         stored
     }
 
@@ -524,6 +525,13 @@ mod tests {
             .execute(pool)
             .await
             .expect("the fixture stamps the inboxes");
+        let _mirrored = sqlx::query(
+            "UPDATE activitypub_actors AS a SET inbox = u.inbox FROM users AS u
+              WHERE u.id = a.user_id AND NOT u.local",
+        )
+        .execute(pool)
+        .await
+        .expect("the fixture stamps the actor rows alike");
     }
 
     /// The args of every queued `federator.deliver` job, oldest first.

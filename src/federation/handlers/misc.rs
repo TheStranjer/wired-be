@@ -260,6 +260,7 @@ mod tests {
             .execute(pool)
             .await
             .expect("the fixture stamps the fetch");
+        crate::test_fixtures::resync_actor(pool, stored.id).await;
         stored
     }
 

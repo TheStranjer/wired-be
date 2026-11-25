@@ -2,10 +2,10 @@
 //! counters move by. The id is minted here and every other column comes
 //! from the handed-in [`NewUser`].
 
-use sqlx::{Executor, Postgres};
+use sqlx::{Acquire, PgConnection, Postgres};
 
 use super::{NewUser, User};
-use crate::{error::AppResult, util::id::new_id};
+use crate::{error::AppResult, models::activitypub_actor, util::id::new_id};
 
 /// One step to apply to the denormalised counters of a user atomically.
 ///
@@ -48,7 +48,7 @@ const INSERT_SQL: &str = "INSERT INTO users (
      $55, $56, $57, $58, $59, $60, $61, $62, $63, $64, $65, $66, $67
 ) RETURNING *";
 
-/// Inserts `new_user` on `executor` — the pool or an open transaction —
+/// Inserts `new_user` on `acquirer` — the pool or an open transaction —
 /// and returns the stored row.
 ///
 /// The id is a fresh `UUIDv7` (decision 4); every other column comes from
@@ -57,15 +57,31 @@ const INSERT_SQL: &str = "INSERT INTO users (
 /// case in the nickname and email comparisons, so a duplicate in any case
 /// is rejected.
 ///
+/// The `ActivityPub` columns also land in the account's `activitypub_actors`
+/// row ([`activitypub_actor::upsert_from_user`]), in one transaction with
+/// the `users` row: a pool opens its own, an open transaction takes a
+/// savepoint. The dual write is temporary (see [`activitypub_actor`]).
+///
 /// # Errors
 ///
 /// Any database failure (connection, constraint, encoding) arrives as
 /// [`AppError::Database`](crate::error::AppError); a unique violation
 /// (SQLSTATE `23505`) is reported through it unchanged.
-pub async fn insert<'e, E>(executor: E, new_user: &NewUser) -> AppResult<User>
+pub async fn insert<'a, A>(acquirer: A, new_user: &NewUser) -> AppResult<User>
 where
-    E: Executor<'e, Database = Postgres>,
+    A: Acquire<'a, Database = Postgres> + Send,
 {
+    let mut tx = acquirer.begin().await?;
+    let user = insert_row(&mut tx, new_user).await?;
+    activitypub_actor::upsert_from_user(&mut *tx, &user, None)
+        .await
+        .map(drop)?;
+    tx.commit().await?;
+    Ok(user)
+}
+
+/// Runs [`INSERT_SQL`] for `new_user` on `conn` and returns the stored row.
+async fn insert_row(conn: &mut PgConnection, new_user: &NewUser) -> AppResult<User> {
     let user = sqlx::query_as::<_, User>(INSERT_SQL)
         .bind(new_id())
         .bind(new_user.nickname.as_str())
@@ -134,7 +150,7 @@ where
         .bind(new_user.email_notifications)
         .bind(new_user.confirmation_token.as_deref())
         .bind(new_user.confirmation_sent_at)
-        .fetch_one(executor)
+        .fetch_one(conn)
         .await?;
     Ok(user)
 }
@@ -144,14 +160,19 @@ mod tests {
     use chrono::{DateTime, NaiveDate, SubsecRound as _, Utc};
     use serde_json::json;
     use sqlx::Error as SqlxError;
+    use uuid::Uuid;
 
     use super::*;
     use crate::{
         error::AppError,
-        models::user::{
-            DEFAULT_SCOPE, Flag, get_by_nickname, get_many, local_ap_id, notification_settings,
-            test_support::*,
+        models::{
+            activitypub_actor::ActorStatus,
+            user::{
+                DEFAULT_SCOPE, Flag, get_by_nickname, get_many, local_ap_id, notification_settings,
+                test_support::*,
+            },
         },
+        test_fixtures::{assert_actor_in_step, remote_new},
     };
 
     /// The privacy and behaviour flags a plain [`NewUser::local`] row gets
@@ -449,6 +470,85 @@ mod tests {
             Some("please let me in"),
             "the registration reason round trips"
         );
+    }
+
+    /// A local account's `ActivityPub` columns, key pair included, land in
+    /// its actor row alike.
+    #[tokio::test]
+    async fn a_local_insert_writes_the_actor_row_too() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let new = NewUser {
+            inbox: Some(format!("{BASE}/users/ella/inbox")),
+            shared_inbox: Some(format!("{BASE}/inbox")),
+            outbox: Some(format!("{BASE}/users/ella/outbox")),
+            followers_url: Some(format!("{BASE}/users/ella/followers")),
+            following_url: Some(format!("{BASE}/users/ella/following")),
+            featured_url: Some(format!("{BASE}/users/ella/collections/featured")),
+            public_key: Some("-----BEGIN PUBLIC KEY-----ella".to_owned()),
+            private_key: Some(SECRET_KEY.to_owned()),
+            ..local_new("ella")
+        };
+
+        let user = insert(&pool, &new).await.unwrap();
+
+        let actor = assert_actor_in_step(&pool, user.id).await;
+        assert_eq!(actor.status, ActorStatus::Active, "the identity is claimed");
+        assert_eq!(actor.inbox, new.inbox, "the inbox landed");
+        assert_eq!(actor.private_key, new.private_key, "so did the secret");
+        assert!(
+            actor.last_fetched_at.is_none(),
+            "a local account is never fetched"
+        );
+    }
+
+    /// A remote mirror's endpoints and fetch stamp land in its actor row.
+    #[tokio::test]
+    async fn a_remote_insert_writes_the_actor_row_too() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let fetched_at = Utc::now().trunc_subsecs(6);
+        let new = NewUser {
+            inbox: Some("https://remote.example/users/far/inbox".to_owned()),
+            shared_inbox: Some("https://remote.example/inbox".to_owned()),
+            public_key: Some("-----BEGIN PUBLIC KEY-----far".to_owned()),
+            last_fetched_at: Some(fetched_at),
+            ..remote_new("far")
+        };
+
+        let user = insert(&pool, &new).await.unwrap();
+
+        let actor = assert_actor_in_step(&pool, user.id).await;
+        assert_eq!(
+            actor.shared_inbox, new.shared_inbox,
+            "the shared inbox landed"
+        );
+        assert_eq!(
+            actor.last_fetched_at,
+            Some(fetched_at),
+            "and the fetch stamp"
+        );
+        assert!(actor.private_key.is_none(), "a mirror has no secret");
+    }
+
+    /// A rolled-back transaction takes the actor row with the user, and a
+    /// refused insert leaves neither.
+    #[tokio::test]
+    async fn the_actor_row_lives_and_dies_with_the_users_row() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let mut tx = pool.begin().await.expect("the transaction opens");
+        let _rolled_back = insert(&mut *tx, &local_new("gone")).await.unwrap();
+        tx.rollback().await.expect("the transaction rolls back");
+        let kept = insert(&pool, &local_new("kept")).await.unwrap();
+        let refused = insert(&pool, &local_new("KEPT")).await;
+        assert!(refused.is_err(), "the duplicate nickname is refused");
+
+        let owners = sqlx::query_scalar::<_, Uuid>("SELECT user_id FROM activitypub_actors")
+            .fetch_all(&pool)
+            .await
+            .expect("the actor rows read");
+        assert_eq!(owners, vec![kept.id], "only the committed insert has a row");
     }
 
     #[tokio::test]
