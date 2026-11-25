@@ -292,11 +292,14 @@ mod tests {
         let db = crate::test_db::test_db().await.expect("test database slot");
         let state = app_state(db.pool());
         let user = local_user(db.pool(), "pending_user").await;
-        sqlx::query("UPDATE activitypub_actors SET status = 'pending' WHERE user_id = $1")
-            .bind(user.id)
-            .execute(db.pool())
-            .await
-            .expect("the status updates");
+        let updated =
+            sqlx::query("UPDATE activitypub_actors SET status = 'pending' WHERE user_id = $1")
+                .bind(user.id)
+                .execute(db.pool())
+                .await
+                .expect("the status updates")
+                .rows_affected();
+        assert_eq!(updated, 1, "one actor row is pending");
 
         let identity = ActivityPub.identity(&state, &user).await;
 
@@ -310,11 +313,13 @@ mod tests {
         let db = crate::test_db::test_db().await.expect("test database slot");
         let state = app_state(db.pool());
         let user = local_user(db.pool(), "unenrolled_user").await;
-        sqlx::query("DELETE FROM activitypub_actors WHERE user_id = $1")
+        let deleted = sqlx::query("DELETE FROM activitypub_actors WHERE user_id = $1")
             .bind(user.id)
             .execute(db.pool())
             .await
-            .expect("the row is removed");
+            .expect("the row is removed")
+            .rows_affected();
+        assert_eq!(deleted, 1, "one actor row is removed");
 
         let identity = ActivityPub.identity(&state, &user).await;
 

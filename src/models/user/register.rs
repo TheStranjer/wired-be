@@ -216,10 +216,9 @@ pub(crate) fn validated_nickname(requested: &str) -> Result<String, Vec<String>>
     let nickname = requested.trim();
     let mut errors = FieldErrors::new();
     validate_nickname(nickname, &mut errors);
-    match errors.remove(NICKNAME_FIELD) {
-        Some(messages) => Err(messages),
-        None => Ok(nickname.to_owned()),
-    }
+    errors
+        .remove(NICKNAME_FIELD)
+        .map_or_else(|| Ok(nickname.to_owned()), Err)
 }
 
 /// The [`FieldErrors`] key of the nickname, which `ActivityPub` also uses for its identifier.
