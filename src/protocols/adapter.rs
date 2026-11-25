@@ -12,6 +12,7 @@ use crate::{
     models::user::User,
     protocols::{
         ProtocolId,
+        events::AccountEvent,
         identity::{ClaimOutcome, Identity},
     },
     state::AppState,
@@ -175,4 +176,43 @@ pub trait ProtocolAdapter: Sync {
         identifier: &'a str,
         state: &'a AppState,
     ) -> BoxFuture<'a, AppResult<ClaimOutcome>>;
+
+    /// Reacts to something that happened to `user`'s account, after it committed.
+    ///
+    /// Core fires the event through [`crate::protocols::events::dispatch`]; the
+    /// account is already in its new state, so an error is logged and changes
+    /// nothing. Network work (federating, announcing) must go into a job
+    /// here, not run inline. The default does nothing.
+    ///
+    /// # Errors
+    ///
+    /// Any failure of the protocol's reaction.
+    fn on_account_event<'a>(
+        &'a self,
+        _state: &'a AppState,
+        _user: &'a User,
+        _event: AccountEvent,
+    ) -> BoxFuture<'a, AppResult<()>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    /// Sees the new plaintext password inside the password-change transaction.
+    ///
+    /// It runs through `conn`, the caller's open transaction, because this is
+    /// the only moment the plaintext exists. It is for protocols that must
+    /// derive their own credentials from it, such as XMPP SCRAM. The plaintext
+    /// must never be stored or logged; keep only what is derived from it. An
+    /// error rolls the password change back. The default does nothing.
+    ///
+    /// # Errors
+    ///
+    /// Any failure to derive or write the protocol's credentials.
+    fn on_password_change_in_tx<'a>(
+        &'a self,
+        _conn: &'a mut PgConnection,
+        _user: &'a User,
+        _new_password: &'a str,
+    ) -> BoxFuture<'a, AppResult<()>> {
+        Box::pin(async { Ok(()) })
+    }
 }

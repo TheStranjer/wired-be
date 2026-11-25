@@ -17,16 +17,18 @@ use std::{
 use axum::{Json, Router, http::StatusCode, routing::MethodRouter, routing::get};
 use futures::future::BoxFuture;
 use sqlx::PgConnection;
+use uuid::Uuid;
 
 use crate::{
     api::well_known::{FingerLink, WebfingerContribution},
     config::Config,
-    error::AppResult,
+    error::{AppError, AppResult},
     jobs::{AttemptInfo, HandlerFn, HandlerFuture, JobError},
     models::user::User,
     protocols::{
         ProtocolId,
         adapter::ProtocolAdapter,
+        events::AccountEvent,
         identity::{ClaimOutcome, Identity},
     },
     state::AppState,
@@ -97,6 +99,56 @@ fn claim_identifier(identifier: &str) -> ClaimOutcome {
 /// other test uses.
 pub fn mark_taken(identifier: &str) {
     taken_identifiers().extend([identifier.to_owned()]);
+}
+
+/// The nickname prefix that makes the fixture's account hooks fail.
+///
+/// It lets a test prove that one adapter's failure is contained.
+pub const FAILING_HOOK_NICKNAME_PREFIX: &str = "fail-hook";
+
+/// One call the fixture's account hooks received.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Recorded {
+    /// [`ProtocolAdapter::on_account_event`] with this event.
+    Event(AccountEvent),
+    /// [`ProtocolAdapter::on_password_change_in_tx`]; the password is not kept.
+    PasswordChangedInTx,
+}
+
+/// Every hook call the fixture received, with the user it was for.
+static RECORDER: LazyLock<Mutex<RecordedCalls>> = LazyLock::new(Mutex::default);
+
+/// The fixture's hook calls, each with the id of the user it was for.
+type RecordedCalls = Vec<(Uuid, Recorded)>;
+
+/// Locks [`RECORDER`], ignoring a poisoning left by a panicked test.
+fn recorder() -> MutexGuard<'static, RecordedCalls> {
+    RECORDER.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// The hook calls the fixture received for `user_id`, oldest first.
+///
+/// The recorder is shared by every test in the process, so a test uses a user
+/// of its own.
+#[must_use]
+pub fn recorded_for(user_id: Uuid) -> Vec<Recorded> {
+    recorder()
+        .iter()
+        .filter(|(recorded_user, _)| *recorded_user == user_id)
+        .map(|(_, call)| *call)
+        .collect()
+}
+
+/// Records `call` for `user`, then fails it when the nickname asks for that.
+fn record_hook_call(user: &User, call: Recorded) -> AppResult<()> {
+    recorder().push((user.id, call));
+    if user.nickname.starts_with(FAILING_HOOK_NICKNAME_PREFIX) {
+        Err(AppError::ServiceUnavailable(
+            "the fixture hook was asked to fail".to_owned(),
+        ))
+    } else {
+        Ok(())
+    }
 }
 
 /// Whether `c` may appear in a fixture ID: `a-z`, `0-9` or `-`.
@@ -228,6 +280,28 @@ impl ProtocolAdapter for Fixture {
     ) -> BoxFuture<'a, AppResult<ClaimOutcome>> {
         let outcome = claim_identifier(identifier);
         Box::pin(async move { Ok(outcome) })
+    }
+
+    /// Records the event; fails for a user whose nickname starts with `fail-hook`.
+    fn on_account_event<'a>(
+        &'a self,
+        _state: &'a AppState,
+        user: &'a User,
+        event: AccountEvent,
+    ) -> BoxFuture<'a, AppResult<()>> {
+        let result = record_hook_call(user, Recorded::Event(event));
+        Box::pin(async move { result })
+    }
+
+    /// Records that it was called, never the password; fails like [`Self::on_account_event`].
+    fn on_password_change_in_tx<'a>(
+        &'a self,
+        _conn: &'a mut PgConnection,
+        user: &'a User,
+        _new_password: &'a str,
+    ) -> BoxFuture<'a, AppResult<()>> {
+        let result = record_hook_call(user, Recorded::PasswordChangedInTx);
+        Box::pin(async move { result })
     }
 }
 

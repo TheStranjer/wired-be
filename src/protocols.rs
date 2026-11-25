@@ -39,11 +39,13 @@
 //! and are mounted by [`crate::discovery`].
 //!
 //! [`identity`] holds the identifier schemes: how an account gets its ID on
-//! each protocol (see its docs). Events will live here too. This file only
-//! names the protocols and declares the submodules.
+//! each protocol (see its docs). [`events`] holds the account lifecycle
+//! events every enabled protocol reacts to. This file only names the protocols
+//! and declares the submodules.
 
 pub mod activitypub;
 pub mod adapter;
+pub mod events;
 #[cfg(any(test, feature = "integration-tests"))]
 pub mod fixture;
 pub mod identity;
