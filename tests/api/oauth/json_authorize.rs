@@ -7,10 +7,13 @@
 use axum::{Router, http::StatusCode};
 use serde_json::{Value, json};
 use sqlx::PgPool;
-use wired_be::models::{oauth_app::OauthApp, oauth_token};
+use wired_be::models::{
+    oauth_app::{self, OauthApp},
+    oauth_token,
+};
 
 use super::authorize_get::{authorization_count, query_param, register_app};
-use super::support::{OOB, REDIRECT, fixtures, post_json};
+use super::support::{OOB, REDIRECT, fixtures, grant_body, post_json};
 use crate::common;
 
 /// Marks `app` trusted straight in the table.
@@ -332,4 +335,82 @@ async fn json_post_validates_the_request() {
     assert_eq!(verdict_response.status, StatusCode::BAD_REQUEST);
     assert_eq!(verdict_response.json_value()["error"], "invalid_request");
     assert_eq!(authorization_count(&pool).await, 0, "nothing was minted");
+}
+
+/// WBE-822: the frontend registers its own app at runtime, logs in with
+/// the password grant and approves another app's authorization with that
+/// token, and the code exchanges for a token; an app registered with a
+/// redirect URI elsewhere is still refused.
+#[tokio::test]
+async fn a_runtime_registered_frontend_app_can_approve_authorizations() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let http = common::test_app(pool.clone());
+    let (_, third_party) = fixtures(&pool, "frida", "read write").await;
+
+    let register = |redirect: &'static str| {
+        let http = http.clone();
+        let pool = pool.clone();
+        async move {
+            let response = common::TestRequest::post("/api/v1/apps")
+                .json(&json!({
+                    "client_name": "WIRED",
+                    "redirect_uris": redirect,
+                    "scopes": "read write follow",
+                }))
+                .send(&http)
+                .await;
+            assert_eq!(response.status, StatusCode::OK, "{}", response.text());
+            let client_id = response.json_value()["client_id"]
+                .as_str()
+                .expect("a client_id")
+                .to_owned();
+            oauth_app::get_by_client_id(&pool, &client_id)
+                .await
+                .expect("lookup")
+                .expect("the registered app")
+        }
+    };
+    let frontend = register("https://test.example/").await;
+    let elsewhere = register("https://elsewhere.example/").await;
+    assert!(frontend.trusted, "the frontend-origin app is trusted");
+    assert!(!elsewhere.trusted, "the other app is not");
+
+    let login = post_json(&http, &grant_body(&frontend, "frida", "read write")).await;
+    assert_eq!(login.status, StatusCode::OK, "{}", login.text());
+    let token = login.json_value()["access_token"]
+        .as_str()
+        .expect("an access token")
+        .to_owned();
+    let refused_login = post_json(&http, &grant_body(&elsewhere, "frida", "read write")).await;
+    let refused_token = refused_login.json_value()["access_token"]
+        .as_str()
+        .expect("an access token")
+        .to_owned();
+
+    let ask = verdict(&third_party, REDIRECT, "read", true);
+    let approved = post_verdict(&http, Some(&token), &ask).await;
+    assert_eq!(approved.status, StatusCode::OK, "{}", approved.text());
+    let redirect = approved.json_value()["redirect_uri"]
+        .as_str()
+        .expect("a redirect_uri")
+        .to_owned();
+    assert!(redirect.starts_with(&format!("{REDIRECT}?")), "{redirect}");
+    let code = query_param(&redirect, "code").expect("a code");
+    let exchanged = post_json(
+        &http,
+        &json!({
+            "grant_type": "authorization_code",
+            "code": code,
+            "client_id": third_party.client_id,
+            "client_secret": third_party.client_secret,
+            "redirect_uri": REDIRECT,
+        }),
+    )
+    .await;
+    assert_eq!(exchanged.status, StatusCode::OK, "{}", exchanged.text());
+
+    let denied = post_verdict(&http, Some(&refused_token), &ask).await;
+    assert_eq!(denied.status, StatusCode::FORBIDDEN, "untrusted app");
+    assert_eq!(denied.json_value()["error"], "unauthorized_client");
 }

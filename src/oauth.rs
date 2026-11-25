@@ -12,5 +12,6 @@
 //! Application and token models, the `/oauth` endpoints and the `AuthUser`
 //! extractors build on top of them.
 
+pub mod frontend_trust;
 pub mod pkce;
 pub mod scopes;

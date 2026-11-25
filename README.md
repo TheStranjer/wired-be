@@ -503,10 +503,15 @@ half of the path:
   redirect with `error=access_denied`. A missing or dead token is a 401, and a
   token whose scopes do not cover the request a 403 `invalid_scope`.
 
-**The frontend's own OAuth app must be marked trusted**
-(`PATCH /api/v1/pleroma/admin/oauth_app/{id}` with `trusted`): the JSON `POST`
-answers 403 `unauthorized_client` for a token issued to any other app, so an
-app holding a user token cannot mint codes for other apps.
+**The approving token's app must be trusted:** the JSON `POST` answers 403
+`unauthorized_client` for a token issued to any other app, so an app holding a
+user token cannot mint codes for other apps. An app is trusted automatically
+when every one of its `redirect_uri`s is on the origin (scheme, host and port)
+of `FRONTEND_BASE_URL`, at registration (`POST /api/v1/apps`) and, for apps
+registered earlier, at startup; the out-of-band URN never counts. That covers
+the frontend's per-browser app. Other first-party tools are marked with
+`PATCH /api/v1/pleroma/admin/oauth_app/{id}` and `trusted`. The JSON `GET`
+never depends on trust.
 
 ## API coverage
 
