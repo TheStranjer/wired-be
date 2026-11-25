@@ -4,11 +4,15 @@
 //! nickname, and the direct insert and reads the login and race tests need
 //! to set a row up without going through registration. Test-only.
 
+use std::collections::BTreeMap;
+
 use sqlx::PgPool;
 
 use super::RegisterParams;
 use crate::{
-    config::Config,
+    config::{
+        BASE_URL_VAR, Config, DATABASE_URL_VAR, PROTOCOLS_VAR, TEST_BASE_URL, TEST_DATABASE_URL,
+    },
     models::user::{NewUser, User, insert},
     state::AppState,
 };
@@ -35,6 +39,7 @@ pub(super) fn params_for(nickname: &str) -> RegisterParams {
         bio: None,
         reason: None,
         provider_email_verified: false,
+        identifiers: BTreeMap::new(),
     }
 }
 
@@ -64,5 +69,25 @@ pub(super) async fn user_count(pool: &PgPool) -> i64 {
         .fetch_one(pool)
         .await
         .expect("users can be counted");
+    row.0
+}
+
+/// A test config that runs `ActivityPub` and the fixture protocol.
+pub(super) fn config_with_fixture() -> Config {
+    Config::from_lookup(|key| match key {
+        DATABASE_URL_VAR => Some(TEST_DATABASE_URL.to_owned()),
+        BASE_URL_VAR => Some(TEST_BASE_URL.to_owned()),
+        PROTOCOLS_VAR => Some("activitypub,fixture".to_owned()),
+        _ => None,
+    })
+    .expect("the fixed fixture config is valid")
+}
+
+/// The number of rows in `activitypub_actors`.
+pub(super) async fn actor_count(pool: &PgPool) -> i64 {
+    let row: (i64,) = sqlx::query_as("SELECT count(*) FROM activitypub_actors")
+        .fetch_one(pool)
+        .await
+        .expect("actor rows can be counted");
     row.0
 }

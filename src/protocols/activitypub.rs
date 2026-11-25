@@ -34,7 +34,7 @@ use crate::{
     federation,
     jobs::{HandlerFn, QUEUE_FEDERATOR_INCOMING, QUEUE_FEDERATOR_OUTGOING},
     models::{
-        activitypub_actor::{self, ActorStatus},
+        activitypub_actor::{self, ActivityPubActorWrite, ActorStatus},
         user::{
             User, local_ap_id, nickname_taken,
             register::{NICKNAME_FIELD, validated_nickname},
@@ -43,7 +43,7 @@ use crate::{
     protocols::{
         ProtocolId,
         adapter::ProtocolAdapter,
-        identity::{Identity, IdentityStatus},
+        identity::{ClaimOutcome, Identity, IdentityStatus},
     },
     services,
     state::AppState,
@@ -176,6 +176,29 @@ impl ProtocolAdapter for ActivityPub {
             }))
         })
     }
+
+    /// Writes the account's active `activitypub_actors` row: keys, inbox URLs and so on.
+    ///
+    /// The actor URL is built from the nickname, so `identifier` is not
+    /// stored: the row copies the endpoints and keys registration put on the
+    /// `users` row. `Taken` when the account already has a row.
+    fn claim<'a>(
+        &'a self,
+        conn: &'a mut PgConnection,
+        user: &'a User,
+        _identifier: &'a str,
+        _state: &'a AppState,
+    ) -> BoxFuture<'a, AppResult<ClaimOutcome>> {
+        Box::pin(async move {
+            let write = ActivityPubActorWrite::for_user(user, None);
+            let inserted = activitypub_actor::insert_new(conn, &write).await?;
+            Ok(if inserted {
+                ClaimOutcome::Claimed
+            } else {
+                ClaimOutcome::Taken
+            })
+        })
+    }
 }
 
 #[cfg(test)]
@@ -284,6 +307,39 @@ mod tests {
             }),
             "identity"
         );
+    }
+
+    /// Claiming writes an active row copied from the account, once.
+    #[tokio::test]
+    async fn claim_writes_the_active_actor_row_once() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let state = app_state(db.pool());
+        let user = local_user(db.pool(), "claim_user").await;
+        let deleted = sqlx::query("DELETE FROM activitypub_actors WHERE user_id = $1")
+            .bind(user.id)
+            .execute(db.pool())
+            .await
+            .expect("the row is removed")
+            .rows_affected();
+        assert_eq!(deleted, 1, "the fixture user had a row");
+        let mut conn = db.pool().acquire().await.expect("a connection");
+
+        let first = ActivityPub
+            .claim(&mut conn, &user, "claim_user", &state)
+            .await;
+        let second = ActivityPub
+            .claim(&mut conn, &user, "claim_user", &state)
+            .await;
+
+        assert_eq!(first.expect("first claim"), ClaimOutcome::Claimed, "first");
+        assert_eq!(second.expect("second claim"), ClaimOutcome::Taken, "second");
+        let row = activitypub_actor::get(db.pool(), user.id)
+            .await
+            .expect("the row reads")
+            .expect("the row exists");
+        assert_eq!(row.status, ActorStatus::Active, "status");
+        assert_eq!(row.inbox, user.inbox, "inbox copied from the account");
+        assert_eq!(row.private_key, user.private_key, "keys copied");
     }
 
     /// A pending actor row is a pending identity.

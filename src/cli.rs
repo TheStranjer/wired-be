@@ -14,6 +14,8 @@
 //!
 //! The password arrives on standard input, never in the process arguments.
 
+use std::collections::BTreeMap;
+
 use crate::{
     error::AppResult,
     models::user::{
@@ -250,6 +252,7 @@ pub async fn create_admin(
         bio: None,
         reason: None,
         provider_email_verified: true,
+        identifiers: BTreeMap::new(),
     };
     let created = create_local_user(state, params, None).await?;
     set_role(&state.db, created.id, Role::Admin, true).await?;

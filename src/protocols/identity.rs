@@ -22,6 +22,30 @@
 //! or [`Active`](IdentityStatus::Active). There is no central identities
 //! table; [`ProtocolAdapter::identity`] reads the protocol's own table and
 //! answers `None` for an account that is not on the protocol.
+//!
+//! # Claiming
+//!
+//! [`ProtocolAdapter::claim`] writes the protocol's identity row for an
+//! account, on the connection of the caller's transaction. The rules:
+//!
+//! - A claim is one step of a batch. Registration claims one identity per
+//!   enabled protocol in the transaction that inserts the user; if any claim
+//!   is invalid or [`Taken`](ClaimOutcome::Taken), the transaction rolls back
+//!   and the response lists every failure under each protocol's
+//!   [`identifier_field`](ProtocolAdapter::identifier_field). Enrolling an
+//!   existing account later claims a single protocol with the same operation.
+//! - The identifier is the one the registrant requested, validated by
+//!   [`validate_identifier`](ProtocolAdapter::validate_identifier), or else
+//!   the one [`derive_identifier`](ProtocolAdapter::derive_identifier) makes
+//!   from the nickname. A derived ID that is taken is not made unique at
+//!   registration (that is [`suggest_identifier`]'s job); the claim fails.
+//! - A claim never checks first and then writes. It writes and relies on the
+//!   protocol's unique constraint to answer [`Taken`](ClaimOutcome::Taken),
+//!   so two racing claims cannot both win. A taken ID is an answer, not an
+//!   error: an unusable connection or a failing statement is `Err`.
+//! - A claim that answers [`Taken`](ClaimOutcome::Taken) leaves the
+//!   transaction usable, so the caller can go on to collect the failures of
+//!   the remaining protocols.
 
 use sqlx::PgConnection;
 
@@ -41,6 +65,15 @@ pub enum IdentityStatus {
     Pending,
     /// The identity is claimed and in use.
     Active,
+}
+
+/// What claiming an identity on a protocol came to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClaimOutcome {
+    /// The identity row was written.
+    Claimed,
+    /// Another account holds the ID, or this account already has the identity.
+    Taken,
 }
 
 /// An account's identity on one protocol.

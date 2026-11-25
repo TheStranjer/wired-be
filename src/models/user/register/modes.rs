@@ -26,6 +26,8 @@ pub(super) fn registration_waits_for_approval(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use sqlx::PgPool;
     use uuid::Uuid;
 
@@ -241,6 +243,7 @@ mod tests {
         let state = test_state_with(&pool, mode_config(Toggle::new(false), Toggle::new(true)));
         let params = RegisterParams {
             provider_email_verified: true,
+            identifiers: BTreeMap::new(),
             ..params_for("external")
         };
 
@@ -268,6 +271,7 @@ mod tests {
         let state = test_state_with(&pool, mode_config(Toggle::new(true), Toggle::new(true)));
         let params = RegisterParams {
             provider_email_verified: true,
+            identifiers: BTreeMap::new(),
             ..params_for("awaiting-external")
         };
 

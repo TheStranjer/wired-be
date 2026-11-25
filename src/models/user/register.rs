@@ -38,7 +38,8 @@
 //! The work is split by job behind this file: `validate` holds the field
 //! rules and their messages, `error` the failure type and its conversions,
 //! `login` the password checks, `insert` the availability check and the
-//! write, and `modes` what the two registration-mode settings decide. Those
+//! write, `claims` the per-protocol identity claims made in that write's
+//! transaction, and `modes` what the two registration-mode settings decide. Those
 //! children are this module's internals; what the rest of the crate uses is
 //! here — [`create_local_user`], [`RegisterParams`], [`FieldErrors`],
 //! [`RegisterError`], [`authenticate`] and [`authenticate_any_status`],
@@ -47,6 +48,7 @@
 //!
 //! [`AppError`]: crate::error::AppError
 
+mod claims;
 mod error;
 mod insert;
 mod login;
@@ -64,6 +66,7 @@ use std::{collections::BTreeMap, fmt};
 use super::confirmation;
 use crate::{
     models::{invite_token::InviteToken, user::User},
+    protocols::ProtocolId,
     services::webhooks,
     state::AppState,
 };
@@ -113,6 +116,13 @@ pub struct RegisterParams {
     /// `POST /api/v1/accounts` ever gives — leaves the confirmation mode
     /// in full force.
     pub provider_email_verified: bool,
+    /// IDs the registrant asked for, per protocol; empty by default.
+    ///
+    /// A protocol with an entry gets that ID, validated by its
+    /// [`validate_identifier`](crate::protocols::adapter::ProtocolAdapter::validate_identifier);
+    /// every other enabled protocol gets the ID derived from the nickname.
+    /// `ActivityPub`'s ID is the nickname itself, so it needs no entry.
+    pub identifiers: BTreeMap<ProtocolId, String>,
 }
 
 /// The password is secret material and renders as `<redacted>`; everything
@@ -127,6 +137,7 @@ impl fmt::Debug for RegisterParams {
             .field("bio", &self.bio)
             .field("reason", &self.reason)
             .field("provider_email_verified", &self.provider_email_verified)
+            .field("identifiers", &self.identifiers)
             .finish()
     }
 }
@@ -141,11 +152,19 @@ impl fmt::Debug for RegisterParams {
 /// re-checked through the insert, so a concurrent registration of the same
 /// account loses with the same field error the check would have produced.
 ///
+/// The insert runs in one transaction with a claim of one identity per
+/// enabled protocol (`ActivityPub`'s is its `activitypub_actors` row; the
+/// rules are in [`crate::protocols::identity`]). Each protocol's ID is the
+/// one in [`RegisterParams::identifiers`] or else derived from the nickname.
+/// If any claim is invalid or taken, nothing is created and the error map
+/// lists every failure under each protocol's
+/// [`identifier_field`](crate::protocols::adapter::ProtocolAdapter::identifier_field).
+///
 /// `invite` is the already-validated [`InviteToken`] the registration came
 /// in with, or `None` for an open-registrations request: an invited
-/// account's [`consume`] runs on the same transaction as the user insert,
-/// so a registration that fails validation spends no invite and the
-/// invite is never left spent without its account.
+/// account's [`consume`] runs on the same transaction as the user insert
+/// and the claims, so a registration that fails validation or a claim spends
+/// no invite and the invite is never left spent without its account.
 ///
 /// The two registration modes decide what the finished row says about
 /// itself. With `REGISTRATIONS_APPROVAL_REQUIRED` the account starts with
@@ -373,6 +392,7 @@ mod tests {
             bio: Some(raw_bio.to_owned()),
             reason: Some("I'm a cool dude, bro".to_owned()),
             provider_email_verified: false,
+            identifiers: BTreeMap::new(),
         };
         let user = create_local_user(&state, params, None).await.unwrap();
 

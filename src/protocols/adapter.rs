@@ -10,7 +10,10 @@ use crate::{
     error::AppResult,
     jobs::HandlerFn,
     models::user::User,
-    protocols::{ProtocolId, identity::Identity},
+    protocols::{
+        ProtocolId,
+        identity::{ClaimOutcome, Identity},
+    },
     state::AppState,
 };
 
@@ -153,4 +156,23 @@ pub trait ProtocolAdapter: Sync {
         state: &'a AppState,
         user: &'a User,
     ) -> BoxFuture<'a, AppResult<Option<Identity>>>;
+
+    /// Writes `user`'s identity on this protocol inside the caller's transaction.
+    ///
+    /// `identifier` is already validated. The write goes through `conn`, which
+    /// is the caller's open transaction, so a claim that is later rolled back
+    /// leaves nothing behind. It relies on the protocol's unique constraint
+    /// to answer [`ClaimOutcome::Taken`] on a race; the claim rules are in
+    /// [`crate::protocols::identity`].
+    ///
+    /// # Errors
+    ///
+    /// Any database failure other than the identity being taken.
+    fn claim<'a>(
+        &'a self,
+        conn: &'a mut PgConnection,
+        user: &'a User,
+        identifier: &'a str,
+        state: &'a AppState,
+    ) -> BoxFuture<'a, AppResult<ClaimOutcome>>;
 }

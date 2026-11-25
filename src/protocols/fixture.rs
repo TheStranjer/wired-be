@@ -24,7 +24,11 @@ use crate::{
     error::AppResult,
     jobs::{AttemptInfo, HandlerFn, HandlerFuture, JobError},
     models::user::User,
-    protocols::{ProtocolId, adapter::ProtocolAdapter, identity::Identity},
+    protocols::{
+        ProtocolId,
+        adapter::ProtocolAdapter,
+        identity::{ClaimOutcome, Identity},
+    },
     state::AppState,
 };
 
@@ -73,6 +77,18 @@ fn taken_identifiers() -> MutexGuard<'static, HashSet<String>> {
     TAKEN_IDENTIFIERS
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Claims `identifier` in the taken set, or reports that it is already there.
+///
+/// The set is not transactional: a claim stays after the caller's transaction
+/// rolls back, which a real protocol's table would not do.
+fn claim_identifier(identifier: &str) -> ClaimOutcome {
+    if taken_identifiers().insert(identifier.to_owned()) {
+        ClaimOutcome::Claimed
+    } else {
+        ClaimOutcome::Taken
+    }
 }
 
 /// Marks `identifier` as taken, as a row in the protocol's table would.
@@ -193,13 +209,25 @@ impl ProtocolAdapter for Fixture {
         format!("fixture:{identifier}")
     }
 
-    /// Always `None`: the fixture has no table, and nothing claims an identity yet.
+    /// Always `None`: the fixture has no table, so no identity is ever stored.
     fn identity<'a>(
         &'a self,
         _state: &'a AppState,
         _user: &'a User,
     ) -> BoxFuture<'a, AppResult<Option<Identity>>> {
         Box::pin(async { Ok(None) })
+    }
+
+    /// Adds the ID to the static set, or `Taken` when it is already there.
+    fn claim<'a>(
+        &'a self,
+        _conn: &'a mut PgConnection,
+        _user: &'a User,
+        identifier: &'a str,
+        _state: &'a AppState,
+    ) -> BoxFuture<'a, AppResult<ClaimOutcome>> {
+        let outcome = claim_identifier(identifier);
+        Box::pin(async move { Ok(outcome) })
     }
 }
 
@@ -275,7 +303,28 @@ mod tests {
         assert!(after.expect("lookup"), "taken once marked");
     }
 
-    /// The fixture has no identity for a user until a later ticket lets one be claimed.
+    /// Claiming adds the ID to the set once; a second claim finds it taken.
+    #[tokio::test]
+    async fn claim_adds_the_identifier_then_reports_it_taken() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let state = app_state(db.pool());
+        let user = crate::test_fixtures::local_user(db.pool(), "claimer").await;
+        let mut conn = db.pool().acquire().await.expect("a connection");
+
+        let first = Fixture
+            .claim(&mut conn, &user, "claimed-once", &state)
+            .await;
+        let second = Fixture
+            .claim(&mut conn, &user, "claimed-once", &state)
+            .await;
+        let taken = Fixture.identifier_taken(&mut conn, "claimed-once").await;
+
+        assert_eq!(first.expect("claim"), ClaimOutcome::Claimed, "first");
+        assert_eq!(second.expect("claim"), ClaimOutcome::Taken, "second");
+        assert!(taken.expect("lookup"), "the set holds the ID");
+    }
+
+    /// The fixture stores no identity row, so `identity` is `None` even for a local user.
     #[tokio::test]
     async fn identity_is_none_until_claimed() {
         let db = crate::test_db::test_db().await.expect("test database slot");
