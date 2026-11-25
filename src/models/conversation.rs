@@ -66,7 +66,7 @@ pub use participation::{
     delete_participation, get_participation, mark_all_read, mark_read, participation_ids,
     participations_for_status, unread_count,
 };
-pub use recipients::{recipients, recipients_map, set_recipients};
+pub use recipients::{recipients, recipients_map, set_recipients, thread_members};
 pub use repoint::repoint_after_delete;
 pub use write::{participate, participate_for_status};
 

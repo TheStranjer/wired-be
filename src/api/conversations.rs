@@ -45,8 +45,9 @@
 //!   form keys, decision 10) becomes the participation's whole addressee
 //!   list. The caller is excluded automatically (Pleroma stores the owner
 //!   on the list, this schema never does); an id that is not id text or
-//!   names no stored account is Pleroma's refused recipient, which the
-//!   ticket folds into the same 404. An empty list clears it. The
+//!   names an account that neither authored nor is @-mentioned in the
+//!   thread's statuses is a refused recipient, which the ticket folds
+//!   into the same 404. An empty list clears it. The
 //!   rewritten entity answers.
 //! - `POST /api/v1/pleroma/conversations/read` — Pleroma's
 //!   `mark_as_read`: flags every unread participation of the caller read
@@ -92,7 +93,7 @@ use crate::{
     models::{
         conversation::{self, Participation},
         status_visibility,
-        user::{self, User},
+        user::User,
     },
     oauth::scopes::{READ_STATUSES, WRITE_CONVERSATIONS},
     pagination::{NO_EXTRA_QUERY, PageParams, keyset_link, link_for_page, set_link_header},
@@ -343,8 +344,8 @@ struct RecipientsParams {
 /// replace the participation's recipient list with the body's accounts.
 /// The caller is excluded from the rewrite automatically (Pleroma keeps
 /// the owner on its list; this schema's lists never hold them); an id that
-/// is not id text or names no stored account is Pleroma's refused
-/// recipient, the ticket's 404. The rewritten entity — same participation,
+/// is not id text or names an account that took part in no status of the
+/// thread (author or @-mention) is a refused recipient, the ticket's 404. The rewritten entity — same participation,
 /// new `accounts` — answers.
 ///
 /// # Errors
@@ -365,7 +366,7 @@ async fn update(
     let requested = requested_recipients(&body.recipients)?;
     let row = owned_participation(&state, auth.0.id, &id).await?;
     let recipients = kept_recipients(requested, auth.0.id);
-    if !all_are_accounts(&state, &recipients).await? {
+    if !all_took_part(&state, row.conversation_id, &recipients).await? {
         return Err(unknown_conversation());
     }
     conversation::set_recipients(&state.db, row.id, &recipients).await?;
@@ -406,20 +407,22 @@ fn kept_recipients(requested: Vec<Uuid>, viewer: Uuid) -> Vec<Uuid> {
     requested.into_iter().filter(|id| *id != viewer).collect()
 }
 
-/// Whether every asked id names a stored account: [`user::get_many`]
-/// answers one row per id that exists, so a short count is Pleroma's
-/// `set_recipients` finding no user for one of the requested ids. An
-/// empty ask needs no read — clearing the list is not a miss.
+/// Whether every asked id took part in the thread: authored a status of
+/// it or is @-mentioned by one ([`conversation::thread_members`]). An id
+/// outside that set — a stranger, or an account that does not exist — is
+/// the refused recipient, so a roster can never name somebody who never
+/// saw the thread. An empty ask needs no read — clearing the list is not
+/// a miss.
 ///
 /// # Errors
 ///
-/// [`Database`](crate::error::AppError::Database) from the account read.
-async fn all_are_accounts(state: &AppState, ids: &[Uuid]) -> AppResult<bool> {
+/// [`Database`](crate::error::AppError::Database) from the member read.
+async fn all_took_part(state: &AppState, conversation_id: Uuid, ids: &[Uuid]) -> AppResult<bool> {
     if ids.is_empty() {
         return Ok(true);
     }
-    let found = user::get_many(&state.db, ids).await?;
-    Ok(found.len() == ids.len())
+    let members = conversation::thread_members(&state.db, conversation_id).await?;
+    Ok(ids.iter().all(|id| members.contains(id)))
 }
 
 /// `POST /api/v1/pleroma/conversations/read` — Pleroma's `mark_as_read`:

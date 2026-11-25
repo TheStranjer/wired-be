@@ -38,6 +38,15 @@ const RECIPIENTS_BATCH_SQL: &str = "SELECT participation_id, user_id \
      FROM conversation_participation_recipients \
      WHERE participation_id = ANY($1) ORDER BY participation_id, user_id";
 
+/// [`thread_members`]: every account that authored or is @-mentioned by
+/// a status of one thread, each named once.
+const THREAD_MEMBERS_SQL: &str = "SELECT s.user_id FROM statuses s \
+     WHERE s.direct_conversation_id = $1 \
+     UNION \
+     SELECT sm.user_id FROM status_mentions sm \
+       JOIN statuses s ON s.id = sm.status_id \
+     WHERE s.direct_conversation_id = $1";
+
 /// [`participate`]'s recipient arm: `participation_id`'s audience becomes
 /// every member of the roster except its owner, remote included — deleted
 /// and reinserted wholesale, so the set always matches the status that
@@ -115,6 +124,25 @@ pub async fn recipients_map(
     Ok(group_pairs(rows))
 }
 
+/// The accounts that took part in thread `conversation_id`.
+///
+/// Every author and every @-mentioned account of the thread's statuses,
+/// each once, in id order. The `PATCH` rewrite may only name these.
+///
+/// # Errors
+///
+/// Any database failure arrives as [`AppError::Database`].
+///
+/// [`AppError::Database`]: crate::error::AppError
+pub async fn thread_members(pool: &PgPool, conversation_id: Uuid) -> AppResult<Vec<Uuid>> {
+    let mut members = sqlx::query_scalar::<_, Uuid>(THREAD_MEMBERS_SQL)
+        .bind(conversation_id)
+        .fetch_all(pool)
+        .await?;
+    members.sort_unstable();
+    Ok(members)
+}
+
 /// Makes `user_ids` the whole addressee list of `participation_id`.
 ///
 /// One transaction: the old set goes before the new one lands, exactly the
@@ -161,7 +189,8 @@ mod tests {
     use crate::models::conversation::{
         Participation, delete_participation,
         test_support::{
-            bump, direct, linked_thread, local, participation, remote, slot, stored_recipients,
+            bump, direct, direct_reply, linked_thread, local, participation, remote, slot,
+            stored_recipients,
         },
     };
 
@@ -209,6 +238,52 @@ mod tests {
                 .expect("the empty ask runs")
                 .is_empty(),
             "an empty ask is the empty map"
+        );
+    }
+
+    #[tokio::test]
+    async fn thread_members_are_the_authors_and_mentioned_accounts() {
+        let (_db, pool) = slot().await;
+        let alice = local(&pool, "alice").await;
+        let bob = local(&pool, "bob").await;
+        let carol = remote(&pool, "carol").await;
+        let dave = local(&pool, "dave").await;
+        let post = direct(&pool, &alice, &[&bob], "@bob psst").await;
+        bump(&pool, &post).await;
+        let thread = linked_thread(&pool, &post).await;
+        let other = direct(&pool, &dave, &[&carol], "@carol elsewhere").await;
+        bump(&pool, &other).await;
+        let other_thread = linked_thread(&pool, &other).await;
+
+        let mut expected = vec![alice.id, bob.id];
+        expected.sort_unstable();
+        assert_eq!(
+            thread_members(&pool, thread).await.expect("the read runs"),
+            expected,
+            "author and mention, each once, and nobody from another thread"
+        );
+        let reply = direct_reply(&pool, &bob, &post, &[&alice], "@alice back").await;
+        bump(&pool, &reply).await;
+        assert_eq!(
+            thread_members(&pool, thread).await.expect("the read runs"),
+            expected,
+            "a reply by the same people adds nobody"
+        );
+        let mut others = vec![dave.id, carol.id];
+        others.sort_unstable();
+        assert_eq!(
+            thread_members(&pool, other_thread)
+                .await
+                .expect("the read runs"),
+            others,
+            "the other thread has its own members, a remote mention included"
+        );
+        assert!(
+            thread_members(&pool, Uuid::now_v7())
+                .await
+                .expect("the read runs")
+                .is_empty(),
+            "an unknown thread has no members"
         );
     }
 
