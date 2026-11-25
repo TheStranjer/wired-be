@@ -142,7 +142,7 @@ async fn the_public_filters_drop_and_their_removal_restores() {
     );
 
     let expired = sqlx::query(
-        "UPDATE filters SET expires_at = now() - interval '1 hour' WHERE id = $1::uuid",
+        "UPDATE custom_filters SET expires_at = now() - interval '1 hour' WHERE id = $1::uuid",
     )
     .bind(irreversible["id"].as_str().expect("id"))
     .execute(&pool)

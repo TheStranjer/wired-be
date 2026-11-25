@@ -1,15 +1,17 @@
-//! Filters over HTTP: one account's phrase filters, the Mastodon v1 CRUD.
+//! Filters over HTTP: one account's phrase filters, the Mastodon v1 CRUD,
+//! and — in [`v2`] — the v2 filter API over the same storage.
 //!
 //! The reference is Pleroma's `FilterController`
 //! (`lib/pleroma/web/mastodon_api/controllers/filter_controller.ex`) and
-//! `Pleroma.Filter` (`lib/pleroma/filter.ex`). Pleroma's per-user integer
-//! `filter_id`, its `hide`-column renaming and its Oban purge job all stay
-//! behind the model ([`crate::models::filter`]); this module is the five
-//! routes and the parameter rules in front of them.
+//! Mastodon's `Api::V1::FiltersController`. As in Mastodon, a v1 filter is
+//! one *keyword* of a v2 filter ([`crate::models::filter::phrase`]): its id
+//! is the keyword's, `irreversible` is the `hide` action. This module is
+//! the five routes and the parameter rules in front of them.
 //!
-//! - `GET /api/v1/filters` answers the caller's filters that have not
-//!   expired ([`list_active`](crate::models::filter::list_active)), newest
-//!   first, each as the `Filter` entity
+//! - `GET /api/v1/filters` answers the caller's phrase filters that have not
+//!   expired
+//!   ([`list_active_phrases`](crate::models::filter::phrase::list_active_phrases)),
+//!   newest first, each as the `Filter` entity
 //!   ([`crate::entities::filter`]).
 //! - `GET /api/v1/filters/{id}` answers one filter by id; an expired filter
 //!   is still a row its owner can read.
@@ -44,31 +46,30 @@ use axum::{
     extract::{Path, State},
     routing::get,
 };
-use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use serde_json::{Map, Value};
 use tracing::debug;
 
+use self::params::{ContextValues, expires_at_from, validated_context};
 use crate::{
     auth::AuthUser,
     entities::filter::Filter,
     error::{AppError, AppResult},
     extract::ApiBody,
-    models::filter,
+    models::filter::phrase::{self, NewPhrase, Phrase},
     oauth::scopes::{READ_FILTERS, WRITE_FILTERS},
     services::streaming,
     state::AppState,
     util::id::parse_id,
 };
 
+mod params;
+pub mod v2;
+
 /// The longest phrase the endpoint accepts (Mastodon's filter limit).
 const MAX_PHRASE_CHARS: usize = 200;
-/// The contexts a filter may name (Mastodon's valid filter contexts).
-const VALID_CONTEXTS: [&str; 5] = ["home", "notifications", "public", "thread", "account"];
 /// 422 body for an absent or blank phrase (Mastodon's changeset wording).
 const PHRASE_BLANK: &str = "Validation failed: Phrase can't be blank";
-/// 422 body for an absent, empty or unknown context (likewise).
-const CONTEXT_INVALID: &str = "Validation failed: Context is invalid";
 
 /// The `/api/v1/filters` router, merged into [`crate::api::v1`].
 pub fn router() -> Router<AppState> {
@@ -93,13 +94,13 @@ async fn list_filters(
     auth: AuthUser,
 ) -> AppResult<Json<Vec<Filter>>> {
     auth.require(READ_FILTERS)?;
-    let active = filter::list_active(&state.db, auth.0.id).await?;
+    let active = phrase::list_active_phrases(&state.db, auth.0.id).await?;
     debug!(
         count = active.len(),
         user = %auth.0.id,
         "filters listed"
     );
-    Ok(Json(active.iter().map(Filter::from_row).collect()))
+    Ok(Json(active.iter().map(Filter::from_phrase).collect()))
 }
 
 /// `GET /api/v1/filters/{id}` — one of the caller's filters; an expired one
@@ -120,10 +121,10 @@ async fn show_filter(
     let Some(filter_id) = parse_id(&id) else {
         return Err(AppError::NotFound);
     };
-    let Some(row) = filter::get_owned(&state.db, filter_id, auth.0.id).await? else {
+    let Some(found) = phrase::get_phrase(&state.db, filter_id, auth.0.id).await? else {
         return Err(AppError::NotFound);
     };
-    Ok(Json(Filter::from_row(&row)))
+    Ok(Json(Filter::from_phrase(&found)))
 }
 
 /// `POST /api/v1/filters` — create a filter for the caller and answer it.
@@ -142,15 +143,18 @@ async fn create_filter(
     ApiBody(params): ApiBody<FilterParams>,
 ) -> AppResult<Json<Filter>> {
     auth.require(WRITE_FILTERS)?;
-    let new = params.into_new_filter()?;
-    let row = filter::create(&state.db, auth.0.id, &new).await?;
+    let new = params.into_new_phrase()?;
+    let row = phrase::create_phrase(&state.db, auth.0.id, &new).await?;
     debug!(
         filter = %row.id,
         user = %auth.0.id,
         "filter created"
     );
+    let Some(created) = row.keywords.first() else {
+        return Err(AppError::NotFound);
+    };
     streaming::filters_changed(&state, auth.0.id);
-    Ok(Json(Filter::from_row(&row)))
+    Ok(Json(Filter::from_phrase(&Phrase::new(&row, created))))
 }
 
 /// `PUT /api/v1/filters/{id}` — replace every mutable column of one owned
@@ -175,15 +179,15 @@ async fn update_filter(
     auth.require(WRITE_FILTERS)?;
     // Validation first, lookup second: Pleroma's `CastAndValidate` plug
     // rejects a bad body before the action ever reaches `Filter.get`.
-    let new = params.into_new_filter()?;
+    let new = params.into_new_phrase()?;
     let Some(filter_id) = parse_id(&id) else {
         return Err(AppError::NotFound);
     };
-    let Some(row) = filter::update(&state.db, filter_id, auth.0.id, &new).await? else {
+    let Some(row) = phrase::update_phrase(&state.db, filter_id, auth.0.id, &new).await? else {
         return Err(AppError::NotFound);
     };
     streaming::filters_changed(&state, auth.0.id);
-    Ok(Json(Filter::from_row(&row)))
+    Ok(Json(Filter::from_phrase(&row)))
 }
 
 /// `DELETE /api/v1/filters/{id}` — remove one owned filter, publish Mastodon's
@@ -204,7 +208,7 @@ async fn delete_filter(
     let Some(filter_id) = parse_id(&id) else {
         return Err(AppError::NotFound);
     };
-    if !filter::delete(&state.db, filter_id, auth.0.id).await? {
+    if !phrase::delete_phrase(&state.db, filter_id, auth.0.id).await? {
         return Err(AppError::NotFound);
     }
     streaming::filters_changed(&state, auth.0.id);
@@ -216,7 +220,7 @@ async fn delete_filter(
 /// Every field is `Option` at the serde layer so the endpoint can answer
 /// the ticket's `{"error":"Validation failed: …"}` wording for what is
 /// missing; the defaults are applied in
-/// [`into_new_filter`](FilterParams::into_new_filter).
+/// [`into_new_phrase`](FilterParams::into_new_phrase).
 #[derive(Debug, Deserialize)]
 struct FilterParams {
     /// The phrase; required and non-blank, at most
@@ -238,27 +242,6 @@ struct FilterParams {
     expires_in: Option<i64>,
 }
 
-/// `context` as clients send it: one string or a list (a JSON array, or
-/// form `context[]=…` keys).
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
-enum ContextValues {
-    /// A lone context name.
-    Single(String),
-    /// A list of context names.
-    Multiple(Vec<String>),
-}
-
-impl ContextValues {
-    /// The names as a list; a lone string becomes the one-element list.
-    fn into_list(self) -> Vec<String> {
-        match self {
-            Self::Single(text) => vec![text],
-            Self::Multiple(values) => values,
-        }
-    }
-}
-
 impl FilterParams {
     /// Validates the parameters and builds the row content they describe,
     /// applying the defaults for the optional flags and the expiry.
@@ -267,8 +250,8 @@ impl FilterParams {
     ///
     /// [`AppError::Unprocessable`] with Mastodon's changeset wording for a
     /// blank or too-long phrase or an invalid context list.
-    fn into_new_filter(self) -> AppResult<filter::NewFilter> {
-        Ok(filter::NewFilter {
+    fn into_new_phrase(self) -> AppResult<NewPhrase> {
+        Ok(NewPhrase {
             phrase: validated_phrase(self.phrase)?,
             context: validated_context(self.context)?,
             whole_word: self.whole_word.unwrap_or(true),
@@ -298,45 +281,19 @@ fn validated_phrase(phrase: Option<String>) -> AppResult<String> {
     Ok(text)
 }
 
-/// The context list, checked: absent, empty or carrying any name outside
-/// [`VALID_CONTEXTS`] is 422 [`CONTEXT_INVALID`].
-///
-/// # Errors
-///
-/// [`AppError::Unprocessable`] as described above.
-fn validated_context(context: Option<ContextValues>) -> AppResult<Vec<String>> {
-    let values = context.map_or_else(Vec::new, ContextValues::into_list);
-    let known = values
-        .iter()
-        .all(|value| VALID_CONTEXTS.contains(&value.as_str()));
-    if values.is_empty() || !known {
-        return Err(AppError::Unprocessable(CONTEXT_INVALID.to_owned()));
-    }
-    Ok(values)
-}
-
-/// The expiry an `expires_in` of `seconds` describes: `None` when absent or
-/// `null`, when the value is not positive, or when it names a span too
-/// large to represent — anything unrepresentable is "never", not an error.
-fn expires_at_from(seconds: Option<i64>) -> Option<DateTime<Utc>> {
-    seconds
-        .filter(|value| *value > 0)
-        .and_then(chrono::Duration::try_seconds)
-        .and_then(|span| Utc::now().checked_add_signed(span))
-}
-
 #[cfg(test)]
 mod tests {
-    use chrono::Duration;
+    use chrono::{Duration, Utc};
     use serde_json::json;
 
+    use super::params::{CONTEXT_INVALID, VALID_CONTEXTS};
     use super::*;
 
     /// Parses `value` as the endpoint's parameters and validates them, as
     /// the handler would.
-    fn new_filter(value: Value) -> AppResult<filter::NewFilter> {
+    fn new_filter(value: Value) -> AppResult<NewPhrase> {
         let params: FilterParams = crate::extract::into_params(value)?;
-        params.into_new_filter()
+        params.into_new_phrase()
     }
 
     /// The minimal valid parameter object.

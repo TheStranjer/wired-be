@@ -11,7 +11,7 @@ use serde_json::{Value, json};
 use sqlx::PgPool;
 use uuid::Uuid;
 use wired_be::models::{
-    filter::{self, NewFilter},
+    filter::{self, phrase::NewPhrase},
     status::{self, NewStatus, Status},
     user::User,
 };
@@ -46,14 +46,14 @@ pub(super) async fn seed(
     text: &str,
     expires_at: Option<DateTime<Utc>>,
 ) -> filter::Filter {
-    filter::create(
+    filter::phrase::create_phrase(
         pool,
         owner.id,
-        &NewFilter {
+        &NewPhrase {
             phrase: text.to_owned(),
             context: vec!["home".to_owned()],
             expires_at,
-            ..NewFilter::default()
+            ..NewPhrase::default()
         },
     )
     .await
@@ -178,10 +178,10 @@ pub(super) async fn warner(
     make_filter(
         pool,
         owner,
-        &NewFilter {
+        &NewPhrase {
             phrase: phrase.to_owned(),
             context: contexts.iter().map(|name| (*name).to_owned()).collect(),
-            ..NewFilter::default()
+            ..NewPhrase::default()
         },
     )
     .await
@@ -197,11 +197,11 @@ pub(super) async fn hider(
     make_filter(
         pool,
         owner,
-        &NewFilter {
+        &NewPhrase {
             phrase: phrase.to_owned(),
             context: contexts.iter().map(|name| (*name).to_owned()).collect(),
             irreversible: true,
-            ..NewFilter::default()
+            ..NewPhrase::default()
         },
     )
     .await
@@ -217,19 +217,19 @@ pub(super) async fn looser(
     make_filter(
         pool,
         owner,
-        &NewFilter {
+        &NewPhrase {
             phrase: phrase.to_owned(),
             context: contexts.iter().map(|name| (*name).to_owned()).collect(),
             whole_word: false,
-            ..NewFilter::default()
+            ..NewPhrase::default()
         },
     )
     .await
 }
 
 /// The one model write the three seeding helpers share.
-pub(super) async fn make_filter(pool: &PgPool, owner: &User, body: &NewFilter) -> filter::Filter {
-    filter::create(pool, owner.id, body)
+pub(super) async fn make_filter(pool: &PgPool, owner: &User, body: &NewPhrase) -> filter::Filter {
+    filter::phrase::create_phrase(pool, owner.id, body)
         .await
         .expect("fixture filter creates")
 }
@@ -240,18 +240,18 @@ pub(super) fn expected(f: &filter::Filter, context: &str, whole_word: bool) -> V
     json!({
         "filter": {
             "id": f.id.to_string(),
-            "title": f.phrase,
+            "title": f.title,
             "context": [context],
             "expires_at": Value::Null,
             "filter_action": "warn",
             "keywords": [{
                 "id": f.id.to_string(),
-                "keyword": f.phrase,
+                "keyword": f.title,
                 "whole_word": whole_word,
             }],
             "statuses": [],
         },
-        "keyword_matches": [f.phrase],
+        "keyword_matches": [f.title],
         "status_matches": Value::Null,
     })
 }
@@ -291,6 +291,74 @@ pub(super) fn newest_first(posts: &[&Status]) -> Vec<String> {
 /// The id of `post`, as its JSON carries it.
 pub(super) fn id_of(post: &Status) -> String {
     post.id.to_string()
+}
+
+// ---------------------------------------------------------------------------
+// The v2 API: `/api/v2/filters` and its keyword and status sub-resources.
+// ---------------------------------------------------------------------------
+
+/// The root path of the v2 filter API.
+pub(super) const ROOT_V2: &str = "/api/v2/filters";
+
+/// `GET path` as `token`.
+pub(super) async fn v2_get(app: &Router, token: &str, path: &str) -> common::TestResponse {
+    common::TestRequest::get(path).bearer(token).send(app).await
+}
+
+/// `POST path` with the JSON `body` as `token`.
+pub(super) async fn v2_post(
+    app: &Router,
+    token: &str,
+    path: &str,
+    body: Value,
+) -> common::TestResponse {
+    common::TestRequest::post(path)
+        .bearer(token)
+        .json(&body)
+        .send(app)
+        .await
+}
+
+/// `PUT path` with the JSON `body` as `token`.
+pub(super) async fn v2_put(
+    app: &Router,
+    token: &str,
+    path: &str,
+    body: Value,
+) -> common::TestResponse {
+    common::TestRequest::put(path)
+        .bearer(token)
+        .json(&body)
+        .send(app)
+        .await
+}
+
+/// `DELETE path` as `token`.
+pub(super) async fn v2_delete(app: &Router, token: &str, path: &str) -> common::TestResponse {
+    common::TestRequest::delete(path)
+        .bearer(token)
+        .send(app)
+        .await
+}
+
+/// `POST /api/v2/filters` as `token`, asserted 200, and the entity parsed.
+pub(super) async fn v2_create(app: &Router, token: &str, body: Value) -> Value {
+    let response = v2_post(app, token, ROOT_V2, body).await;
+    assert_eq!(
+        response.status,
+        StatusCode::OK,
+        "the v2 create answers 200: {}",
+        response.text()
+    );
+    response.json_value()
+}
+
+/// The `id` of the JSON entity `value`.
+pub(super) fn id_in(value: &Value) -> String {
+    value["id"]
+        .as_str()
+        .expect("every entity carries its id")
+        .to_owned()
 }
 
 /// Inserts `author`'s public reply to `parent`.

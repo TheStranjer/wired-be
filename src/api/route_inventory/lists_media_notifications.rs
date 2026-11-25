@@ -76,6 +76,76 @@ pub(super) const ROWS: &[RouteSpec] = &[
     },
     RouteSpec {
         method: "GET",
+        path: "/api/v2/filters",
+        auth: AuthClass::User,
+    },
+    RouteSpec {
+        method: "POST",
+        path: "/api/v2/filters",
+        auth: AuthClass::User,
+    },
+    RouteSpec {
+        method: "GET",
+        path: "/api/v2/filters/:id",
+        auth: AuthClass::User,
+    },
+    RouteSpec {
+        method: "PUT",
+        path: "/api/v2/filters/:id",
+        auth: AuthClass::User,
+    },
+    RouteSpec {
+        method: "DELETE",
+        path: "/api/v2/filters/:id",
+        auth: AuthClass::User,
+    },
+    RouteSpec {
+        method: "GET",
+        path: "/api/v2/filters/:id/keywords",
+        auth: AuthClass::User,
+    },
+    RouteSpec {
+        method: "POST",
+        path: "/api/v2/filters/:id/keywords",
+        auth: AuthClass::User,
+    },
+    RouteSpec {
+        method: "GET",
+        path: "/api/v2/filters/keywords/:id",
+        auth: AuthClass::User,
+    },
+    RouteSpec {
+        method: "PUT",
+        path: "/api/v2/filters/keywords/:id",
+        auth: AuthClass::User,
+    },
+    RouteSpec {
+        method: "DELETE",
+        path: "/api/v2/filters/keywords/:id",
+        auth: AuthClass::User,
+    },
+    RouteSpec {
+        method: "GET",
+        path: "/api/v2/filters/:id/statuses",
+        auth: AuthClass::User,
+    },
+    RouteSpec {
+        method: "POST",
+        path: "/api/v2/filters/:id/statuses",
+        auth: AuthClass::User,
+    },
+    RouteSpec {
+        method: "GET",
+        path: "/api/v2/filters/statuses/:id",
+        auth: AuthClass::User,
+    },
+    RouteSpec {
+        method: "DELETE",
+        path: "/api/v2/filters/statuses/:id",
+        auth: AuthClass::User,
+    },
+    RouteSpec {
+        method: "GET",
         path: "/api/v1/tags/:id",
         auth: AuthClass::Public,
     },

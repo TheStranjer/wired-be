@@ -522,7 +522,9 @@ changed. Four families make it up:
 
 - the **Mastodon client API** under `/api/v1` and `/api/v2` — apps, accounts,
   statuses, timelines, notifications (flat and grouped), conversations, lists,
-  filters, markers, media, polls, search, domain blocks, follow requests,
+  filters (v1 and v2: grouped keywords, `warn`/`hide`/`blur` actions and
+  single-status filters over one storage), markers, media, polls, search,
+  domain blocks, follow requests,
   endorsements, scheduled statuses, push subscriptions, announcements, reports,
   trends, the directory and the instance documents;
 - **Pleroma's own extensions** under `/api/v1/pleroma` and `/api/pleroma` —
