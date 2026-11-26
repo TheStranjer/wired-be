@@ -17,7 +17,10 @@ use crate::{
     mailer::{self, templates},
     models::{
         moderation_log,
-        user::{User, admin},
+        user::{
+            User,
+            admin::{self, Standing},
+        },
     },
     state::AppState,
 };
@@ -56,20 +59,22 @@ pub(super) async fn delete_account(
     Ok(Json(AdminAccount::from_user(&account, &state.config)))
 }
 
-/// `POST /api/v1/admin/accounts/{id}/enable` — Pleroma's `enable`:
-/// [`helpers::set_activation`] with the flag set, the fresh row's entity as the
-/// answer and the `activate` entry Pleroma's own action writes.
+/// `POST /api/v1/admin/accounts/{id}/enable` — Mastodon's `enable`: the
+/// reversal of a `disable` through [`Standing::Enabled`].
 ///
-/// The flag is the whole gate: the deactivation revoked no token and stamped
-/// no deletion, so the account's own credential works again on this answer
-/// and its actor document never stopped resolving (the `Unsuspended` event
-/// has `ActivityPub` send the peers a fresh `Update` without the `suspended`
-/// flag). Re-enabling an active account writes the same `true` back and
-/// answers the same entity.
+/// The answer is the fresh row's entity, and the entry is the `activate` one
+/// Pleroma's own action writes.
 ///
-/// `enable` reverses a `disable`, not a suspension (WBE-878): a suspended
-/// account is answered as it is, with no write and no entry, and
-/// [`unsuspend_account`] is the route that lifts it.
+/// The flag is the whole gate: the disable revoked no token and stamped
+/// no deletion, so the account's own credential works again on this answer.
+/// It federates nothing, because a disable never did (WBE-883). Re-enabling
+/// an account that is not disabled writes the same `NULL` back and answers
+/// the same entity.
+///
+/// `enable` reverses a `disable` and only that: a suspended account that is
+/// not disabled is answered as it is, with no write and no entry, and
+/// [`unsuspend_account`] is the route that lifts a suspension. A suspended
+/// account that is also disabled loses the disable and stays suspended.
 ///
 /// # Errors
 ///
@@ -84,22 +89,23 @@ pub(super) async fn enable_account(
 ) -> AppResult<Json<AdminAccount>> {
     admin.require(CLASS_WRITE, AREA_ACCOUNTS)?;
     let account = named_account(&state, &raw).await?;
-    let answered = if account.suspended_at.is_some() {
+    let answered = if account.suspended_at.is_some() && !account.is_disabled() {
         account
     } else {
-        reactivate(&state, &admin.0, &account).await?
+        restand(&state, &admin.0, &account, Standing::Enabled).await?
     };
     debug!(account = %answered.id, "admin enabled an account");
     Ok(Json(AdminAccount::from_user(&answered, &state.config)))
 }
 
 /// `POST /api/v1/admin/accounts/{id}/unsuspend` — Mastodon's `unsuspend`:
-/// the reversal of a `suspend` (WBE-878), through the same activation write
-/// and `activate` entry as [`enable_account`].
+/// the reversal of a `suspend` (WBE-878) through [`Standing::Unsuspended`],
+/// with the same `activate` entry as [`enable_account`].
 ///
-/// Only a suspended account moves. One that is active, or disabled without a
-/// suspension, is answered as it is, with no write and no entry — `enable`
-/// is what lifts a `disable`.
+/// Only a suspended account moves, and only its suspension: a disable stays
+/// (WBE-883). One that is active, or disabled without a suspension, is
+/// answered as it is, with no write and no entry — `enable` is what lifts a
+/// `disable`.
 ///
 /// # Errors
 ///
@@ -112,7 +118,7 @@ pub(super) async fn unsuspend_account(
     admin.require(CLASS_WRITE, AREA_ACCOUNTS)?;
     let account = named_account(&state, &raw).await?;
     let answered = if account.suspended_at.is_some() {
-        reactivate(&state, &admin.0, &account).await?
+        restand(&state, &admin.0, &account, Standing::Unsuspended).await?
     } else {
         account
     };
@@ -120,15 +126,20 @@ pub(super) async fn unsuspend_account(
     Ok(Json(AdminAccount::from_user(&answered, &state.config)))
 }
 
-/// Activates `account` through [`helpers::set_activation`] and answers the
-/// row the write returned.
+/// Gives `account` the lifting `standing` through [`helpers::set_standing`]
+/// and answers the row the write returned.
 ///
 /// # Errors
 ///
 /// [`AppError::NotFound`] when the write matches no row;
 /// [`AppError::Database`] from the write and the log.
-async fn reactivate(state: &AppState, actor: &User, account: &User) -> AppResult<User> {
-    helpers::set_activation(state, actor, slice::from_ref(account), true)
+async fn restand(
+    state: &AppState,
+    actor: &User,
+    account: &User,
+    standing: Standing,
+) -> AppResult<User> {
+    helpers::set_standing(state, actor, slice::from_ref(account), standing)
         .await?
         .pop()
         .ok_or(AppError::NotFound)

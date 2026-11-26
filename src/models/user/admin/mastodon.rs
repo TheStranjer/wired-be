@@ -35,9 +35,9 @@ pub struct MastodonListParams {
     /// `pending` (and `status=pending`):
     /// [`approval_pending`](User::approval_pending) is set.
     pub pending: Criterion,
-    /// `disabled` (and `status=disabled`): [`is_active`](User::is_active) is
-    /// false without the account being suspended (see
-    /// [`suspended`](Self::suspended)).
+    /// `disabled` (and `status=disabled`): [`User::disabled_at`] is set,
+    /// whether or not the account is also suspended (see
+    /// [`suspended`](Self::suspended)); WBE-883.
     pub disabled: Criterion,
     /// `suspended` (and `status=suspended`): [`User::is_suspended`] — a local
     /// or remote suspension or a deletion under way (WBE-878).
@@ -119,8 +119,9 @@ fn push_mastodon_state(builder: &mut QueryBuilder<Postgres>, params: &MastodonLi
     push_criterion(
         builder,
         params.active,
-        " AND is_active AND NOT approval_pending AND email_confirmed",
-        " AND (NOT is_active OR approval_pending OR NOT email_confirmed)",
+        " AND is_active AND disabled_at IS NULL AND NOT approval_pending AND email_confirmed",
+        " AND (NOT is_active OR disabled_at IS NOT NULL OR approval_pending \
+         OR NOT email_confirmed)",
     );
     push_criterion(
         builder,
@@ -131,10 +132,8 @@ fn push_mastodon_state(builder: &mut QueryBuilder<Postgres>, params: &MastodonLi
     push_criterion(
         builder,
         params.disabled,
-        " AND NOT is_active AND NOT (suspended_at IS NOT NULL OR remote_suspended \
-         OR deleted_at IS NOT NULL)",
-        " AND (is_active OR suspended_at IS NOT NULL OR remote_suspended \
-         OR deleted_at IS NOT NULL)",
+        " AND disabled_at IS NOT NULL",
+        " AND disabled_at IS NULL",
     );
     push_criterion(
         builder,
@@ -256,6 +255,19 @@ mod tests {
         }
     }
 
+    /// Marks the inactive fixture row as also disabled, the flag `disabled`
+    /// weighs (WBE-883).
+    async fn disable_inactive_row(pool: &PgPool) {
+        let disabled =
+            sqlx::query("UPDATE users SET disabled_at = now() WHERE nickname = $1::citext")
+                .bind("suspended")
+                .execute(pool)
+                .await
+                .expect("the disable writes")
+                .rows_affected();
+        assert_eq!(disabled, 1, "the inactive fixture row is also disabled");
+    }
+
     /// The four state criteria and their negations, each against rows that
     /// differ from every other row in exactly one column: `active` wants all
     /// three green, `pending` the approval gate, `disabled` the flag off and
@@ -263,6 +275,7 @@ mod tests {
     #[tokio::test]
     async fn the_mastodon_state_criteria_weigh_their_own_columns() {
         let (_db, pool) = fixture().await;
+        disable_inactive_row(&pool).await;
         let cases: &[MastodonCase<'_>] = &[
             (
                 "active",

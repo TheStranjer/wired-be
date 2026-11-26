@@ -184,6 +184,10 @@ pub struct User {
     /// When a local suspension deactivated the account; `None` for an
     /// account that is active or only disabled (WBE-878).
     pub suspended_at: Option<DateTime<Utc>>,
+    /// When an admin disabled the account; `None` while it is not. A
+    /// disabled account only loses its owner's sign-in and API use — it
+    /// stays active, visible and federated (WBE-883).
+    pub disabled_at: Option<DateTime<Utc>>,
     /// Whether the account's origin server marks its actor `suspended`
     /// (WBE-873); only the remote actor upsert writes it.
     pub remote_suspended: Flag,
@@ -256,6 +260,7 @@ impl fmt::Debug for User {
             .field("email_notifications", &self.email_notifications)
             .field("deleted_at", &self.deleted_at)
             .field("suspended_at", &self.suspended_at)
+            .field("disabled_at", &self.disabled_at)
             .field("remote_suspended", &self.remote_suspended)
             .finish()
     }
@@ -276,17 +281,25 @@ impl User {
     /// deletion under way ([`deleted_at`](Self::deleted_at)).
     ///
     /// The one reading behind the `suspended` of the account entities and of
-    /// the federated actor document; `disabled` is
-    /// [`is_active`](Self::is_active) off without this.
+    /// the federated actor document. A disable
+    /// ([`disabled_at`](Self::disabled_at)) is no suspension.
     #[must_use]
     pub const fn is_suspended(&self) -> bool {
         self.suspended_at.is_some() || self.remote_suspended.get() || self.deleted_at.is_some()
     }
 
+    /// Whether an admin disabled the account: its owner may not sign in or
+    /// use the API, nothing else changes (WBE-883).
+    #[must_use]
+    pub const fn is_disabled(&self) -> bool {
+        self.disabled_at.is_some()
+    }
+
     /// Where this account stands between registration and use, weighed in
-    /// the order Pleroma's `User.account_status` uses: deactivation, then
-    /// the staff approval `REGISTRATIONS_APPROVAL_REQUIRED` asks for, then
-    /// the email confirmation `ACCOUNT_ACTIVATION_REQUIRED` asks for.
+    /// the order Pleroma's `User.account_status` uses: deactivation (or a
+    /// disable), then the staff approval `REGISTRATIONS_APPROVAL_REQUIRED`
+    /// asks for, then the email confirmation `ACCOUNT_ACTIVATION_REQUIRED`
+    /// asks for.
     ///
     /// The two registration flags are only ever cleared for local accounts
     /// (a federated mirror arrives confirmed and approved), so no `local`
@@ -295,6 +308,17 @@ impl User {
     /// both decide from this one read.
     #[must_use]
     pub const fn account_status(&self) -> AccountStatus {
+        if self.is_disabled() {
+            return AccountStatus::Deactivated;
+        }
+        self.registration_status()
+    }
+
+    /// [`account_status`](Self::account_status) without the disable: what
+    /// the account's public face weighs, since a disabled account stays
+    /// visible to everyone but its owner (WBE-883).
+    #[must_use]
+    pub const fn registration_status(&self) -> AccountStatus {
         if !self.is_active.get() {
             return AccountStatus::Deactivated;
         }
@@ -451,6 +475,37 @@ mod tests {
                 "local={local}, active={active}"
             );
         }
+    }
+
+    /// A disable gates the owner (`account_status`) but not the public
+    /// face (`registration_status`), and is no suspension (WBE-883).
+    #[tokio::test]
+    async fn a_disable_gates_the_owner_and_not_the_public_face() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let mut row = insert(&pool, &local_new("gated")).await.unwrap();
+        assert_eq!(row.account_status(), AccountStatus::Active, "a fresh row");
+
+        row.disabled_at = Some(Utc::now());
+        assert!(row.is_disabled(), "the stamp is a disable");
+        assert!(!row.is_suspended(), "which is no suspension");
+        assert_eq!(
+            row.account_status(),
+            AccountStatus::Deactivated,
+            "the owner is gated"
+        );
+        assert_eq!(
+            row.registration_status(),
+            AccountStatus::Active,
+            "the public face is not"
+        );
+
+        row.is_active = Flag::new(false);
+        assert_eq!(
+            row.registration_status(),
+            AccountStatus::Deactivated,
+            "an inactive account is gated either way"
+        );
     }
 
     #[tokio::test]

@@ -182,7 +182,7 @@ async fn credential_stands(connection: &Connection) -> bool {
         return false;
     };
     match user::get_by_id(db, user_id).await {
-        Ok(found) => found.is_some_and(|row| row.is_active.get()),
+        Ok(found) => found.is_some_and(|row| row.is_active.get() && !row.is_disabled()),
         Err(err) => {
             warn!(%err, "streaming user could not be re-checked; the socket stays");
             true

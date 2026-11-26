@@ -82,6 +82,7 @@ pub(super) fn template_user(nickname: &str) -> User {
         email_notifications: user::Flag::new(true),
         deleted_at: None,
         suspended_at: None,
+        disabled_at: None,
         remote_suspended: user::Flag::new(false),
     }
 }

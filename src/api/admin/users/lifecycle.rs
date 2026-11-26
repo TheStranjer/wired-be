@@ -164,7 +164,9 @@ pub(super) async fn toggle_activation(
     if found.id == admin.0.id && found.is_active.get() {
         return Err(AppError::Forbidden(SELF_DEACTIVATION.to_owned()));
     }
-    let activate = !found.is_active.get();
+    // A disabled account reads inactive in this entity, so toggling it
+    // activates it (WBE-883).
+    let activate = !found.is_active.get() || found.is_disabled();
     let updated = helpers::set_activation(&state, &admin.0, slice::from_ref(&found), activate)
         .await?
         .pop()

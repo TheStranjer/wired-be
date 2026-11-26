@@ -47,7 +47,7 @@ const LOGIN_LOOKUP_SQL: &str = "SELECT * FROM users
 pub async fn authenticate(pool: &PgPool, nickname_or_email: &str, password: &str) -> Option<User> {
     let user = authenticate_any_status(pool, nickname_or_email, password).await?;
     // The credential was correct; now enforce the ordinary active-user rule.
-    user.is_active.get().then_some(user)
+    (user.is_active.get() && !user.is_disabled()).then_some(user)
 }
 
 /// Verifies `password` for the local user whose nickname or email is
@@ -241,6 +241,33 @@ mod tests {
                 .is_none(),
             "remote users never authenticate by password"
         );
+    }
+
+    /// A disabled account stays active but never passes the strict login
+    /// gate, while the any-status one still verifies it (WBE-883).
+    #[tokio::test]
+    async fn authenticate_refuses_a_disabled_account_that_is_still_active() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let hash = hash_password(PASSWORD).expect("the fixture hash is made");
+        let alice = insert_login(&pool, "ida", "ida@example.org", Some(&hash)).await;
+        let disabled = sqlx::query("UPDATE users SET disabled_at = now() WHERE id = $1")
+            .bind(alice.id)
+            .execute(&pool)
+            .await
+            .expect("the disable writes")
+            .rows_affected();
+        assert_eq!(disabled, 1, "the row exists to disable");
+
+        assert!(
+            authenticate(&pool, "ida", PASSWORD).await.is_none(),
+            "a disabled account never logs in"
+        );
+        let found = authenticate_any_status(&pool, "ida", PASSWORD)
+            .await
+            .expect("the password still verifies");
+        assert!(found.is_active.get(), "the account itself stays active");
+        assert!(found.is_disabled(), "and reads as disabled");
     }
 
     #[tokio::test]

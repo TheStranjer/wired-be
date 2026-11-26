@@ -62,10 +62,10 @@
 //! - `active` (v1) and `status=active` (v2) want an account active, approved
 //!   *and* confirmed; `pending` / `status=pending` want a stated
 //!   [`approval_pending`](User::approval_pending); `disabled` /
-//!   `status=disabled` want [`is_active`](User::is_active) off without a
-//!   suspension; `suspended` / `status=suspended` want
-//!   [`User::is_suspended`] (WBE-878), so a suspended account is found by the
-//!   one and not the other.
+//!   `status=disabled` want [`disabled_at`](User::disabled_at) set (WBE-883);
+//!   `suspended` / `status=suspended` want [`User::is_suspended`] (WBE-878),
+//!   so an account that is only suspended is found by the one and not the
+//!   other (one that is both is found by both).
 //! - `staff` (v1) and `permissions=staff` (v2) want an admin or a moderator.
 //! - `username`, `display_name`, `by_domain` and `email` are the four criteria
 //!   both versions state identically: the handle and the display name as
@@ -97,16 +97,18 @@
 //!   and would announce the admin's own `Delete` to the peers; the ticket
 //!   pins the guard, so naming your own account is the 403 `"This action is
 //!   not allowed"`.
-//! - `POST …/accounts/{id}/enable` is [`admin::set_active`] with the flag
-//!   set: the flag alone, minting no credential — the deactivation revoked
-//!   none either, so the account's own token works again the moment it is
-//!   enabled — and it logs Pleroma's `enable` entry, the `activate` one.
-//!   Enabling an account that was never disabled changes nothing, answers
-//!   200 and logs. `POST …/accounts/{id}/unsuspend` is its twin for the other
-//!   kind of deactivation (WBE-878): `enable` reverses a `disable` and
-//!   `unsuspend` a `suspend`, and each leaves an account in the other state
-//!   as it is, answering 200, writing and logging nothing — Mastodon's
-//!   `enable` clears `disabled` and `unsuspend` only a suspension.
+//! - `POST …/accounts/{id}/enable` clears [`disabled_at`](User::disabled_at)
+//!   ([`admin::Standing::Enabled`]) and nothing else, minting no credential —
+//!   the disable revoked none either, so the account's own token works again
+//!   the moment it is enabled — and it logs Pleroma's `enable` entry, the
+//!   `activate` one. Enabling an account that was never disabled changes
+//!   nothing, answers 200 and logs; one that is suspended and not disabled
+//!   is answered as it is, writing and logging nothing.
+//!   `POST …/accounts/{id}/unsuspend` is its twin for the suspension
+//!   (WBE-878, [`admin::Standing::Unsuspended`]): `enable` reverses a
+//!   `disable` and `unsuspend` a `suspend`, and each leaves the other flag
+//!   as it is — Mastodon's `enable` clears `disabled` and `unsuspend` only a
+//!   suspension (WBE-883).
 //! - `POST …/accounts/{id}/approve` is the console's `PATCH /users/approve`
 //!   for one account by id, sharing its write and its `account_approved`
 //!   letter through [`helpers::approve_account`]. An account nobody left
@@ -126,8 +128,10 @@
 //!   400, which the ticket replaces with the same refusal the delete route
 //!   gives.
 //! - `POST …/accounts/{id}/action` is Mastodon's moderation umbrella.
-//!   `disable` clears `is_active` and nothing else, so the account reads
-//!   `disabled: true`; `suspend` clears it too and also stamps
+//!   `disable` stamps [`disabled_at`](User::disabled_at) and nothing else
+//!   (WBE-883), so the account reads `disabled: true` while it stays active,
+//!   visible and federated and only its owner is locked out; `suspend`
+//!   clears `is_active` and also stamps
 //!   [`suspended_at`](User::suspended_at) (WBE-878), so the account reads
 //!   `suspended: true` and not `disabled` — it deactivates only, stamps no
 //!   `deleted_at`, revokes no token and removes no data. The `Suspended` event
@@ -166,7 +170,8 @@
 //! [`moderation_log`]: crate::models::moderation_log
 //! [`helpers::start_deletion`]: crate::api::helpers::start_deletion
 //! [`helpers::approve_account`]: crate::api::helpers::approve_account
-//! [`admin::set_active`]: crate::models::user::admin::set_active
+//! [`admin::Standing::Enabled`]: crate::models::user::admin::Standing::Enabled
+//! [`admin::Standing::Unsuspended`]: crate::models::user::admin::Standing::Unsuspended
 //! [`admin::delete_user`]: crate::models::user::admin::delete_user
 //! [`User`]: crate::models::user::User
 

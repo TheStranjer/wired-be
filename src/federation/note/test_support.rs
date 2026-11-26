@@ -107,6 +107,7 @@ fn fixture_user(nickname: &str, ap_id: &str, local: bool) -> User {
         email_notifications: Flag::new(true),
         deleted_at: None,
         suspended_at: None,
+        disabled_at: None,
         remote_suspended: Flag::new(false),
     }
 }

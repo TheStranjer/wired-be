@@ -253,7 +253,7 @@ async fn active_owner(conn: &mut PgConnection, token: &OauthToken) -> AppResult<
         .bind(user_id)
         .fetch_optional(conn)
         .await?;
-    Ok(owner.filter(|user| user.is_active.get()))
+    Ok(owner.filter(|user| user.is_active.get() && !user.is_disabled()))
 }
 
 #[cfg(test)]

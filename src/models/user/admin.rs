@@ -66,6 +66,9 @@
 /// The three-state boolean the Mastodon listings weigh and its `WHERE`-arm
 /// writer.
 mod criterion;
+/// The data move of the `disabled_at` migration.
+#[cfg(test)]
+mod disabled_migration_tests;
 /// The direct nickname-or-id reads of one admin account.
 mod lookups;
 /// The Mastodon admin account listing.

@@ -172,6 +172,7 @@ pub(super) fn base_user(nickname: &str) -> User {
         email_notifications: Flag::new(true),
         deleted_at: None,
         suspended_at: None,
+        disabled_at: None,
         remote_suspended: Flag::new(false),
     }
 }
