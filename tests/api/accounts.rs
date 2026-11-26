@@ -16,6 +16,7 @@
 
 #![cfg(test)]
 
+mod batch;
 mod emojis;
 mod lookup;
 mod pending;

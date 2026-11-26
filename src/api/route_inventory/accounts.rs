@@ -10,6 +10,11 @@ use super::{AuthClass, RouteSpec};
 pub(super) const ROWS: &[RouteSpec] = &[
     // ── Accounts and the social graph ────────────────────────────────────
     RouteSpec {
+        method: "GET",
+        path: "/api/v1/accounts",
+        auth: AuthClass::Public,
+    },
+    RouteSpec {
         method: "POST",
         path: "/api/v1/accounts",
         auth: AuthClass::User,

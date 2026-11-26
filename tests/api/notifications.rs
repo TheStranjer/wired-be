@@ -14,7 +14,8 @@
 //! (`id` reads that row and its elders, `max_id` reads up to the cursor
 //! and answers the marked array), deleting a status takes its
 //! notifications with it, the reads demand `read:notifications` and every
-//! write route demands `write:notifications`.
+//! write route demands `write:notifications`; the v1 `unread_count` shares
+//! the v2 count's rules.
 
 #![cfg(test)]
 
@@ -32,3 +33,5 @@ mod read;
 mod show_types;
 /// Shared consts, fixtures, seeds and helpers every submodule draws on.
 mod support;
+/// The v1 unread count.
+mod unread;

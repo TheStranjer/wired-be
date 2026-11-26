@@ -459,6 +459,10 @@ mod notification_quotes;
 /// and the owner-only render of the flags.
 mod notification_settings;
 
+/// The notification policy and filtered-notification requests
+/// (`/api/v{1,2}/notifications/policy`, `/api/v1/notifications/requests`).
+mod notification_policy;
+
 /// The flat notification API: `clear`, the dismissals, `destroy_multiple`
 /// and Pleroma's `read` (`/api/v1/notifications`, `/api/pleroma`).
 mod notifications;
