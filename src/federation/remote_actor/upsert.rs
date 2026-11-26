@@ -209,6 +209,9 @@ pub async fn upsert_remote_user(pool: &PgPool, new: NewRemoteUser) -> Result<Use
 mod moderation_tests;
 
 #[cfg(test)]
+mod backfill_fix_tests;
+
+#[cfg(test)]
 mod tests {
     use chrono::{DateTime, TimeDelta, Utc};
     use serde_json::{Value, json};
