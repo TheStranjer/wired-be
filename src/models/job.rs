@@ -19,7 +19,10 @@
 //! keyed job no worker has started yet — the cancel half of re-queueing
 //! scheduled work. A live job (`available`, `executing`
 //! or `retryable`) carrying a `unique_key` blocks any further job with the
-//! same key: the deduplication contract of the partial unique index.
+//! same key: the deduplication contract of the partial unique index. Keys
+//! starting `periodic:` (the scheduler's one-row-per-period keys) are held
+//! in every state by a second unique index, so a finished row still blocks
+//! its key.
 
 use std::time::Duration;
 
