@@ -111,10 +111,14 @@ pub async fn set_email(
     Ok(())
 }
 
-/// The `UPDATE` behind [`set_activation`]: flips `is_active` and refreshes
-/// `updated_at`, leaving every other column alone.
-const SET_ACTIVATION_SQL: &str =
-    "UPDATE users SET is_active = $2, updated_at = now() WHERE id = $1";
+/// The `UPDATE` behind [`set_activation`]: moves the local origin
+/// (`local_deactivated`), recomputes `is_active` (a remote suspension keeps
+/// it off) and refreshes `updated_at`, leaving every other column alone.
+const SET_ACTIVATION_SQL: &str = "UPDATE users
+       SET local_deactivated = NOT $2::boolean,
+           is_active = $2::boolean AND NOT remote_suspended,
+           updated_at = now()
+     WHERE id = $1";
 
 /// Sets user `id`'s [`is_active`](super::User::is_active) flag: the write
 /// `POST /api/pleroma/disable_account` performs.
