@@ -104,6 +104,7 @@ pub async fn preview_status(
             muted: JsonBool(false),
             direct_participation: None,
             quote: None,
+            quote_url: None,
             reblog: None,
             poll: None,
             parent_visible: JsonBool(true),

@@ -137,6 +137,37 @@ async fn the_quote_nests_from_the_batch_with_its_visibility_read() {
     assert_eq!(quiet["pleroma"]["quote_visible"], json!(false));
 }
 
+/// `pleroma.quote_id` and `pleroma.quote_url` name the quoted row for
+/// every viewer, the quoted row's `url` else its `uri`, even when the
+/// viewer may not see the quoted post and `pleroma.quote` is null.
+#[tokio::test]
+async fn the_pleroma_block_names_the_quoted_row_even_when_it_is_hidden() {
+    let db = crate::test_db::test_db().await.expect("test database slot");
+    let pool = db.pool().clone();
+    let state = app_state(&pool);
+    let alice = user(&pool, "alice").await;
+    let bob = user(&pool, "bob").await;
+    let source = post(&pool, &bob, "the source").await;
+    let secret = private_post(&pool, &alice).await;
+    let open_quote = quote(&pool, &alice, &source, Visibility::Public).await;
+    let hidden_quote = quote(&pool, &alice, &secret, Visibility::Public).await;
+
+    for (quoting, quoted, visible) in [
+        (&open_quote, &source, true),
+        (&hidden_quote, &secret, false),
+    ] {
+        let rendered = render_status(&state, ViewerMode::ANONYMOUS, quoting)
+            .await
+            .expect("the quote renders")
+            .expect("a live public row renders");
+        let value = serde_json::to_value(&rendered).expect("it serializes");
+        let expected = quoted.url.clone().unwrap_or_else(|| quoted.uri.clone());
+        assert_eq!(value["pleroma"]["quote_id"], quoted.id.to_string());
+        assert_eq!(value["pleroma"]["quote_url"], expected);
+        assert_eq!(value["pleroma"]["quote_visible"], json!(visible));
+    }
+}
+
 /// The one lift [`ViewerMode::Admin`] buys, on the renderer's own
 /// surface: a quoted original its viewer cannot reach still nests for
 /// staff, where the anonymous view — and any [`ViewerMode::User`] —

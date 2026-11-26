@@ -73,6 +73,8 @@ pub(in crate::entities::status) struct Parts<'a> {
     /// What the quoting ticket's batch found behind the row's quote;
     /// `None` is a row that quotes nothing.
     quote: Option<QuoteSlot>,
+    /// The url the batch found on the quoted row, `None` for none.
+    quote_url: Option<String>,
     /// Whether the viewer may see the replied-to status, in the same
     /// [`JsonBool`] wrapper the source field carries; `true` unless the
     /// test hides the parent.
@@ -99,6 +101,7 @@ impl<'a> Parts<'a> {
             muted: JsonBool(false),
             poll: None,
             quote: None,
+            quote_url: None,
             parent_visible: JsonBool(true),
         }
     }
@@ -250,6 +253,15 @@ impl<'a> Parts<'a> {
         }
     }
 
+    /// Sets [`quote_url`](Self::quote_url): the url the batch found on
+    /// the quoted row.
+    pub(in crate::entities::status) fn quote_url_of(self, url: &str) -> Self {
+        Self {
+            quote_url: Some(url.to_owned()),
+            ..self
+        }
+    }
+
     /// Sets [`quote`](Self::quote): the rendered quote, which the
     /// quoting ticket's batch hands the renderer for a quote this
     /// viewer may see.
@@ -322,6 +334,7 @@ pub(in crate::entities::status) fn render(
         muted: parts.muted.clone(),
         direct_participation: None,
         quote: parts.quote.clone(),
+        quote_url: parts.quote_url.clone(),
         reblog: reblog.map(Box::new),
         poll: parts.poll.clone(),
         parent_visible: parts.parent_visible.clone(),
@@ -353,6 +366,7 @@ pub(in crate::entities::status) fn render_nested(row: &StatusRow, author: &User)
             muted: JsonBool(false),
             direct_participation: None,
             quote: None,
+            quote_url: None,
             reblog: None,
             poll: None,
             parent_visible: JsonBool(true),

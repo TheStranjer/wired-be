@@ -252,6 +252,67 @@ fn a_quote_hidden_from_the_viewer_is_unauthorized() {
 }
 
 #[test]
+fn a_quote_of_a_visible_status_carries_its_id_and_url_in_the_pleroma_block() {
+    let alice = base_user("alice");
+    let quoted_id = Uuid::parse_str("01955555-5555-7555-8555-555555555555").unwrap();
+    let url = "https://wired2.test/objects/01a2159e-691f-738d-9694-e333ac1fc81a";
+    let mut row = base_row();
+    row.quote_of_id = Some(quoted_id);
+    let quote = json!({ "id": quoted_id.to_string(), "content": "<p>quoted</p>" });
+    let parts = Parts::of(&alice).quoting(quote.clone()).quote_url_of(url);
+    let value = render(&row, &parts, None);
+    assert_eq!(value["pleroma"]["quote"], quote);
+    assert_eq!(value["pleroma"]["quote_visible"], true);
+    assert_eq!(
+        value["pleroma"]["quote_id"],
+        quoted_id.to_string(),
+        "the local id of the quoted status, as the top-level key names it"
+    );
+    assert_eq!(value["pleroma"]["quote_url"], url);
+}
+
+#[test]
+fn a_quote_of_an_invisible_status_still_renders_its_id_and_url() {
+    let alice = base_user("alice");
+    let quoted_id = Uuid::parse_str("01955555-5555-7555-8555-555555555555").unwrap();
+    let url = "https://wired2.test/objects/01a2159e-691f-738d-9694-e333ac1fc81a";
+    let mut row = base_row();
+    row.quote_of_id = Some(quoted_id);
+    let parts = Parts::of(&alice).quoting_hidden().quote_url_of(url);
+    let value = render(&row, &parts, None);
+    assert_eq!(
+        value["pleroma"]["quote"],
+        Value::Null,
+        "the render is withheld"
+    );
+    assert_eq!(value["pleroma"]["quote_visible"], false);
+    assert_eq!(value["pleroma"]["quote_id"], quoted_id.to_string());
+    assert_eq!(
+        value["pleroma"]["quote_url"], url,
+        "the url is rendered anyway, as Pleroma does"
+    );
+}
+
+#[test]
+fn a_quote_whose_target_is_gone_has_an_id_but_no_url() {
+    let alice = base_user("alice");
+    let quoted_id = Uuid::parse_str("01955555-5555-7555-8555-555555555555").unwrap();
+    let mut row = base_row();
+    row.quote_of_id = Some(quoted_id);
+    let value = render(&row, &Parts::of(&alice).quoting_deleted(), None);
+    assert_eq!(value["pleroma"]["quote_id"], quoted_id.to_string());
+    assert_eq!(value["pleroma"]["quote_url"], Value::Null);
+}
+
+#[test]
+fn a_status_that_quotes_nothing_has_null_quote_id_and_url() {
+    let alice = base_user("alice");
+    let value = render(&base_row(), &Parts::of(&alice), None);
+    assert_eq!(value["pleroma"]["quote_id"], Value::Null);
+    assert_eq!(value["pleroma"]["quote_url"], Value::Null);
+}
+
+#[test]
 fn a_quote_that_is_gone_is_deleted() {
     let alice = base_user("alice");
     let quoted_id = Uuid::parse_str("01955555-5555-7555-8555-555555555555").unwrap();

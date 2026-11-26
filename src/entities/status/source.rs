@@ -200,6 +200,12 @@ pub struct StatusSource<'a> {
     /// [`QuoteSlot::Visible`] feeds `pleroma.quote`, whose
     /// `pleroma.quote_visible` is exactly that slot's presence.
     pub quote: Option<QuoteSlot>,
+    /// The quoted row's `url`, else its `uri`: feeds
+    /// [`pleroma.quote_url`](PleromaMetadata::quote_url). `None` when the
+    /// row quotes nothing or the batch found no row behind the quote
+    /// (a deleted target); set whatever the viewer may see of the quoted
+    /// post, as Pleroma renders it.
+    pub quote_url: Option<String>,
     /// The already-rendered original, boxed, when [`row`](Self::row) is
     /// a reblog; `None` for anything else. The nested entity is rendered
     /// from the original's own `StatusSource`, one level deep — Pleroma's

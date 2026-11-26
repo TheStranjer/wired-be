@@ -323,6 +323,15 @@ impl<'a> Batch<'a> {
         Some(rendered.map_or(QuoteSlot::Deleted, QuoteSlot::Visible))
     }
 
+    /// The `pleroma.quote_url` of `row`: its quoted row's `url`, else its
+    /// `uri`, `None` when `row` quotes nothing or the batch found no row
+    /// behind the quote. The viewer's access to the quoted row does not
+    /// matter, as in Pleroma.
+    fn quote_url(&self, row: &StatusRow) -> Option<String> {
+        let quoted = self.quoted.get(&row.quote_of_id?)?;
+        Some(quoted.url.clone().unwrap_or_else(|| quoted.uri.clone()))
+    }
+
     /// The reference a quoted status carries to its own quote, `None`
     /// when it quotes nothing. Only the page rows' quote targets are
     /// loaded, so a target the batch has not seen reads as visible.
@@ -413,6 +422,7 @@ impl<'a> Batch<'a> {
                 .direct_conversation_id
                 .and_then(|thread| self.direct_participations.get(&thread).copied()),
             quote,
+            quote_url: self.quote_url(row),
             reblog,
             poll: self.render_poll(row),
             parent_visible: JsonBool(

@@ -105,7 +105,7 @@ async fn a_quote_create_nests_its_original_and_counts_it_once() {
 /// entity keeps the quoting contract: top-level `quote_id` names the
 /// original to every viewer, `pleroma.quote` mirrors the bare quoted
 /// status and `pleroma.quote_visible` is false exactly when it is null, and `pleroma`
-/// carries no `quote_id` or `quote_url` key at all (a recorded decision).
+/// carries the original's `quote_id` and `quote_url` to every viewer.
 #[tokio::test]
 async fn a_quote_shows_its_original_only_to_viewers_that_reach_it() {
     let db = common::test_db().await;
@@ -159,12 +159,14 @@ async fn a_quote_shows_its_original_only_to_viewers_that_reach_it() {
             entity["pleroma"]["quote"], entity["quote"]["quoted_status"],
             "{who}: the pleroma block mirrors the nested render"
         );
-        for key in ["quote_id", "quote_url"] {
-            assert!(
-                entity["pleroma"].get(key).is_none(),
-                "{who}: no `{key}` key rides the pleroma block"
-            );
-        }
+        assert_eq!(
+            entity["pleroma"]["quote_id"], original["id"],
+            "{who}: the pleroma block names the original too"
+        );
+        assert_eq!(
+            entity["pleroma"]["quote_url"], original["url"],
+            "{who}: and its url, even when the original is not visible"
+        );
     }
 }
 
