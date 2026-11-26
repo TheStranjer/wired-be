@@ -153,8 +153,8 @@ async fn follow_tag(
     Path(name): Path<String>,
 ) -> AppResult<Json<Tag>> {
     auth.require(WRITE_FOLLOWS)?;
-    let usable = usable_name(&name)?;
-    let tag = hashtag::find_or_create(&state.db, &usable)
+    let written = written_name(&name)?;
+    let tag = hashtag::find_or_create(&state.db, &written)
         .await?
         .ok_or_else(|| AppError::Unprocessable(INVALID_HASHTAG.to_owned()))?;
     let new = hashtag_follow::follow(&state.db, auth.0.id, tag.id).await?;
@@ -221,8 +221,8 @@ async fn feature_tag(
     Path(name): Path<String>,
 ) -> AppResult<Json<Tag>> {
     auth.require(WRITE_ACCOUNTS)?;
-    let usable = usable_name(&name)?;
-    let tag = hashtag::find_or_create(&state.db, &usable)
+    let written = written_name(&name)?;
+    let tag = hashtag::find_or_create(&state.db, &written)
         .await?
         .ok_or_else(|| AppError::Unprocessable(INVALID_HASHTAG.to_owned()))?;
     match featured_tag::feature(&state.db, auth.0.id, &tag).await? {
@@ -347,6 +347,19 @@ async fn known_tag(state: &AppState, name: &str) -> AppResult<hashtag::Hashtag> 
 /// [`AppError::Unprocessable`] with [`INVALID_HASHTAG`].
 fn usable_name(name: &str) -> AppResult<String> {
     hashtag::normalize_name(name).ok_or_else(|| AppError::Unprocessable(INVALID_HASHTAG.to_owned()))
+}
+
+/// The `{name}` path segment of a create-on-demand write in its display
+/// spelling (casing kept), checked the way [`usable_name`] checks it.
+///
+/// What [`hashtag::find_or_create`] stores as the display name when the tag
+/// is new; an existing row keeps the casing it already has.
+///
+/// # Errors
+///
+/// [`AppError::Unprocessable`] with [`INVALID_HASHTAG`].
+fn written_name(name: &str) -> AppResult<String> {
+    hashtag::written_form(name).ok_or_else(|| AppError::Unprocessable(INVALID_HASHTAG.to_owned()))
 }
 
 /// The full Tag entity for `tag` as `following` sees it: the two identity
