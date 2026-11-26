@@ -8,6 +8,7 @@
 
 use futures::future::BoxFuture;
 use tracing::debug;
+use uuid::Uuid;
 
 use crate::{
     federation::{
@@ -15,7 +16,9 @@ use crate::{
         fetch_object, json,
     },
     models::{
-        activitypub_actor, pinned_status,
+        activitypub_actor,
+        featured_live::{self, Collection},
+        pinned_status,
         status::{self, Status},
         user::User,
     },
@@ -112,6 +115,31 @@ async fn stored_featured_url(
     Ok(actor.and_then(|row| row.featured_url))
 }
 
+/// Pins (`pinning`) or unpins the stored status `status_id` for `signer`.
+///
+/// # Errors
+///
+/// [`FederationError::Transient`] for a database failure.
+async fn write_pin(
+    state: &AppState,
+    signer: &User,
+    status_id: Uuid,
+    pinning: bool,
+) -> Result<(), FederationError> {
+    let written = if pinning {
+        pinned_status::pin(&state.db, signer.id, status_id)
+            .await
+            .map(drop)
+    } else {
+        pinned_status::unpin(&state.db, signer.id, status_id)
+            .await
+            .map(drop)
+    };
+    written.map_err(|err| {
+        FederationError::transient("could not fold the remote activity's featured pin", &err)
+    })
+}
+
 /// The shared body of [`handle_add`] and [`handle_remove`]: the featured
 /// collection's pins, folded for the signer alone.
 async fn apply_featured_change(
@@ -139,11 +167,23 @@ async fn apply_featured_change(
             "an Add or Remove whose target is not the actor's featured collection",
         ));
     }
-    if let Some(object) = view
+    let hashtag = view
         .object
         .embedded()
-        .filter(|object| featured_hashtag::is_hashtag(object))
-    {
+        .filter(|object| featured_hashtag::is_hashtag(object));
+    // Marked before the change is looked at: a peer's cached collection can
+    // be older than this activity whether or not it folds into a row.
+    let collection = if hashtag.is_some() {
+        Collection::Tags
+    } else {
+        Collection::Pins
+    };
+    featured_live::mark(&state.db, signer.id, collection)
+        .await
+        .map_err(|err| {
+            FederationError::transient("could not record the live featured change", &err)
+        })?;
+    if let Some(object) = hashtag {
         return featured_hashtag::fold_hashtag(&state, &signer, object, pinning).await;
     }
     let Some(uri) = view.object.id() else {
@@ -167,25 +207,7 @@ async fn apply_featured_change(
             "an Add or Remove of a status its actor did not author",
         ));
     }
-    if pinning {
-        let _pinned = pinned_status::pin(&state.db, signer.id, stored.id)
-            .await
-            .map_err(|err| {
-                FederationError::transient(
-                    "could not fold the remote activity's featured pin",
-                    &err,
-                )
-            })?;
-    } else {
-        let _unpinned = pinned_status::unpin(&state.db, signer.id, stored.id)
-            .await
-            .map_err(|err| {
-                FederationError::transient(
-                    "could not fold the remote activity's featured pin",
-                    &err,
-                )
-            })?;
-    }
+    write_pin(&state, &signer, stored.id, pinning).await?;
     debug!(
         actor = %signer.nickname,
         status = %stored.id,

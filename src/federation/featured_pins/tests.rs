@@ -8,6 +8,7 @@ use axum::{
     response::{IntoResponse as _, Response},
     routing::get,
 };
+use chrono::{Duration, Utc};
 use reqwest::header::CONTENT_TYPE;
 use sqlx::PgPool;
 
@@ -527,4 +528,87 @@ async fn the_job_discards_unusable_args_and_skips_what_it_cannot_sync() {
     handle_sync(state, bare)
         .await
         .expect("an actor row without a featured url is the same");
+}
+
+/// The job inside the grace of a live pin change keeps the stored pins; once
+/// the mark is back-dated past the grace it syncs the collection again.
+#[tokio::test]
+async fn the_job_skips_a_recent_live_pin_change_and_syncs_after_the_grace() {
+    let db = crate::test_db::test_db().await.expect("test database slot");
+    let state = state(db.pool().clone());
+    let (base, server) = serve(|base| {
+        let items = [note_url(base, "listed")];
+        (Some(ordered(&featured_url(base), &items)), None)
+    })
+    .await;
+    let alice = alice(&state.db, &base).await;
+    let _row = write_actor(
+        &state.db,
+        &ActivityPubActorWrite {
+            featured_url: Some(featured_url(&base)),
+            ..ActivityPubActorWrite::bare(alice.id)
+        },
+    )
+    .await;
+    let live = stored_status(&state.db, &alice, &note_url(&base, "live")).await;
+    let _pinned = pinned_status::pin(&state.db, alice.id, live.id)
+        .await
+        .expect("the live pin stores");
+    let args = json!({"user_id": alice.id.to_string()});
+
+    featured_live::mark(&state.db, alice.id, Collection::Pins)
+        .await
+        .expect("the mark stores");
+    handle_sync(state.clone(), args.clone())
+        .await
+        .expect("the job runs");
+    assert_eq!(
+        pinned_uris(&state.db, alice.id).await,
+        [note_url(&base, "live")],
+        "inside the grace the stale collection does not undo the live pin"
+    );
+
+    featured_live::mark_at(
+        &state.db,
+        alice.id,
+        Collection::Pins,
+        Utc::now() - featured_live::FEATURED_SYNC_GRACE - Duration::seconds(1),
+    )
+    .await
+    .expect("the mark back-dates");
+    handle_sync(state.clone(), args)
+        .await
+        .expect("the job runs");
+    server.abort();
+    assert_eq!(
+        pinned_uris(&state.db, alice.id).await,
+        [note_url(&base, "listed")],
+        "past the grace the collection replaces the set"
+    );
+}
+
+/// A recent live change to the featured tags does not hold the pins back.
+#[tokio::test]
+async fn a_recent_tag_change_does_not_suppress_the_pin_sync() {
+    let db = crate::test_db::test_db().await.expect("test database slot");
+    let state = state(db.pool().clone());
+    let (base, server) = serve(|base| {
+        let items = [note_url(base, "listed")];
+        (Some(ordered(&featured_url(base), &items)), None)
+    })
+    .await;
+    let alice = alice(&state.db, &base).await;
+    featured_live::mark(&state.db, alice.id, Collection::Tags)
+        .await
+        .expect("the mark stores");
+
+    sync(&state, &alice, &json!(featured_url(&base)), None)
+        .await
+        .expect("the sync runs");
+    server.abort();
+
+    assert_eq!(
+        pinned_uris(&state.db, alice.id).await,
+        [note_url(&base, "listed")]
+    );
 }

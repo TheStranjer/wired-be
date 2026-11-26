@@ -27,6 +27,7 @@ use crate::{
         note,
     },
     models::{
+        featured_live::{self, Collection},
         featured_tag,
         user::{User, featured_tags},
     },
@@ -103,6 +104,10 @@ pub(crate) async fn sync_remote(
     actor: &Value,
     signer: Option<&Signer>,
 ) {
+    if featured_live::is_recent(&state.db, user.id, Collection::Tags).await {
+        debug!(actor = %user.ap_id, "a live tag change is recent; the collection may be cached, tags kept");
+        return;
+    }
     let names = match actor.get("featuredTags").filter(|field| !field.is_null()) {
         None => Vec::new(),
         Some(reference) => match load_collection(state, &user.ap_id, reference, signer).await {
