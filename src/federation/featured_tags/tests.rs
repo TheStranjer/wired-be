@@ -212,8 +212,8 @@ async fn a_refresh_stores_the_featured_tags_the_actor_advertises() {
 
     assert_eq!(
         featured_names(&state.db, user.id).await,
-        ["fedlab", "rust"],
-        "the collection's tags, normalized"
+        ["fedlab", "Rust"],
+        "the collection's tags, with their casing"
     );
 }
 
@@ -276,4 +276,52 @@ async fn an_inline_collection_is_read_without_a_fetch() {
     }});
     sync_remote(&state, &remote, &advert, None).await;
     assert_eq!(featured_names(&state.db, remote.id).await, ["inline"]);
+}
+
+#[tokio::test]
+async fn the_collection_keeps_the_casing_and_the_href_stays_lowercase() {
+    let db = crate::test_db::test_db().await.expect("test database slot");
+    let pool = db.pool().clone();
+    let alice = local_user(&pool, "alice").await;
+    let tag = hashtag::find_or_create(&pool, "FedLabR4")
+        .await
+        .expect("upserts")
+        .expect("usable");
+    let shown = featured_tag::display_name("#FedLabR4", &tag);
+    let featured = featured_tag::feature_as(&pool, alice.id, &tag, &shown)
+        .await
+        .expect("features");
+    assert!(featured.entry().is_some(), "the tag fits");
+
+    let document = featured_tags_document(&pool, &Config::for_tests(), &alice)
+        .await
+        .expect("the document builds");
+
+    assert_eq!(
+        document["items"],
+        json!([{
+            "type": "Hashtag",
+            "href": format!("{TEST_BASE_URL}/tags/fedlabr4"),
+            "name": "#FedLabR4",
+        }]),
+        "the name keeps the owner's casing, the href slug does not"
+    );
+}
+
+#[tokio::test]
+async fn a_refresh_follows_the_casing_the_peer_now_uses() {
+    let db = crate::test_db::test_db().await.expect("test database slot");
+    let state = state(db.pool().clone());
+    let remote = remote_user(&state.db, "bob").await;
+    let first = json!({"featuredTags": {"items": [{"type": "Hashtag", "name": "#fedlabr4"}]}});
+    sync_remote(&state, &remote, &first, None).await;
+    assert_eq!(featured_names(&state.db, remote.id).await, ["fedlabr4"]);
+
+    let second = json!({"featuredTags": {"items": [{"type": "Hashtag", "name": "#FedLabR4"}]}});
+    sync_remote(&state, &remote, &second, None).await;
+    assert_eq!(
+        featured_names(&state.db, remote.id).await,
+        ["FedLabR4"],
+        "the same tag, now in the peer's new casing, is still one row"
+    );
 }

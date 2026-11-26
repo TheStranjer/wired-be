@@ -61,7 +61,7 @@ async fn featuring_a_tag_answers_the_entity_and_lists_it() {
     let created = feature(&app, &token, "#FedLab").await;
     assert_eq!(created.status, StatusCode::OK, "the tag is featured");
     let entity = created.json_value();
-    assert_eq!(entity["name"], "fedlab", "the stored, lowercase name");
+    assert_eq!(entity["name"], "FedLab", "the casing the owner wrote");
     assert_eq!(
         entity["url"],
         format!("https://test.example/@{}/tagged/fedlab", alice.nickname)
@@ -237,7 +237,7 @@ async fn an_accounts_list_is_public_for_local_and_remote_accounts() {
     assert_eq!(mirrored.status, StatusCode::OK);
     assert_eq!(
         names(&mirrored.json_value()),
-        ["art", "fedlab"],
+        ["Art", "fedlab"],
         "the stored collection of the remote account"
     );
     for bad in [uuid::Uuid::now_v7().to_string(), "nope".to_owned()] {
@@ -379,5 +379,54 @@ async fn changing_the_set_queues_one_profile_update() {
         jobs[0]["activity"]["object"]["featuredTags"],
         format!("{ap_id}/collections/tags"),
         "the actor document carries the collection address"
+    );
+}
+
+#[tokio::test]
+async fn the_owners_casing_is_kept_and_matching_ignores_case() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let app = common::test_app(pool.clone());
+    let (alice, token) = user_and_token(&pool, "alice", "read write").await;
+
+    let created = feature(&app, &token, "FedLabR4").await;
+    assert_eq!(created.status, StatusCode::OK);
+    let entity = created.json_value();
+    assert_eq!(entity["name"], "FedLabR4", "the casing as given");
+    assert_eq!(
+        entity["url"],
+        format!("https://test.example/@{}/tagged/fedlabr4", alice.nickname),
+        "the slug stays lowercase"
+    );
+
+    let again = feature(&app, &token, "fedlabr4").await;
+    assert_eq!(again.status, StatusCode::UNPROCESSABLE_ENTITY);
+    common::assert_error(
+        &again,
+        "Validation failed: Name has already been taken",
+        "another casing is the same tag",
+    );
+
+    let _post = common::create_status(&pool, &alice, "hello #fedlabr4", Visibility::Public).await;
+    let listed = get(&app, &token, FEATURED).await.json_value();
+    assert_eq!(names(&listed), ["FedLabR4"], "the list shows the casing");
+    assert_eq!(
+        listed[0]["statuses_count"], "1",
+        "a post under #fedlabr4 counts"
+    );
+
+    let collection = common::TestRequest::get("/users/alice/collections/tags")
+        .header("accept", "application/activity+json")
+        .send(&app)
+        .await
+        .json_value();
+    assert_eq!(
+        collection["items"],
+        json!([{
+            "type": "Hashtag",
+            "href": "https://test.example/tags/fedlabr4",
+            "name": "#FedLabR4",
+        }]),
+        "the collection item keeps the casing, its href does not"
     );
 }

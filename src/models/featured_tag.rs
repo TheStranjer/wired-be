@@ -15,6 +15,7 @@
 
 use chrono::{DateTime, Utc};
 use sqlx::{PgConnection, PgPool};
+use unicode_normalization::UnicodeNormalization as _;
 use uuid::Uuid;
 
 use crate::{
@@ -58,16 +59,22 @@ const REFRESH_SQL: &str = "UPDATE featured_tags ft
 const LOCK_SQL: &str = "SELECT id FROM users WHERE id = $1 FOR UPDATE";
 
 /// [`feature`]'s insert: the pair, left alone when it already exists.
-const INSERT_SQL: &str = "INSERT INTO featured_tags (id, user_id, tag_id)
-     VALUES ($1, $2, $3)
+const INSERT_SQL: &str = "INSERT INTO featured_tags (id, user_id, tag_id, display_name)
+     VALUES ($1, $2, $3, $4)
 ON CONFLICT (user_id, tag_id) DO NOTHING";
+
+/// [`replace_all`]'s insert: the pair, with the peer's latest spelling of an
+/// existing one.
+const UPSERT_SQL: &str = "INSERT INTO featured_tags (id, user_id, tag_id, display_name)
+     VALUES ($1, $2, $3, $4)
+ON CONFLICT (user_id, tag_id) DO UPDATE SET display_name = EXCLUDED.display_name";
 
 /// The head of every [`Entry`] read: the featured row with its tag's name,
 /// as a literal so [`concat!`] can splice it into each statement.
 macro_rules! entry_select {
     () => {
-        "SELECT ft.id, ft.user_id, ft.tag_id, h.name, ft.statuses_count,
-       ft.last_status_at, ft.inserted_at
+        "SELECT ft.id, ft.user_id, ft.tag_id, COALESCE(ft.display_name, h.name) AS name,
+       h.name AS tag_name, ft.statuses_count, ft.last_status_at, ft.inserted_at
   FROM featured_tags ft
   JOIN hashtags h ON h.id = ft.tag_id"
     };
@@ -102,8 +109,11 @@ pub struct Entry {
     pub user_id: Uuid,
     /// The featured tag's row id.
     pub tag_id: Uuid,
-    /// The tag name as stored: lowercase, without the leading `#`.
+    /// The tag name as its owner wrote it, without the leading `#`.
     pub name: String,
+    /// The tag's stored name: lowercase, without the leading `#`; the slug
+    /// of its URLs.
+    pub tag_name: String,
     /// How many public and unlisted statuses of the account use the tag.
     pub statuses_count: i64,
     /// When the account last used the tag in such a status.
@@ -145,6 +155,42 @@ impl Featured {
 ///
 /// Any database failure arrives as [`AppError::Database`](crate::error::AppError).
 pub async fn feature(pool: &PgPool, user_id: Uuid, tag: &Hashtag) -> AppResult<Featured> {
+    feature_as(pool, user_id, tag, &tag.name).await
+}
+
+/// The spelling of `tag` to show when its owner wrote it as `written`.
+///
+/// Mastodon's `display_name`: the written name, trimmed, without its `#`
+/// and NFKC-folded, as long as it only differs from the stored name in case.
+/// Any other spelling falls back to the stored name.
+#[must_use]
+pub fn display_name(written: &str, tag: &Hashtag) -> String {
+    let shown: String = written
+        .trim()
+        .trim_start_matches('#')
+        .trim()
+        .nfkc()
+        .collect();
+    if shown.to_lowercase() == tag.name {
+        shown
+    } else {
+        tag.name.clone()
+    }
+}
+
+/// [`feature`], showing the tag as `shown`.
+///
+/// A tag the account already features keeps the spelling it has.
+///
+/// # Errors
+///
+/// Any database failure arrives as [`AppError::Database`](crate::error::AppError).
+pub async fn feature_as(
+    pool: &PgPool,
+    user_id: Uuid,
+    tag: &Hashtag,
+    shown: &str,
+) -> AppResult<Featured> {
     let mut tx = pool.begin().await?;
     sqlx::query(LOCK_SQL)
         .bind(user_id)
@@ -158,7 +204,7 @@ pub async fn feature(pool: &PgPool, user_id: Uuid, tag: &Hashtag) -> AppResult<F
     if usize::try_from(held).unwrap_or(usize::MAX) >= MAX_PER_USER {
         return Ok(Featured::LimitReached);
     }
-    insert_conn(&mut tx, user_id, tag.id).await?;
+    insert_conn(&mut tx, user_id, tag.id, shown).await?;
     refresh_conn(&mut tx, user_id, None).await?;
     let entry = find_conn(&mut tx, user_id, tag.id).await?;
     tx.commit().await?;
@@ -175,18 +221,19 @@ pub async fn feature(pool: &PgPool, user_id: Uuid, tag: &Hashtag) -> AppResult<F
 ///
 /// Any database failure arrives as [`AppError::Database`](crate::error::AppError).
 pub async fn replace_all(pool: &PgPool, user_id: Uuid, names: &[String]) -> AppResult<()> {
-    let mut tags: Vec<Hashtag> = Vec::new();
+    let mut tags: Vec<(Hashtag, String)> = Vec::new();
     for name in names {
         if tags.len() >= MAX_PER_USER {
             break;
         }
         if let Some(tag) = hashtag::find_or_create(pool, name).await?
-            && !tags.iter().any(|kept| kept.id == tag.id)
+            && !tags.iter().any(|(kept, _)| kept.id == tag.id)
         {
-            tags.push(tag);
+            let shown = display_name(name, &tag);
+            tags.push((tag, shown));
         }
     }
-    let ids: Vec<Uuid> = tags.iter().map(|tag| tag.id).collect();
+    let ids: Vec<Uuid> = tags.iter().map(|(tag, _)| tag.id).collect();
     let mut tx = pool.begin().await?;
     sqlx::query(LOCK_SQL)
         .bind(user_id)
@@ -199,8 +246,15 @@ pub async fn replace_all(pool: &PgPool, user_id: Uuid, names: &[String]) -> AppR
         .execute(&mut *tx)
         .await
         .map(drop)?;
-    for id in &ids {
-        insert_conn(&mut tx, user_id, *id).await?;
+    for (tag, shown) in &tags {
+        sqlx::query(UPSERT_SQL)
+            .bind(new_id())
+            .bind(user_id)
+            .bind(tag.id)
+            .bind(shown)
+            .execute(&mut *tx)
+            .await
+            .map(drop)?;
     }
     refresh_conn(&mut tx, user_id, None).await?;
     tx.commit().await?;
@@ -332,11 +386,17 @@ async fn count_conn(conn: &mut PgConnection, user_id: Uuid) -> AppResult<i64> {
 }
 
 /// Inserts the pair on `conn`, leaving an existing one alone.
-async fn insert_conn(conn: &mut PgConnection, user_id: Uuid, tag_id: Uuid) -> AppResult<()> {
+async fn insert_conn(
+    conn: &mut PgConnection,
+    user_id: Uuid,
+    tag_id: Uuid,
+    shown: &str,
+) -> AppResult<()> {
     sqlx::query(INSERT_SQL)
         .bind(new_id())
         .bind(user_id)
         .bind(tag_id)
+        .bind(shown)
         .execute(&mut *conn)
         .await
         .map(drop)?;
@@ -494,8 +554,8 @@ mod tests {
         let names = |rows: Vec<Entry>| rows.into_iter().map(|e| e.name).collect::<Vec<_>>();
         assert_eq!(
             names(list(&pool, remote.id).await.expect("reads")),
-            ["alpha", "beta", "gamma"],
-            "usable, folded names"
+            ["Alpha", "beta", "gamma"],
+            "usable names, repeats folded into the first spelling"
         );
         let many: Vec<String> = (0..15).map(|n| format!("t{n}x")).collect();
         replace_all(&pool, remote.id, &many)
@@ -535,5 +595,41 @@ mod tests {
         let _again = feature(&pool, alice.id, &rust).await.expect("features");
         assert!(unfeature_tag(&pool, alice.id, rust.id).await.expect("runs"));
         assert!(!unfeature_tag(&pool, alice.id, rust.id).await.expect("runs"));
+    }
+
+    #[tokio::test]
+    async fn the_display_name_keeps_case_and_the_tag_name_stays_lowercase() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = local_user(&pool, "alice").await;
+        let fedlab = tag(&pool, "FedLabR4").await;
+        assert_eq!(fedlab.name, "fedlabr4", "the shared row is lowercase");
+        let shown = display_name(" #FedLabR4 ", &fedlab);
+        assert_eq!(shown, "FedLabR4", "trimmed, unhashed, case kept");
+        assert_eq!(
+            display_name("other", &fedlab),
+            "fedlabr4",
+            "a foreign name is refused"
+        );
+
+        let entry = feature_as(&pool, alice.id, &fedlab, &shown)
+            .await
+            .expect("features")
+            .entry()
+            .expect("fits");
+        assert_eq!(entry.name, "FedLabR4");
+        assert_eq!(entry.tag_name, "fedlabr4");
+
+        let again = feature_as(&pool, alice.id, &fedlab, "FEDLABR4")
+            .await
+            .expect("features");
+        assert!(matches!(&again, Featured::Existing(kept) if kept.name == "FedLabR4"));
+
+        let plain = feature(&pool, alice.id, &tag(&pool, "plain").await)
+            .await
+            .expect("features")
+            .entry()
+            .expect("fits");
+        assert_eq!(plain.name, "plain", "`feature` shows the stored name");
     }
 }

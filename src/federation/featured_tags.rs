@@ -61,19 +61,25 @@ pub async fn featured_tags_document(
     } else {
         Vec::new()
     };
-    let names: Vec<&str> = entries.iter().map(|entry| entry.name.as_str()).collect();
-    Ok(collection_json(&featured_tags(&user.ap_id), config, &names))
+    Ok(collection_json(
+        &featured_tags(&user.ap_id),
+        config,
+        &entries,
+    ))
 }
 
-/// The collection document for the tag `names`.
-fn collection_json(id: &str, config: &Config, names: &[&str]) -> Value {
-    let items: Vec<Value> = names
+/// The collection document for the featured `entries`.
+///
+/// Each item's `name` keeps the owner's casing; its `href` slug is the
+/// lowercase tag.
+fn collection_json(id: &str, config: &Config, entries: &[featured_tag::Entry]) -> Value {
+    let items: Vec<Value> = entries
         .iter()
-        .map(|name| {
+        .map(|entry| {
             json!({
                 "type": HASHTAG,
-                "href": format!("{}/tags/{name}", config.base_url),
-                "name": format!("#{name}"),
+                "href": format!("{}/tags/{}", config.base_url, entry.tag_name),
+                "name": format!("#{}", entry.name),
             })
         })
         .collect();
