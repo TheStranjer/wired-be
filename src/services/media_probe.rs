@@ -20,7 +20,7 @@
 mod frame;
 mod mp3;
 
-pub use frame::{FFMPEG, extract_frame};
+pub use frame::{extract_frame, frame_seek};
 
 /// What a container's headers say about its media.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]

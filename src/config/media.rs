@@ -6,18 +6,19 @@ use super::Config;
 
 use super::{
     defaults::{
-        DEFAULT_MEDIA_PROXY_CACHE_LIMIT, DEFAULT_MEDIA_PROXY_ENABLED,
+        DEFAULT_FFMPEG_PATH, DEFAULT_MEDIA_PROXY_CACHE_LIMIT, DEFAULT_MEDIA_PROXY_ENABLED,
         DEFAULT_MEDIA_PROXY_MAX_BYTES, DEFAULT_RICH_MEDIA_IGNORE_HOSTS, DEFAULT_RICH_MEDIA_REMOTE,
-        MIN_MEDIA_PROXY_SECRET_CHARS,
+        FFMPEG_DISABLED, MIN_MEDIA_PROXY_SECRET_CHARS,
     },
     error::ConfigError,
     federation_types::Toggle,
     integrations::MediaProxyConfig,
     parse::{boolean, comma_list, number, trimmed, trimmed_url},
     vars::{
-        MEDIA_PROXY_BASE_URL_VAR, MEDIA_PROXY_BLACKLIST_VAR, MEDIA_PROXY_CACHE_LIMIT_VAR,
-        MEDIA_PROXY_ENABLED_VAR, MEDIA_PROXY_MAX_BYTES_VAR, MEDIA_PROXY_PURGE_URL_VAR,
-        MEDIA_PROXY_SECRET_VAR, RICH_MEDIA_IGNORE_HOSTS_VAR, RICH_MEDIA_REMOTE_VAR,
+        FFMPEG_PATH_VAR, MEDIA_PROXY_BASE_URL_VAR, MEDIA_PROXY_BLACKLIST_VAR,
+        MEDIA_PROXY_CACHE_LIMIT_VAR, MEDIA_PROXY_ENABLED_VAR, MEDIA_PROXY_MAX_BYTES_VAR,
+        MEDIA_PROXY_PURGE_URL_VAR, MEDIA_PROXY_SECRET_VAR, RICH_MEDIA_IGNORE_HOSTS_VAR,
+        RICH_MEDIA_REMOTE_VAR,
     },
 };
 
@@ -65,6 +66,18 @@ where
     })
 }
 
+/// Reads `FFMPEG_PATH`: the program a video's preview frame is rendered
+/// with, trimmed — [`DEFAULT_FFMPEG_PATH`] when unset or blank, `None` when
+/// the value is `off` (any case), which turns frame extraction off.
+pub(crate) fn ffmpeg_path<F>(lookup: &F) -> Option<String>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let program =
+        trimmed(lookup, FFMPEG_PATH_VAR).unwrap_or_else(|| DEFAULT_FFMPEG_PATH.to_owned());
+    (!program.eq_ignore_ascii_case(FFMPEG_DISABLED)).then_some(program)
+}
+
 /// Reads `RICH_MEDIA_IGNORE_HOSTS`: the comma-separated list of hosts rich
 /// media card fetching never visits, empty when unset or blank — the same
 /// trimmed-list reading as the media proxy's blacklist.
@@ -99,6 +112,39 @@ mod tests {
     use super::*;
 
     use crate::config::test_support::{config_with, try_config_with};
+
+    #[test]
+    fn ffmpeg_defaults_to_the_program_on_path() {
+        assert_eq!(
+            config_with(&[]).ffmpeg_path.as_deref(),
+            Some("ffmpeg"),
+            "default FFMPEG_PATH"
+        );
+        assert_eq!(
+            config_with(&[(FFMPEG_PATH_VAR, "  ")])
+                .ffmpeg_path
+                .as_deref(),
+            Some("ffmpeg"),
+            "a blank FFMPEG_PATH is the default"
+        );
+    }
+
+    #[test]
+    fn ffmpeg_path_is_read_trimmed_and_can_be_turned_off() {
+        let custom = config_with(&[(FFMPEG_PATH_VAR, " /opt/ffmpeg/bin/ffmpeg ")]);
+        assert_eq!(
+            custom.ffmpeg_path.as_deref(),
+            Some("/opt/ffmpeg/bin/ffmpeg"),
+            "custom FFMPEG_PATH"
+        );
+        for spelling in ["off", "OFF", " Off "] {
+            assert_eq!(
+                config_with(&[(FFMPEG_PATH_VAR, spelling)]).ffmpeg_path,
+                None,
+                "`{spelling}` disables frame extraction"
+            );
+        }
+    }
 
     #[test]
     fn media_proxy_defaults_to_disabled_passthrough() {

@@ -93,6 +93,9 @@ pub const MAX_REMOTE_MENTION_LOOKUPS_VAR: &str = "MAX_REMOTE_MENTION_LOOKUPS";
 pub const HTTP_ALLOW_PRIVATE_HOSTS_VAR: &str = "HTTP_ALLOW_PRIVATE_HOSTS";
 /// Environment variable holding the directory uploaded files are stored in.
 pub const UPLOADS_DIR_VAR: &str = "UPLOADS_DIR";
+/// Environment variable holding the `ffmpeg` program a video upload's
+/// preview frame is rendered with (`off` disables it).
+pub const FFMPEG_PATH_VAR: &str = "FFMPEG_PATH";
 /// Environment variable holding the directory emoji packs are stored in.
 pub const EMOJI_DIR_VAR: &str = "EMOJI_DIR";
 /// Environment variable holding the directory the instance documents

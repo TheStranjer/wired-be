@@ -137,10 +137,32 @@ pub(crate) fn attachment_json(media: &MediaAttachment) -> Value {
             put("duration", json!(duration));
         }
         if let Some(preview) = &media.preview_url {
-            put("icon", json!({ "type": TYPE_IMAGE, "url": preview }));
+            put(
+                "icon",
+                json!({
+                    "type": TYPE_IMAGE,
+                    "mediaType": preview_media_type(preview),
+                    "url": preview,
+                }),
+            );
         }
     }
     Value::Object(fields)
+}
+
+/// The `MIME` type of a stored preview image, read from its url's
+/// extension: the encoder writes `JPEG` unless the picture has
+/// transparency to keep (`PNG`), and a client-supplied preview is stored
+/// re-encoded under the type the encoder wrote, so the extension is the
+/// truth; anything unrecognised is `image/jpeg`, the common case.
+fn preview_media_type(url: &str) -> &'static str {
+    let path = url.split(['?', '#']).next().unwrap_or(url);
+    match path.rsplit_once('.').map(|(_, extension)| extension) {
+        Some(extension) if extension.eq_ignore_ascii_case("png") => "image/png",
+        Some(extension) if extension.eq_ignore_ascii_case("gif") => "image/gif",
+        Some(extension) if extension.eq_ignore_ascii_case("webp") => "image/webp",
+        _ => "image/jpeg",
+    }
 }
 
 /// Whether `content_type` is a video or audio type, the kinds that carry a
@@ -438,9 +460,33 @@ mod tests {
                 "width": 640,
                 "height": 360,
                 "duration": "PT3.75S",
-                "icon": {"type": "Image", "url": format!("{BASE}/media/clip_small.jpg")},
+                "icon": {
+                    "type": "Image",
+                    "mediaType": "image/jpeg",
+                    "url": format!("{BASE}/media/clip_small.jpg"),
+                },
             }),
             "a video carries width, height, duration and a preview icon"
+        );
+    }
+
+    #[test]
+    fn the_icon_media_type_follows_the_stored_previews_extension() {
+        for (url, expected) in [
+            ("https://x.example/media/a_small.jpg", "image/jpeg"),
+            ("https://x.example/media/a_small.PNG", "image/png"),
+            ("https://x.example/media/a_small.webp?v=2", "image/webp"),
+            ("https://x.example/media/a_small.gif#t", "image/gif"),
+            ("https://x.example/media/a_small", "image/jpeg"),
+        ] {
+            assert_eq!(preview_media_type(url), expected, "{url}");
+        }
+        let mut song = fixture_media(&format!("{BASE}/media/song.mp3"), "audio/mpeg");
+        song.preview_url = Some(format!("{BASE}/media/cover.png"));
+        assert_eq!(
+            attachment_json(&song)["icon"]["mediaType"],
+            "image/png",
+            "audio with a cover federates its icon too"
         );
     }
 
