@@ -45,10 +45,6 @@ const REMOTE_THREAD_CONTEXT_SQL: &str = "SELECT s.ap_context FROM statuses s
     ORDER BY s.id
        LIMIT 1";
 
-/// [`conversation_root_is_remote`]: the `local` flag of the conversation's
-/// root row.
-const ROOT_LOCAL_SQL: &str = "SELECT local FROM statuses WHERE id = $1";
-
 /// Fetches the live status whose primary key is `id`, `None` when no row
 /// matches or when the row is a tombstone.
 ///
@@ -138,23 +134,6 @@ pub async fn remote_thread_context(
         .fetch_optional(pool)
         .await?;
     Ok(context)
-}
-
-/// Whether the root of conversation `conversation_id` is a mirrored status.
-///
-/// `false` for a locally rooted conversation and for an id no status
-/// carries; the context collection only answers for the former's owner.
-///
-/// # Errors
-///
-/// Any database failure (connection, encoding) arrives as
-/// [`AppError::Database`](crate::error::AppError).
-pub async fn conversation_root_is_remote(pool: &PgPool, conversation_id: Uuid) -> AppResult<bool> {
-    let local = sqlx::query_scalar::<_, bool>(ROOT_LOCAL_SQL)
-        .bind(conversation_id)
-        .fetch_optional(pool)
-        .await?;
-    Ok(local == Some(false))
 }
 
 /// Fetches the live statuses whose ids are in `ids`, in `id` order (`UUIDv7`
