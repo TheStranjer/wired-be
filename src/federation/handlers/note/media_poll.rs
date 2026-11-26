@@ -304,6 +304,8 @@ mod tests {
             height: None,
             focus_x: Some(focus.0),
             focus_y: Some(focus.1),
+            preview_url: None,
+            duration: None,
         }
     }
 

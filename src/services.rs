@@ -128,6 +128,7 @@ pub mod filter;
 pub mod ingest;
 pub mod instance_actor;
 pub mod instance_meta;
+pub mod media_probe;
 pub mod media_processing;
 pub mod media_proxy;
 pub mod mentions;

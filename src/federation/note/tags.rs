@@ -105,6 +105,9 @@ pub(super) fn attachments_json(attachments: &[MediaAttachment]) -> Vec<Value> {
 ///
 /// `focalPoint` (`[x, y]`, Mastodon's `-1..1` convention) and `width` /
 /// `height` appear only when the row stores them; `blurhash` only when set.
+/// A video or audio file also states its `duration` (an `ISO 8601`
+/// duration, as `PeerTube` and Pleroma write it) and, when it has a stored
+/// preview, an `icon` `Image` pointing at it — never the media file itself.
 pub(crate) fn attachment_json(media: &MediaAttachment) -> Value {
     let class = if media.content_type.starts_with("image/") {
         TYPE_IMAGE
@@ -129,7 +132,33 @@ pub(crate) fn attachment_json(media: &MediaAttachment) -> Value {
         put("width", json!(width));
         put("height", json!(height));
     }
+    if is_timed(&media.content_type) {
+        if let Some(duration) = media.duration.and_then(iso_duration) {
+            put("duration", json!(duration));
+        }
+        if let Some(preview) = &media.preview_url {
+            put("icon", json!({ "type": TYPE_IMAGE, "url": preview }));
+        }
+    }
     Value::Object(fields)
+}
+
+/// Whether `content_type` is a video or audio type, the kinds that carry a
+/// duration and a preview `icon`.
+fn is_timed(content_type: &str) -> bool {
+    content_type.starts_with("video/") || content_type.starts_with("audio/")
+}
+
+/// `seconds` as an `ISO 8601` duration (`PT3.75S`), to the millisecond with
+/// trailing zeros dropped; `None` for a length that is not a positive,
+/// finite number.
+fn iso_duration(seconds: f64) -> Option<String> {
+    if !seconds.is_finite() || seconds <= 0.0 {
+        return None;
+    }
+    let text = format!("{seconds:.3}");
+    let trimmed = text.trim_end_matches('0').trim_end_matches('.');
+    (!trimmed.is_empty() && trimmed != "0").then(|| format!("PT{trimmed}S"))
 }
 
 /// The `[x, y]` focal point of `media`, when both axes are stored and finite.
@@ -386,6 +415,88 @@ mod tests {
         assert_eq!(rendered["type"], "Document", "audio is a Document");
         for key in ["width", "height", "focalPoint", "blurhash"] {
             assert!(rendered.get(key).is_none(), "{key} is omitted");
+        }
+    }
+
+    #[test]
+    fn a_video_states_its_size_duration_and_preview_icon() {
+        let mut clip = fixture_media(&format!("{BASE}/media/clip.mp4"), "video/mp4");
+        clip.width = Some(640);
+        clip.height = Some(360);
+        clip.duration = Some(3.75);
+        clip.preview_url = Some(format!("{BASE}/media/clip_small.jpg"));
+        clip.blurhash = Some("UBLHZ;9a".to_owned());
+        let rendered = attachment_json(&clip);
+        assert_eq!(
+            rendered,
+            json!({
+                "type": "Document",
+                "mediaType": "video/mp4",
+                "url": format!("{BASE}/media/clip.mp4"),
+                "name": "",
+                "blurhash": "UBLHZ;9a",
+                "width": 640,
+                "height": 360,
+                "duration": "PT3.75S",
+                "icon": {"type": "Image", "url": format!("{BASE}/media/clip_small.jpg")},
+            }),
+            "a video carries width, height, duration and a preview icon"
+        );
+    }
+
+    #[test]
+    fn audio_states_a_duration_and_no_size() {
+        let mut song = fixture_media(&format!("{BASE}/media/song.mp3"), "audio/mpeg");
+        song.duration = Some(61.0);
+        let rendered = attachment_json(&song);
+        assert_eq!(rendered["duration"], "PT61S", "whole seconds drop the dot");
+        for key in ["width", "height", "icon"] {
+            assert!(rendered.get(key).is_none(), "{key} is omitted");
+        }
+    }
+
+    #[test]
+    fn a_timed_file_without_the_facts_omits_the_keys() {
+        let clip = fixture_media(&format!("{BASE}/media/clip.mp4"), "video/mp4");
+        let rendered = attachment_json(&clip);
+        for key in ["width", "height", "duration", "icon"] {
+            assert!(rendered.get(key).is_none(), "{key} is omitted");
+        }
+        let mut bad = fixture_media(&format!("{BASE}/media/bad.mp4"), "video/mp4");
+        for length in [0.0, -1.0, f64::NAN, f64::INFINITY, 0.0004] {
+            bad.duration = Some(length);
+            assert!(
+                attachment_json(&bad).get("duration").is_none(),
+                "{length} is no duration"
+            );
+        }
+    }
+
+    #[test]
+    fn an_image_never_gets_a_duration_or_icon() {
+        let mut photo = fixture_media(&format!("{BASE}/media/photo.png"), "image/png");
+        photo.duration = Some(2.0);
+        photo.preview_url = Some(format!("{BASE}/media/photo_small.jpg"));
+        let rendered = attachment_json(&photo);
+        for key in ["duration", "icon"] {
+            assert!(rendered.get(key).is_none(), "{key} is for video and audio");
+        }
+    }
+
+    #[test]
+    fn durations_render_to_the_millisecond_without_trailing_zeros() {
+        for (seconds, expected) in [
+            (3.75, "PT3.75S"),
+            (30.0, "PT30S"),
+            (100.5, "PT100.5S"),
+            (0.001, "PT0.001S"),
+            (12.3456, "PT12.346S"),
+        ] {
+            assert_eq!(
+                iso_duration(seconds).as_deref(),
+                Some(expected),
+                "{seconds}s"
+            );
         }
     }
 

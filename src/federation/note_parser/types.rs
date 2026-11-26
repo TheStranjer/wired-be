@@ -122,6 +122,12 @@ pub struct ParsedAttachment {
     pub focus_x: Option<f32>,
     /// Vertical focal point from `focalPoint`, if the entry carries one.
     pub focus_y: Option<f32>,
+    /// The `http(s)` url of the entry's preview image (`icon` or
+    /// `preview`), if it names one.
+    pub preview_url: Option<String>,
+    /// Length in seconds from the entry's `duration` (`ISO 8601` or a
+    /// number), if it states a plausible one.
+    pub duration: Option<f64>,
 }
 
 /// A `Question`'s poll as the document states it.

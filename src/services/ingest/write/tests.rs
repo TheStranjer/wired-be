@@ -94,6 +94,15 @@ fn satellites_object() -> Value {
                 "url": "https://remote.example/media/a.jpg",
                 "name": "First"
             },
+            {
+                "type": "Document",
+                "mediaType": "video/mp4",
+                "url": "https://remote.example/media/c.mp4",
+                "width": 1280,
+                "height": 720,
+                "duration": "PT1M30S",
+                "icon": { "type": "Image", "url": "https://remote.example/media/c-thumb.jpg" }
+            },
         ],
     })
 }
@@ -102,7 +111,7 @@ fn satellites_object() -> Value {
 /// order, unowned, with the stated url, alt text, placeholder and
 /// dimensions kept.
 fn assert_media_rows(media: &[media_attachment::MediaAttachment]) {
-    assert_eq!(media.len(), 2, "both attachments land");
+    assert_eq!(media.len(), 3, "all three attachments land");
     assert_eq!(
         media[0].url, "https://remote.example/media/b.png",
         "in document order"
@@ -125,6 +134,25 @@ fn assert_media_rows(media: &[media_attachment::MediaAttachment]) {
     );
     assert_eq!(media[0].width, Some(640), "and its dimensions");
     assert_eq!(media[0].height, Some(480), "both");
+    assert!(
+        media[0].preview_url.is_none() && media[0].duration.is_none(),
+        "an image states no preview or length"
+    );
+    assert_eq!(
+        media[2].preview_url.as_deref(),
+        Some("https://remote.example/media/c-thumb.jpg"),
+        "the video's icon is its preview"
+    );
+    assert_eq!(
+        media[2].duration,
+        Some(90.0),
+        "its ISO 8601 length in seconds"
+    );
+    assert_eq!(
+        (media[2].width, media[2].height),
+        (Some(1280), Some(720)),
+        "and its size"
+    );
 }
 
 #[tokio::test]
@@ -377,7 +405,7 @@ async fn a_lost_uri_race_reports_raced_and_writes_nothing() {
         .expect("the media reads")
         .remove(&winner.id)
         .expect("the winner keeps its media");
-    assert_eq!(media.len(), 2, "the loser added no media");
+    assert_eq!(media.len(), 3, "the loser added no media");
 }
 
 #[tokio::test]

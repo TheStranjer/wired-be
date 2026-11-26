@@ -66,9 +66,11 @@ pub struct MediaAttachment {
     pub media_type: AttachmentType,
     /// The public URL of the media file.
     pub url: String,
-    /// The preview/thumbnail URL; falls back to [`url`](Self::url) when
-    /// the row stores none.
-    pub preview_url: String,
+    /// The preview/thumbnail URL. An image without a stored preview falls
+    /// back to [`url`](Self::url) (it is its own thumbnail); every other
+    /// kind without one is `null`, because clients render this in an
+    /// `<img>` and a video or audio file is not an image.
+    pub preview_url: Option<String>,
     /// The original URL of remote media; `null` for local uploads.
     pub remote_url: Option<String>,
     /// A URL clients may link to as plain text: the same as
@@ -93,7 +95,7 @@ impl MediaAttachment {
     ///
     /// Pure (decision 3): every value comes from the row or `config` —
     /// the media type from the content type, `preview_url` falling back
-    /// to the public URL, `meta` assembled from whichever detection
+    /// to the public URL for images only, `meta` assembled from whichever detection
     /// columns are filled. `url`, `preview_url` and `text_url` pass
     /// through the media proxy helper; `remote_url` keeps the stored
     /// origin verbatim.
@@ -102,7 +104,7 @@ impl MediaAttachment {
         let media_type = type_for_content_type(&row.content_type);
         let url = media_proxy::proxy_url(config, &row.url);
         let preview_url =
-            media_proxy::proxy_url(config, row.preview_url.as_deref().unwrap_or(&row.url));
+            preview_source(row, media_type).map(|source| media_proxy::proxy_url(config, source));
         Self {
             id: row.id.to_string(),
             media_type,
@@ -115,6 +117,18 @@ impl MediaAttachment {
             blurhash: row.blurhash.clone(),
             pleroma: json!({ "mime_type": row.content_type }),
         }
+    }
+}
+
+/// The stored URL a row's `preview_url` renders from: its own preview when
+/// it has one, the media file itself for an image (which previews as
+/// itself), and nothing for any other kind — a video or audio file is no
+/// image, so it is never offered as one.
+fn preview_source(row: &AttachmentRow, kind: AttachmentType) -> Option<&str> {
+    match (row.preview_url.as_deref(), kind) {
+        (Some(preview), _) => Some(preview),
+        (None, AttachmentType::Image) => Some(&row.url),
+        (None, _) => None,
     }
 }
 
@@ -376,14 +390,49 @@ mod tests {
             "an empty stored description renders as null"
         );
         assert_eq!(
-            value["preview_url"], value["url"],
-            "a row without a preview falls back to the file url"
+            value["preview_url"],
+            Value::Null,
+            "a video without a preview never offers the file as one"
         );
         assert_eq!(
             value["pleroma"],
             serde_json::json!({ "mime_type": "video/mp4" }),
             "pleroma carries the mime type"
         );
+    }
+
+    #[test]
+    fn video_and_audio_previews_are_the_stored_ones_or_null() {
+        for content_type in ["video/mp4", "audio/mpeg", "application/pdf"] {
+            let mut row = base_row(content_type);
+            assert_eq!(
+                render(&row)["preview_url"],
+                Value::Null,
+                "{content_type} without a preview renders null"
+            );
+            row.preview_url = Some(format!("{BASE}/media/9b3c1d0e4f5a6b7c_small.jpg"));
+            let value = render(&row);
+            assert_eq!(
+                value["preview_url"],
+                format!("{BASE}/media/9b3c1d0e4f5a6b7c_small.jpg"),
+                "{content_type} with a preview renders it"
+            );
+            assert_ne!(value["preview_url"], value["url"], "never the media url");
+        }
+    }
+
+    #[test]
+    fn a_remote_video_with_a_federated_icon_previews_as_the_icon() {
+        let mut row = base_row("video/mp4");
+        row.remote_url = Some("https://remote.example/media/clip.mp4".to_owned());
+        row.url = "https://remote.example/media/clip.mp4".to_owned();
+        row.preview_url = Some("https://remote.example/media/clip-thumb.jpg".to_owned());
+        let value = render(&row);
+        assert_eq!(
+            value["preview_url"], "https://remote.example/media/clip-thumb.jpg",
+            "the icon the remote federated"
+        );
+        assert_eq!(value["url"], "https://remote.example/media/clip.mp4");
     }
 
     #[test]

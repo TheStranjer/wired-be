@@ -1,45 +1,60 @@
-//! The analysis an `image/*` upload goes through before anything is stored.
+//! The analysis an `image/*`, `video/*` or `audio/*` upload goes through
+//! before anything is stored.
 //!
 //! `analyze_upload` runs the blocking-pool pass — decoding the header,
 //! rendering the `_small` preview and computing the `Blurhash` — and
 //! `detect_stored` folds what it found into the `Detection` the row
 //! records, once the generated preview did (or did not) reach storage.
+//! A video or audio file is not decoded: its container headers give the
+//! duration and the picture size ([`media_probe`]), and a video's first
+//! frame, when `ffmpeg` is available, goes through the same preview and
+//! `Blurhash` pass an image does.
 //! `detect_media_type` is the magic-byte gate every stored file passes
 //! through, upload and replacement thumbnail alike. The pipeline that
 //! calls these is `store_upload` in the sibling `upload`; the constants
 //! they read live in this module's parent.
 
 use axum::body::Bytes;
+use tokio::sync::OwnedSemaphorePermit;
 use tracing::warn;
 
 use crate::{
     error::{AppError, AppResult},
     models::media_attachment::NewMediaAttachment,
-    services::media_processing::{self, ImageInfo, Thumbnail},
+    services::{
+        media_probe,
+        media_processing::{self, ImageInfo, ProcessedImage, Thumbnail},
+    },
     state::AppState,
 };
 
 use super::{THUMBNAIL_MAX_EDGE, UNSUPPORTED_FILE_TYPE, upload::Upload};
 
-/// What one blocking pass over an image upload's bytes found out: the
-/// dimensions are required, the preview and the `Blurhash` are the extras
-/// whose failure must not cost the upload.
+/// What one blocking pass over an upload's bytes found out: for an image
+/// the dimensions are required, and everything else — the preview, the
+/// `Blurhash`, a video's or audio file's size and duration — is an extra
+/// whose absence must not cost the upload.
 #[derive(Debug)]
 pub(super) struct Analyzed {
-    /// Dimensions read from the file's header.
-    info: ImageInfo,
-    /// The rendered preview, or why rendering it failed.
-    thumbnail: AppResult<Thumbnail>,
+    /// Dimensions read from the file's header, when it states any.
+    info: Option<ImageInfo>,
+    /// Length in seconds of a video or audio file that states one.
+    duration: Option<f64>,
+    /// The rendered preview, or why rendering it failed; `None` when none
+    /// was attempted (audio, or a video without a frame to render).
+    thumbnail: Option<AppResult<Thumbnail>>,
     /// `Blurhash` string; `None` when the image cannot be hashed.
     blurhash: Option<String>,
 }
 
-/// The image analysis an upload records on its row, after the generated
+/// The analysis an upload records on its row, after the generated
 /// preview did (or did not) reach storage.
 #[derive(Debug)]
 pub(super) struct Detection {
-    /// Dimensions of the original file.
-    info: ImageInfo,
+    /// Dimensions of the original file, if it stated any.
+    info: Option<ImageInfo>,
+    /// Length in seconds of a video or audio file, if it stated one.
+    duration: Option<f64>,
     /// `Blurhash` string of the original, if one was computed.
     blurhash: Option<String>,
     /// Stored preview of the original, if one was generated and stored.
@@ -62,8 +77,11 @@ impl Detection {
     /// the `Blurhash` and the preview's URL and dimensions — the columns
     /// behind the entity's `meta.original`, `meta.small` and `blurhash`.
     pub(super) fn record(&self, new: &mut NewMediaAttachment) {
-        new.width = column_dimension(self.info.width);
-        new.height = column_dimension(self.info.height);
+        if let Some(info) = self.info {
+            new.width = column_dimension(info.width);
+            new.height = column_dimension(info.height);
+        }
+        new.duration = self.duration;
         new.blurhash.clone_from(&self.blurhash);
         if let Some(preview) = &self.preview {
             new.preview_url = Some(preview.url.clone());
@@ -87,48 +105,125 @@ fn column_dimension(pixels: u32) -> Option<i32> {
     }
 }
 
-/// Read the upload's image dimensions and, for an `image/*` type, render
-/// its preview and compute its `Blurhash` — all the CPU work in one
+/// The pixel gate of `state`'s configuration as the decoder's `u64`.
+fn pixel_limit(state: &AppState) -> u64 {
+    u64::try_from(state.config.max_image_pixels).unwrap_or(u64::MAX)
+}
+
+/// Runs [`media_processing::process_image`] over `bytes` on the blocking
+/// pool, holding `permit` until the pass returns even if the request is
+/// cancelled meanwhile.
+async fn process_blocking(
+    bytes: Bytes,
+    max_pixels: u64,
+    permit: OwnedSemaphorePermit,
+) -> AppResult<ProcessedImage> {
+    tokio::task::spawn_blocking(move || {
+        let processed = media_processing::process_image(&bytes, max_pixels, THUMBNAIL_MAX_EDGE);
+        drop(permit);
+        processed
+    })
+    .await
+    .map_err(|err| AppError::Internal(format!("image analysis task did not finish: {err}")))?
+}
+
+/// Read the upload's dimensions and, for an `image/*` type, render its
+/// preview and compute its `Blurhash` — all the CPU work in one
 /// [`tokio::task::spawn_blocking`] pass, so decoders never run on the
 /// async runtime. The original is decoded once, and the pass starts only
 /// once it holds a permit from
 /// [`media_processing::decode_semaphore`], which bounds concurrent decodes
-/// process-wide. A non-image upload analyzes to `None`: there is nothing
-/// on the row for it to fill.
+/// process-wide. A `video/*` or `audio/*` upload is probed for its duration
+/// and size and a video's first frame is rendered when `ffmpeg` can; any
+/// other upload analyzes to `None`: there is nothing on the row for it to
+/// fill.
 ///
 /// # Errors
 ///
 /// [`AppError::Unprocessable`] from [`media_processing::analyze_image`] for
 /// an undecodable image ("Invalid image") or one over
 /// `MAX_IMAGE_PIXELS` ("Image too large"); [`AppError::Internal`] when the
-/// blocking task itself is gone. Thumbnail and `Blurhash` failures are not
-/// errors here — they ride along inside [`Analyzed`], because losing an
-/// extra must not fail the upload.
+/// blocking task itself is gone. Thumbnail and `Blurhash` failures — and
+/// every failure of the video and audio probing — are not errors here:
+/// they ride along inside [`Analyzed`], because losing an extra must not
+/// fail the upload.
 pub(super) async fn analyze_upload(
     state: &AppState,
     upload: &Upload,
 ) -> AppResult<Option<Analyzed>> {
-    if !upload.content_type.starts_with("image/") {
-        return Ok(None);
+    if upload.content_type.starts_with("image/") {
+        analyze_image_upload(state, upload).await.map(Some)
+    } else if upload.content_type.starts_with("video/") || upload.content_type.starts_with("audio/")
+    {
+        Ok(Some(analyze_timed_upload(state, upload).await))
+    } else {
+        Ok(None)
     }
+}
+
+/// The image arm of [`analyze_upload`]: header gate, preview and hash.
+async fn analyze_image_upload(state: &AppState, upload: &Upload) -> AppResult<Analyzed> {
     let bytes = upload.file.bytes.clone();
-    let max_pixels = u64::try_from(state.config.max_image_pixels).unwrap_or(u64::MAX);
+    let limit = pixel_limit(state);
+    let processed = process_blocking(
+        bytes,
+        limit,
+        media_processing::acquire_decode_permit(media_processing::decode_semaphore()).await?,
+    )
+    .await?;
+    Ok(Analyzed {
+        info: Some(processed.info),
+        duration: None,
+        thumbnail: Some(processed.thumbnail),
+        blurhash: processed.blurhash,
+    })
+}
+
+/// The video and audio arm of [`analyze_upload`]: the container headers'
+/// size and duration, plus a video's rendered first frame. Nothing here can
+/// fail the upload; whatever could not be found is simply left unknown.
+async fn analyze_timed_upload(state: &AppState, upload: &Upload) -> Analyzed {
+    let probed = media_probe::probe(&upload.file.bytes, upload.content_type);
+    let frame = if upload.content_type.starts_with("video/") {
+        video_frame(state, upload).await.unwrap_or_else(|err| {
+            warn!(%err, "processing the video frame failed, storing no preview");
+            None
+        })
+    } else {
+        None
+    };
+    let (thumbnail, blurhash) = frame.map_or((None, None), |processed| {
+        (Some(processed.thumbnail), processed.blurhash)
+    });
+    Analyzed {
+        info: probed
+            .dimensions
+            .map(|(width, height)| ImageInfo { width, height }),
+        duration: probed.duration,
+        thumbnail,
+        blurhash,
+    }
+}
+
+/// A video's first frame, scaled and processed like an uploaded image;
+/// `None` when `ffmpeg` is unavailable or finds no frame.
+///
+/// # Errors
+///
+/// [`AppError::Internal`] when the decode gate or the blocking task is
+/// gone.
+async fn video_frame(state: &AppState, upload: &Upload) -> AppResult<Option<ProcessedImage>> {
     let permit =
         media_processing::acquire_decode_permit(media_processing::decode_semaphore()).await?;
-    let analyzed = tokio::task::spawn_blocking(move || -> AppResult<Analyzed> {
-        // Held until the pass returns, even if the request is cancelled.
-        let processed = media_processing::process_image(&bytes, max_pixels, THUMBNAIL_MAX_EDGE);
-        drop(permit);
-        let processed = processed?;
-        Ok(Analyzed {
-            info: processed.info,
-            thumbnail: processed.thumbnail,
-            blurhash: processed.blurhash,
-        })
-    })
-    .await
-    .map_err(|err| AppError::Internal(format!("image analysis task did not finish: {err}")))??;
-    Ok(Some(analyzed))
+    let Some(frame) =
+        media_probe::extract_frame(media_probe::FFMPEG, &upload.file.bytes, THUMBNAIL_MAX_EDGE)
+            .await
+    else {
+        return Ok(None);
+    };
+    process_blocking(Bytes::from(frame), pixel_limit(state), permit)
+        .await
+        .map(Some)
 }
 
 /// Fold [`Analyzed`] into the [`Detection`] the row records: store the
@@ -138,18 +233,21 @@ pub(super) async fn analyze_upload(
 pub(super) async fn detect_stored(state: &AppState, key: &str, analyzed: Analyzed) -> Detection {
     let Analyzed {
         info,
+        duration,
         thumbnail,
         blurhash,
     } = analyzed;
     let preview = match thumbnail {
-        Ok(thumbnail) => store_generated_preview(state, key, &thumbnail).await,
-        Err(err) => {
+        Some(Ok(thumbnail)) => store_generated_preview(state, key, &thumbnail).await,
+        Some(Err(err)) => {
             warn!(%err, %key, "thumbnail generation failed, storing no preview");
             None
         }
+        None => None,
     };
     Detection {
         info,
+        duration,
         blurhash,
         preview,
     }
@@ -281,10 +379,11 @@ mod tests {
     #[test]
     fn detection_records_the_analysis_columns() {
         let detection = Detection {
-            info: ImageInfo {
+            info: Some(ImageInfo {
                 width: 1024,
                 height: 512,
-            },
+            }),
+            duration: None,
             blurhash: Some("UBLHZ;9a?wWB%%.8t7Rj".to_owned()),
             preview: Some(StoredPreview {
                 url: "https://test.example/media/u/9b3c_small.jpg".to_owned(),
@@ -323,6 +422,7 @@ mod tests {
 
         let without_preview = Detection {
             info: detection.info,
+            duration: None,
             blurhash: None,
             preview: None,
         };
@@ -346,6 +446,67 @@ mod tests {
         assert!(
             lost.blurhash.is_none(),
             "and a failed hash leaves blurhash unset"
+        );
+    }
+
+    #[test]
+    fn a_timed_detection_records_the_duration_and_the_size_it_found() {
+        let upload = Upload {
+            file: file_part("clip.mp4", "video/mp4", MP4),
+            description: None,
+            focus: None,
+            content_type: "video/mp4",
+        };
+        let detection = Detection {
+            info: Some(ImageInfo {
+                width: 640,
+                height: 360,
+            }),
+            duration: Some(12.5),
+            blurhash: Some("UBLHZ;9a?wWB%%.8t7Rj".to_owned()),
+            preview: Some(StoredPreview {
+                url: "https://test.example/media/u/9b3c_small.jpg".to_owned(),
+                width: 400,
+                height: 225,
+            }),
+        };
+        let new = upload
+            .new_attachment(
+                Uuid::now_v7(),
+                &uploader(),
+                "u/9b3c1d0e4f5a6b7c.mp4",
+                Some(&detection),
+            )
+            .expect("the fixture size is recordable");
+        assert_eq!(
+            (new.width, new.height, new.duration),
+            (Some(640), Some(360), Some(12.5)),
+            "size and duration are the probe's"
+        );
+        assert_eq!(
+            new.preview_url.as_deref(),
+            Some("https://test.example/media/u/9b3c_small.jpg"),
+            "the rendered frame is the preview"
+        );
+        assert_eq!(
+            (new.preview_width, new.preview_height),
+            (Some(400), Some(225)),
+            "with its own size"
+        );
+
+        let audio = Detection {
+            info: None,
+            duration: Some(61.0),
+            blurhash: None,
+            preview: None,
+        };
+        let song = upload
+            .new_attachment(Uuid::now_v7(), &uploader(), "u/9b3c.mp3", Some(&audio))
+            .expect("the fixture size is recordable");
+        assert_eq!(song.duration, Some(61.0), "audio keeps its length");
+        assert!(
+            song.width.is_none() && song.height.is_none() && song.preview_url.is_none(),
+            "and no picture of any kind"
         );
     }
 

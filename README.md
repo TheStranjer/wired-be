@@ -40,6 +40,11 @@ answers `Accept: text/html` with `text/html`.
 
 - Rust (stable, see `rust-version` in `Cargo.toml`)
 - PostgreSQL (the only supported database)
+- `ffmpeg` on `PATH` (optional): when present, a video upload gets a JPEG
+  preview frame and a blurhash. Without it, uploads still work: video and
+  audio duration and video dimensions are read from the file's own headers
+  (`MP4`/`MOV`/`M4A` and `MP3`) in pure Rust, and the attachment's
+  `preview_url` is `null` instead of a thumbnail.
 
 ## Configuration
 
