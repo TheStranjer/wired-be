@@ -23,7 +23,7 @@ use crate::{
     models::{
         moderation_log,
         report::{self, ReportState},
-        user::User,
+        user::{User, admin::Standing},
     },
     services::report_moderation::set_report_state,
     state::AppState,
@@ -108,13 +108,14 @@ async fn apply_action(
     account: &User,
     action: AccountAction,
 ) -> AppResult<()> {
-    if action.deactivates() {
-        let moved = helpers::set_activation(state, actor, slice::from_ref(account), false)
+    if let Some(standing) = action.standing() {
+        let moved = helpers::set_standing(state, actor, slice::from_ref(account), standing)
             .await?
             .pop()
             .ok_or(AppError::NotFound)?;
         debug!(
             account = %moved.id,
+            suspended = moved.suspended_at.is_some(),
             "admin action deactivated an account"
         );
     }
@@ -206,10 +207,13 @@ enum AccountAction {
     /// silence to model — the reads answer `silenced: false` on every row —
     /// so the entry is all of it, documented as the deliberate no-op.
     Silence,
-    /// `disable`: [`is_active`](User::is_active) off, nothing else.
+    /// `disable`: [`is_active`](User::is_active) off, nothing else; the
+    /// account reads `disabled`, and `enable` undoes it.
     Disable,
-    /// `suspend`: the same as [`Disable`](Self::Disable) — the flag off and
-    /// nothing deleted, so `enable` (or `unsuspend`) undoes it.
+    /// `suspend`: [`is_active`](User::is_active) off and
+    /// [`suspended_at`](User::suspended_at) stamped, nothing deleted; the
+    /// account reads `suspended` and federates as such, and `unsuspend` undoes
+    /// it (WBE-878).
     Suspend,
 }
 
@@ -228,7 +232,17 @@ impl AccountAction {
 
     /// Whether this action is one of the two that deactivate the account.
     const fn deactivates(self) -> bool {
-        matches!(self, Self::Disable | Self::Suspend)
+        self.standing().is_some()
+    }
+
+    /// The standing this action gives the account, `None` for the three
+    /// types that touch no flag.
+    const fn standing(self) -> Option<Standing> {
+        match self {
+            Self::Disable => Some(Standing::Disabled),
+            Self::Suspend => Some(Standing::Suspended),
+            Self::NoAction | Self::Sensitive | Self::Silence => None,
+        }
     }
 
     /// Reads the submitted `type`: [`MISSING_TYPE`] for a request that

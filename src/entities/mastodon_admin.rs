@@ -143,11 +143,13 @@ pub struct AdminAccount {
     /// Pleroma's `is_confirmed`: [`email_confirmed`](User::email_confirmed)
     /// here.
     pub confirmed: JsonBool,
-    /// Whether staff suspended the account; nothing suspends one here.
+    /// Whether the account is suspended ([`User::is_suspended`]): staff
+    /// suspended it, its origin server did, or its deletion is under way.
     pub suspended: JsonBool,
     /// Whether staff silenced it; nothing silences one here.
     pub silenced: JsonBool,
-    /// Pleroma's `disabled`: [`is_active`](User::is_active) inverted.
+    /// Pleroma's `disabled`: the account is inactive without being
+    /// [suspended](Self::suspended), so the two never both read true.
     pub disabled: JsonBool,
     /// Pleroma's `approved`: the absence of
     /// [`approval_pending`](User::approval_pending) here.
@@ -173,9 +175,9 @@ impl AdminAccount {
             invite_request: user.registration_reason.clone(),
             role: AdminRole::for_user(user),
             confirmed: JsonBool(user.email_confirmed.get()),
-            suspended: JsonBool(false),
+            suspended: JsonBool(user.is_suspended()),
             silenced: JsonBool(false),
-            disabled: JsonBool(!user.is_active.get()),
+            disabled: JsonBool(!user.is_active.get() && !user.is_suspended()),
             approved: JsonBool(!user.approval_pending.get()),
             account: Account::from_user(user, config),
         }
@@ -293,6 +295,8 @@ mod tests {
             password_reset_pending: Flag::new(false),
             email_notifications: Flag::new(true),
             deleted_at: None,
+            suspended_at: None,
+            remote_suspended: Flag::new(false),
         }
     }
 
@@ -470,5 +474,30 @@ mod tests {
             json!(false),
             "and suspension is not the same fact"
         );
+    }
+
+    /// A suspension, local or remote, reads `suspended` and not `disabled`,
+    /// whether or not the row is also inactive (WBE-878).
+    #[test]
+    fn a_suspension_reads_suspended_and_not_disabled() {
+        let local = User {
+            is_active: Flag::new(false),
+            suspended_at: Some(stamped()),
+            ..base_user("local")
+        };
+        let remote = User {
+            is_active: Flag::new(false),
+            remote_suspended: Flag::new(true),
+            ..base_user("remote")
+        };
+        for (name, row) in [("local", &local), ("remote", &remote)] {
+            let rendered = entity(row);
+            assert_eq!(rendered["suspended"], json!(true), "the {name} suspension");
+            assert_eq!(
+                rendered["disabled"],
+                json!(false),
+                "is not also a disabled account ({name})"
+            );
+        }
     }
 }

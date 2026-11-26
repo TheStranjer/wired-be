@@ -361,7 +361,7 @@ async fn toggle_activation_records_each_direction() {
     );
 }
 
-/// The Mastodon admin `action` (suspend) and `enable` fire `Suspended` and `Unsuspended`.
+/// The Mastodon admin `action` (suspend) and `unsuspend` fire `Suspended` and `Unsuspended`.
 #[tokio::test]
 async fn the_mastodon_admin_action_and_enable_record_both_events() {
     let db = common::test_db().await;
@@ -376,11 +376,11 @@ async fn the_mastodon_admin_action_and_enable_record_both_events() {
         .send(&app)
         .await;
     common::assert_answer(&suspend, StatusCode::OK, "the suspend action");
-    let enable = common::TestRequest::post(&format!("{ADMIN_ACCOUNTS}/{}/enable", alice.id))
+    let unsuspend = common::TestRequest::post(&format!("{ADMIN_ACCOUNTS}/{}/unsuspend", alice.id))
         .bearer(&token)
         .send(&app)
         .await;
-    common::assert_answer(&enable, StatusCode::OK, "the enable");
+    common::assert_answer(&unsuspend, StatusCode::OK, "the unsuspend");
 
     assert_eq!(
         events_of(&alice),

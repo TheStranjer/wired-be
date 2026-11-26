@@ -53,7 +53,7 @@ mod visible;
 
 pub use account_page::{AccountPageEntry, account_page, empty_account_page};
 pub use accounts::{accounts_with_relationships, expand_accounts};
-pub use activation::set_activation;
+pub use activation::{set_activation, set_standing};
 pub use visible::{FilteredStatuses, keyed_json, render_filtered, render_visible};
 
 /// The `RESTRICT_UNAUTHENTICATED` area that closes anonymous reads of a

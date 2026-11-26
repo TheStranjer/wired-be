@@ -110,7 +110,8 @@ pub struct Account {
     /// an ordinary render has to render nothing at all.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mute_expires_at: Option<MuteExpiresAt>,
-    /// Whether the account is deactivated: `is_active` inverted.
+    /// Whether the account is suspended ([`User::is_suspended`]): a local or
+    /// remote suspension or a deletion under way, not a plain disable.
     pub suspended: JsonBool,
     /// Whether the account is rate-limited by moderation; nothing limits
     /// accounts yet, so this is always false.
@@ -316,7 +317,7 @@ mod tests {
     }
 
     #[test]
-    fn deactivated_users_are_suspended() {
+    fn suspended_users_render_suspended_and_disabled_ones_do_not() {
         let config = Config::for_tests();
         let mut alice = base_user("alice", &format!("{BASE}/users/alice"));
         assert_eq!(
@@ -326,11 +327,26 @@ mod tests {
         );
 
         alice.is_active = Flag::new(false);
+        assert_eq!(
+            render(&alice, &config)["suspended"],
+            false,
+            "a merely disabled account is not suspended"
+        );
+
+        alice.suspended_at = Some(Utc::now());
         let value = render(&alice, &config);
         assert_eq!(
             value["suspended"], true,
-            "a deactivated account renders suspended: true"
+            "a suspended account renders suspended: true"
         );
         assert_eq!(value["limited"], false, "limited stays false either way");
+
+        alice.suspended_at = None;
+        alice.remote_suspended = Flag::new(true);
+        assert_eq!(
+            render(&alice, &config)["suspended"],
+            true,
+            "so does one its origin server suspended"
+        );
     }
 }

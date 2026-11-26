@@ -86,5 +86,5 @@ pub use criterion::Criterion;
 pub use lookups::{get_by_nickname_or_id, resolve_nicknames};
 pub use mastodon::{MastodonListParams, mastodon_list};
 pub use pleroma_list::{ListFilters, ListPage, ListParams, list};
-pub use returns::{delete_user, set_active, set_approved, set_suggested};
+pub use returns::{Standing, delete_user, set_active, set_approved, set_standing, set_suggested};
 pub use writes::{Role, set_role, set_tags, staff_with_email};

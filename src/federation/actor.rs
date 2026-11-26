@@ -88,7 +88,7 @@ pub fn actor_json(
             .map(|(name, value)| (name.to_owned(), value))
             .collect(),
     );
-    super::suspended_actor::for_activity(document, user.is_active.get())
+    super::suspended_actor::for_activity(document, !user.is_suspended())
 }
 
 /// The `ActivityPub` document of the instance actor.
@@ -424,6 +424,8 @@ mod tests {
             password_reset_pending: Flag::new(false),
             email_notifications: Flag::new(true),
             deleted_at: None,
+            suspended_at: None,
+            remote_suspended: Flag::new(false),
         }
     }
 

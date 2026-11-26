@@ -221,6 +221,8 @@ pub(super) fn base_user(nickname: &str, ap_id: &str) -> User {
         password_reset_pending: Flag::new(false),
         email_notifications: Flag::new(true),
         deleted_at: None,
+        suspended_at: None,
+        remote_suspended: Flag::new(false),
     }
 }
 

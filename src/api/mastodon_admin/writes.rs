@@ -15,7 +15,10 @@ use crate::{
     entities::mastodon_admin::AdminAccount,
     error::{AppError, AppResult},
     mailer::{self, templates},
-    models::{moderation_log, user::admin},
+    models::{
+        moderation_log,
+        user::{User, admin},
+    },
     state::AppState,
 };
 
@@ -61,8 +64,12 @@ pub(super) async fn delete_account(
 /// no deletion, so the account's own credential works again on this answer
 /// and its actor document never stopped resolving (the `Unsuspended` event
 /// has `ActivityPub` send the peers a fresh `Update` without the `suspended`
-/// flag). `POST …/unsuspend` is routed here too. Re-enabling an active
-/// account writes the same `true` back and answers the same entity.
+/// flag). Re-enabling an active account writes the same `true` back and
+/// answers the same entity.
+///
+/// `enable` reverses a `disable`, not a suspension (WBE-878): a suspended
+/// account is answered as it is, with no write and no entry, and
+/// [`unsuspend_account`] is the route that lifts it.
 ///
 /// # Errors
 ///
@@ -77,12 +84,54 @@ pub(super) async fn enable_account(
 ) -> AppResult<Json<AdminAccount>> {
     admin.require(CLASS_WRITE, AREA_ACCOUNTS)?;
     let account = named_account(&state, &raw).await?;
-    let updated = helpers::set_activation(&state, &admin.0, slice::from_ref(&account), true)
+    let answered = if account.suspended_at.is_some() {
+        account
+    } else {
+        reactivate(&state, &admin.0, &account).await?
+    };
+    debug!(account = %answered.id, "admin enabled an account");
+    Ok(Json(AdminAccount::from_user(&answered, &state.config)))
+}
+
+/// `POST /api/v1/admin/accounts/{id}/unsuspend` — Mastodon's `unsuspend`:
+/// the reversal of a `suspend` (WBE-878), through the same activation write
+/// and `activate` entry as [`enable_account`].
+///
+/// Only a suspended account moves. One that is active, or disabled without a
+/// suspension, is answered as it is, with no write and no entry — `enable`
+/// is what lifts a `disable`.
+///
+/// # Errors
+///
+/// As [`enable_account`].
+pub(super) async fn unsuspend_account(
+    State(state): State<AppState>,
+    admin: AdminUser,
+    Path(raw): Path<String>,
+) -> AppResult<Json<AdminAccount>> {
+    admin.require(CLASS_WRITE, AREA_ACCOUNTS)?;
+    let account = named_account(&state, &raw).await?;
+    let answered = if account.suspended_at.is_some() {
+        reactivate(&state, &admin.0, &account).await?
+    } else {
+        account
+    };
+    debug!(account = %answered.id, "admin unsuspended an account");
+    Ok(Json(AdminAccount::from_user(&answered, &state.config)))
+}
+
+/// Activates `account` through [`helpers::set_activation`] and answers the
+/// row the write returned.
+///
+/// # Errors
+///
+/// [`AppError::NotFound`] when the write matches no row;
+/// [`AppError::Database`] from the write and the log.
+async fn reactivate(state: &AppState, actor: &User, account: &User) -> AppResult<User> {
+    helpers::set_activation(state, actor, slice::from_ref(account), true)
         .await?
         .pop()
-        .ok_or(AppError::NotFound)?;
-    debug!(account = %account.id, "admin enabled an account");
-    Ok(Json(AdminAccount::from_user(&updated, &state.config)))
+        .ok_or(AppError::NotFound)
 }
 
 /// `POST /api/v1/admin/accounts/{id}/approve` — Pleroma's `approve`: the

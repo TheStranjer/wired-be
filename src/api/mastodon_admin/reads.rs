@@ -9,7 +9,7 @@ use tracing::debug;
 
 use super::{
     AREA_ACCOUNTS, CLASS_READ, DEFAULT_LIMIT, MAX_LIMIT, ORIGIN_LOCAL, ORIGIN_REMOTE,
-    PERMISSIONS_STAFF, STATUS_ACTIVE, STATUS_DISABLED, STATUS_PENDING,
+    PERMISSIONS_STAFF, STATUS_ACTIVE, STATUS_DISABLED, STATUS_PENDING, STATUS_SUSPENDED,
 };
 use crate::{
     api::helpers::{QueryPairs, link_query},
@@ -139,7 +139,7 @@ async fn page_response(
     Ok((headers, Json(accounts)))
 }
 
-/// v1's criteria: the six booleans, each read by [`Criterion::parse`] so that
+/// v1's criteria: the seven booleans, each read by [`Criterion::parse`] so that
 /// a `false` asks for the opposite set, and the four text criteria.
 fn v1_params(query: Option<&str>) -> MastodonListParams {
     let pairs = QueryPairs::parse(query);
@@ -149,16 +149,17 @@ fn v1_params(query: Option<&str>) -> MastodonListParams {
         active: Criterion::parse(pairs.value("active").as_deref()),
         pending: Criterion::parse(pairs.value("pending").as_deref()),
         disabled: Criterion::parse(pairs.value("disabled").as_deref()),
+        suspended: Criterion::parse(pairs.value("suspended").as_deref()),
         staff: Criterion::parse(pairs.value("staff").as_deref()),
         ..text_params(&pairs)
     }
 }
 
-/// v2's criteria: the same six facts spelled as three word parameters —
-/// `origin`, `status` and `permissions` — and the four text criteria. The two
-/// `status` words with no column behind them (`silenced` and `suspended`) fall
-/// through [`word_criterion`] without matching and so filter nothing, which is
-/// how the ticket has them treated.
+/// v2's criteria: the same seven facts spelled as three word parameters —
+/// `origin`, `status` and `permissions` — and the four text criteria. The
+/// `status` word with no column behind it (`silenced`) falls through
+/// [`word_criterion`] without matching and so filters nothing, which is how the
+/// ticket has it treated.
 fn v2_params(query: Option<&str>) -> MastodonListParams {
     let pairs = QueryPairs::parse(query);
     let origin = pairs.value("origin");
@@ -170,6 +171,7 @@ fn v2_params(query: Option<&str>) -> MastodonListParams {
         active: word_criterion(status.as_deref(), STATUS_ACTIVE),
         pending: word_criterion(status.as_deref(), STATUS_PENDING),
         disabled: word_criterion(status.as_deref(), STATUS_DISABLED),
+        suspended: word_criterion(status.as_deref(), STATUS_SUSPENDED),
         staff: word_criterion(permissions.as_deref(), PERMISSIONS_STAFF),
         ..text_params(&pairs)
     }
@@ -216,6 +218,7 @@ mod tests {
                 assert_eq!(params.active, Criterion::Any, "no state filter");
                 assert_eq!(params.pending, Criterion::Any, "no approval filter");
                 assert_eq!(params.disabled, Criterion::Any, "no activation filter");
+                assert_eq!(params.suspended, Criterion::Any, "no suspension filter");
                 assert_eq!(params.staff, Criterion::Any, "no role filter");
                 assert!(
                     params.username.is_none()
@@ -337,6 +340,19 @@ mod tests {
             assert_eq!(stated, 1, "`status={status}` states exactly one criterion");
         }
 
+        let suspended = v2_params(Some("status=suspended"));
+        assert_eq!(suspended.suspended, Criterion::Only, "status=suspended");
+        assert_eq!(
+            suspended.disabled,
+            Criterion::Any,
+            "which is not `status=disabled`"
+        );
+        assert_eq!(
+            v1_params(Some("suspended=false")).suspended,
+            Criterion::Except,
+            "and v1 reads `suspended=false` as the opposite set"
+        );
+
         let unsupported = v2_params(Some("status=silenced&suspended=1"));
         assert_eq!(
             unsupported.active,
@@ -346,7 +362,7 @@ mod tests {
         assert_eq!(
             unsupported.disabled,
             Criterion::Any,
-            "and neither is a suspended one"
+            "and a v2 `suspended` key is no `status` word"
         );
         assert_eq!(
             v2_params(Some("status=Active")).active,

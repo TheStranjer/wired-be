@@ -409,6 +409,8 @@ mod tests {
             password_reset_pending: user::Flag::new(false),
             email_notifications: user::Flag::new(true),
             deleted_at: None,
+            suspended_at: None,
+            remote_suspended: user::Flag::new(false),
         }
     }
 

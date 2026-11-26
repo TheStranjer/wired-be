@@ -6,7 +6,10 @@ use crate::{
     error::AppResult,
     models::{
         moderation_log,
-        user::{User, admin},
+        user::{
+            User,
+            admin::{self, Standing},
+        },
     },
     protocols::events::{AccountEvent, dispatch},
     state::AppState,
@@ -41,9 +44,35 @@ pub async fn set_activation(
     accounts: &[User],
     active: bool,
 ) -> AppResult<Vec<User>> {
+    let standing = if active {
+        Standing::Active
+    } else {
+        Standing::Suspended
+    };
+    set_standing(state, actor, accounts, standing).await
+}
+
+/// [`set_activation`] with the kind of deactivation named (WBE-878).
+///
+/// [`Standing::Disabled`] and [`Standing::Suspended`] both deactivate and are
+/// logged as one `deactivate` entry, but only the suspension stamps
+/// [`suspended_at`](User::suspended_at), which is what the account entities
+/// and the federated actor read `suspended` from. [`Standing::Active`]
+/// reactivates and clears it.
+///
+/// # Errors
+///
+/// [`AppError::Database`](crate::error::AppError) from the writes and the log.
+pub async fn set_standing(
+    state: &AppState,
+    actor: &User,
+    accounts: &[User],
+    standing: Standing,
+) -> AppResult<Vec<User>> {
+    let active = matches!(standing, Standing::Active);
     let mut moved = Vec::with_capacity(accounts.len());
     for account in accounts {
-        if let Some(updated) = admin::set_active(&state.db, account.id, active).await? {
+        if let Some(updated) = admin::set_standing(&state.db, account.id, standing).await? {
             moved.push(updated);
         }
     }
