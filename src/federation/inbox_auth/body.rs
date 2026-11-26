@@ -1,7 +1,7 @@
 //! The shape of the received request: the body readers (the size-capped
-//! read, its JSON parse, the media-type gate), the `Signature` header's
-//! presentation (bare or under `Authorization`, read by the shared
-//! [`signature_header`]).
+//! read, its JSON parse, the media-type gate). The signatures it presents
+//! are read by the shared
+//! [`present_signatures`](crate::federation::signature::verify::present_signatures).
 
 use axum::{
     body::Body,
@@ -13,11 +13,7 @@ use serde_json::Value;
 use tracing::debug;
 
 use super::{InboxAuthError, JSON_MEDIA_TYPES};
-use crate::{
-    error::AppError,
-    federation::signature::verify::{ParsedSignature, parse_signature_header, signature_header},
-    util::media_type::essence,
-};
+use crate::{error::AppError, util::media_type::essence};
 
 /// Whether the request labels its body one of the JSON `ActivityPub` media
 /// types: the `Content-Type` up to its first `;`, trimmed and
@@ -54,15 +50,6 @@ pub(super) async fn read_limited(stream: Body, max_bytes: usize) -> Result<Bytes
 /// Parses the capped body as the JSON activity document.
 pub(super) fn parse_json_body(body: &[u8]) -> Result<Value, InboxAuthError> {
     serde_json::from_slice(body).map_err(|_err| InboxAuthError::invalid_json())
-}
-
-/// The parsed `Signature` parameters the request presents: the bare
-/// `Signature` header first, then an `Authorization: Signature ...`
-/// carrying the same ones. A header that is present but unparsable has
-/// failed to present a signature at all, so it reports the same 401.
-pub(super) fn present_signature(headers: &HeaderMap) -> Result<ParsedSignature, InboxAuthError> {
-    let raw = signature_header(headers).ok_or_else(InboxAuthError::missing_signature)?;
-    parse_signature_header(raw).map_err(|_err| InboxAuthError::missing_signature())
 }
 
 /// The text of header `name`, `None` when absent or not visible ASCII.

@@ -6,7 +6,9 @@
 //! `:authorized_fetch` mode. [`fetch_allowed`] is the gate every such route
 //! calls before it answers: while the flag is off it is the no-op every
 //! federation client expects; when on it parses the request's `Signature`
-//! header (or `Authorization: Signature ...`), finds the signing actor
+//! header (or `Authorization: Signature ...`, or the RFC 9421
+//! `Signature-Input` and `Signature` pair; a request offering both is
+//! accepted when either verifies), finds the signing actor
 //! exactly as the inbox does ([`resolve_signer`]: the stored row, else a
 //! dereference of the `keyId`'s actor), and verifies the signature through
 //! [`crate::federation::signature`] — with the inbox's once-per-window key
@@ -34,7 +36,8 @@ use crate::{
         inbox_auth::{InboxAuthError, signer::resolve_signer, verify::verify_with_refetch},
         policy::{host_refused, signer_host},
         signature::verify::{
-            SignedRequestParts, parse_signature_header, path_and_query, signature_header, verify,
+            Presented, SignedRequestParts, path_and_query, present_signatures, public_scheme,
+            signatures_offered,
         },
     },
     models::user::User,
@@ -132,7 +135,7 @@ async fn authenticated_reader(
     uri: &Uri,
     headers: &HeaderMap,
 ) -> AppResult<Option<User>> {
-    let Some(header) = signature_header(headers) else {
+    if !signatures_offered(headers) {
         // Nothing was offered: the refusal while the gate is on, the
         // legitimate anonymous read while it is off.
         return if state.config.fetch.authorized_fetch.get() {
@@ -140,25 +143,55 @@ async fn authenticated_reader(
         } else {
             Ok(None)
         };
-    };
-    // Something was offered and it cannot be read: that is a failed proof,
-    // not the absence of one.
-    let Ok(signature) = parse_signature_header(header) else {
-        tracing::debug!("the Signature header could not be parsed");
-        return Err(refusal());
-    };
+    }
+    // Something was offered; if none of it can be read, that is a failed
+    // proof, not the absence of one. A request may offer several signatures
+    // (cavage and RFC 9421): the first that proves the read wins, and the
+    // first failure is the one reported.
+    let presented = present_signatures(headers);
+    let mut failure = None;
+    for signature in &presented {
+        match prove_read(state, method, uri, headers, signature).await {
+            Ok(signer) => return Ok(Some(signer)),
+            Err(err) => {
+                if failure.is_none() {
+                    failure = Some(err);
+                }
+            }
+        }
+    }
+    if presented.is_empty() {
+        tracing::debug!("the signature headers could not be parsed");
+    }
+    Err(failure.unwrap_or_else(refusal))
+}
+
+/// Proves a read with one presented signature: resolves the key of the
+/// actor its `keyId` names (stored, or fetched once) and verifies the
+/// signature over exactly this request.
+///
+/// A signer on a reject list is the 403 `Rejected`; every other failure is
+/// the 401 refusal.
+async fn prove_read(
+    state: &AppState,
+    method: &Method,
+    uri: &Uri,
+    headers: &HeaderMap,
+    signature: &Presented,
+) -> AppResult<User> {
     // A rejected instance is turned away before its key is even resolved:
     // no lookup and no dereference is spent on a host this instance refuses.
     // An unparsable `keyId` names no host here and fails at resolution.
-    if let Some(host) = signer_host(&signature.key_id)
+    let key_id = signature.key_id();
+    if let Some(host) = signer_host(key_id)
         && host_refused(state, &host).await?
     {
-        tracing::debug!(key_id = %signature.key_id, "fetch signed by a rejected instance");
+        tracing::debug!(key_id, "fetch signed by a rejected instance");
         return Err(AppError::Forbidden(REJECTED.to_owned()));
     }
     // The inbox's resolution, with an empty body: no `Delete` of the signer
     // can be about it, so a gone actor is an unknown one here.
-    let candidate = resolve_signer(state, &signature.key_id, &json!({}))
+    let candidate = resolve_signer(state, key_id, &json!({}))
         .await
         .map_err(unresolved)?;
     let target = path_and_query(uri);
@@ -167,11 +200,12 @@ async fn authenticated_reader(
         path_and_query: &target,
         headers: headers.clone(),
     };
+    let scheme = public_scheme(&state.config.base_url);
     // The stored key first, then — once per window — the refetched one, as
     // the inbox does: a peer that rotated its key is not locked out until
     // the next scheduled mirror refresh.
-    let signer = verify_with_refetch(state, candidate, |pem| {
-        verify(&signature, &request, pem, Utc::now()).is_ok()
+    verify_with_refetch(state, candidate, |pem| {
+        signature.verify(&request, scheme, pem, Utc::now()).is_ok()
     })
     .await
     .map_err(|outcome| {
@@ -179,8 +213,7 @@ async fn authenticated_reader(
         // internally, answer the one refusal externally.
         tracing::debug!(?outcome, "the fetch signature did not verify");
         refusal()
-    })?;
-    Ok(Some(signer))
+    })
 }
 
 /// The error of a `keyId` that did not resolve to a signer: a database
@@ -832,6 +865,7 @@ mod tests {
     }
 
     mod refetch;
+    mod rfc9421;
 
     #[tokio::test]
     async fn an_authorization_signature_header_authenticates_a_fetch() {
