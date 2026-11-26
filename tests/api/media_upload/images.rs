@@ -190,8 +190,9 @@ async fn an_animated_gif_stores_first_frame_dimensions() {
     );
 }
 
-/// Video and audio uploads are not analyzed: no preview, no `Blurhash`, no
-/// dimensions — the detection columns stay as empty as they were.
+/// Video and audio files whose headers state nothing (these fixtures are bare
+/// magic bytes) detect nothing: no preview, no `Blurhash`, no dimensions, and
+/// the entity's `preview_url` is `null` rather than the media file itself.
 #[tokio::test]
 async fn video_and_audio_keep_no_detection() {
     let db = common::test_db().await;
@@ -210,12 +211,15 @@ async fn video_and_audio_keep_no_detection() {
         assert_eq!(entity["blurhash"], Value::Null, "and hashes nothing");
         assert_eq!(
             entity["preview_url"],
-            url_of(&entity),
-            "{filename} previews as the file itself"
+            Value::Null,
+            "{filename} has no preview, and the file is not offered as one"
         );
         let row = stored_row(&pool, &id).await;
         assert!(
-            row.width.is_none() && row.height.is_none() && row.blurhash.is_none(),
+            row.width.is_none()
+                && row.height.is_none()
+                && row.blurhash.is_none()
+                && row.duration.is_none(),
             "no detection columns were filled for {filename}"
         );
         assert!(row.preview_url.is_none(), "and no preview was stored");

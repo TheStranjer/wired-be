@@ -45,6 +45,13 @@
 //! on upload is still accepted and ignored: the preview is generated, not
 //! supplied.
 //!
+//! A `video/*` or `audio/*` upload is never rejected for what it contains.
+//! Its duration (and a video's picture size) is read from the container
+//! headers by [`crate::services::media_probe`] and recorded, and a video's
+//! first frame becomes the `_small.jpg` preview and `Blurhash` when
+//! `ffmpeg` is on `PATH`. Without a preview the entity's `preview_url` is
+//! `null`: it is never the media file itself.
+//!
 //! `GET /media/{id}` answers the
 //! [`MediaAttachment`](crate::entities::media_attachment::MediaAttachment)
 //! entity of an UNATTACHED upload owned by the viewer — Mastodon's

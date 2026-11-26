@@ -51,6 +51,7 @@ mod tags;
 #[cfg(test)]
 mod test_support;
 mod text;
+mod timed;
 mod types;
 
 pub use types::{

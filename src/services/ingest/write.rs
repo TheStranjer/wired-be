@@ -169,6 +169,8 @@ pub(crate) async fn insert_media(
             height: media.height,
             focus_x: media.focus_x,
             focus_y: media.focus_y,
+            preview_url: media.preview_url.clone(),
+            duration: media.duration,
             ..NewMediaAttachment::default()
         };
         media_attachment::insert(&mut *conn, &new)

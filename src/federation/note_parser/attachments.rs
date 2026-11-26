@@ -9,7 +9,7 @@ use crate::{
     util::{format::truncate_chars, url::is_http_url},
 };
 
-use super::{ATTACHMENT_TYPES, MAX_ATTACHMENTS, types::ParsedAttachment};
+use super::{ATTACHMENT_TYPES, MAX_ATTACHMENTS, timed, types::ParsedAttachment};
 
 /// The longest alt text kept, in characters; longer ones are cut.
 const MAX_DESCRIPTION_CHARS: usize = 1500;
@@ -81,6 +81,8 @@ fn parse_attachment(entry: &Value) -> Option<ParsedAttachment> {
         height: pixel_dimension(entry.get("height")),
         focus_x,
         focus_y,
+        preview_url: timed::preview_url(entry),
+        duration: timed::duration_seconds(entry),
     })
 }
 
@@ -253,6 +255,8 @@ mod tests {
                 height: Some(1080),
                 focus_x: Some(0.25),
                 focus_y: Some(-0.5),
+                preview_url: None,
+                duration: None,
             },
             "the full Document entry"
         );
@@ -271,9 +275,61 @@ mod tests {
                 height: None,
                 focus_x: None,
                 focus_y: None,
+                preview_url: None,
+                duration: None,
             },
             "the Link entry keeps its declared type"
         );
+    }
+
+    #[test]
+    fn a_video_attachment_keeps_its_icon_size_and_duration() {
+        let mut document = minimal_note();
+        document["attachment"] = json!([{
+            "type": "Document",
+            "mediaType": "video/mp4",
+            "url": "https://remote.example/media/clip.mp4",
+            "name": "a clip",
+            "blurhash": GOOD_BLURHASH,
+            "width": 640,
+            "height": 360,
+            "duration": "PT12.5S",
+            "icon": {
+                "type": "Image",
+                "mediaType": "image/jpeg",
+                "url": "https://remote.example/media/clip-thumb.jpg"
+            },
+        }]);
+        assert_eq!(
+            parse(&document).attachments,
+            [ParsedAttachment {
+                url: "https://remote.example/media/clip.mp4".to_owned(),
+                content_type: "video/mp4".to_owned(),
+                description: Some("a clip".to_owned()),
+                blurhash: Some(GOOD_BLURHASH.to_owned()),
+                width: Some(640),
+                height: Some(360),
+                focus_x: None,
+                focus_y: None,
+                preview_url: Some("https://remote.example/media/clip-thumb.jpg".to_owned()),
+                duration: Some(12.5),
+            }],
+            "the icon becomes the preview and the duration its seconds"
+        );
+    }
+
+    #[test]
+    fn an_audio_attachment_without_an_icon_has_no_preview() {
+        let mut document = minimal_note();
+        document["attachment"] = json!([{
+            "type": "Audio",
+            "mediaType": "audio/mpeg",
+            "url": "https://remote.example/media/tone.mp3",
+            "duration": 61,
+        }]);
+        let kept = parse(&document).attachments.remove(0);
+        assert_eq!(kept.preview_url, None, "no icon, no preview");
+        assert_eq!(kept.duration, Some(61.0), "a numeric duration is seconds");
     }
 
     /// An attachment entry with only a type and url.

@@ -58,8 +58,8 @@ pub struct MediaAttachment {
     pub remote_url: Option<String>,
     /// Public URL clients read.
     pub url: String,
-    /// Preview/thumbnail URL; `None` means clients fall back to
-    /// [`url`](Self::url).
+    /// Preview/thumbnail URL; `None` means an image previews as
+    /// [`url`](Self::url) and any other kind has no preview.
     pub preview_url: Option<String>,
     /// `MIME` type of the media, e.g. `image/png`.
     pub content_type: String,

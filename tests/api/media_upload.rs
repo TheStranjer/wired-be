@@ -21,5 +21,6 @@
 mod images;
 mod limits_auth;
 mod support;
+mod timed;
 mod validation;
 mod versions;
