@@ -61,7 +61,11 @@
 //!   max_id"}`; a `max_id` that is not id text is the pagination wording's
 //!   400 `"Invalid id"`.
 //!
-//! Every route is authenticated ([`AuthUser`]); the two reads require
+//! - `GET /api/v1/notifications/unread_count` — the v2 count under the
+//!   same rules (shared handler): `{"count": N}`, `limit` default 100, at
+//!   most 1000, `types[]`, `exclude_types[]`, `account_id`.
+//!
+//! Every route is authenticated ([`AuthUser`]); the reads require
 //! `read:notifications` and the five write routes `write:notifications`.
 //! The deleted-status cleanup that keeps these listings honest runs off
 //! the delete route's `after_status_deleted` hook in
@@ -85,7 +89,7 @@ use crate::{
     api::{
         chats::message_of,
         helpers::{StringList, accounts_with_relationships, distinct, keyed_json, render_filtered},
-        notifications_v2::{account_filter, type_filters},
+        notifications_v2::{account_filter, type_filters, unread_count},
     },
     auth::AuthUser,
     entities::{
@@ -128,6 +132,7 @@ pub fn router() -> Router<AppState> {
     Router::new()
         .route("/notifications", get(list))
         .route("/notifications/{id}", get(show))
+        .route("/notifications/unread_count", get(unread_count))
         .route("/notifications/clear", post(clear))
         .route("/notifications/dismiss", post(dismiss_via_body))
         .route("/notifications/{id}/dismiss", post(dismiss))

@@ -230,6 +230,41 @@ pub(super) const ROWS: &[RouteSpec] = &[
         auth: AuthClass::User,
     },
     RouteSpec {
+        method: "GET",
+        path: "/api/v1/notifications/unread_count",
+        auth: AuthClass::User,
+    },
+    RouteSpec {
+        method: "GET",
+        path: "/api/v1/notifications/policy",
+        auth: AuthClass::User,
+    },
+    RouteSpec {
+        method: "PATCH",
+        path: "/api/v1/notifications/policy",
+        auth: AuthClass::User,
+    },
+    RouteSpec {
+        method: "GET",
+        path: "/api/v1/notifications/requests",
+        auth: AuthClass::User,
+    },
+    RouteSpec {
+        method: "GET",
+        path: "/api/v1/notifications/requests/merged",
+        auth: AuthClass::User,
+    },
+    RouteSpec {
+        method: "GET",
+        path: "/api/v2/notifications/policy",
+        auth: AuthClass::User,
+    },
+    RouteSpec {
+        method: "PATCH",
+        path: "/api/v2/notifications/policy",
+        auth: AuthClass::User,
+    },
+    RouteSpec {
         method: "POST",
         path: "/api/pleroma/notifications/read",
         auth: AuthClass::User,

@@ -8,6 +8,7 @@
 //! | `POST /accounts` | core |
 //! | `GET /accounts/verify_credentials` | core |
 //! | `PATCH`/`POST /accounts/update_credentials` | core |
+//! | `GET /accounts` | `ActivityPub`-backed |
 //! | `GET /accounts/{id}` | `ActivityPub`-backed |
 //! | `GET /accounts/lookup` | `ActivityPub`-backed |
 //! | `GET /accounts/relationships` | `ActivityPub`-backed |
@@ -72,7 +73,7 @@ use self::{
     credentials::{update_credentials, verify_credentials, with_moved},
     follow::{follow_account, follow_by_uri, unfollow_account},
     follow_lists::{list_followers, list_following},
-    lookup::{lookup_account, relationships, show_account},
+    lookup::{list_accounts, lookup_account, relationships, show_account},
     notes_followers::{remove_from_followers, set_note},
     register::{confirm_email, create_account},
 };
@@ -178,6 +179,7 @@ pub fn activitypub_router(state: &AppState) -> Router<AppState> {
             "/follows",
             post(follow_by_uri).layer(crate::rate_limit::rate_limit(state, "relations_actions")),
         )
+        .route("/accounts", get(list_accounts))
         .route("/accounts/relationships", get(relationships))
         .route("/accounts/lookup", get(lookup_account))
         .route("/accounts/{id}/followers", get(list_followers))

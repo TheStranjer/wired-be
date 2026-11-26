@@ -32,7 +32,7 @@
 //!
 //! | Class | Areas |
 //! |---|---|
-//! | Core | [`apps`], the credential and departure routes of [`pleroma_account_settings`] ([`pleroma_account_settings::core_router`]), [`misc`] (`/pleroma`), the registration and credentials routes of [`accounts`], [`announcements`], [`custom_emojis`], [`instance`] (v1 and v2), [`markers`], [`media`] (v1 and v2), [`notifications`], [`notifications_v2`], [`notification_settings`], [`password_reset`], [`pleroma_settings`], [`preferences`], [`push`], [`streaming`], [`wired`] (`/api/v1/wired`), [`oauth_tokens`] (every mount), [`backups`], [`emoji_packs`], [`mfa`], the `/api/account` email-confirmation router ([`accounts::email_confirmation_router`]), the account and instance management of [`admin`] ([`admin::core_router`]) and of [`mastodon_admin`] (v1 and v2) |
+//! | Core | [`apps`], the credential and departure routes of [`pleroma_account_settings`] ([`pleroma_account_settings::core_router`]), [`misc`] (`/pleroma`), the registration and credentials routes of [`accounts`], [`announcements`], [`custom_emojis`], [`instance`] (v1 and v2), [`markers`], [`media`] (v1 and v2), [`notifications`], [`notifications_v2`], [`notification_policy`], [`notification_settings`], [`password_reset`], [`pleroma_settings`], [`preferences`], [`push`], [`streaming`], [`wired`] (`/api/v1/wired`), [`oauth_tokens`] (every mount), [`backups`], [`emoji_packs`], [`mfa`], the `/api/account` email-confirmation router ([`accounts::email_confirmation_router`]), the account and instance management of [`admin`] ([`admin::core_router`]) and of [`mastodon_admin`] (v1 and v2) |
 //! | `ActivityPub`-backed | [`account_lists`] (v1 and v2), the other routes of [`accounts`], the aliases and account moves of [`pleroma_account_settings`] ([`pleroma_account_settings::activitypub_router`] and [`pleroma_account_settings::mastodon_router`]), [`blocks`], [`conversations`] (v1 and `/pleroma/conversations`), [`domain_blocks`], [`endorsements`], [`featured_tags`], [`filters`] (v1 and v2), [`follow_requests`], [`lists`], [`mutes`], [`pleroma_accounts`], [`pleroma_bookmark_folders`], [`polls`], [`remote_interaction`], [`reports`] (v1 and `/api/v0/pleroma`), [`scheduled_statuses`], [`scrobbles`], [`search`] (v1 and v2), [`statuses`], [`tags`], [`timelines`], [`chats`] (v1 and v2), [`emoji_reactions`], [`federation_status`], [`pleroma_import`], the status, report, relay, remote-instance and chat routes of [`admin`] ([`admin::activitypub_router`]), [`mastodon_admin_reports`] |
 //!
 //! No area is left unclassified. A new client module must be classified as
@@ -108,6 +108,7 @@ pub mod mfa;
 pub mod misc;
 pub mod mutes;
 pub mod nodeinfo;
+pub mod notification_policy;
 pub mod notification_settings;
 pub mod notifications;
 pub mod notifications_v2;

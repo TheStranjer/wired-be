@@ -184,7 +184,7 @@ impl ListParams {
 /// same filters as the listing, `grouped_types[]` aside (the answer counts
 /// notifications, not groups).
 #[derive(Debug, Deserialize)]
-struct UnreadCountParams {
+pub(crate) struct UnreadCountParams {
     /// `types[]`: count only these notification types.
     #[serde(default)]
     types: Option<StringList>,
@@ -314,7 +314,7 @@ async fn list_groups(
 /// [`NotFound`](crate::error::AppError::NotFound) for an `account_id`
 /// naming no readable account;
 /// [`Database`](crate::error::AppError::Database) from the reads.
-async fn unread_count(
+pub(crate) async fn unread_count(
     State(state): State<AppState>,
     auth: AuthUser,
     OriginalUri(uri): OriginalUri,

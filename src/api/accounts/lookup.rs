@@ -1,5 +1,5 @@
 //! The single-account reads and the relationship batch:
-//! `GET /api/v1/accounts/{id}`, `…/lookup` and `…/relationships`, with
+//! `GET /api/v1/accounts?id[]=…`, `…/{id}`, `…/lookup` and `…/relationships`, with
 //! the id filtering [`known_ids`] performs for the batch.
 //!
 //! Authentication on `show` and `lookup` is optional, as in Pleroma's
@@ -42,7 +42,7 @@
 //! from [`Relationship::load_many`], one batched query set per request.
 //!
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use axum::{
     Json,
@@ -100,6 +100,64 @@ pub(super) async fn show_account(
     let found = visible_account_or_404(&state, &id, viewer.as_ref()).await?;
     require_profile_read(&state.config, viewer.as_ref(), &found)?;
     Ok(Json(render_account(&state, viewer.as_ref(), &found).await?))
+}
+
+/// How many ids one `GET /api/v1/accounts` batch takes: Mastodon's limit
+/// of 40; more is the 422 below.
+const MAX_BATCH_IDS: usize = 40;
+
+/// `GET /api/v1/accounts?id[]=a&id[]=b` — the visible accounts among the
+/// requested ids, in the order requested (Mastodon 4.3's "get multiple
+/// accounts").
+///
+/// The ids are read by [`requested_ids`], so values that are not `UUID`
+/// text drop out, a repeated id answers once, and an id that names no
+/// stored account, or one the viewer may not see (see [`visible_to`]), is
+/// skipped rather than refused. No usable `id` is the empty array. The
+/// viewer behind an optional token is the account the entities are
+/// rendered for, as in [`show_account`].
+///
+/// # Errors
+///
+/// [`AppError::Unprocessable`] for more than [`MAX_BATCH_IDS`] ids;
+/// [`AppError::Forbidden`] when a presented user token does not grant
+/// `read:accounts`, and for an anonymous request while
+/// `RESTRICT_UNAUTHENTICATED` closes the profile half of a returned
+/// account (see [`require_profile_read`]);
+/// [`AppError::Unauthorized`] from the extractor for an invalid token.
+/// Any database failure arrives through `?` as [`AppError::Database`].
+pub(super) async fn list_accounts(
+    State(state): State<AppState>,
+    auth: MaybeAuthUser,
+    uri: Uri,
+) -> AppResult<Json<Vec<Account>>> {
+    auth.require_user_scope(READ_ACCOUNTS)?;
+    let mut seen = HashSet::new();
+    let requested: Vec<Uuid> = requested_ids(uri.query())
+        .into_iter()
+        .filter(|id| seen.insert(*id))
+        .collect();
+    if requested.len() > MAX_BATCH_IDS {
+        return Err(AppError::Unprocessable(format!(
+            "Invalid parameters: id[] takes at most {MAX_BATCH_IDS} ids, got {}",
+            requested.len()
+        )));
+    }
+    let viewer = auth.0.as_ref();
+    let mut stored: HashMap<Uuid, user::User> = user::get_many(&state.db, &requested)
+        .await?
+        .into_iter()
+        .map(|found| (found.id, found))
+        .collect();
+    let mut accounts = Vec::with_capacity(requested.len());
+    for id in requested {
+        let Some(found) = stored.remove(&id).filter(|found| visible_to(found, viewer)) else {
+            continue;
+        };
+        require_profile_read(&state.config, viewer, &found)?;
+        accounts.push(render_account(&state, viewer, &found).await?);
+    }
+    Ok(Json(accounts))
 }
 
 /// The query parameters of `GET /api/v1/accounts/lookup`. The absent and

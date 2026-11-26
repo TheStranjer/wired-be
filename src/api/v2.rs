@@ -9,7 +9,8 @@ use axum::Router;
 
 use crate::{
     api::{
-        account_lists, chats, filters, instance, mastodon_admin, media, notifications_v2, search,
+        account_lists, chats, filters, instance, mastodon_admin, media, notification_policy,
+        notifications_v2, search,
     },
     state::AppState,
 };
@@ -40,6 +41,7 @@ pub fn core_router(state: &AppState) -> Router<AppState> {
         .merge(instance::v2_router())
         .merge(media::router(&state.config))
         .merge(notifications_v2::router())
+        .merge(notification_policy::v2_router())
         .nest("/admin", mastodon_admin::v2_router())
 }
 
