@@ -10,7 +10,9 @@
 //! origin, following `first` when it is paged), keeps the first 20 items
 //! that are the actor's own statuses — fetching an unknown one on the actor's
 //! origin through the object resolver — and replaces the account's pins with
-//! them. A collection that cannot be read leaves the stored pins alone.
+//! them. A collection that cannot be read leaves the stored pins alone, and
+//! so does a sync within [`FEATURED_SYNC_GRACE`](featured_live::FEATURED_SYNC_GRACE)
+//! of a live `Add`/`Remove`: the peer may still serve its cached, older set.
 //!
 //! The actor `Update` handler runs the sync inline and never fails on it;
 //! an actor fetch queues the `federator.featured_pins` job
@@ -30,7 +32,13 @@ use super::{
 };
 use crate::{
     jobs::{AttemptInfo, HandlerFuture, JobError, QUEUE_BACKGROUND, enqueue_keyed, load_user},
-    models::{activitypub_actor, job::NewJob, pinned_status, user::User},
+    models::{
+        activitypub_actor,
+        featured_live::{self, Collection},
+        job::NewJob,
+        pinned_status,
+        user::User,
+    },
     state::AppState,
     util::url::{parse_http_url, same_origin},
 };
@@ -166,6 +174,10 @@ pub(crate) async fn sync(
     featured: &Value,
     signer: Option<&Signer>,
 ) -> Result<(), FederationError> {
+    if featured_live::is_recent(&state.db, user.id, Collection::Pins).await {
+        debug!(actor = %user.ap_id, "a live pin change is recent; the collection may be cached, pins kept");
+        return Ok(());
+    }
     let Some(collection) = load_collection(state, &user.ap_id, featured, signer).await else {
         return Ok(());
     };

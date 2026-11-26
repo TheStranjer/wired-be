@@ -1,6 +1,7 @@
 //! Tests of the featured-tags refresh an actor `Update` runs.
 
 use axum::{Router, extract::State, response::IntoResponse as _, routing::get};
+use chrono::{Duration, Utc};
 use reqwest::header::CONTENT_TYPE;
 use serde_json::{Value, json};
 use sqlx::PgPool;
@@ -15,6 +16,7 @@ use crate::{
     federation::remote_actor::{parse_actor, upsert_remote_user},
     http_client::HttpClient,
     models::{
+        featured_live::{self, Collection, FEATURED_SYNC_GRACE},
         featured_tag::{self, Entry},
         hashtag,
         user::User,
@@ -221,4 +223,56 @@ async fn an_update_with_an_inline_collection_stores_its_tags() {
     fold(&state, alice, actor_document(base, Some(inline))).await;
 
     assert_eq!(featured_names(&pool, alice_id).await, ["inline"]);
+}
+
+/// An inline `featuredTags` collection listing `names`.
+fn inline_tags(names: &[&str]) -> Value {
+    let items: Vec<Value> = names
+        .iter()
+        .map(|name| json!({"type": "Hashtag", "name": format!("#{name}")}))
+        .collect();
+    json!({"type": "Collection", "totalItems": items.len(), "items": items})
+}
+
+/// An `Update` inside the grace of a live tag change keeps the stored tags; a
+/// mark back-dated past the grace lets the same `Update` replace them. A
+/// recent pin change does not hold the tag sync back.
+#[tokio::test]
+async fn an_update_inside_the_grace_of_a_live_tag_change_keeps_the_tags() {
+    let db = crate::test_db::test_db().await.expect("test database slot");
+    let pool = db.pool().clone();
+    let state = state(&pool);
+    let base = "http://127.0.0.1:9";
+    let alice = mirror_featuring(&pool, base, &["live"]).await;
+    let alice_id = alice.id;
+    let document = actor_document(base, Some(inline_tags(&["stale"])));
+
+    featured_live::mark(&pool, alice_id, Collection::Tags)
+        .await
+        .expect("the mark stores");
+    fold(&state, alice, document.clone()).await;
+    assert_eq!(
+        featured_names(&pool, alice_id).await,
+        ["live"],
+        "the cached collection does not undo the live tag"
+    );
+
+    featured_live::mark_at(
+        &pool,
+        alice_id,
+        Collection::Tags,
+        Utc::now() - FEATURED_SYNC_GRACE - Duration::seconds(1),
+    )
+    .await
+    .expect("the mark back-dates");
+    featured_live::mark(&pool, alice_id, Collection::Pins)
+        .await
+        .expect("the pin mark stores");
+    let current = ready_for_update(&pool, alice_id).await;
+    fold(&state, current, document).await;
+    assert_eq!(
+        featured_names(&pool, alice_id).await,
+        ["stale"],
+        "past the grace, and despite a recent pin change, the collection wins"
+    );
 }

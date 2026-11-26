@@ -76,6 +76,8 @@ use crate::{
 mod block;
 mod featured;
 mod featured_hashtag;
+#[cfg(test)]
+mod featured_live_tests;
 mod flag;
 mod moves;
 #[cfg(test)]
