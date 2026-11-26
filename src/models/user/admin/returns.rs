@@ -38,11 +38,19 @@ pub async fn set_suggested(pool: &PgPool, id: Uuid, suggested: bool) -> AppResul
 
 /// The `UPDATE` behind [`set_active`]: writes the activation flag,
 /// refreshes `updated_at` and returns the stored row.
-const SET_ACTIVE_SQL: &str =
-    "UPDATE users SET is_active = $2, updated_at = now() WHERE id = $1 RETURNING *";
+const SET_ACTIVE_SQL: &str = "UPDATE users
+       SET local_deactivated = NOT $2::boolean,
+           is_active = $2::boolean AND NOT remote_suspended,
+           updated_at = now()
+     WHERE id = $1 RETURNING *";
 
-/// Stores `active` as user `id`'s [`is_active`](User::is_active) flag and
-/// returns the updated row (WBE-196).
+/// Stores `active` as user `id`'s local activation and returns the updated
+/// row (WBE-196).
+///
+/// Only the local origin moves: `local_deactivated` follows `active`, and
+/// [`is_active`](User::is_active) becomes `active` unless the account's
+/// origin server has it suspended (`remote_suspended`), which a local
+/// activation does not clear (WBE-873).
 ///
 /// The write of the admin `PATCH /users/activate`, `PATCH /users/deactivate`
 /// and `PATCH /users/{nickname}/toggle_activation` trio, whose answers carry

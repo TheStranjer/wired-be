@@ -20,6 +20,11 @@ use crate::{
 /// profile, `alsoKnownAs`, `bot` and birthday columns the actor document
 /// describes plus `updated_at`, and `is_active` from the document's
 /// `suspended` flag (a mirror whose deletion started keeps its own value).
+/// The flag is stored in `remote_suspended`, the remote origin of an
+/// inactive mirror; `is_active` is the effective state and follows it only
+/// where the local origin allows: a mirror that is `local_deactivated` stays
+/// inactive when the remote lifts its suspension (WBE-873), and an `Update`
+/// that leaves the suspension as it was leaves `is_active` as it was.
 /// `local`, the login columns, the moderation
 /// roles and the denormalised counters are deliberately not touched:
 /// re-fetching a remote actor must not undo anything this instance knows
@@ -28,13 +33,18 @@ use crate::{
 const UPSERT_SQL: &str = "INSERT INTO users (
      id, nickname, ap_id, local, domain, actor_type, name, bio, raw_bio,
      avatar_url, banner_url, profile_url, locked, discoverable, fields,
-     also_known_as, bot, birthday, show_birthday, is_active
+     also_known_as, bot, birthday, show_birthday, remote_suspended, is_active
  ) VALUES (
      $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15,
-     $16, $17, $18::date, $18::date IS NOT NULL, $19
+     $16, $17, $18::date, $18::date IS NOT NULL, $19, NOT $19
  ) ON CONFLICT (ap_id) DO UPDATE SET
-     is_active = CASE WHEN users.deleted_at IS NULL THEN EXCLUDED.is_active
+     is_active = CASE WHEN users.deleted_at IS NOT NULL THEN users.is_active
+                      WHEN EXCLUDED.remote_suspended THEN false
+                      WHEN users.remote_suspended THEN NOT users.local_deactivated
                       ELSE users.is_active END,
+     remote_suspended = CASE WHEN users.deleted_at IS NULL
+                             THEN EXCLUDED.remote_suspended
+                             ELSE users.remote_suspended END,
      birthday = EXCLUDED.birthday,
      show_birthday = EXCLUDED.show_birthday,
      nickname = EXCLUDED.nickname,
@@ -163,7 +173,7 @@ pub async fn upsert_remote_user(pool: &PgPool, new: NewRemoteUser) -> Result<Use
         .bind(&new.also_known_as)
         .bind(new.bot)
         .bind(new.birthday)
-        .bind(!new.suspended.get())
+        .bind(new.suspended.get())
         .fetch_one(&mut *tx)
         .await?;
     let identity = ActivityPubActorWrite {
@@ -194,6 +204,9 @@ pub async fn upsert_remote_user(pool: &PgPool, new: NewRemoteUser) -> Result<Use
     }
     Ok(user)
 }
+
+#[cfg(test)]
+mod moderation_tests;
 
 #[cfg(test)]
 mod tests {
