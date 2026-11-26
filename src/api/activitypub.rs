@@ -31,7 +31,9 @@
 //! documents name in their `@context` — the five activity-collection
 //! documents the actor names, `GET /users/{nickname}/outbox` (and
 //! `/followers`, `/following`, `/collections/featured`) and
-//! `GET /objects/{uuid}/replies`, built by [`crate::federation::collections`]
+//! `GET /objects/{uuid}/replies` (and `GET /contexts/{uuid}`, the thread
+//! collection the notes name as their `context`), built by
+//! [`crate::federation::collections`]
 //! from the same controller's `outbox/2`, `followers/2`, `following/2`,
 //! `pinned/2` and `object_replies/2` actions — and the four inbox
 //! `POST`s of the actors those documents name (`inbox/2` feeding
@@ -184,7 +186,7 @@ use self::{
     c2s_misc::{ap_upload_media, whoami},
     inbox::{inbox, read_inbox, user_inbox},
     negotiation::{frontend_redirect, wants_activity_json, wants_html},
-    objects::{get_notice, get_object, get_replies, get_scoped_object},
+    objects::{get_context, get_notice, get_object, get_replies, get_scoped_object},
     outbox_create::update_outbox,
     quote_authorizations::get_quote_authorization,
 };
@@ -317,6 +319,7 @@ pub fn router(config: &Config) -> Router<AppState> {
         .route("/users/{nickname}/collections/featured", get(get_featured))
         .route("/users/{nickname}/collections/tags", get(get_featured_tags))
         .route("/objects/{uuid}/replies", get(get_replies))
+        .route("/contexts/{uuid}", get(get_context))
         .route("/internal/fetch", get(get_instance_actor))
         .route("/internal/fetch/outbox", get(get_instance_outbox))
         .route("/internal/fetch/followers", get(get_instance_followers))

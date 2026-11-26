@@ -176,6 +176,7 @@ pub(super) fn note_context(visibility: Visibility) -> NoteContext {
         poll: None,
         quote_uri: None,
         quote_authorization: None,
+        self_replies: Vec::new(),
         config: Config::for_tests(),
     }
 }
@@ -197,7 +198,7 @@ pub(super) fn expected_context() -> Value {
 }
 
 /// Every key a bare note object carries.
-pub(super) const NOTE_KEYS: [&str; 19] = [
+pub(super) const NOTE_KEYS: [&str; 20] = [
     "@context",
     "actor",
     "attachment",
@@ -210,6 +211,7 @@ pub(super) const NOTE_KEYS: [&str; 19] = [
     "inReplyTo",
     "interactionPolicy",
     "published",
+    "replies",
     "sensitive",
     "source",
     "summary",
@@ -221,7 +223,7 @@ pub(super) const NOTE_KEYS: [&str; 19] = [
 
 /// Terms of the `ActivityStreams` and `security` vocabularies the first two
 /// `@context` entries define, so the served schema does not have to.
-const CORE_TERMS: [&str; 36] = [
+const CORE_TERMS: [&str; 37] = [
     "actor",
     "anyOf",
     "attachment",
@@ -250,6 +252,7 @@ const CORE_TERMS: [&str; 36] = [
     "preferredUsername",
     "publicKey",
     "published",
+    "replies",
     "source",
     "summary",
     "tag",

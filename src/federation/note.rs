@@ -22,11 +22,15 @@
 //! every one of these references from its `@context`, served at
 //! [`LITEPUB_SCHEMA_PATH`] by [`crate::api::activitypub`].
 //!
-//! Deliberate deltas from Pleroma, fixed by the ticket: `likes`, `replies`,
-//! `shares` and the `emoji` map are not written into the object (readers
-//! discover them through their own collections), the internal `context_id`
-//! stays internal, and a `local`-visibility status is never federated at
-//! all — [`note_json`] and [`announce_activity_json`] answer `None` for it.
+//! Deliberate deltas from Pleroma, fixed by the ticket: `likes`, `shares`
+//! and the `emoji` map are not written into the object (readers discover
+//! them through their own collections), the internal `context_id` stays
+//! internal, and a `local`-visibility status is never federated at all —
+//! [`note_json`] and [`announce_activity_json`] answer `None` for it.
+//! `replies` is written, Mastodon's way: a `Collection` whose inline first
+//! page lists the author's own answers and whose `next` leads to everyone
+//! else's (`only_other_accounts`), so a peer that missed some answers can
+//! crawl them.
 //!
 //! The module is a thin root: the vocabulary constants and the [`NoteContext`]
 //! data live here, the object body is built in the `fields` and `tags`
@@ -95,6 +99,11 @@ const TYPE_IMAGE: &str = "Image";
 const TYPE_DOCUMENT: &str = "Document";
 /// The type of an option's vote collection.
 const TYPE_COLLECTION: &str = "Collection";
+/// The type of the `replies` collection's inline first page.
+const TYPE_COLLECTION_PAGE: &str = "CollectionPage";
+/// How many of the author's own answers the `replies` collection's inline
+/// first page lists; a longer run continues through the replies route.
+pub const SELF_REPLIES_LIMIT: i64 = 20;
 /// What Pleroma writes as the object language in the `@context` language
 /// map of a document that declares none: `und`etermined.
 pub(crate) const LANGUAGE_UNDETERMINED: &str = "und";
@@ -145,6 +154,11 @@ pub struct NoteContext {
     /// quote; `None` until an `Accept` of its `QuoteRequest` names one, and
     /// again once the grant is revoked.
     pub quote_authorization: Option<String>,
+    /// The object ids of the author's own publicly visible answers to this
+    /// status, oldest first, at most [`SELF_REPLIES_LIMIT`]: the items of
+    /// the `replies` collection's inline first page. Empty for a status
+    /// nobody (or only others) answered and for a non-public one.
+    pub self_replies: Vec<String>,
     /// The instance whose origin, schema route and language default the
     /// document is built from.
     pub config: Config,

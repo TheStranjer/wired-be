@@ -21,13 +21,14 @@ use crate::{
         hashtag,
         media_attachment::{self, MediaAttachment},
         mention, poll, quote_request,
-        status::{self, Status},
+        status::{self, Status, Visibility},
         user::{self, User},
     },
+    pagination::PageParams,
     util::emoji::is_shortcode_char,
 };
 
-use super::{NoteContext, PollData, PollOptionData};
+use super::{NoteContext, PollData, PollOptionData, SELF_REPLIES_LIMIT};
 
 /// Reads everything [`note_json`](super::note_json) needs for status `status_id`.
 ///
@@ -67,6 +68,7 @@ pub async fn load_note_context(
     let emojis = load_emojis(pool, &status, poll_data.as_ref()).await?;
     let quote_uri = load_quote_uri(pool, &status).await?;
     let quote_authorization = quote_request::accepted_authorization(pool, status.id).await?;
+    let self_replies = load_self_replies(pool, &status).await?;
     Ok(NoteContext {
         status,
         author,
@@ -79,8 +81,35 @@ pub async fn load_note_context(
         poll: poll_data,
         quote_uri,
         quote_authorization,
+        self_replies,
         config: config.clone(),
     })
+}
+
+/// The object ids of the author's own public answers to `status`.
+///
+/// Oldest first, at most [`SELF_REPLIES_LIMIT`]: the items of the
+/// `replies` collection's inline first page. A `private`, `direct` or
+/// `local` status advertises no `replies` and costs no read.
+async fn load_self_replies(pool: &PgPool, status: &Status) -> AppResult<Vec<String>> {
+    if !matches!(status.visibility, Visibility::Public | Visibility::Unlisted) {
+        return Ok(Vec::new());
+    }
+    let window = PageParams {
+        max_id: None,
+        min_id: None,
+        since_id: None,
+        limit: SELF_REPLIES_LIMIT,
+        offset: None,
+    };
+    let rows = status::public_replies_page_by(
+        pool,
+        status.id,
+        status::ReplyAuthors::Only(status.user_id),
+        &window,
+    )
+    .await?;
+    Ok(rows.into_iter().map(|row| row.uri).collect())
 }
 
 /// The answered status's object id: the stored parent's `uri` (a parent

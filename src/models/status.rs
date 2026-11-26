@@ -71,6 +71,7 @@ mod quote_policy;
 mod quoting;
 mod reads;
 mod reblogs;
+mod thread_pages;
 mod threads;
 mod types;
 
@@ -102,6 +103,9 @@ pub use reads::{
 };
 pub use reblogs::{
     create_reblog, local_reblogger_ids, reblogged_status_ids, reblogger_page, remove_reblog,
+};
+pub use thread_pages::{
+    ReplyAuthors, public_context_count, public_context_page, public_replies_page_by,
 };
 pub use threads::{ancestor_chain, descendant_tree, link_backfilled_reply};
 pub use types::{

@@ -86,6 +86,64 @@ fn mention_ap_ids(ctx: &NoteContext) -> Vec<&str> {
 }
 
 #[tokio::test]
+async fn load_note_context_lists_only_the_authors_public_self_replies() {
+    let db = crate::test_db::test_db().await.expect("test database slot");
+    let pool = db.pool().clone();
+    let alice = create_local(&pool, "selfalice").await;
+    let bob = create_local(&pool, "selfbob").await;
+    let root = post(&pool, &NewStatus::local(&alice, "thread start")).await;
+    let reply_by = |author: &User, visibility| NewStatus {
+        in_reply_to_id: Some(root.id),
+        visibility,
+        ..NewStatus::local(author, "answer")
+    };
+    let first = post(&pool, &reply_by(&alice, Visibility::Public)).await;
+    let _by_bob = post(&pool, &reply_by(&bob, Visibility::Public)).await;
+    let second = post(&pool, &reply_by(&alice, Visibility::Unlisted)).await;
+    let _private = post(&pool, &reply_by(&alice, Visibility::Private)).await;
+    let config = Config::for_tests();
+
+    let ctx = load_note_context(&pool, &config, root.id)
+        .await
+        .expect("the note context loads");
+    assert_eq!(
+        ctx.self_replies,
+        vec![first.uri.clone(), second.uri.clone()],
+        "the author's public answers, oldest first; bob's and the private one stay out"
+    );
+    let document = note_json(&ctx).expect("and the loaded context renders");
+    assert_eq!(
+        document["replies"]["first"]["items"],
+        json!([first.uri, second.uri]),
+        "they are the items of the inline first page"
+    );
+
+    let direct = post(
+        &pool,
+        &NewStatus {
+            visibility: Visibility::Direct,
+            ..NewStatus::local(&alice, "secret")
+        },
+    )
+    .await;
+    let _answer = post(
+        &pool,
+        &NewStatus {
+            in_reply_to_id: Some(direct.id),
+            ..NewStatus::local(&alice, "to myself")
+        },
+    )
+    .await;
+    let private_ctx = load_note_context(&pool, &config, direct.id)
+        .await
+        .expect("the direct note context loads");
+    assert!(
+        private_ctx.self_replies.is_empty(),
+        "a direct status advertises no replies, so none are read"
+    );
+}
+
+#[tokio::test]
 async fn load_note_context_reads_a_bare_status_with_no_satellites() {
     let db = crate::test_db::test_db().await.expect("test database slot");
     let pool = db.pool().clone();
@@ -333,7 +391,7 @@ async fn load_note_context_loads_emojis_used_only_in_the_cw_or_a_poll_option() {
 
 #[test]
 fn used_shortcodes_cover_the_cw_and_poll_options_once_each() {
-    let mut ctx = note_context(status::Visibility::Public);
+    let mut ctx = note_context(Visibility::Public);
     ctx.status.raw_text = ":a: body".to_owned();
     ctx.status.spoiler_text = ":b: :a:".to_owned();
     let poll_data = PollData {

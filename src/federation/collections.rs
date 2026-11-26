@@ -53,6 +53,12 @@ use crate::{
     pagination::{MAX_LIMIT, PageParams},
 };
 
+/// The replies collection of a status and the context collection of its
+/// thread.
+mod replies;
+
+pub use replies::{context_document, context_id, replies_document};
+
 /// The `type` of the outbox and the two follow lists: an ordered
 /// collection, walked newest-first.
 const ORDERED_COLLECTION: &str = "OrderedCollection";
@@ -75,8 +81,6 @@ const MIN_ID: &str = "min_id";
 const OUTBOX_PAGE_SIZE: i64 = 20;
 /// How many actor ids one followers/following page holds.
 const FOLLOW_PAGE_SIZE: i64 = 10;
-/// How many reply ids one replies page holds.
-const REPLIES_PAGE_SIZE: i64 = 20;
 
 /// Which side of the follow graph a route serves.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -250,8 +254,14 @@ fn json_ld_context(config: &Config) -> Value {
 /// duplicates; anything but `true` is the root.
 #[must_use]
 pub fn page_requested(query: Option<&str>) -> bool {
+    flag_set(query, "page")
+}
+
+/// Whether the query parameter `name` is `true`; a repeated parameter
+/// counts by its last value.
+fn flag_set(query: Option<&str>, name: &str) -> bool {
     form_urlencoded::parse(query.unwrap_or_default().as_bytes())
-        .filter(|(key, _value)| key == "page")
+        .filter(|(key, _value)| key == name)
         .map(|(_key, value)| value.into_owned())
         .last()
         .is_some_and(|value| value == PAGE_TRUE)
@@ -315,27 +325,6 @@ pub(crate) fn descending_page_links(
             .flatten()
             .map(|id| cursor_url(collection, MAX_ID, id)),
         prev: newest.map(|id| cursor_url(collection, MIN_ID, id)),
-    }
-}
-
-/// The envelope of one oldest-first page (the replies collection): `next`
-/// walks newer from the page's newest id while the page came back full,
-/// `prev` walks back toward the oldest end from the page's oldest id.
-fn ascending_page_links(
-    collection: &str,
-    query: Option<&str>,
-    oldest: Option<Uuid>,
-    newest: Option<Uuid>,
-    full: bool,
-) -> PageLinks {
-    PageLinks {
-        id: requested_url(collection, query),
-        part_of: collection.to_owned(),
-        next: full
-            .then_some(newest)
-            .flatten()
-            .map(|id| cursor_url(collection, MIN_ID, id)),
-        prev: oldest.map(|id| cursor_url(collection, MAX_ID, id)),
     }
 }
 
@@ -539,39 +528,6 @@ async fn featured_object(pool: &PgPool, config: &Config, row: &Status) -> AppRes
     }
 }
 
-/// The replies collection of `object`: the root with the count of
-/// publicly visible answers, or — when the query asks for a page — the
-/// 20 (`REPLIES_PAGE_SIZE`) oldest ones as their object ids.
-///
-/// # Errors
-///
-/// [`AppError::BadRequest`] when a cursor is no id; any database failure
-/// arrives as [`AppError::Database`](crate::error::AppError).
-pub async fn replies_document(
-    pool: &PgPool,
-    config: &Config,
-    object: &Status,
-    query: Option<&str>,
-) -> AppResult<Value> {
-    let id = format!("{}/replies", object.uri);
-    if !page_requested(query) {
-        let total = status::public_replies_count(pool, object.id).await?;
-        return Ok(collection_root(&id, COLLECTION, Some(total), config));
-    }
-    let page = keyset_page(query, REPLIES_PAGE_SIZE)?;
-    let rows =
-        status::public_replies_page(pool, object.id, page.min_id, page.max_id, page.limit).await?;
-    let links = ascending_page_links(
-        &id,
-        query,
-        rows.first().map(|row| row.id),
-        rows.last().map(|row| row.id),
-        full_page(rows.len(), page.limit),
-    );
-    let items = rows.iter().map(|row| json!(&row.uri)).collect();
-    Ok(collection_page(&links, items, config))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -769,27 +725,6 @@ mod tests {
         assert!(
             empty.next.is_none() && empty.prev.is_none(),
             "no items, no links"
-        );
-    }
-
-    #[test]
-    fn ascending_pages_walk_newer_and_back_to_older() {
-        let links = ascending_page_links(
-            ROOT,
-            Some("page=true"),
-            Some(oldest()),
-            Some(newest()),
-            true,
-        );
-        assert_eq!(
-            links.next.as_deref(),
-            Some(format!("{ROOT}?page=true&min_id={NEWEST}").as_str()),
-            "a full oldest-first page offers the newer page keyed on its newest id"
-        );
-        assert_eq!(
-            links.prev.as_deref(),
-            Some(format!("{ROOT}?page=true&max_id={OLDER}").as_str()),
-            "and a page back toward the oldest end keyed on its oldest"
         );
     }
 
