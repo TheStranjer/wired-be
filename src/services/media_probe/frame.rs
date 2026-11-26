@@ -18,9 +18,6 @@ use tempfile::NamedTempFile;
 use tokio::{process::Command, time::timeout};
 use tracing::{debug, warn};
 
-/// The program name looked up on `PATH`.
-pub const FFMPEG: &str = "ffmpeg";
-
 /// How long `ffmpeg` may spend on one frame before it is killed.
 const FRAME_TIMEOUT: Duration = Duration::from_secs(20);
 
@@ -50,19 +47,43 @@ async fn write_input(bytes: &[u8]) -> Option<NamedTempFile> {
     Some(file)
 }
 
-/// The first frame of the video in `bytes`, as `JPEG` bytes scaled to fit
-/// within `max_edge` pixels on both edges.
+/// The latest point of a video, in seconds, its preview frame is taken at.
+const MAX_SEEK_SECONDS: f64 = 1.0;
+
+/// Where in a video of `duration` seconds its preview frame is taken.
 ///
-/// `program` is the `ffmpeg` binary to run ([`FFMPEG`] in production).
-/// `None` when it is not installed, exits unsuccessfully, writes nothing
-/// or runs past its time limit; the reason is logged.
-pub async fn extract_frame(program: &str, bytes: &[u8], max_edge: u32) -> Option<Vec<u8>> {
+/// The point is the smaller of one second and half the duration, so a clip
+/// shorter than two seconds is sampled in its middle. A video with no known
+/// (or a useless) duration is sampled at its start.
+#[must_use]
+pub fn frame_seek(duration: Option<f64>) -> f64 {
+    duration
+        .filter(|seconds| seconds.is_finite() && *seconds > 0.0)
+        .map_or(0.0, |seconds| (seconds / 2.0).min(MAX_SEEK_SECONDS))
+}
+
+/// A frame of the video in `bytes` at `seek_secs`, as `JPEG` bytes scaled
+/// to fit within `max_edge` pixels on both edges.
+///
+/// `program` is the `ffmpeg` binary to run (`FFMPEG_PATH` in production).
+/// `seek_secs` is [`frame_seek`] of the video's duration. `None` when the
+/// program is not installed, exits unsuccessfully, writes nothing or runs
+/// past its time limit; the reason is logged.
+pub async fn extract_frame(
+    program: &str,
+    bytes: &[u8],
+    max_edge: u32,
+    seek_secs: f64,
+) -> Option<Vec<u8>> {
     let input = write_input(bytes).await?;
     let filter = scale_filter(max_edge);
+    let seek = format!("{:.3}", seek_secs.max(0.0));
     let ran = timeout(
         FRAME_TIMEOUT,
         Command::new(program)
-            .args(["-nostdin", "-hide_banner", "-loglevel", "error", "-i"])
+            .args(["-nostdin", "-hide_banner", "-loglevel", "error", "-ss"])
+            .arg(seek)
+            .arg("-i")
             .arg(input.path())
             .args([
                 "-frames:v",
@@ -122,10 +143,30 @@ mod tests {
         );
     }
 
+    #[test]
+    fn the_frame_is_taken_at_one_second_or_the_middle_of_a_short_clip() {
+        for (duration, expected) in [
+            (Some(60.0), 1.0),
+            (Some(2.0), 1.0),
+            (Some(1.5), 0.75),
+            (Some(0.2), 0.1),
+            (Some(0.0), 0.0),
+            (Some(-4.0), 0.0),
+            (Some(f64::NAN), 0.0),
+            (Some(f64::INFINITY), 0.0),
+            (None, 0.0),
+        ] {
+            assert!(
+                (frame_seek(duration) - expected).abs() < 1e-9,
+                "{duration:?} seeks to {expected}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn a_missing_program_gives_no_frame() {
         assert!(
-            extract_frame("wired-be-no-such-ffmpeg", b"video bytes", 400)
+            extract_frame("wired-be-no-such-ffmpeg", b"video bytes", 400, 1.0)
                 .await
                 .is_none(),
             "an absent ffmpeg is no preview, not an error"
@@ -136,7 +177,9 @@ mod tests {
     async fn a_failing_or_silent_program_gives_no_frame() {
         for program in ["false", "true"] {
             assert!(
-                extract_frame(program, b"video bytes", 400).await.is_none(),
+                extract_frame(program, b"video bytes", 400, 1.0)
+                    .await
+                    .is_none(),
                 "`{program}` writes no frame"
             );
         }
@@ -144,13 +187,13 @@ mod tests {
 
     #[tokio::test]
     async fn the_programs_stdout_is_the_frame() {
-        let frame = extract_frame("echo", b"video bytes", 400)
+        let frame = extract_frame("echo", b"video bytes", 400, 0.75)
             .await
             .expect("echo succeeds and prints its arguments");
         let text = String::from_utf8(frame).expect("echo prints text");
         assert!(
-            text.starts_with("-nostdin -hide_banner -loglevel error -i "),
-            "the input comes after the quiet flags: {text}"
+            text.starts_with("-nostdin -hide_banner -loglevel error -ss 0.750 -i "),
+            "the seek and the input come after the quiet flags: {text}"
         );
         assert!(
             text.contains(&scale_filter(400)) && text.trim_end().ends_with("pipe:1"),

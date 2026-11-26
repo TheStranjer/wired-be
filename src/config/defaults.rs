@@ -182,6 +182,11 @@ pub const DEFAULT_HTTP_ALLOW_PRIVATE_HOSTS: bool = false;
 /// relative to the working directory (Pleroma's `Pleroma.Uploaders.Local`
 /// default is a `public/uploads` directory in the same spirit).
 pub const DEFAULT_UPLOADS_DIR: &str = "./uploads";
+/// Program run for a video's preview frame when `FFMPEG_PATH` is unset:
+/// `ffmpeg`, looked up on `PATH`.
+pub const DEFAULT_FFMPEG_PATH: &str = "ffmpeg";
+/// The `FFMPEG_PATH` value that turns frame extraction off.
+pub const FFMPEG_DISABLED: &str = "off";
 /// Directory emoji packs live in when `EMOJI_DIR` is unset, relative to
 /// the working directory.
 ///

@@ -41,16 +41,20 @@
 //! `_small.jpg` / `_small.png` suffix, encoded JPEG for an opaque image,
 //! PNG when it has transparency to keep — and a `Blurhash` string. Those
 //! two extras are best-effort: a thumbnail or hash that fails is logged
-//! and the upload answers without it. A `thumbnail` parameter or file part
-//! on upload is still accepted and ignored: the preview is generated, not
-//! supplied.
+//! and the upload answers without it. A `thumbnail` file part on an image
+//! upload is accepted and ignored: that preview is generated, not supplied.
 //!
 //! A `video/*` or `audio/*` upload is never rejected for what it contains.
 //! Its duration (and a video's picture size) is read from the container
-//! headers by [`crate::services::media_probe`] and recorded, and a video's
-//! first frame becomes the `_small.jpg` preview and `Blurhash` when
-//! `ffmpeg` is on `PATH`. Without a preview the entity's `preview_url` is
-//! `null`: it is never the media file itself.
+//! headers by [`crate::services::media_probe`] and recorded. Its preview is
+//! the client's `thumbnail` file part when it sent one — an image, held to
+//! the same decode, `MAX_IMAGE_PIXELS` and scaling rules as an uploaded
+//! one, so a bad one is a 422 — and otherwise, for a video, a frame
+//! `ffmpeg` renders (at the smaller of one second and half the duration)
+//! when the `FFMPEG_PATH` program is available. Either becomes the
+//! `_small.jpg` / `_small.png` preview and the `Blurhash`. Without a
+//! preview the entity's `preview_url` is `null`: it is never the media
+//! file itself.
 //!
 //! `GET /media/{id}` answers the
 //! [`MediaAttachment`](crate::entities::media_attachment::MediaAttachment)

@@ -67,6 +67,7 @@ fn debug_identity_and_exposure<'a, 'b, 'd>(
             &config.max_remote_mention_lookups,
         )
         .field("uploads_dir", &config.uploads_dir)
+        .field("ffmpeg_path", &config.ffmpeg_path)
         .field("emoji_dir", &config.emoji_dir)
         .field("statics", &config.statics)
         .field("media_base_url", &config.media_base_url)

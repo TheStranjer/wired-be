@@ -401,3 +401,71 @@ async fn a_remote_question_note_lands_a_poll_the_viewer_can_vote_on() {
         "and marks the voter as having voted"
     );
 }
+
+/// Scenario: a delivered Mastodon-shaped video `Document` with an `icon`.
+/// The icon url is the attachment's `preview_url` (the video file stays its
+/// `url`), and a video without an icon has a `null` preview.
+#[tokio::test]
+async fn a_remote_video_icon_is_its_preview_url() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let (app, state) = remote::app_and_state(pool.clone());
+    let peer = remote::MockPeer::start().await;
+    let actor = peer.actor(BOB);
+
+    let uri = peer.note("video-1");
+    let create = create_note(
+        &peer,
+        &actor,
+        "video-1",
+        "<p>a clip</p>",
+        json!({
+            "attachment": [
+                {
+                    "type": "Document",
+                    "mediaType": "video/mp4",
+                    "url": "https://remote.example/media/clip.mp4",
+                    "name": "",
+                    "width": 640,
+                    "height": 360,
+                    "duration": "PT3S",
+                    "icon": {
+                        "type": "Image",
+                        "mediaType": "image/jpeg",
+                        "url": "https://remote.example/media/clip_thumb.jpg",
+                    },
+                },
+                {
+                    "type": "Document",
+                    "mediaType": "video/mp4",
+                    "url": "https://remote.example/media/bare.mp4",
+                    "name": "",
+                },
+            ],
+        }),
+    );
+    deliver(&app, &state, &peer, BOB, &create).await;
+
+    let entry = entry_for(&public_timeline(&app).await, &uri).clone();
+    let media = entry["media_attachments"]
+        .as_array()
+        .expect("media is an array");
+    let with_icon = media
+        .iter()
+        .find(|item| item["url"] == "https://remote.example/media/clip.mp4")
+        .expect("the video with an icon landed");
+    assert_eq!(
+        with_icon["preview_url"],
+        json!("https://remote.example/media/clip_thumb.jpg"),
+        "the icon is the preview"
+    );
+    let bare = media
+        .iter()
+        .find(|item| item["url"] == "https://remote.example/media/bare.mp4")
+        .expect("the video without an icon landed");
+    assert_eq!(
+        bare["preview_url"],
+        Value::Null,
+        "no icon, no preview: never the video file"
+    );
+}

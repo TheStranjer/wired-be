@@ -6,9 +6,10 @@
 //! `detect_stored` folds what it found into the `Detection` the row
 //! records, once the generated preview did (or did not) reach storage.
 //! A video or audio file is not decoded: its container headers give the
-//! duration and the picture size ([`media_probe`]), and a video's first
-//! frame, when `ffmpeg` is available, goes through the same preview and
-//! `Blurhash` pass an image does.
+//! duration and the picture size ([`media_probe`]), and its preview is the
+//! client's `thumbnail` part or, for a video, a frame `ffmpeg` renders when
+//! it is available (`FFMPEG_PATH`); either goes through the same preview
+//! and `Blurhash` pass an image does.
 //! `detect_media_type` is the magic-byte gate every stored file passes
 //! through, upload and replacement thumbnail alike. The pipeline that
 //! calls these is `store_upload` in the sibling `upload`; the constants
@@ -20,6 +21,7 @@ use tracing::warn;
 
 use crate::{
     error::{AppError, AppResult},
+    extract::multipart::UploadedFile,
     models::media_attachment::NewMediaAttachment,
     services::{
         media_probe,
@@ -134,19 +136,20 @@ async fn process_blocking(
 /// once it holds a permit from
 /// [`media_processing::decode_semaphore`], which bounds concurrent decodes
 /// process-wide. A `video/*` or `audio/*` upload is probed for its duration
-/// and size and a video's first frame is rendered when `ffmpeg` can; any
-/// other upload analyzes to `None`: there is nothing on the row for it to
-/// fill.
+/// and size, and previews as the client's `thumbnail` part or, for a video
+/// without one, a frame `ffmpeg` renders; any other upload analyzes to
+/// `None`: there is nothing on the row for it to fill.
 ///
 /// # Errors
 ///
 /// [`AppError::Unprocessable`] from [`media_processing::analyze_image`] for
 /// an undecodable image ("Invalid image") or one over
-/// `MAX_IMAGE_PIXELS` ("Image too large"); [`AppError::Internal`] when the
-/// blocking task itself is gone. Thumbnail and `Blurhash` failures — and
-/// every failure of the video and audio probing — are not errors here:
-/// they ride along inside [`Analyzed`], because losing an extra must not
-/// fail the upload.
+/// `MAX_IMAGE_PIXELS` ("Image too large"), and the same for a video or
+/// audio upload's `thumbnail` part (or "Unsupported file type" when it is
+/// not an image); [`AppError::Internal`] when the blocking task itself is
+/// gone. Thumbnail and `Blurhash` failures — and every failure of the video
+/// and audio probing and of `ffmpeg` — are not errors here: they ride along
+/// inside [`Analyzed`], because losing an extra must not fail the upload.
 pub(super) async fn analyze_upload(
     state: &AppState,
     upload: &Upload,
@@ -155,7 +158,7 @@ pub(super) async fn analyze_upload(
         analyze_image_upload(state, upload).await.map(Some)
     } else if upload.content_type.starts_with("video/") || upload.content_type.starts_with("audio/")
     {
-        Ok(Some(analyze_timed_upload(state, upload).await))
+        analyze_timed_upload(state, upload).await.map(Some)
     } else {
         Ok(None)
     }
@@ -180,44 +183,87 @@ async fn analyze_image_upload(state: &AppState, upload: &Upload) -> AppResult<An
 }
 
 /// The video and audio arm of [`analyze_upload`]: the container headers'
-/// size and duration, plus a video's rendered first frame. Nothing here can
-/// fail the upload; whatever could not be found is simply left unknown.
-async fn analyze_timed_upload(state: &AppState, upload: &Upload) -> Analyzed {
+/// size and duration, plus the preview — the client's `thumbnail` part when
+/// it sent one (no decoder needed), else a video's frame rendered by
+/// `ffmpeg`. Whatever could not be found is simply left unknown.
+///
+/// # Errors
+///
+/// [`AppError::Unprocessable`] from [`supplied_preview`] for a `thumbnail`
+/// part that is not a usable image: the client asked for that exact
+/// picture, so a bad one is refused rather than silently replaced.
+async fn analyze_timed_upload(state: &AppState, upload: &Upload) -> AppResult<Analyzed> {
     let probed = media_probe::probe(&upload.file.bytes, upload.content_type);
-    let frame = if upload.content_type.starts_with("video/") {
-        video_frame(state, upload).await.unwrap_or_else(|err| {
-            warn!(%err, "processing the video frame failed, storing no preview");
-            None
-        })
+    let processed = if let Some(part) = &upload.thumbnail {
+        Some(supplied_preview(state, part).await?)
+    } else if upload.content_type.starts_with("video/") {
+        video_frame(state, upload, probed.duration)
+            .await
+            .unwrap_or_else(|err| {
+                warn!(%err, "processing the video frame failed, storing no preview");
+                None
+            })
     } else {
         None
     };
-    let (thumbnail, blurhash) = frame.map_or((None, None), |processed| {
-        (Some(processed.thumbnail), processed.blurhash)
+    let (thumbnail, blurhash) = processed.map_or((None, None), |image| {
+        (Some(image.thumbnail), image.blurhash)
     });
-    Analyzed {
+    Ok(Analyzed {
         info: probed
             .dimensions
             .map(|(width, height)| ImageInfo { width, height }),
         duration: probed.duration,
         thumbnail,
         blurhash,
-    }
+    })
 }
 
-/// A video's first frame, scaled and processed like an uploaded image;
-/// `None` when `ffmpeg` is unavailable or finds no frame.
+/// The client's `thumbnail` part as the preview: the [`detect_media_type`]
+/// gate, then the same scaling, encoding and `Blurhash` pass an uploaded
+/// image gets, so its metadata is never published and an image bomb is
+/// never served.
+///
+/// # Errors
+///
+/// [`AppError::Unprocessable`] with [`UNSUPPORTED_FILE_TYPE`] for bytes that
+/// are not an image, "Invalid image" for one no decoder reads and "Image
+/// too large" for one over `MAX_IMAGE_PIXELS`; [`AppError::Internal`] when
+/// the decode gate or the blocking task is gone.
+async fn supplied_preview(state: &AppState, part: &UploadedFile) -> AppResult<ProcessedImage> {
+    if !detect_media_type(&part.bytes)?.starts_with("image/") {
+        return Err(AppError::Unprocessable(UNSUPPORTED_FILE_TYPE.to_owned()));
+    }
+    let permit =
+        media_processing::acquire_decode_permit(media_processing::decode_semaphore()).await?;
+    process_blocking(part.bytes.clone(), pixel_limit(state), permit).await
+}
+
+/// A video's frame at [`media_probe::frame_seek`] of `duration`, scaled and
+/// processed like an uploaded image; `None` when `ffmpeg` is turned off
+/// (`FFMPEG_PATH=off`), unavailable or finds no frame.
 ///
 /// # Errors
 ///
 /// [`AppError::Internal`] when the decode gate or the blocking task is
 /// gone.
-async fn video_frame(state: &AppState, upload: &Upload) -> AppResult<Option<ProcessedImage>> {
+async fn video_frame(
+    state: &AppState,
+    upload: &Upload,
+    duration: Option<f64>,
+) -> AppResult<Option<ProcessedImage>> {
+    let Some(program) = state.config.ffmpeg_path.as_deref() else {
+        return Ok(None);
+    };
     let permit =
         media_processing::acquire_decode_permit(media_processing::decode_semaphore()).await?;
-    let Some(frame) =
-        media_probe::extract_frame(media_probe::FFMPEG, &upload.file.bytes, THUMBNAIL_MAX_EDGE)
-            .await
+    let Some(frame) = media_probe::extract_frame(
+        program,
+        &upload.file.bytes,
+        THUMBNAIL_MAX_EDGE,
+        media_probe::frame_seek(duration),
+    )
+    .await
     else {
         return Ok(None);
     };
@@ -396,6 +442,7 @@ mod tests {
             description: None,
             focus: None,
             content_type: "image/png",
+            thumbnail: None,
         };
         let new = upload
             .new_attachment(
@@ -456,6 +503,7 @@ mod tests {
             description: None,
             focus: None,
             content_type: "video/mp4",
+            thumbnail: None,
         };
         let detection = Detection {
             info: Some(ImageInfo {

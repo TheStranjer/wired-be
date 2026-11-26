@@ -145,6 +145,11 @@ pub struct Config {
     pub max_remote_mention_lookups: usize,
     /// Directory uploaded files are stored in, from `UPLOADS_DIR`.
     pub uploads_dir: PathBuf,
+    /// The `ffmpeg` program a video upload's preview frame is rendered
+    /// with, from `FFMPEG_PATH`: `ffmpeg` on `PATH` by default, `None`
+    /// when the setting is `off`. A missing or failing program only costs
+    /// the video its preview.
+    pub ffmpeg_path: Option<String>,
     /// Directory emoji packs are stored in, from `EMOJI_DIR`: one
     /// subdirectory per pack holding a `pack.json` and its image files
     /// (see [`crate::services::emoji_packs`]).

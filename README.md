@@ -40,11 +40,13 @@ answers `Accept: text/html` with `text/html`.
 
 - Rust (stable, see `rust-version` in `Cargo.toml`)
 - PostgreSQL (the only supported database)
-- `ffmpeg` on `PATH` (optional): when present, a video upload gets a JPEG
-  preview frame and a blurhash. Without it, uploads still work: video and
-  audio duration and video dimensions are read from the file's own headers
-  (`MP4`/`MOV`/`M4A` and `MP3`) in pure Rust, and the attachment's
-  `preview_url` is `null` instead of a thumbnail.
+- `ffmpeg` on `PATH` (optional, see `FFMPEG_PATH`): when present, a video
+  upload gets a JPEG preview frame (taken at the smaller of one second and
+  half the duration) and a blurhash. Without it, uploads still work: video
+  and audio duration and video dimensions are read from the file's own
+  headers (`MP4`/`MOV`/`M4A` and `MP3`) in pure Rust, and the attachment's
+  `preview_url` is `null` instead of a thumbnail unless the client sends a
+  `thumbnail` part (which needs no decoder).
 
 ## Configuration
 
@@ -125,6 +127,7 @@ below.
 | `MAX_IMAGE_PIXELS` | no | `40000000` | Maximum pixel count (width times height) of an uploaded image; the media upload endpoints reject a larger image with 422 `{"error":"Image too large"}` and an undecodable one with 422 `{"error":"Invalid image"}` |
 | `HTTP_ALLOW_PRIVATE_HOSTS` | no | `false` | Disable the outbound SSRF guard so the instance may fetch private/loopback addresses, and finger `nick@host:port` handles over plain `http://` that authority, and let `POST /api/v1/pleroma/remote_interaction` finger handles naming a port other than 80/443 (otherwise refused as `Couldn't find user`), and accept Web Push subscriptions whose endpoint is a private/loopback address (with the guard on those are refused at registration) (`true`/`false`, or `1`/`0`); development and test only |
 | `UPLOADS_DIR` | no | `./uploads` | Directory uploaded files are stored in (relative paths resolve against the working directory) |
+| `FFMPEG_PATH` | no | `ffmpeg` | The `ffmpeg` program a video upload's preview frame is rendered with (looked up on `PATH` unless it is a path); `off` never runs it. Without a working `ffmpeg` a video has no generated preview and `preview_url` is `null`, unless the client sends a `thumbnail` part |
 | `EMOJI_DIR` | no | `./emoji` | Directory emoji packs are stored in (one subdirectory per pack, with a `pack.json` and its images; served by `GET /emoji/{pack}/{file}`) |
 | `MEDIA_BASE_URL` | no | `{BASE_URL}/media` | Public prefix of uploaded files' URLs, served by `GET /media/{key}` (no trailing slash) |
 | `JOB_CONCURRENCY` | no | `10` | Job handlers a single worker runs at the same time |
