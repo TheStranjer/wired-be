@@ -62,13 +62,16 @@
 //! - `active` (v1) and `status=active` (v2) want an account active, approved
 //!   *and* confirmed; `pending` / `status=pending` want a stated
 //!   [`approval_pending`](User::approval_pending); `disabled` /
-//!   `status=disabled` want [`is_active`](User::is_active) off.
+//!   `status=disabled` want [`is_active`](User::is_active) off without a
+//!   suspension; `suspended` / `status=suspended` want
+//!   [`User::is_suspended`] (WBE-878), so a suspended account is found by the
+//!   one and not the other.
 //! - `staff` (v1) and `permissions=staff` (v2) want an admin or a moderator.
 //! - `username`, `display_name`, `by_domain` and `email` are the four criteria
 //!   both versions state identically: the handle and the display name as
 //!   case-insensitive substrings, the mirrored host and the address exactly.
-//! - `silenced`, `suspended`, `sensitized`, `ip` and `invited_by` are accepted
-//!   and ignored. This schema has no silence, suspension, sensitive-flag,
+//! - `silenced`, `sensitized`, `ip` and `invited_by` are accepted
+//!   and ignored. This schema has no silence, sensitive-flag,
 //!   login-address or invitation column to weigh them against, so they filter
 //!   nothing instead of refusing the request — the same treatment Pleroma's
 //!   controller gives a criterion its `build_criteria` never puts in.
@@ -99,8 +102,11 @@
 //!   none either, so the account's own token works again the moment it is
 //!   enabled — and it logs Pleroma's `enable` entry, the `activate` one.
 //!   Enabling an account that was never disabled changes nothing, answers
-//!   200 and logs. `POST …/accounts/{id}/unsuspend` is the same handler
-//!   under Mastodon's name for it.
+//!   200 and logs. `POST …/accounts/{id}/unsuspend` is its twin for the other
+//!   kind of deactivation (WBE-878): `enable` reverses a `disable` and
+//!   `unsuspend` a `suspend`, and each leaves an account in the other state
+//!   as it is, answering 200, writing and logging nothing — Mastodon's
+//!   `enable` clears `disabled` and `unsuspend` only a suspension.
 //! - `POST …/accounts/{id}/approve` is the console's `PATCH /users/approve`
 //!   for one account by id, sharing its write and its `account_approved`
 //!   letter through [`helpers::approve_account`]. An account nobody left
@@ -120,13 +126,15 @@
 //!   400, which the ticket replaces with the same refusal the delete route
 //!   gives.
 //! - `POST …/accounts/{id}/action` is Mastodon's moderation umbrella.
-//!   `disable` clears `is_active`; `suspend` does exactly the same and
-//!   nothing more — it deactivates only, stamps no `deleted_at`, revokes no
-//!   token and removes no data. The `Suspended` event it fires makes
-//!   `ActivityPub` queue an actor `Update` saying `"suspended": true` (no
-//!   `Delete`, no `Reject` of the follows), so `…/enable` reverses it completely
-//!   (Mastodon's suspension is reversible, and Pleroma has no `suspend`
-//!   at all; a dedicated suspension state is out of scope here);
+//!   `disable` clears `is_active` and nothing else, so the account reads
+//!   `disabled: true`; `suspend` clears it too and also stamps
+//!   [`suspended_at`](User::suspended_at) (WBE-878), so the account reads
+//!   `suspended: true` and not `disabled` — it deactivates only, stamps no
+//!   `deleted_at`, revokes no token and removes no data. The `Suspended` event
+//!   it fires makes `ActivityPub` queue an actor `Update` saying
+//!   `"suspended": true` (no `Delete`, no `Reject` of the follows; a
+//!   `disable` federates the full profile), and `…/unsuspend` reverses it
+//!   completely where `…/enable` reverses a `disable`;
 //!   `none`, `sensitive` and `silence` change nothing this schema can
 //!   change, because there is no sensitive flag and no silence state to set
 //!   (the same absence the reads answer with their `sensitive`-less entity
@@ -182,7 +190,7 @@ mod writes;
 use self::{
     actions::account_action,
     reads::{list_accounts, list_accounts_v2, show_account},
-    writes::{approve_account, delete_account, enable_account, reject_account},
+    writes::{approve_account, delete_account, enable_account, reject_account, unsuspend_account},
 };
 
 /// The read endpoint class of [`AdminUser::require`].
@@ -210,6 +218,8 @@ const STATUS_ACTIVE: &str = "active";
 const STATUS_PENDING: &str = "pending";
 /// The `status` value that weighs a deactivated account.
 const STATUS_DISABLED: &str = "disabled";
+/// The `status` value that weighs a suspended account.
+const STATUS_SUSPENDED: &str = "suspended";
 /// The `permissions` value that weighs the two staff flags.
 const PERMISSIONS_STAFF: &str = "staff";
 /// The 403 body of the two refusals this surface answers alike: the admin
@@ -251,7 +261,7 @@ pub fn v1_router() -> Router<AppState> {
         .route("/accounts", get(list_accounts))
         .route("/accounts/{id}", get(show_account).delete(delete_account))
         .route("/accounts/{id}/enable", post(enable_account))
-        .route("/accounts/{id}/unsuspend", post(enable_account))
+        .route("/accounts/{id}/unsuspend", post(unsuspend_account))
         .route("/accounts/{id}/approve", post(approve_account))
         .route("/accounts/{id}/reject", post(reject_account))
         .route("/accounts/{id}/action", post(account_action))

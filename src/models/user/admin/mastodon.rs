@@ -11,7 +11,7 @@ use crate::{
     error::AppResult, models::user::NOT_INSTANCE_ACTOR, pagination::PageParams, util::like,
 };
 
-/// The criteria of one [`mastodon_list`] call: the six booleans the two
+/// The criteria of one [`mastodon_list`] call: the seven booleans the two
 /// admin account listings share and the four text criteria they read off the
 /// same columns.
 ///
@@ -19,7 +19,7 @@ use crate::{
 /// v1's and v2's parameter sets: v2 spells `origin=local` the `local` filter
 /// and `status=pending` the `pending` one, and its reading of `permissions`
 /// lands on [`staff`](Self::staff). The criteria the ticket has this instance
-/// ignore (`silenced`, `suspended`, `sensitized`, `ip`, `invited_by`) are not
+/// ignore (`silenced`, `sensitized`, `ip`, `invited_by`) are not
 /// fields at all: their absence from the `WHERE` clause *is* the ignoring.
 #[derive(Clone, Debug, Default)]
 pub struct MastodonListParams {
@@ -36,8 +36,12 @@ pub struct MastodonListParams {
     /// [`approval_pending`](User::approval_pending) is set.
     pub pending: Criterion,
     /// `disabled` (and `status=disabled`): [`is_active`](User::is_active) is
-    /// false.
+    /// false without the account being suspended (see
+    /// [`suspended`](Self::suspended)).
     pub disabled: Criterion,
+    /// `suspended` (and `status=suspended`): [`User::is_suspended`] — a local
+    /// or remote suspension or a deletion under way (WBE-878).
+    pub suspended: Criterion,
     /// `staff` (and `permissions=staff`): an admin or a moderator.
     pub staff: Criterion,
     /// `username`: a case-insensitive substring of the handle, Pleroma's
@@ -127,8 +131,16 @@ fn push_mastodon_state(builder: &mut QueryBuilder<Postgres>, params: &MastodonLi
     push_criterion(
         builder,
         params.disabled,
-        " AND NOT is_active",
-        " AND is_active",
+        " AND NOT is_active AND NOT (suspended_at IS NOT NULL OR remote_suspended \
+         OR deleted_at IS NOT NULL)",
+        " AND (is_active OR suspended_at IS NOT NULL OR remote_suspended \
+         OR deleted_at IS NOT NULL)",
+    );
+    push_criterion(
+        builder,
+        params.suspended,
+        " AND (suspended_at IS NOT NULL OR remote_suspended OR deleted_at IS NOT NULL)",
+        " AND suspended_at IS NULL AND NOT remote_suspended AND deleted_at IS NULL",
     );
     push_criterion(
         builder,

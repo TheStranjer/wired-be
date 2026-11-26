@@ -181,6 +181,12 @@ pub struct User {
     /// purge; this is what tells a deleted account from a merely
     /// deactivated one.
     pub deleted_at: Option<DateTime<Utc>>,
+    /// When a local suspension deactivated the account; `None` for an
+    /// account that is active or only disabled (WBE-878).
+    pub suspended_at: Option<DateTime<Utc>>,
+    /// Whether the account's origin server marks its actor `suspended`
+    /// (WBE-873); only the remote actor upsert writes it.
+    pub remote_suspended: Flag,
 }
 
 /// [`password_hash`](Self::password_hash) and [`mfa_settings`](Self::mfa_settings)
@@ -249,6 +255,8 @@ impl fmt::Debug for User {
             .field("password_reset_pending", &self.password_reset_pending)
             .field("email_notifications", &self.email_notifications)
             .field("deleted_at", &self.deleted_at)
+            .field("suspended_at", &self.suspended_at)
+            .field("remote_suspended", &self.remote_suspended)
             .finish()
     }
 }
@@ -260,6 +268,19 @@ impl User {
     #[must_use]
     pub const fn is_local_active(&self) -> bool {
         self.local.get() && self.is_active.get()
+    }
+
+    /// Whether this account stands suspended rather than merely disabled:
+    /// a local suspension ([`suspended_at`](Self::suspended_at)), its origin
+    /// server's suspension ([`remote_suspended`](Self::remote_suspended)) or a
+    /// deletion under way ([`deleted_at`](Self::deleted_at)).
+    ///
+    /// The one reading behind the `suspended` of the account entities and of
+    /// the federated actor document; `disabled` is
+    /// [`is_active`](Self::is_active) off without this.
+    #[must_use]
+    pub const fn is_suspended(&self) -> bool {
+        self.suspended_at.is_some() || self.remote_suspended.get() || self.deleted_at.is_some()
     }
 
     /// Where this account stands between registration and use, weighed in

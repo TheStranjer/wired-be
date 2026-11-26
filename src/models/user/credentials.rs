@@ -113,10 +113,13 @@ pub async fn set_email(
 
 /// The `UPDATE` behind [`set_activation`]: moves the local origin
 /// (`local_deactivated`), recomputes `is_active` (a remote suspension keeps
-/// it off) and refreshes `updated_at`, leaving every other column alone.
+/// it off), stamps or clears `suspended_at` the way a suspension does
+/// (WBE-878) and refreshes `updated_at`, leaving every other column alone.
 const SET_ACTIVATION_SQL: &str = "UPDATE users
        SET local_deactivated = NOT $2::boolean,
            is_active = $2::boolean AND NOT remote_suspended,
+           suspended_at = CASE WHEN $2::boolean THEN NULL
+                               ELSE COALESCE(suspended_at, now()) END,
            updated_at = now()
      WHERE id = $1";
 

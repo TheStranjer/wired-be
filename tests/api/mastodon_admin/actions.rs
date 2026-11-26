@@ -224,11 +224,11 @@ async fn the_action_suspends_and_federates_only_the_suspended_update() {
     );
 }
 
-/// `enable` reverses a suspension completely: the account is active again,
+/// `unsuspend` reverses a suspension completely: the account is active again,
 /// its own token works, and its post, follower and (empty) job queue are as
 /// they were.
 #[tokio::test]
-async fn enabling_a_suspended_account_restores_it_with_its_data() {
+async fn unsuspending_a_suspended_account_restores_it_with_its_data() {
     let db = common::test_db().await;
     let seeded = seed_writes(&db).await;
     let start = seed_suspendable(&seeded).await;
@@ -243,12 +243,12 @@ async fn enabling_a_suspended_account_restores_it_with_its_data() {
     let enabled = post_json(
         &seeded.app,
         &seeded.token,
-        &account_action_path(seeded.plain.id, "enable"),
+        &account_action_path(seeded.plain.id, "unsuspend"),
         &json!({}),
     )
     .await;
 
-    common::assert_answer(&enabled, StatusCode::OK, "the enable that reverses it");
+    common::assert_answer(&enabled, StatusCode::OK, "the unsuspend that reverses it");
     let (active, _, doomed) = row_state(&seeded.pool, seeded.plain.id)
         .await
         .expect("the row is still there");
@@ -286,10 +286,10 @@ async fn enabling_a_suspended_account_restores_it_with_its_data() {
     );
 }
 
-/// `POST …/unsuspend` does what `enable` does: 200 with the entity, the
-/// account active again and a fresh `Update` for its peers.
+/// `POST …/enable` does not lift a suspension: 200 with the entity, the
+/// account still inactive and no further `Update` for its peers.
 #[tokio::test]
-async fn unsuspend_is_the_enable_under_mastodons_name() {
+async fn enable_leaves_a_suspension_in_place() {
     let db = common::test_db().await;
     let seeded = seed_writes(&db).await;
     let start = seed_suspendable(&seeded).await;
@@ -301,29 +301,32 @@ async fn unsuspend_is_the_enable_under_mastodons_name() {
     )
     .await;
 
-    let unsuspended = post_json(
+    let enabled = post_json(
         &seeded.app,
         &seeded.token,
-        &account_action_path(seeded.plain.id, "unsuspend"),
+        &account_action_path(seeded.plain.id, "enable"),
         &json!({}),
     )
     .await;
 
-    common::assert_answer(&unsuspended, StatusCode::OK, "the unsuspend");
+    common::assert_answer(&enabled, StatusCode::OK, "the enable");
+    assert_eq!(
+        enabled.json_value()["suspended"],
+        json!(true),
+        "answered as the suspended account it still is"
+    );
     let (active, _, doomed) = row_state(&seeded.pool, seeded.plain.id)
         .await
         .expect("the row is still there");
-    assert!(active && !doomed, "the account is active again");
-    let published = published_activities(&seeded.pool).await;
-    assert_eq!(published.len(), 2, "the suspension's Update and the second");
-    assert!(
-        published[1]["object"].get("suspended").is_none(),
-        "the second carries no flag"
-    );
+    assert!(!active && !doomed, "the account is still inactive");
     assert_eq!(
         job_count(&seeded.pool).await,
-        start.jobs_before + 2,
-        "and nothing else was queued"
+        start.jobs_before + 1,
+        "and only the suspension's Update was queued"
+    );
+    assert!(
+        logged(&seeded.pool, "activate").await.is_empty(),
+        "with no `activate` entry"
     );
 }
 

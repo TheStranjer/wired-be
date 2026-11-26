@@ -117,7 +117,7 @@ impl Account {
             moved: None,
             also_known_as: None,
             mute_expires_at: None,
-            suspended: JsonBool(!user.is_active.get()),
+            suspended: JsonBool(user.is_suspended()),
             limited: JsonBool(false),
             source: None,
             pleroma: pleroma_metadata(user, viewer, relationships),

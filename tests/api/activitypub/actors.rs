@@ -462,6 +462,49 @@ async fn unknown_and_remote_users_are_not_found() {
     }
 }
 
+/// Stamps `suspended_at` on account `id`, the mark of a suspension.
+async fn stamp_suspension(pool: &sqlx::PgPool, id: uuid::Uuid) {
+    let stamped = sqlx::query("UPDATE users SET suspended_at = now() WHERE id = $1")
+        .bind(id)
+        .execute(pool)
+        .await
+        .expect("the suspension stamps")
+        .rows_affected();
+    assert_eq!(stamped, 1, "one account is suspended");
+}
+
+/// A disabled local account still resolves, as itself: the full profile and
+/// no `suspended` flag, until a suspension stamps it.
+#[tokio::test]
+async fn a_disabled_user_resolves_with_its_profile_until_suspended() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let alice = common::create_local_user_with(&pool, "alice", |new| NewUser {
+        is_active: Flag::new(false),
+        ..new
+    })
+    .await;
+    let app = common::test_app(pool.clone());
+    let path = format!("/users/{}", alice.nickname);
+    let disabled = fetch_activity_json(&app, &path).await;
+    assert_eq!(
+        disabled.status,
+        StatusCode::OK,
+        "a disabled account resolves"
+    );
+    assert!(
+        disabled.json_value().get("suspended").is_none(),
+        "a plain disable is no suspension: the full profile, no flag"
+    );
+    stamp_suspension(&pool, alice.id).await;
+    let suspended = fetch_activity_json(&app, &path).await;
+    assert_eq!(
+        suspended.json_value()["suspended"],
+        true,
+        "the stamp makes it say suspended"
+    );
+}
+
 /// A deactivated or suspended local account still answers 200, with the
 /// minimal document saying `"suspended": true` — a 410 would make a peer
 /// delete the account, which enabling it again cannot undo. A deleted account
@@ -475,12 +518,13 @@ async fn a_deactivated_user_resolves_as_suspended_and_a_deleted_one_is_gone() {
         ..new
     })
     .await;
+    stamp_suspension(&pool, alice.id).await;
     let app = common::test_app(pool.clone());
     let response = fetch_activity_json(&app, &format!("/users/{}", alice.nickname)).await;
     assert_eq!(
         response.status,
         StatusCode::OK,
-        "a deactivated local account still resolves"
+        "a suspended local account still resolves"
     );
     assert_eq!(
         response.header("vary"),

@@ -34,6 +34,8 @@ async fn the_v1_filters_select_their_own_rows() {
         ("pending=false", &APPROVED),
         ("disabled=true", &["suspended"]),
         ("disabled=false", &ENABLED),
+        ("suspended=true", &[]),
+        ("suspended=false", &LISTED),
         ("staff=true", &["moddy", "root"]),
         ("staff=false", &MEMBERS),
         ("username=mod", &["moddy"]),
@@ -67,10 +69,9 @@ async fn the_v1_listing_accepts_the_filters_it_cannot_weigh() {
     let seeded = seed(&db).await;
     for query in [
         "silenced=true",
-        "suspended=true",
         "sensitized=true",
         "ip=203.0.113.7",
-        "silenced=false&suspended=false&sensitized=false&ip=203.0.113.7",
+        "silenced=false&sensitized=false&ip=203.0.113.7",
     ] {
         assert_eq!(
             listed(&v1_page(&seeded.app, &seeded.token, query).await),
@@ -79,7 +80,7 @@ async fn the_v1_listing_accepts_the_filters_it_cannot_weigh() {
         );
     }
     assert_eq!(
-        listed(&v1_page(&seeded.app, &seeded.token, "suspended=true&staff=true").await),
+        listed(&v1_page(&seeded.app, &seeded.token, "silenced=true&staff=true").await),
         vec!["moddy", "root"],
         "and a weighable criterion still decides"
     );
@@ -101,7 +102,7 @@ async fn the_v2_listing_spells_the_same_criteria_as_words() {
         ("status=pending", &["newbie"]),
         ("status=disabled", &["suspended"]),
         ("status=silenced", &LISTED),
-        ("status=suspended", &LISTED),
+        ("status=suspended", &[]),
         ("status=whatever", &LISTED),
         ("permissions=staff", &["moddy", "root"]),
         ("permissions=admin", &LISTED),
@@ -244,11 +245,11 @@ async fn the_entity_states_the_private_columns_and_their_empty_readings() {
     assert_eq!(pending["approved"], json!(false), "and it still waits");
     let asleep = entity(&whole, "suspended");
     assert_eq!(asleep["disabled"], json!(true), "a deactivated account");
-    assert_eq!(
-        asleep["account"]["suspended"],
-        json!(true),
-        "and its profile entity says so too"
-    );
+    let flags = [
+        asleep["suspended"].clone(),
+        asleep["account"]["suspended"].clone(),
+    ];
+    assert_eq!(flags, [json!(false), json!(false)], "is no suspended one");
     let unminded = entity(&whole, "unminded");
     assert_eq!(
         unminded["confirmed"],
