@@ -1,6 +1,6 @@
 //! The object `GET`s of the `ActivityPub` router: `GET /objects/{uuid}`
-//! and its nickname-scoped twin, `GET /notice/{id}`, and an object's
-//! replies collection. The three status reads share one core
+//! and its nickname-scoped twin, `GET /notice/{id}`, an object's
+//! replies collection and a thread's context collection. The three status reads share one core
 //! ([`object_core`]); the tombstone, the author check and the visibility
 //! admission ([`read_admitted`]) beside it are the same gates the
 //! [`crate::federation::note`] documents are served under.
@@ -68,6 +68,40 @@ async fn object_replies_answer(
     fetch_allowed(state, &Method::GET, uri, headers).await?;
     let object = publicly_replyable(state, raw_id).await?;
     let built = collections::replies_document(&state.db, &state.config, &object, uri.query()).await;
+    document(built)
+}
+
+/// `GET /contexts/{uuid}` — the context collection local notes name.
+///
+/// An `OrderedCollection` of the thread's publicly visible object ids
+/// (FEP-7888), or with `?page=true` a page of them, oldest first, 20 at a
+/// time. A conversation with no public object, an id that is no id, and an
+/// `Accept` naming no `ActivityPub` media type are the plain 404;
+/// `AUTHORIZED_FETCH` gates it like the object reads.
+pub(super) async fn get_context(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    uri: Uri,
+    Path(raw_id): Path<String>,
+) -> Response {
+    let response = context_answer(&state, &raw_id, &headers, &uri).await;
+    with_vary(response)
+}
+
+/// The context route's answer: the negotiation, the gate, then the
+/// collection [`collections::context_document`] builds.
+async fn context_answer(
+    state: &AppState,
+    raw_id: &str,
+    headers: &HeaderMap,
+    uri: &Uri,
+) -> AppResult<Response> {
+    let id = parse_id(raw_id).ok_or(AppError::RouteNotFound)?;
+    if !wants_activity_json(headers) {
+        return Err(AppError::RouteNotFound);
+    }
+    fetch_allowed(state, &Method::GET, uri, headers).await?;
+    let built = collections::context_document(&state.db, &state.config, id, uri.query()).await;
     document(built)
 }
 

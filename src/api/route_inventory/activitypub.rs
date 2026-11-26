@@ -97,6 +97,11 @@ pub(super) const ROWS: &[RouteSpec] = &[
     },
     RouteSpec {
         method: "GET",
+        path: "/contexts/:uuid",
+        auth: AuthClass::Public,
+    },
+    RouteSpec {
+        method: "GET",
         path: "/activities/:uuid",
         auth: AuthClass::Public,
     },

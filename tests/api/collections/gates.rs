@@ -169,6 +169,7 @@ async fn bad_cursors_are_the_shared_invalid_id() {
         "/users/alice/followers".to_owned(),
         "/users/alice/following".to_owned(),
         format!("/objects/{}/replies", post.id),
+        format!("/contexts/{}", post.conversation_id),
     ];
     for path in paged {
         let response = fetch_ap(&app, &format!("{path}?page=true&max_id=nonsense")).await;
@@ -202,6 +203,7 @@ async fn authorized_fetch_gates_every_collection_route() {
         "/users/alice/following".to_owned(),
         "/users/alice/collections/featured".to_owned(),
         format!("/objects/{}/replies", post.id),
+        format!("/contexts/{}", post.conversation_id),
     ];
     for path in gated {
         let response = fetch_ap(&app, &path).await;
@@ -221,6 +223,7 @@ async fn authorized_fetch_gates_every_collection_route() {
         "/users/alice/outbox?page=true".to_owned(),
         "/users/alice/collections/featured".to_owned(),
         format!("/objects/{}/replies", post.id),
+        format!("/contexts/{}", post.conversation_id),
     ];
     for path in opened {
         let signed = sign_request(

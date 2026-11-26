@@ -19,8 +19,9 @@ use crate::{
 };
 
 use super::{
-    NoteContext, TYPE_NOTE, TYPE_QUESTION, activities::json_ld_context_for, tags::attachments_json,
-    tags::poll_fields, tags::tags_json,
+    NoteContext, SELF_REPLIES_LIMIT, TYPE_COLLECTION, TYPE_COLLECTION_PAGE, TYPE_NOTE,
+    TYPE_QUESTION, activities::json_ld_context_for, tags::attachments_json, tags::poll_fields,
+    tags::tags_json,
 };
 
 /// The `Note`/`Question` object of the status in `ctx`, as this instance
@@ -104,7 +105,47 @@ fn note_fields(ctx: &NoteContext) -> Vec<(&'static str, Value)> {
             Value::Array(attachments_json(&ctx.attachments)),
         ),
     ]);
+    if let Some(replies) = replies_json(ctx) {
+        fields.push(("replies", replies));
+    }
     fields
+}
+
+/// The `replies` collection of a publicly readable status.
+///
+/// Shaped the way Mastodon's `NoteSerializer` writes it.
+///
+/// The collection's id is `{object}/replies`, the route that serves it;
+/// its inline `first` page lists the author's own answers, and `next` leads
+/// to the page of everyone else's (`only_other_accounts`). When the
+/// author's own answers fill the inline page, `next` is the unfiltered
+/// walk instead, so a longer run is not cut off. `None` for a `private`
+/// or `direct` status: the replies route answers those with a 404, and the
+/// document must not advertise it.
+fn replies_json(ctx: &NoteContext) -> Option<Value> {
+    if !matches!(
+        ctx.status.visibility,
+        Visibility::Public | Visibility::Unlisted
+    ) {
+        return None;
+    }
+    let id = format!("{}/replies", ctx.status.uri);
+    let filled = i64::try_from(ctx.self_replies.len()).is_ok_and(|n| n >= SELF_REPLIES_LIMIT);
+    let next = if filled {
+        format!("{id}?page=true")
+    } else {
+        format!("{id}?only_other_accounts=true&page=true")
+    };
+    Some(json!({
+        "id": &id,
+        "type": TYPE_COLLECTION,
+        "first": {
+            "type": TYPE_COLLECTION_PAGE,
+            "next": next,
+            "partOf": &id,
+            "items": &ctx.self_replies,
+        },
+    }))
 }
 
 /// `Question` when the status carries a poll, `Note` otherwise.
@@ -249,6 +290,18 @@ mod tests {
                 "conversation": format!("{BASE}/contexts/{STATUS_ID}"),
                 "tag": [],
                 "attachment": [],
+                "replies": {
+                    "id": format!("{BASE}/objects/{STATUS_ID}/replies"),
+                    "type": "Collection",
+                    "first": {
+                        "type": "CollectionPage",
+                        "next": format!(
+                            "{BASE}/objects/{STATUS_ID}/replies?only_other_accounts=true&page=true"
+                        ),
+                        "partOf": format!("{BASE}/objects/{STATUS_ID}/replies"),
+                        "items": [],
+                    },
+                },
                 "interactionPolicy": {
                     "canQuote": {
                         "automaticApproval": [AS_PUBLIC],
@@ -259,6 +312,53 @@ mod tests {
             "the whole document, field for field"
         );
         assert_eq!(json_keys(&document), NOTE_KEYS, "and nothing else");
+    }
+
+    #[test]
+    fn the_replies_first_page_lists_the_authors_own_answers() {
+        let mut ctx = note_context(Visibility::Unlisted);
+        ctx.self_replies = vec![format!("{BASE}/objects/one"), format!("{BASE}/objects/two")];
+        let document = note_json(&ctx).expect("an unlisted note renders");
+        let replies = &document["replies"];
+        assert_eq!(
+            replies["id"],
+            format!("{BASE}/objects/{STATUS_ID}/replies"),
+            "the id is the route that serves the collection"
+        );
+        assert_eq!(
+            replies["first"]["items"],
+            json!([format!("{BASE}/objects/one"), format!("{BASE}/objects/two")]),
+            "the author's own answers, in order"
+        );
+        assert_eq!(
+            replies["first"]["next"],
+            format!("{BASE}/objects/{STATUS_ID}/replies?only_other_accounts=true&page=true"),
+            "the rest of the thread is the next page"
+        );
+    }
+
+    #[test]
+    fn a_full_inline_page_continues_through_the_unfiltered_walk() {
+        let mut ctx = note_context(Visibility::Public);
+        ctx.self_replies = (0..SELF_REPLIES_LIMIT)
+            .map(|n| format!("{BASE}/objects/{n}"))
+            .collect();
+        let document = note_json(&ctx).expect("a public note renders");
+        assert_eq!(
+            document["replies"]["first"]["next"],
+            format!("{BASE}/objects/{STATUS_ID}/replies?page=true"),
+            "the author's own run may go on, so the next page is everything"
+        );
+    }
+
+    #[test]
+    fn a_followers_only_or_direct_note_advertises_no_replies() {
+        for visibility in [Visibility::Private, Visibility::Direct] {
+            assert!(
+                render(visibility).get("replies").is_none(),
+                "the replies route answers {visibility:?} posts with a 404"
+            );
+        }
     }
 
     #[test]

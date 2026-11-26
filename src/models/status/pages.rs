@@ -9,7 +9,7 @@ use uuid::Uuid;
 
 use crate::{error::AppResult, models::status_visibility, pagination::PageParams};
 
-use super::{Status, StatusVisibilityCounts};
+use super::{ReplyAuthors, Status, StatusVisibilityCounts, thread_pages::public_replies_page_by};
 
 /// [`outbox_page`]: the head of the author's outbox statement, up to (and
 /// including) the placeholder [`outbox_page`] pushes the author's id into;
@@ -33,12 +33,6 @@ const BACKUP_PAGE_SQL: &str = "SELECT s.* FROM statuses s WHERE s.user_id = ";
 /// [`note_json`]: crate::federation::note::note_json
 const BACKUP_VISIBLE: &str = " AND s.deleted_at IS NULL \
     AND s.visibility IN ('public', 'unlisted', 'private', 'direct')";
-
-/// [`public_replies_page`]: the head of the replies statement, up to (and
-/// including) the placeholder the object id is pushed into; the function
-/// then appends the anonymous [`status_visibility`] clause, the cursor, the
-/// ordering and the `LIMIT`.
-const REPLIES_PAGE_SQL: &str = "SELECT s.* FROM statuses s WHERE s.in_reply_to_id = ";
 
 /// [`public_replies_count`]: the head of the count statement, up to (and
 /// including) the placeholder the object id is pushed into; the function
@@ -205,31 +199,14 @@ pub async fn public_replies_page(
     max_id: Option<Uuid>,
     limit: i64,
 ) -> AppResult<Vec<Status>> {
-    let mut builder = QueryBuilder::<Postgres>::new(REPLIES_PAGE_SQL);
-    let _bound: &mut _ = builder.push_bind(object_id);
-    status_visibility::push_visibility_clause(&mut builder, None, "s");
-    // A `max_id` page is read from the cursor backwards — the newest rows
-    // below it come off the index first — and flipped, so the answer keeps
-    // the oldest-first order every replies page is served in.
-    let backwards = max_id.is_some();
-    if let Some(max_id) = max_id {
-        let _older: &mut _ = builder.push(" AND s.id < ").push_bind(max_id);
-    } else if let Some(min_id) = min_id {
-        let _newer: &mut _ = builder.push(" AND s.id > ").push_bind(min_id);
-    }
-    let _paged: &mut _ = builder
-        .push(if backwards {
-            " ORDER BY s.id DESC"
-        } else {
-            " ORDER BY s.id ASC"
-        })
-        .push(" LIMIT ")
-        .push_bind(limit);
-    let mut rows = builder.build_query_as::<Status>().fetch_all(pool).await?;
-    if backwards {
-        rows.reverse();
-    }
-    Ok(rows)
+    let window = PageParams {
+        max_id,
+        min_id,
+        since_id: None,
+        limit,
+        offset: None,
+    };
+    public_replies_page_by(pool, object_id, ReplyAuthors::Anyone, &window).await
 }
 
 #[cfg(test)]
