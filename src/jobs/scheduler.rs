@@ -15,10 +15,12 @@
 //! ten seconds, enqueueing each registry job with the
 //! `unique_key` `periodic:<kind>:<bucket>` — where [`bucket`] is
 //! `floor(unix_secs / every_secs)`. Every app instance derives the same key
-//! for the same period, so the queue's deduplication index (see
+//! for the same period, so the `periodic:%` unique index (see
 //! [`crate::models::job::enqueue`]) lets exactly one row per period exist no
-//! matter how many schedulers tick: within one period the repeats are
-//! dropped, and a new period enqueues a fresh row. Nothing executes the
+//! matter how many schedulers tick: that index covers every state, so a
+//! row that already completed (or was discarded) still claims its bucket,
+//! the repeats within one period are dropped, and a new period enqueues a
+//! fresh row. Nothing executes the
 //! rows; that is [`Worker`](super::Worker)'s side of the same table.
 //!
 //! The tick clock is the wall-clock time read once at startup shifted by the
@@ -273,6 +275,9 @@ async fn tick(pool: &PgPool, jobs: &[PeriodicJob], now: DateTime<Utc>) {
 /// Enqueues `job` once for the period `now` falls in, keyed
 /// `periodic:<kind>:<bucket>` so repeats within the period and other app
 /// instances deduplicate against the same row.
+///
+/// The `jobs_periodic_unique_key_idx` index holds the key in every state, so
+/// the repeat is dropped even after the period's row has finished.
 async fn enqueue_for_period(pool: &PgPool, job: PeriodicJob, now: DateTime<Utc>) {
     let key = format!("periodic:{}:{}", job.kind, bucket(now, job.every));
     let request = NewJob {
@@ -428,6 +433,117 @@ mod tests {
         assert_eq!(row.queue, "scheduled", "the job's queue is honoured");
         assert_eq!(row.state, "available", "the row waits claimable");
         assert_eq!(row.args, json!({}), "periodic jobs run with empty args");
+    }
+
+    /// The hourly `purge` job the terminal-state tests tick.
+    fn hourly_purge() -> Vec<PeriodicJob> {
+        vec![PeriodicJob {
+            kind: "purge",
+            queue: "scheduled",
+            every: Duration::from_hours(1),
+        }]
+    }
+
+    #[tokio::test]
+    async fn finished_rows_still_block_their_period() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let jobs = hourly_purge();
+        let period_start = at(1_699_999_200);
+
+        for state in ["completed", "discarded"] {
+            tick(&pool, &jobs, period_start).await;
+            let finished = sqlx::query("UPDATE jobs SET state = $1 WHERE kind = 'purge'")
+                .bind(state)
+                .execute(&pool)
+                .await
+                .unwrap()
+                .rows_affected();
+            assert_eq!(finished, 1, "one row to finish as {state}");
+
+            tick(&pool, &jobs, period_start).await;
+            tick(&pool, &jobs, at(1_699_999_200 + 3_599)).await;
+
+            assert_eq!(
+                count_jobs(&pool, "purge").await,
+                1,
+                "a {state} row keeps its period closed"
+            );
+            let kept =
+                sqlx::query_scalar::<_, String>("SELECT state FROM jobs WHERE kind = 'purge'")
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            assert_eq!(kept, state, "the finished row is left as it was");
+
+            let cleared = sqlx::query("DELETE FROM jobs WHERE kind = 'purge'")
+                .execute(&pool)
+                .await
+                .unwrap()
+                .rows_affected();
+            assert_eq!(cleared, 1, "reset for the next state");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_next_period_after_a_finished_row_enqueues_again() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let jobs = hourly_purge();
+
+        tick(&pool, &jobs, at(1_699_999_200)).await;
+        let finished = sqlx::query("UPDATE jobs SET state = 'completed' WHERE kind = 'purge'")
+            .execute(&pool)
+            .await
+            .unwrap()
+            .rows_affected();
+        assert_eq!(finished, 1, "the first period's row completed");
+        tick(&pool, &jobs, at(1_700_002_800)).await;
+
+        assert_eq!(
+            keys_for(&pool, "purge").await,
+            vec!["periodic:purge:472222", "periodic:purge:472223"],
+            "the next bucket gets a second row"
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_ticks_in_one_period_enqueue_one_job() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let jobs = hourly_purge();
+        let now = at(1_699_999_200);
+
+        let ((), (), (), ()) = tokio::join!(
+            tick(&pool, &jobs, now),
+            tick(&pool, &jobs, now),
+            tick(&pool, &jobs, now),
+            tick(&pool, &jobs, now),
+        );
+
+        assert_eq!(
+            count_jobs(&pool, "purge").await,
+            1,
+            "simultaneous schedulers produce one row"
+        );
+    }
+
+    #[tokio::test]
+    async fn finished_non_periodic_keys_may_still_repeat() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        for _repeat in 0..2 {
+            let inserted = sqlx::query(
+                "INSERT INTO jobs (id, queue, kind, state, unique_key)
+                 VALUES ($1, 'q', 'other', 'completed', 'other:1')",
+            )
+            .bind(crate::util::id::new_id())
+            .execute(&pool)
+            .await
+            .unwrap()
+            .rows_affected();
+            assert_eq!(inserted, 1, "only `periodic:` keys outlive their job");
+        }
     }
 
     #[tokio::test]
