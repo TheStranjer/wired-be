@@ -54,11 +54,12 @@ pub async fn set_activation(
 
 /// [`set_activation`] with the kind of deactivation named (WBE-878).
 ///
-/// [`Standing::Disabled`] and [`Standing::Suspended`] both deactivate and are
-/// logged as one `deactivate` entry, but only the suspension stamps
-/// [`suspended_at`](User::suspended_at), which is what the account entities
-/// and the federated actor read `suspended` from. [`Standing::Active`]
-/// reactivates and clears it.
+/// [`Standing::Disabled`] and [`Standing::Suspended`] are logged as one
+/// `deactivate` entry, the three lifting standings as one `activate`. Only
+/// a suspension, [`Standing::Active`] and [`Standing::Unsuspended`] reach the
+/// protocols (through [`AccountEvent::Suspended`] and
+/// [`AccountEvent::Unsuspended`]): a disable only blocks the owner, so
+/// [`Standing::Disabled`] and [`Standing::Enabled`] federate nothing (WBE-883).
 ///
 /// # Errors
 ///
@@ -69,7 +70,7 @@ pub async fn set_standing(
     accounts: &[User],
     standing: Standing,
 ) -> AppResult<Vec<User>> {
-    let active = matches!(standing, Standing::Active);
+    let active = standing.lifts();
     let mut moved = Vec::with_capacity(accounts.len());
     for account in accounts {
         if let Some(updated) = admin::set_standing(&state.db, account.id, standing).await? {
@@ -87,13 +88,15 @@ pub async fn set_standing(
         active,
         "admin changed account activations"
     );
-    let event = if active {
-        AccountEvent::Unsuspended
-    } else {
-        AccountEvent::Suspended
-    };
-    for account in &moved {
-        dispatch(state, account, event).await;
+    if standing.federates() {
+        let event = if active {
+            AccountEvent::Unsuspended
+        } else {
+            AccountEvent::Suspended
+        };
+        for account in &moved {
+            dispatch(state, account, event).await;
+        }
     }
     Ok(moved)
 }

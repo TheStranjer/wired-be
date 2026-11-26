@@ -13,15 +13,15 @@ use wired_be::models::{follow, status::Visibility, user::User};
 use super::support::{BASE, NOT_FOUND};
 use super::write_support::{
     DISABLED, INVALID_TYPE, MISSING_TYPE, NOT_ALLOWED, ONLY_LOCAL, WRONG_TARGET, Writes,
-    account_action_path, act, file_against, job_count, letters, logged, login, one_entry,
-    post_json, report_state, row_state, seed_writes, sweeps_for, token_count, verify,
+    account_action_path, act, disabled_state, file_against, job_count, letters, logged, login,
+    one_entry, post_json, report_state, row_state, seed_writes, sweeps_for, token_count, verify,
 };
 use crate::common::{self, TestRequest};
 
-/// `disable` is the deactivation and nothing more: the flag moves, the row is
-/// not stamped for deletion, the credential survives (refused, but live), and
-/// the request leaves both the `deactivate` entry of the move and the `disable`
-/// entry of the ask.
+/// `disable` blocks the owner and nothing more: `disabled_at` moves, the
+/// account stays active, the row is not stamped for deletion, the credential
+/// survives (refused, but live), and the request leaves both the `deactivate`
+/// entry of the move and the `disable` entry of the ask.
 #[tokio::test]
 async fn the_action_disables_the_account_it_is_pointed_at() {
     let db = common::test_db().await;
@@ -40,7 +40,15 @@ async fn the_action_disables_the_account_it_is_pointed_at() {
     let (active, _, doomed) = row_state(&seeded.pool, seeded.plain.id)
         .await
         .expect("the row is there");
-    assert!(!active, "the flag moved");
+    assert!(
+        active,
+        "the account stays active: a disable only blocks sign-in"
+    );
+    assert_eq!(
+        disabled_state(&seeded.pool, seeded.plain.id).await,
+        Some(true),
+        "the disable flag moved"
+    );
     assert!(
         !doomed,
         "and no deletion was stamped — disable is not delete"

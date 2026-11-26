@@ -32,6 +32,8 @@ mod actions;
 mod approve_reject;
 /// The delete and enable writes and their misses.
 mod delete_enable;
+/// A disabled account stays public while its owner is locked out.
+mod disabled_public;
 /// The two read gates: the admin user and the accounts read scope.
 mod read_gates;
 /// The listings, the pinned entity, the page and the show route.

@@ -148,7 +148,8 @@ impl From<bool> for Flag {
 pub enum AccountStatus {
     /// Nothing waits: the account logs in and uses its tokens.
     Active,
-    /// [`is_active`](User::is_active) is false.
+    /// [`is_active`](User::is_active) is false, or an admin disabled the
+    /// account ([`disabled_at`](User::disabled_at)).
     Deactivated,
     /// Staff have not approved the registration
     /// ([`approval_pending`](User::approval_pending) is set).

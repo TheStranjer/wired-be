@@ -77,8 +77,8 @@ pub struct AdminAccount {
     /// The display name as plain text, the nickname when the account has no
     /// name of its own.
     pub display_name: String,
-    /// [`is_active`](User::is_active): false once an account is deactivated
-    /// or suspended.
+    /// [`is_active`](User::is_active): false once an account is deactivated,
+    /// suspended or disabled.
     pub is_active: JsonBool,
     /// Whether this instance owns the account.
     pub local: JsonBool,
@@ -119,7 +119,7 @@ impl AdminAccount {
             ),
             nickname: user.nickname.clone(),
             display_name: plain_display_name(user),
-            is_active: JsonBool(user.is_active.get()),
+            is_active: JsonBool(user.is_active.get() && !user.is_disabled()),
             local: JsonBool(user.local.get()),
             roles: AdminRoles {
                 admin: user.is_admin.get(),
@@ -426,6 +426,7 @@ mod tests {
             email_notifications: Flag::new(true),
             deleted_at: None,
             suspended_at: None,
+            disabled_at: None,
             remote_suspended: Flag::new(false),
         }
     }

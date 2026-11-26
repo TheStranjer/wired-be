@@ -93,6 +93,7 @@ pub(super) fn author() -> User {
         email_notifications: Flag::new(true),
         deleted_at: None,
         suspended_at: None,
+        disabled_at: None,
         remote_suspended: Flag::new(false),
     }
 }

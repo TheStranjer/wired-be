@@ -9,8 +9,8 @@ use uuid::Uuid;
 
 use super::support::{INVALID_TOKEN, NOT_FOUND, V1};
 use super::write_support::{
-    DISABLED, NOT_ALLOWED, account_action_path, account_path, delete_as, logged, login, one_entry,
-    post_json, row_state, seed_writes, sweeps_for, token_count, verify,
+    DISABLED, NOT_ALLOWED, account_action_path, account_path, delete_as, disabled_state, logged,
+    login, one_entry, post_json, row_state, seed_writes, sweeps_for, token_count, verify,
 };
 use crate::common::{self, TestRequest};
 
@@ -170,7 +170,7 @@ async fn the_writes_404_for_an_id_that_names_no_account() {
     );
 }
 
-/// Enabling is the flag alone: the deactivated account answers active, its
+/// Enabling is the flag alone: the disabled account answers enabled, its
 /// untouched credential works again, its password signs in once more, and the
 /// `activate` entry Pleroma's `enable` writes names it.
 #[tokio::test]
@@ -202,7 +202,12 @@ async fn enabling_a_disabled_account_frees_it_again() {
     let (active, _, _) = row_state(&seeded.pool, seeded.asleep.id)
         .await
         .expect("the row is there");
-    assert!(active, "and the flag moved in the row");
+    assert!(active, "the disable never touched the activation");
+    assert_eq!(
+        disabled_state(&seeded.pool, seeded.asleep.id).await,
+        Some(false),
+        "and the flag moved in the row"
+    );
     assert_eq!(
         token_count(&seeded.pool, &seeded.asleep).await,
         1,

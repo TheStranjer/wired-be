@@ -121,7 +121,7 @@ pub fn visible_to(account: &User, viewer: Option<&User>) -> bool {
     {
         return true;
     }
-    matches!(account.account_status(), AccountStatus::Active)
+    matches!(account.registration_status(), AccountStatus::Active)
 }
 
 /// [`account_or_404`] for a request made by `viewer`: the row is returned

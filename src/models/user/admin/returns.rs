@@ -36,51 +36,106 @@ pub async fn set_suggested(pool: &PgPool, id: Uuid, suggested: bool) -> AppResul
     Ok(updated)
 }
 
-/// The `UPDATE` behind [`set_standing`]: writes the activation flag and
-/// the kind of deactivation, refreshes `updated_at` and returns the stored
-/// row. A suspension keeps the time it began when it is written again.
-const SET_STANDING_SQL: &str = "UPDATE users
-       SET local_deactivated = NOT $2::boolean,
-           is_active = $2::boolean AND NOT remote_suspended,
-           suspended_at = CASE WHEN $3::boolean
-                               THEN COALESCE(suspended_at, now()) ELSE NULL END,
+/// The `UPDATE` of [`Standing::Suspended`]: deactivates and stamps the
+/// suspension, which keeps the time it began when it is written again. The
+/// disable stays as it was.
+const SUSPEND_SQL: &str = "UPDATE users
+       SET local_deactivated = true,
+           is_active = false,
+           suspended_at = COALESCE(suspended_at, now()),
            updated_at = now()
      WHERE id = $1 RETURNING *";
 
-/// The local standing an admin write gives an account (WBE-878).
+/// The `UPDATE` of [`Standing::Unsuspended`]: lifts the local suspension. A
+/// remote one keeps the account inactive (WBE-873) and the disable stays.
+const UNSUSPEND_SQL: &str = "UPDATE users
+       SET local_deactivated = false,
+           is_active = NOT remote_suspended,
+           suspended_at = NULL,
+           updated_at = now()
+     WHERE id = $1 RETURNING *";
+
+/// The `UPDATE` of [`Standing::Active`]: [`UNSUSPEND_SQL`] and the disable
+/// lifted too.
+const ACTIVATE_SQL: &str = "UPDATE users
+       SET local_deactivated = false,
+           is_active = NOT remote_suspended,
+           suspended_at = NULL,
+           disabled_at = NULL,
+           updated_at = now()
+     WHERE id = $1 RETURNING *";
+
+/// The `UPDATE` of [`Standing::Disabled`]: stamps the disable, which keeps
+/// the time it began when it is written again, and nothing else.
+const DISABLE_SQL: &str = "UPDATE users
+       SET disabled_at = COALESCE(disabled_at, now()),
+           updated_at = now()
+     WHERE id = $1 RETURNING *";
+
+/// The `UPDATE` of [`Standing::Enabled`]: lifts the disable and nothing else.
+const ENABLE_SQL: &str = "UPDATE users
+       SET disabled_at = NULL,
+           updated_at = now()
+     WHERE id = $1 RETURNING *";
+
+/// The local standing an admin write gives an account (WBE-878, WBE-883).
+///
+/// A suspension and a disable are two flags that never touch each other:
+/// suspending or unsuspending leaves a disable in place, and enabling leaves
+/// a suspension in place.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Standing {
-    /// Active: neither disabled nor suspended.
+    /// Neither disabled nor suspended: lifts both.
     Active,
-    /// Deactivated by a plain disable: [`is_active`](User::is_active) off,
-    /// [`suspended_at`](User::suspended_at) empty.
+    /// Disabled: only [`disabled_at`](User::disabled_at) is stamped. The
+    /// account stays active, visible and federated; its owner cannot sign in.
     Disabled,
-    /// Deactivated by a suspension: [`is_active`](User::is_active) off and
+    /// The disable lifted; a suspension stays.
+    Enabled,
+    /// Suspended: [`is_active`](User::is_active) off and
     /// [`suspended_at`](User::suspended_at) stamped.
     Suspended,
+    /// The local suspension lifted; a disable stays.
+    Unsuspended,
 }
 
 impl Standing {
-    /// Whether the standing leaves the account active.
-    const fn active(self) -> bool {
-        matches!(self, Self::Active)
+    /// The write this standing is.
+    const fn sql(self) -> &'static str {
+        match self {
+            Self::Active => ACTIVATE_SQL,
+            Self::Disabled => DISABLE_SQL,
+            Self::Enabled => ENABLE_SQL,
+            Self::Suspended => SUSPEND_SQL,
+            Self::Unsuspended => UNSUSPEND_SQL,
+        }
     }
 
-    /// Whether the standing is a suspension.
-    const fn suspended(self) -> bool {
-        matches!(self, Self::Suspended)
+    /// Whether the standing reverses something (and is logged as an
+    /// activation) rather than imposing it.
+    #[must_use]
+    pub const fn lifts(self) -> bool {
+        matches!(self, Self::Active | Self::Enabled | Self::Unsuspended)
+    }
+
+    /// Whether the write changes the account's federated face: only a
+    /// suspension and its lifting do (a disable federates nothing).
+    #[must_use]
+    pub const fn federates(self) -> bool {
+        matches!(self, Self::Active | Self::Suspended | Self::Unsuspended)
     }
 }
 
 /// Stores `standing` as user `id`'s local standing and returns the updated
-/// row (WBE-878).
+/// row (WBE-878, WBE-883).
 ///
-/// Only the local origin moves: `local_deactivated` follows the standing,
-/// [`is_active`](User::is_active) becomes true for [`Standing::Active`]
-/// unless the account's origin server has it suspended (`remote_suspended`),
-/// which a local activation does not clear (WBE-873), and
-/// [`suspended_at`](User::suspended_at) is stamped by
-/// [`Standing::Suspended`] and cleared by the other two.
+/// Only the local origin moves. [`Standing::Suspended`] sets
+/// `local_deactivated` and stamps [`suspended_at`](User::suspended_at);
+/// [`Standing::Unsuspended`] clears both, and [`is_active`](User::is_active)
+/// comes back unless the account's origin server has it suspended
+/// (`remote_suspended`), which a local activation does not clear (WBE-873).
+/// [`Standing::Disabled`] and [`Standing::Enabled`] write
+/// [`disabled_at`](User::disabled_at) alone.
 ///
 /// `None` when `id` names no row.
 ///
@@ -88,10 +143,8 @@ impl Standing {
 ///
 /// Any database failure arrives as [`AppError::Database`](crate::error::AppError).
 pub async fn set_standing(pool: &PgPool, id: Uuid, standing: Standing) -> AppResult<Option<User>> {
-    let updated = sqlx::query_as::<_, User>(SET_STANDING_SQL)
+    let updated = sqlx::query_as::<_, User>(standing.sql())
         .bind(id)
-        .bind(Flag::new(standing.active()))
-        .bind(Flag::new(standing.suspended()))
         .fetch_optional(pool)
         .await?;
     Ok(updated)
@@ -331,25 +384,99 @@ mod tests {
         assert!(suspended.suspended_at.is_some(), "and stamped");
         assert!(suspended.is_suspended(), "so it reads suspended");
 
+        let lifted = set_standing(&pool, alice.id, Standing::Unsuspended)
+            .await
+            .expect("the unsuspension runs")
+            .expect("the row comes back");
+        assert!(lifted.is_active.get(), "the unsuspension wakes it");
+        assert!(lifted.suspended_at.is_none(), "and clears the stamp");
+
         let disabled = set_standing(&pool, alice.id, Standing::Disabled)
             .await
             .expect("the disable runs")
             .expect("the row comes back");
-        assert!(!disabled.is_active.get(), "still inactive");
-        assert!(disabled.suspended_at.is_none(), "but no longer stamped");
+        assert!(disabled.is_active.get(), "a disable leaves it active");
+        assert!(disabled.suspended_at.is_none(), "and unstamped");
+        assert!(disabled.disabled_at.is_some(), "but it is disabled");
         assert!(!disabled.is_suspended(), "so it reads disabled only");
+    }
+
+    /// The disable and the suspension are two flags: each reversal lifts only
+    /// its own, the active standing lifts both, and a remote suspension
+    /// outlives a local activation (WBE-883).
+    #[tokio::test]
+    async fn the_disable_and_the_suspension_are_lifted_separately() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = insert(
+            &pool,
+            &NewUser::local("alice", "https://test.example/users/alice"),
+        )
+        .await
+        .expect("the fixture inserts");
+        let _disabled = set_standing(&pool, alice.id, Standing::Disabled)
+            .await
+            .expect("the disable runs");
 
         let resuspended = set_standing(&pool, alice.id, Standing::Suspended)
             .await
             .expect("the second suspension runs")
             .expect("the row comes back");
+        assert!(resuspended.suspended_at.is_some(), "suspended again");
+        assert!(resuspended.disabled_at.is_some(), "the disable stays");
+        let unsuspended = set_standing(&pool, alice.id, Standing::Unsuspended)
+            .await
+            .expect("the unsuspension runs")
+            .expect("the row comes back");
+        assert!(unsuspended.is_active.get(), "the account is awake");
+        assert!(unsuspended.disabled_at.is_some(), "and still disabled");
+        let enabled = set_standing(&pool, alice.id, Standing::Enabled)
+            .await
+            .expect("the enable runs")
+            .expect("the row comes back");
+        assert!(
+            enabled.disabled_at.is_none(),
+            "the enable lifts the disable"
+        );
+        let suspended_again = set_standing(&pool, alice.id, Standing::Suspended)
+            .await
+            .expect("the suspension runs")
+            .expect("the row comes back");
+        let still = set_standing(&pool, alice.id, Standing::Enabled)
+            .await
+            .expect("the enable runs")
+            .expect("the row comes back");
+        assert!(suspended_again.suspended_at.is_some(), "suspended");
+        assert!(
+            !still.is_active.get() && still.suspended_at.is_some(),
+            "an enable leaves a suspension in force"
+        );
+        let both = set_standing(&pool, alice.id, Standing::Disabled)
+            .await
+            .expect("the disable runs")
+            .expect("the row comes back");
         let again = set_standing(&pool, alice.id, Standing::Active)
             .await
             .expect("the activation runs")
             .expect("the row comes back");
-        assert!(resuspended.suspended_at.is_some(), "suspended again");
+        assert!(both.disabled_at.is_some(), "disabled and suspended");
         assert!(again.is_active.get(), "the activation wakes it");
-        assert!(again.suspended_at.is_none(), "and clears the stamp");
+        assert!(again.suspended_at.is_none(), "clears the stamp");
+        assert!(again.disabled_at.is_none(), "and the disable");
+    }
+
+    /// A remote suspension outlives a local activation, and an unknown id
+    /// matches no row.
+    #[tokio::test]
+    async fn a_remote_suspension_outlives_a_local_activation() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = insert(
+            &pool,
+            &NewUser::local("alice", "https://test.example/users/alice"),
+        )
+        .await
+        .expect("the fixture inserts");
 
         let flagged = sqlx::query("UPDATE users SET remote_suspended = true WHERE id = $1")
             .bind(alice.id)

@@ -69,7 +69,8 @@ pub(super) struct Writes {
     pub(super) root: User,
     /// An ordinary active, approved, confirmed account, with a password.
     pub(super) plain: User,
-    /// A deactivated account, with a password.
+    /// A disabled account (active and public, its owner locked out), with a
+    /// password.
     pub(super) asleep: User,
     /// A registration awaiting staff, with an address.
     pub(super) newbie: User,
@@ -93,7 +94,14 @@ pub(super) async fn seed_writes(db: &TestDb) -> Writes {
     })
     .await;
     let plain = common::create_user_with_password(&pool, "plain", PASSWORD).await;
-    let asleep = common::create_deactivated_user_with_password(&pool, "asleep", PASSWORD).await;
+    let asleep = common::create_user_with_password(&pool, "asleep", PASSWORD).await;
+    let disabled = sqlx::query("UPDATE users SET disabled_at = now() WHERE id = $1")
+        .bind(asleep.id)
+        .execute(&pool)
+        .await
+        .expect("the fixture is disabled")
+        .rows_affected();
+    assert_eq!(disabled, 1, "the disabled fixture exists");
     let newbie = create(&pool, "newbie", |user| NewUser {
         approval_pending: Flag::new(true),
         email: Some("newbie@example.org".to_owned()),
@@ -187,6 +195,15 @@ pub(super) async fn row_state(pool: &PgPool, id: Uuid) -> Option<(bool, bool, bo
     .fetch_optional(pool)
     .await
     .expect("the row reads back")
+}
+
+/// Whether the row of `id` carries a disable, or `None` once it is gone.
+pub(super) async fn disabled_state(pool: &PgPool, id: Uuid) -> Option<bool> {
+    sqlx::query_scalar::<_, bool>("SELECT disabled_at IS NOT NULL FROM users WHERE id = $1")
+        .bind(id)
+        .fetch_optional(pool)
+        .await
+        .expect("the row reads back")
 }
 
 /// How many live bearer tokens `account` holds.

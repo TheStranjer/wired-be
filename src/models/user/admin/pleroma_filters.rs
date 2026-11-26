@@ -35,11 +35,11 @@ fn push_location(builder: &mut QueryBuilder<Postgres>, filters: ListFilters) {
 /// `unconfirmed` an address nobody confirmed.
 fn push_state(builder: &mut QueryBuilder<Postgres>, filters: ListFilters) {
     if filters.active.get() {
-        let _active: &mut _ =
-            builder.push(" AND is_active AND NOT approval_pending AND email_confirmed");
+        let _active: &mut _ = builder.push(" AND is_active AND disabled_at IS NULL");
+        let _green: &mut _ = builder.push(" AND NOT approval_pending AND email_confirmed");
     }
     if filters.deactivated.get() {
-        let _deactivated: &mut _ = builder.push(" AND NOT is_active");
+        let _deactivated: &mut _ = builder.push(" AND (NOT is_active OR disabled_at IS NOT NULL)");
     }
     if filters.need_approval.get() {
         let _pending: &mut _ = builder.push(" AND approval_pending");

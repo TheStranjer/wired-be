@@ -148,8 +148,9 @@ pub struct AdminAccount {
     pub suspended: JsonBool,
     /// Whether staff silenced it; nothing silences one here.
     pub silenced: JsonBool,
-    /// Pleroma's `disabled`: the account is inactive without being
-    /// [suspended](Self::suspended), so the two never both read true.
+    /// Mastodon's `disabled`: an admin disabled the account
+    /// ([`disabled_at`](User::disabled_at)), which only stops its owner
+    /// signing in. It is independent of [`suspended`](Self::suspended).
     pub disabled: JsonBool,
     /// Pleroma's `approved`: the absence of
     /// [`approval_pending`](User::approval_pending) here.
@@ -177,7 +178,7 @@ impl AdminAccount {
             confirmed: JsonBool(user.email_confirmed.get()),
             suspended: JsonBool(user.is_suspended()),
             silenced: JsonBool(false),
-            disabled: JsonBool(!user.is_active.get() && !user.is_suspended()),
+            disabled: JsonBool(user.is_disabled()),
             approved: JsonBool(!user.approval_pending.get()),
             account: Account::from_user(user, config),
         }
@@ -296,6 +297,7 @@ mod tests {
             email_notifications: Flag::new(true),
             deleted_at: None,
             suspended_at: None,
+            disabled_at: None,
             remote_suspended: Flag::new(false),
         }
     }
@@ -448,7 +450,7 @@ mod tests {
             registration_reason: Some("please let me in".to_owned()),
             approval_pending: Flag::new(true),
             email_confirmed: Flag::new(false),
-            is_active: Flag::new(false),
+            disabled_at: Some(stamped()),
             ..base_user("newbie")
         };
         let rendered = entity(&pending);
@@ -467,7 +469,7 @@ mod tests {
         assert_eq!(
             rendered["disabled"],
             json!(true),
-            "an inactive account is a disabled one"
+            "a disabled account reads disabled"
         );
         assert_eq!(
             rendered["suspended"],
@@ -476,8 +478,8 @@ mod tests {
         );
     }
 
-    /// A suspension, local or remote, reads `suspended` and not `disabled`,
-    /// whether or not the row is also inactive (WBE-878).
+    /// A suspension, local or remote, reads `suspended` and not `disabled`;
+    /// a disable alone reads `disabled` and not `suspended` (WBE-883).
     #[test]
     fn a_suspension_reads_suspended_and_not_disabled() {
         let local = User {
@@ -499,5 +501,11 @@ mod tests {
                 "is not also a disabled account ({name})"
             );
         }
+        let disabled = entity(&User {
+            disabled_at: Some(stamped()),
+            ..base_user("disabled")
+        });
+        assert_eq!(disabled["disabled"], json!(true), "a disable");
+        assert_eq!(disabled["suspended"], json!(false), "is not a suspension");
     }
 }

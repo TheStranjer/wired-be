@@ -156,6 +156,15 @@ pub(super) async fn seed(db: &TestDb) -> Seeded {
         ..user
     })
     .await;
+    // The row reads as a disabled account (the flag `status=disabled` weighs),
+    // beside being inactive.
+    let disabled = sqlx::query("UPDATE users SET disabled_at = now() WHERE nickname = $1::citext")
+        .bind("suspended")
+        .execute(&pool)
+        .await
+        .expect("the disable writes")
+        .rows_affected();
+    assert_eq!(disabled, 1, "the inactive fixture row is also disabled");
     seeded(&pool, "newbie", |user| NewUser {
         approval_pending: Flag::new(true),
         registration_reason: Some("please let me in".to_owned()),
