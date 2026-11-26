@@ -184,7 +184,7 @@ async fn fill_renders_the_custom_emoji_entities_and_leaves_others_empty() {
         json!([{
             "shortcode": "blob",
             "url": "https://remote.example/emoji/blob.png",
-            "static_url": null,
+            "static_url": "https://remote.example/emoji/blob.png",
             "visible_in_picker": true,
             "category": null,
             "tags": [],

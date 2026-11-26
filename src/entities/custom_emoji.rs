@@ -11,8 +11,8 @@
 //!
 //! Differences from the Pleroma view, per the ticket: file-backed pack
 //! emojis always know their url, while a row here may have no still
-//! variant, so `static_url` is `null` when the column is (clients fall
-//! back to `url`), and `category` is the stored pack name or `null`, not
+//! variant, so `static_url` falls back to the (proxied) `url` when the
+//! column is null, and `category` is the stored pack name or `null`, not
 //! the tag list joined with commas. `url` and `static_url` pass through
 //! the media proxy helper ([`proxy_url`](crate::services::media_proxy::proxy_url)):
 //! with `MEDIA_PROXY_ENABLED` set, emojis hosted on foreign domains get
@@ -34,9 +34,10 @@ pub struct CustomEmoji {
     pub shortcode: String,
     /// The emoji image url: the stored [`image_url`](EmojiRow::image_url).
     pub url: String,
-    /// The still (non-animated) variant; `null` when the row stores none
-    /// and clients fall back to [`url`](Self::url).
-    pub static_url: Option<String>,
+    /// The still (non-animated) variant, never `null`.
+    ///
+    /// A row that stores none renders [`url`](Self::url) here, as Pleroma does.
+    pub static_url: String,
     /// Whether clients list the emoji in their pickers.
     pub visible_in_picker: bool,
     /// The pack name; `null` when the emoji is ungrouped.
@@ -48,16 +49,19 @@ pub struct CustomEmoji {
 impl CustomEmoji {
     /// Renders `row` as a `CustomEmoji` entity: every field passes
     /// through from the stored row, `url` taking the image url through
-    /// the media proxy helper (`static_url` likewise when present).
+    /// the media proxy helper. `static_url` does likewise with the stored
+    /// still url, falling back to the image url when the row has none.
     #[must_use]
     pub fn from_model(row: &EmojiRow, config: &Config) -> Self {
+        let url = media_proxy::proxy_url(config, &row.image_url);
+        let static_url = row.static_url.as_deref().map_or_else(
+            || url.clone(),
+            |still| media_proxy::proxy_url(config, still),
+        );
         Self {
             shortcode: row.shortcode.clone(),
-            url: media_proxy::proxy_url(config, &row.image_url),
-            static_url: row
-                .static_url
-                .as_deref()
-                .map(|url| media_proxy::proxy_url(config, url)),
+            url,
+            static_url,
             visible_in_picker: row.visible_in_picker,
             category: row.category.clone(),
             tags: row.tags.clone(),
@@ -190,7 +194,7 @@ mod tests {
     }
 
     #[test]
-    fn absent_pack_still_and_tags_render_as_null_and_empty() {
+    fn absent_pack_and_tags_render_as_null_and_empty_and_the_still_falls_back_to_url() {
         let mut row = base_row("plain");
         row.static_url = None;
         row.category = None;
@@ -203,7 +207,7 @@ mod tests {
             serde_json::json!({
                 "shortcode": "plain",
                 "url": "https://test.example/emoji/custom/plain.gif",
-                "static_url": null,
+                "static_url": "https://test.example/emoji/custom/plain.gif",
                 "visible_in_picker": false,
                 "category": null,
                 "tags": [],
@@ -211,6 +215,25 @@ mod tests {
             "the ungrouped emoji keeps every key"
         );
         assert_eq!(json_keys(&value), EXPECTED_KEYS, "exact key set");
+    }
+
+    #[test]
+    fn a_row_without_a_still_renders_the_proxied_url_as_static_url() {
+        let mut row = base_row("blobcat");
+        row.domain = Some("remote.example".to_owned());
+        row.image_url = "https://remote.example/emoji/blobcat.gif".to_owned();
+        row.static_url = None;
+
+        let value = render_proxied(&row);
+        let url = value["url"].as_str().unwrap();
+        assert!(
+            url.starts_with("https://test.example/proxy/"),
+            "the remote emoji is proxied: {url}"
+        );
+        assert_eq!(
+            value["static_url"], value["url"],
+            "static_url is the same proxied link as url"
+        );
     }
 
     #[test]

@@ -484,7 +484,7 @@ mod tests {
             json!([{
                 "shortcode": "plerofox",
                 "url": "https://remote.example/emoji/plerofox.png",
-                "static_url": null,
+                "static_url": "https://remote.example/emoji/plerofox.png",
                 "visible_in_picker": true,
                 "category": null,
                 "tags": [],
