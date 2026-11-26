@@ -30,6 +30,11 @@ pub(super) const ROWS: &[RouteSpec] = &[
     },
     RouteSpec {
         method: "POST",
+        path: "/api/v1/admin/accounts/:id/unsuspend",
+        auth: AuthClass::Admin,
+    },
+    RouteSpec {
+        method: "POST",
         path: "/api/v1/admin/accounts/:id/action",
         auth: AuthClass::Admin,
     },

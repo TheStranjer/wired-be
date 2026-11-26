@@ -10,8 +10,9 @@
 //! `application/activity+json; charset=utf-8`; a browser (`Accept` naming
 //! `text/html`, no `ActivityPub` type) gets Pleroma's 302 to the frontend
 //! profile URL; anyone else gets 404 `{"error":"Not found"}`. An unknown
-//! or remote account gets the same 404 to an `ActivityPub` ask, and a
-//! deactivated local account gets 410 Gone. Every answer says it varies
+//! or remote account gets the same 404 to an `ActivityPub` ask, and an
+//! account being deleted gets 410 Gone, while a deactivated or suspended one
+//! still answers 200 with the minimal `suspended` document. Every answer says it varies
 //! on `Accept`.
 //!
 //! The inboxes (`POST /inbox`, `POST /users/{nickname}/inbox` and

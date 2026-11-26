@@ -78,5 +78,6 @@ pub mod publisher;
 pub mod quotes;
 pub mod remote_actor;
 pub mod signature;
+pub mod suspended_actor;
 pub mod vocab;
 pub mod webfinger_client;

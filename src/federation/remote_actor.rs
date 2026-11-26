@@ -138,6 +138,11 @@ pub struct NewRemoteUser {
     pub locked: Flag,
     /// `discoverable`.
     pub discoverable: Flag,
+    /// `suspended`: the origin suspended the account (Mastodon's
+    /// `suspension_origin: remote`). The upsert stores it as the mirror's
+    /// `is_active` inverted, so its statuses stop showing, and an `Update`
+    /// without the flag clears it.
+    pub suspended: Flag,
     /// The `PropertyValue` entries of `attachment` as `{name, value}`
     /// objects, the shape of the `fields` column.
     pub fields: Value,

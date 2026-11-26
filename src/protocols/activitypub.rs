@@ -38,11 +38,17 @@
 //!   ([`services::federation_out::after_account_deleted`]). The `users.delete`
 //!   job fires the event before it clears the relationship rows that
 //!   function reads, and retries the job when it fails.
-//! - `Deactivated`: nothing is federated. The actor document stays resolvable
-//!   ([`services::federation_out::after_account_disabled`] is the no-op landing point).
-//! - `Suspended`, `Unsuspended`: nothing is federated.
+//! - `Suspended`, `Deactivated`, `Unsuspended`, `Reactivated`: queues an `Update` of the
+//!   actor ([`services::federation_out::after_account_activation_changed`]) to every inbox
+//!   that knows the account, the set the `Delete` uses. While the account is inactive the
+//!   actor document is the minimal one with `"suspended": true`, and it keeps answering 200
+//!   (only a deleted account is 410, which a peer reads as deletion); once it is active
+//!   again the `Update` carries the full profile without the flag. No `Reject` of the
+//!   remote follows is sent, so re-enabling restores the account completely.
 //! - `Registered`, `PasswordChanged`: nothing is federated.
-//! - `Reactivated`: nothing fires it.
+//!
+//! Inbound, an actor document or `Update` with `"suspended": true` marks the mirror inactive
+//! (its statuses stop showing) and an `Update` without the flag reactivates it.
 //!
 //! It is one of the two worked examples a new protocol copies: this one wraps
 //! existing code, `protocols::fixture` is the minimal one.
@@ -225,18 +231,15 @@ impl ProtocolAdapter for ActivityPub {
                 AccountEvent::Deleted => {
                     services::federation_out::after_account_deleted(state, user).await?;
                 }
-                // Deactivation federates nothing: the actor stays resolvable.
-                AccountEvent::Deactivated => {
-                    services::federation_out::after_account_disabled(state, user);
-                }
-                // Nothing federates for these today. A suspension is a local moderation
-                // flag, and the actor document keeps resolving, as for a deactivation.
-                // `Reactivated` is never fired, because no endpoint re-enables an account.
-                AccountEvent::Registered
-                | AccountEvent::PasswordChanged
-                | AccountEvent::Suspended
+                // A suspension, a deactivation and their reversals each announce the
+                // actor's new state as an `Update`; the document renders from the row.
+                AccountEvent::Suspended
+                | AccountEvent::Deactivated
                 | AccountEvent::Unsuspended
-                | AccountEvent::Reactivated => {}
+                | AccountEvent::Reactivated => {
+                    services::federation_out::after_account_activation_changed(state, user).await?;
+                }
+                AccountEvent::Registered | AccountEvent::PasswordChanged => {}
             }
             Ok(())
         })

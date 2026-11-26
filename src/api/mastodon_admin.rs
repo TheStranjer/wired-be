@@ -99,7 +99,8 @@
 //!   none either, so the account's own token works again the moment it is
 //!   enabled — and it logs Pleroma's `enable` entry, the `activate` one.
 //!   Enabling an account that was never disabled changes nothing, answers
-//!   200 and logs.
+//!   200 and logs. `POST …/accounts/{id}/unsuspend` is the same handler
+//!   under Mastodon's name for it.
 //! - `POST …/accounts/{id}/approve` is the console's `PATCH /users/approve`
 //!   for one account by id, sharing its write and its `account_approved`
 //!   letter through [`helpers::approve_account`]. An account nobody left
@@ -120,9 +121,10 @@
 //!   gives.
 //! - `POST …/accounts/{id}/action` is Mastodon's moderation umbrella.
 //!   `disable` clears `is_active`; `suspend` does exactly the same and
-//!   nothing more — it deactivates only, queues no job, federates nothing
-//!   (no actor `Delete`, no `Update`), stamps no `deleted_at`, revokes no
-//!   token and removes no data, so `…/enable` reverses it completely
+//!   nothing more — it deactivates only, stamps no `deleted_at`, revokes no
+//!   token and removes no data. The `Suspended` event it fires makes
+//!   `ActivityPub` queue an actor `Update` saying `"suspended": true` (no
+//!   `Delete`, no `Reject` of the follows), so `…/enable` reverses it completely
 //!   (Mastodon's suspension is reversible, and Pleroma has no `suspend`
 //!   at all; a dedicated suspension state is out of scope here);
 //!   `none`, `sensitive` and `silence` change nothing this schema can
@@ -249,6 +251,7 @@ pub fn v1_router() -> Router<AppState> {
         .route("/accounts", get(list_accounts))
         .route("/accounts/{id}", get(show_account).delete(delete_account))
         .route("/accounts/{id}/enable", post(enable_account))
+        .route("/accounts/{id}/unsuspend", post(enable_account))
         .route("/accounts/{id}/approve", post(approve_account))
         .route("/accounts/{id}/reject", post(reject_account))
         .route("/accounts/{id}/action", post(account_action))

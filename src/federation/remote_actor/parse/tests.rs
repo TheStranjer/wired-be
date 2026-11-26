@@ -808,3 +808,24 @@ fn an_invalid_or_absent_vcard_bday_is_ignored() {
     remove(&mut document, "vcard:bday");
     assert_eq!(parse_actor(&document).unwrap().birthday, None, "absent");
 }
+
+#[test]
+fn the_suspended_flag_is_read_and_defaults_to_false() {
+    let mut document = fixture(MASTODON);
+    assert!(
+        !parse_actor(&document).unwrap().suspended.get(),
+        "an absent flag is not a suspension"
+    );
+
+    document["suspended"] = json!(true);
+    assert!(
+        parse_actor(&document).unwrap().suspended.get(),
+        "`suspended: true` is read"
+    );
+
+    document["suspended"] = json!("yes");
+    assert!(
+        !parse_actor(&document).unwrap().suspended.get(),
+        "a flag that is no boolean is ignored"
+    );
+}

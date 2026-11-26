@@ -6,12 +6,12 @@ use uuid::Uuid;
 use super::super::{
     test_support::{
         ALICE, NEW_PEM, app_state, assert_handled, broken_state, fresh_user, ignored, local_user,
-        mirror, person, ready_for_update, remote_user, view,
+        mirror, mirror_post, person, ready_for_update, remote_user, view,
     },
     update_actor,
 };
 use super::*;
-use crate::services::runtime_config;
+use crate::{models::status_visibility::can_view, services::runtime_config};
 
 /// The profile half of an `Update`: name, note, avatar, fields and the
 /// endpoints the document changed all land on the mirror.
@@ -543,4 +543,51 @@ async fn two_updates_under_one_activity_id_both_apply() {
 
     let stored = fresh_user(&pool, alice_id).await;
     assert_eq!(stored.name, "Alice two", "the second display name wins");
+}
+
+/// An `Update` whose document says `"suspended": true` marks the mirror
+/// inactive, so its statuses stop showing; a later `Update` without the flag
+/// brings it back.
+#[tokio::test]
+async fn an_update_toggles_the_suspension_of_the_mirror() {
+    let db = crate::test_db::test_db().await.expect("test database slot");
+    let pool = db.pool().clone();
+    let state = app_state(&pool);
+    let alice = mirror(&pool).await;
+    let alice_id = alice.id;
+    let post = mirror_post(&pool, &alice, "alice").await;
+    let shown = can_view(&pool, &post, None).await.expect("the check runs");
+    assert!(shown, "the post shows while the mirror is active");
+
+    let mut suspended = person();
+    suspended["suspended"] = json!(true);
+    let folded = update_actor(
+        state.clone(),
+        view("Update", "suspend-1", ALICE, suspended),
+        alice,
+    )
+    .await;
+    assert_handled(&folded);
+
+    let stored = fresh_user(&pool, alice_id).await;
+    assert!(!stored.is_active.get(), "the mirror is suspended");
+    let hidden = can_view(&pool, &post, None).await.expect("the check runs");
+    assert!(!hidden, "its statuses stop showing");
+
+    let aged = ready_for_update(&pool, alice_id).await;
+    let refolded = update_actor(
+        state.clone(),
+        view("Update", "unsuspend-1", ALICE, person()),
+        aged,
+    )
+    .await;
+    assert_handled(&refolded);
+
+    let restored = fresh_user(&pool, alice_id).await;
+    assert!(
+        restored.is_active.get(),
+        "the flag dropped, the mirror is back"
+    );
+    let back = can_view(&pool, &post, None).await.expect("the check runs");
+    assert!(back, "and its statuses show again");
 }

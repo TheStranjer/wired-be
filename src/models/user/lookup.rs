@@ -76,13 +76,34 @@ where
 /// (neither is told apart from a missing route), [`AppError::Gone`] for a
 /// deactivated local account, [`AppError::Database`] on a lookup failure.
 pub async fn require_local_active(pool: &PgPool, nickname: &str) -> AppResult<User> {
+    let user = require_local_resolvable(pool, nickname).await?;
+    if !user.is_active.get() {
+        return Err(AppError::Gone);
+    }
+    Ok(user)
+}
+
+/// Fetches the local account named `nickname` for a route that must keep
+/// answering for a deactivated or suspended account.
+///
+/// The actor document is the one such route: a peer that refetches a
+/// suspended actor and gets 410 treats it as deleted, so only an account
+/// whose deletion has been started ([`deleted_at`](User::deleted_at) set) is
+/// gone.
+///
+/// # Errors
+///
+/// [`AppError::RouteNotFound`] for an unknown nickname or a remote mirror's,
+/// [`AppError::Gone`] for an account whose deletion has started,
+/// [`AppError::Database`] on a lookup failure.
+pub async fn require_local_resolvable(pool: &PgPool, nickname: &str) -> AppResult<User> {
     let Some(user) = get_by_nickname(pool, nickname).await? else {
         return Err(AppError::RouteNotFound);
     };
     if !user.local.get() {
         return Err(AppError::RouteNotFound);
     }
-    if !user.is_active.get() {
+    if user.deleted_at.is_some() {
         return Err(AppError::Gone);
     }
     Ok(user)
@@ -259,7 +280,8 @@ mod tests {
         models::{
             activitypub_actor::ActivityPubActorWrite,
             user::{
-                DEFAULT_ACTOR_TYPE, NewUser, insert, local_ap_id, set_activation, test_support::*,
+                DEFAULT_ACTOR_TYPE, NewUser, insert, local_ap_id, mark_deleted, set_activation,
+                test_support::*,
             },
         },
         util::id::new_id,
@@ -579,6 +601,33 @@ mod tests {
         assert!(
             matches!(deactivated, Err(AppError::Gone)),
             "a deactivated local account is gone, got {deactivated:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn require_local_resolvable_is_gone_only_for_a_deleted_account() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let asleep = insert(&pool, &local_new("asleep")).await.unwrap();
+        set_activation(&pool, asleep.id, false).await.unwrap();
+        let deleted = insert(&pool, &local_new("deleted")).await.unwrap();
+        mark_deleted(&pool, deleted.id).await.unwrap();
+
+        let found = require_local_resolvable(&pool, "asleep").await;
+        assert_eq!(
+            found.map(|user| user.id).ok(),
+            Some(asleep.id),
+            "a deactivated account still resolves"
+        );
+        let gone = require_local_resolvable(&pool, "deleted").await;
+        assert!(
+            matches!(gone, Err(AppError::Gone)),
+            "a deleted account is gone, got {gone:?}"
+        );
+        let unknown = require_local_resolvable(&pool, "nobody").await;
+        assert!(
+            matches!(unknown, Err(AppError::RouteNotFound)),
+            "an unknown nickname is a missing route, got {unknown:?}"
         );
     }
 }

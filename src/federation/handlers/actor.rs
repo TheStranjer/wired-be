@@ -18,7 +18,9 @@
 //!   fetcher uses, so profile, keys, endpoints and fields move together —
 //!   plus the two columns that upsert deliberately leaves alone,
 //!   `moved_to_ap_id` and `also_known_as`, whenever the document changed
-//!   them. It runs only when the object's `id` *is* the activity's `actor`
+//!   them. A document with `"suspended": true` marks the mirror inactive
+//!   (Mastodon's `suspension_origin: remote`), which hides its statuses, and
+//!   one without the flag clears it. It runs only when the object's `id` *is* the activity's `actor`
 //!   (an `Update` of somebody else's document is nothing to fold), and not
 //!   when the document's own `updated` is present and no newer than the
 //!   stored mirror's `updated_at`; a document without `updated` always

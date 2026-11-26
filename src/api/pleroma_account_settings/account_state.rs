@@ -64,8 +64,8 @@ pub(super) async fn delete_account(
 /// disabled account must not still be acting.
 ///
 /// After the write it fires [`AccountEvent::Deactivated`]. `ActivityPub`
-/// publishes nothing for it: a deactivation leaves the actor document
-/// resolvable so the posts and follows peers already hold keep rendering.
+/// queues an actor `Update` saying `"suspended": true`; the actor document
+/// stays resolvable (200), so peers never read the account as deleted.
 ///
 /// # Errors
 ///

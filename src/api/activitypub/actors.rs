@@ -29,7 +29,7 @@ use crate::{
 };
 
 use super::{
-    ORDERED_COLLECTION, RELAY_PATH, Reader, gate_actor_read,
+    ORDERED_COLLECTION, RELAY_PATH, Reader, gate_actor_document_read, gate_actor_read,
     negotiation::{
         actor_response, document, instance_actor_response, wants_activity_json, with_vary,
     },
@@ -42,13 +42,16 @@ use super::{
 ///
 /// `Vary: Accept` is added to whatever the route sends, so the
 /// negotiation itself never has to remember the header.
+///
+/// A deactivated or suspended account answers 200 with the minimal
+/// `suspended` document; only an account being deleted is the 410.
 pub(super) async fn get_actor(
     State(state): State<AppState>,
     headers: HeaderMap,
     uri: Uri,
     Path(nickname): Path<String>,
 ) -> Response {
-    let outcome = gate_actor_read(&state, &nickname, &headers, &uri).await;
+    let outcome = gate_actor_document_read(&state, &nickname, &headers, &uri).await;
     let response = match outcome {
         Ok(Reader::Account(user)) => actor_response(&state, &user).await,
         Ok(Reader::Redirect(redirect)) => Ok(redirect),

@@ -462,10 +462,12 @@ async fn unknown_and_remote_users_are_not_found() {
     }
 }
 
-/// A deactivated local account is 410 Gone, so a remote instance stops
-/// refetching it; a browser still gets the content-negotiation 404.
+/// A deactivated or suspended local account still answers 200, with the
+/// minimal document saying `"suspended": true` — a 410 would make a peer
+/// delete the account, which enabling it again cannot undo. A deleted account
+/// is the 410, and a browser still gets the frontend redirect.
 #[tokio::test]
-async fn a_deactivated_user_is_gone() {
+async fn a_deactivated_user_resolves_as_suspended_and_a_deleted_one_is_gone() {
     let db = common::test_db().await;
     let pool = db.pool().clone();
     let alice = common::create_local_user_with(&pool, "alice", |new| NewUser {
@@ -477,21 +479,56 @@ async fn a_deactivated_user_is_gone() {
     let response = fetch_activity_json(&app, &format!("/users/{}", alice.nickname)).await;
     assert_eq!(
         response.status,
-        StatusCode::GONE,
-        "a deactivated local account is gone"
-    );
-    assert_eq!(
-        response.header("content-type"),
-        Some("application/json"),
-        "the 410 is JSON like every error"
+        StatusCode::OK,
+        "a deactivated local account still resolves"
     );
     assert_eq!(
         response.header("vary"),
         Some("Accept"),
+        "the answer says it varies on Accept"
+    );
+    let document = response.json_value();
+    assert_eq!(document["suspended"], true, "and says it is suspended");
+    assert_eq!(document["id"], alice.ap_id, "under its own id");
+    assert_eq!(
+        document["publicKey"]["owner"], alice.ap_id,
+        "with the key object peers verify its signatures with"
+    );
+    assert!(document["inbox"].is_string(), "and its inbox");
+    for stripped in ["name", "summary", "icon", "image", "attachment", "tag"] {
+        assert!(
+            document.get(stripped).is_none(),
+            "{stripped} is stripped from the suspended document"
+        );
+    }
+
+    let doomed = common::create_local_user(&pool, "doomed").await;
+    let stamped =
+        sqlx::query("UPDATE users SET is_active = false, deleted_at = now() WHERE id = $1")
+            .bind(doomed.id)
+            .execute(&pool)
+            .await
+            .expect("the deletion stamps")
+            .rows_affected();
+    assert_eq!(stamped, 1, "one account is being deleted");
+    let gone = fetch_activity_json(&app, &format!("/users/{}", doomed.nickname)).await;
+    assert_eq!(
+        gone.status,
+        StatusCode::GONE,
+        "an account whose deletion started is gone"
+    );
+    assert_eq!(
+        gone.header("content-type"),
+        Some("application/json"),
+        "the 410 is JSON like every error"
+    );
+    assert_eq!(
+        gone.header("vary"),
+        Some("Accept"),
         "the 410 says it varies on Accept"
     );
     assert_eq!(
-        response.json_value(),
+        gone.json_value(),
         json!({"error": "Gone"}),
         "the 410 body follows decision 8"
     );

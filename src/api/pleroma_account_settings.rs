@@ -131,8 +131,9 @@
 //! while it still holds the relationship rows the fan-out reads, and
 //! `ActivityPub` answers it with
 //! [`crate::services::federation_out::after_account_deleted`]. A disabled
-//! account fires `AccountEvent::Deactivated` and publishes nothing, the
-//! decision [`crate::services::federation_out::after_account_disabled`] documents.
+//! account fires `AccountEvent::Deactivated`, which `ActivityPub` answers with
+//! the `suspended` actor `Update` of
+//! [`crate::services::federation_out::after_account_activation_changed`].
 //!
 //! [`get_or_fetch_by_acct`]: crate::federation::fetch_actor::get_or_fetch_by_acct
 //! [`get_or_fetch_by_ap_id`]: crate::federation::fetch_actor::get_or_fetch_by_ap_id
