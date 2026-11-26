@@ -36,6 +36,19 @@ const CONTEXT_CONVERSATION_SQL: &str = "SELECT conversation_id FROM statuses
     ORDER BY id
         LIMIT 1";
 
+/// [`remote_thread_context`]: the oldest context stored under a
+/// conversation whose root row (the status with the conversation's id) is
+/// a mirrored one.
+const REMOTE_THREAD_CONTEXT_SQL: &str = "SELECT s.ap_context FROM statuses s
+       WHERE s.conversation_id = $1 AND s.ap_context IS NOT NULL
+         AND EXISTS (SELECT 1 FROM statuses r WHERE r.id = $1 AND NOT r.local)
+    ORDER BY s.id
+       LIMIT 1";
+
+/// [`conversation_root_is_remote`]: the `local` flag of the conversation's
+/// root row.
+const ROOT_LOCAL_SQL: &str = "SELECT local FROM statuses WHERE id = $1";
+
 /// Fetches the live status whose primary key is `id`, `None` when no row
 /// matches or when the row is a tombstone.
 ///
@@ -102,6 +115,46 @@ pub async fn conversation_id_for_context(
         .fetch_optional(pool)
         .await?;
     Ok(conversation.map(|row| row.0))
+}
+
+/// The `ActivityPub` context a remote-rooted conversation advertises.
+///
+/// The oldest stored `ap_context` among the conversation's statuses, `None`
+/// when the thread is rooted here (this instance owns its context), when
+/// the remote root is unknown, and when no remote status of the thread
+/// carried a context. A local reply names this instead of a context of
+/// its own.
+///
+/// # Errors
+///
+/// Any database failure (connection, encoding) arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn remote_thread_context(
+    pool: &PgPool,
+    conversation_id: Uuid,
+) -> AppResult<Option<String>> {
+    let context = sqlx::query_scalar::<_, String>(REMOTE_THREAD_CONTEXT_SQL)
+        .bind(conversation_id)
+        .fetch_optional(pool)
+        .await?;
+    Ok(context)
+}
+
+/// Whether the root of conversation `conversation_id` is a mirrored status.
+///
+/// `false` for a locally rooted conversation and for an id no status
+/// carries; the context collection only answers for the former's owner.
+///
+/// # Errors
+///
+/// Any database failure (connection, encoding) arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn conversation_root_is_remote(pool: &PgPool, conversation_id: Uuid) -> AppResult<bool> {
+    let local = sqlx::query_scalar::<_, bool>(ROOT_LOCAL_SQL)
+        .bind(conversation_id)
+        .fetch_optional(pool)
+        .await?;
+    Ok(local == Some(false))
 }
 
 /// Fetches the live statuses whose ids are in `ids`, in `id` order (`UUIDv7`

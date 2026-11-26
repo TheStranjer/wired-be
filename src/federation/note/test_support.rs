@@ -177,6 +177,7 @@ pub(super) fn note_context(visibility: Visibility) -> NoteContext {
         quote_uri: None,
         quote_authorization: None,
         self_replies: Vec::new(),
+        thread_context: None,
         config: Config::for_tests(),
     }
 }
