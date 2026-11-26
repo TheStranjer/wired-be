@@ -2,6 +2,7 @@
 //! routing, guard, relay and retry tests, and the refusals as a child
 //! module.
 
+mod blocks;
 mod refusals;
 
 use serde_json::{Value, json};

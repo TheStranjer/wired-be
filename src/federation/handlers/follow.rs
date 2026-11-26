@@ -15,11 +15,15 @@
 //!
 //! * [`handle_follow`] folds a remote account's follow of a local one: only
 //!   a stored **active local** object can be followed (anything else is
-//!   ignored), a pair blocked either way ([`block::blocked_between`]) is
+//!   ignored), a follower the target blocks ([`block::is_blocking`]) is
 //!   answered with a [`reject_follow`] published back and *nothing stored*,
 //!   as is a follow from a domain the target blocks
 //!   ([`domain_block::is_domain_blocked`]) or of an account that has moved
-//!   (Mastodon's `follow.rb` refusal), and every other delivery runs [`follow::follow`] with the delivered
+//!   (Mastodon's `follow.rb` refusal). A block the *follower* holds of the
+//!   target does not refuse: the Follow is proof they no longer mean it, so
+//!   the stored block is deleted and the follow goes through (their `Undo`
+//!   may land later and then finds nothing). Every other delivery runs
+//!   [`follow::follow`] with the delivered
 //!   activity id landed on the row as its `ap_id` (decision 6). The
 //!   followee's own telling ([`notify::on_follow`]) rides every stored
 //!   fold: its type is the relationship's state. An accepted answer — this
@@ -96,7 +100,7 @@ pub fn register(handlers: &mut Handlers) {
 ///
 /// Grant it with an `Accept` back when this instance owns the answer, hold
 /// it `pending` with the followee's telling when the target is locked, and
-/// answer a blocked pair with a `Reject` and nothing stored.
+/// answer a follower the target blocks with a `Reject` and nothing stored.
 ///
 /// # Errors
 ///
@@ -160,7 +164,7 @@ pub fn handle_undo_follow(
     Box::pin(async move { apply_undo_follow(state, view, signer).await })
 }
 
-/// The body of [`handle_follow`]: the local-target gate, the blocked pair's
+/// The body of [`handle_follow`]: the local-target gate, the blocking target's
 /// `Reject`, the relationship write with its mirror id, and the state's
 /// answer — [`accept_follow`] for a granted follow, silence and a telling
 /// for a waiting one.
@@ -194,7 +198,7 @@ async fn apply_follow(
         follow_id: &view.id,
         follower_ap_id: &signer.ap_id,
     };
-    if block::blocked_between(&state.db, signer.id, target.id)
+    if block::is_blocking(&state.db, target.id, signer.id)
         .await
         .map_err(|err| {
             FederationError::transient(
@@ -207,7 +211,7 @@ async fn apply_follow(
         debug!(
             follower = %signer.nickname,
             followee = %target.nickname,
-            "an inbound Follow met a blocked pair and was answered with a Reject"
+            "an inbound Follow met a target that blocks the follower and was answered with a Reject"
         );
         return Ok(Outcome::Handled);
     }
@@ -232,7 +236,37 @@ async fn apply_follow(
         );
         return Ok(Outcome::Handled);
     }
+    lift_followers_block(&state, &signer, &target).await?;
     store_follow(&state, &view, &signer, &target, &answer).await
+}
+
+/// Deletes the follower's own block of the target, if it stored one.
+///
+/// A `Follow` proves the follower no longer means to block, and inbound
+/// activities are not processed in order, so its `Undo` of the `Block` may
+/// land after the `Follow`; that later `Undo` then finds nothing, which is
+/// harmless. [`follow::follow`] would refuse the pair while the row stands.
+async fn lift_followers_block(
+    state: &AppState,
+    follower: &User,
+    target: &User,
+) -> Result<(), FederationError> {
+    let lifted = block::unblock(&state.db, follower, target)
+        .await
+        .map_err(|err| {
+            FederationError::transient(
+                "could not fold the remote follow activity's block lift",
+                &err,
+            )
+        })?;
+    if lifted.is_some() {
+        debug!(
+            follower = %follower.nickname,
+            followee = %target.nickname,
+            "an inbound Follow lifted the follower's own block of the target"
+        );
+    }
+    Ok(())
 }
 
 /// Queues the `Reject` answering a refused `Follow`; a failed enqueue is the

@@ -4,12 +4,12 @@
 use super::*;
 
 /// A local target the answer can be published as: keys and an inbox.
-async fn answering_local(pool: &PgPool, nickname: &str) -> User {
+pub(super) async fn answering_local(pool: &PgPool, nickname: &str) -> User {
     federating_user(pool, nickname).await
 }
 
 /// The `peer.example` mirror `nickname`, with a personal inbox to answer.
-async fn answerable_mirror(pool: &PgPool, nickname: &str) -> User {
+pub(super) async fn answerable_mirror(pool: &PgPool, nickname: &str) -> User {
     let ap_id = format!("https://peer.example/users/{nickname}");
     let user = insert(
         pool,
@@ -35,7 +35,7 @@ async fn answerable_mirror(pool: &PgPool, nickname: &str) -> User {
 }
 
 /// The args of every queued delivery job, oldest first.
-async fn delivery_args(pool: &PgPool) -> Vec<Value> {
+pub(super) async fn delivery_args(pool: &PgPool) -> Vec<Value> {
     sqlx::query_scalar::<_, Value>("SELECT args FROM jobs WHERE kind = $1 ORDER BY inserted_at, id")
         .bind(crate::federation::delivery::KIND_DELIVER)
         .fetch_all(pool)
