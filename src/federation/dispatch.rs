@@ -84,7 +84,7 @@ mod types;
 
 pub use error::{FederationError, TransientExt};
 pub use handlers::Handlers;
-pub use identity::dedupe_key;
+pub use identity::{dedupe_key, is_synthesized_id, synthesize_id};
 pub use types::{ActivityView, CreatePreCheck, HandlerFn, ObjectRef, Outcome, UndoFn};
 
 use ledger::prune_ledger;

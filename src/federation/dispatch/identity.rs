@@ -40,6 +40,39 @@ pub fn dedupe_key(activity: &Value) -> Option<String> {
     })
 }
 
+/// The fragment prefix of an id this instance made up for an id-less activity.
+const SYNTHESIZED_PREFIX: &str = "idless-";
+
+/// An id for an activity that arrived without one: the signer's `actor_id`
+/// plus a fragment holding a SHA-256 of the whole canonical body.
+///
+/// Mastodon sends `Add` and `Remove` (pins, featured hashtags) with no `id`.
+/// The id lives on the actor's host, so containment passes, and it is a pure
+/// function of the body, which names the actor, so a redelivery of the same
+/// document dedupes to the same key.
+#[must_use]
+pub fn synthesize_id(activity: &Value, actor_id: &str) -> String {
+    let mut canonical = String::new();
+    write_canonical(activity, &mut canonical);
+    format!(
+        "{actor_id}#{SYNTHESIZED_PREFIX}{}",
+        to_hex(&Sha256::digest(canonical.as_bytes()))
+    )
+}
+
+/// Whether `id` is one [`synthesize_id`] made up.
+///
+/// Such an activity carries no identity of its own, and the same body can
+/// legitimately arrive again (a pin, an unpin, the same pin), so the ledger
+/// does not remember it past its queue job.
+#[must_use]
+pub fn is_synthesized_id(id: &str) -> bool {
+    Url::parse(id).is_ok_and(|url| {
+        url.fragment()
+            .is_some_and(|fragment| fragment.starts_with(SYNTHESIZED_PREFIX))
+    })
+}
+
 /// The canonical spelling of an activity id: lowercase, no trailing dot on
 /// the host, no empty query or fragment.
 ///
@@ -192,6 +225,28 @@ mod tests {
             "a real fragment is a different id"
         );
         assert_eq!(key("not a url/ID").as_deref(), Some("not a url/id"));
+    }
+
+    /// A made-up id is on the actor's host, recognizable, stable for one body
+    /// and different for another body or actor.
+    #[test]
+    fn a_synthesized_id_is_stable_per_body_and_recognizable() {
+        let actor = "https://peer.example/users/alice";
+        let add = |target: &str| json!({"type": "Add", "actor": actor, "target": target});
+
+        let id = synthesize_id(&add("a"), actor);
+        assert!(id.starts_with("https://peer.example/users/alice#idless-"));
+        assert!(is_synthesized_id(&id), "{id} is recognized");
+        assert_eq!(id, synthesize_id(&add("a"), actor), "same body, same id");
+        assert_ne!(id, synthesize_id(&add("b"), actor), "another body");
+        assert_eq!(
+            dedupe_key(&json!({"id": id, "type": "Add"})),
+            Some(id),
+            "the key of an activity wearing it is the id itself"
+        );
+        assert!(!is_synthesized_id("https://peer.example/activities/1"));
+        assert!(!is_synthesized_id("https://peer.example/a#other"));
+        assert!(!is_synthesized_id("not a url"));
     }
 
     /// An array `type` containing `Update` counts as an `Update`.

@@ -18,8 +18,9 @@ use crate::{
     error::{AppError, AppResult},
     federation::{
         collections,
-        dispatch::{KIND_INCOMING, dedupe_key},
+        dispatch::{KIND_INCOMING, dedupe_key, synthesize_id},
         inbox_auth::{InboxAuthError, SignedActivity},
+        json::first_type,
         note::{create_activity_json, load_note_context, note_json},
     },
     jobs::QUEUE_FEDERATOR_INCOMING,
@@ -85,8 +86,9 @@ async fn inbox_answer(
         debug!("inbox delivery refused: federation is disabled");
         return Err(AppError::Forbidden(FEDERATION_DISABLED.to_owned()).into());
     }
-    let activity = SignedActivity::from_request(request, state).await?;
+    let mut activity = SignedActivity::from_request(request, state).await?;
     let owner_id = inbox_owner_id(state, owner_nickname).await?;
+    give_idless_activity_an_id(&mut activity);
     let activity_id = require_activity_fields(&activity.json)?;
     enqueue_incoming(state, &activity, owner_id, activity_id).await?;
     Ok(StatusCode::ACCEPTED.into_response())
@@ -107,6 +109,31 @@ async fn inbox_owner_id(state: &AppState, nickname: Option<&str>) -> AppResult<O
         .filter(user::User::is_local_active)
         .ok_or(AppError::RouteNotFound)?;
     Ok(Some(owner.id))
+}
+
+/// Gives an `Add` or `Remove` that arrived without an `id` one made up from
+/// its body, so it dedupes and routes like any other activity.
+///
+/// Mastodon sends pins, unpins and featured hashtags this way (its
+/// `add_note_serializer.rb` and kin emit only `type`, `actor`, `target` and
+/// `object`). The id is the signer's actor id plus a digest of the canonical
+/// body ([`synthesize_id`]); every other id-less activity keeps failing
+/// [`require_activity_fields`], and an `Add` or `Remove` without a `type`
+/// or `actor` still does.
+fn give_idless_activity_an_id(activity: &mut SignedActivity) {
+    let idless = activity.json.get("id").is_none_or(Value::is_null);
+    let pin_like = activity
+        .json
+        .get("type")
+        .and_then(first_type)
+        .is_some_and(|kind| kind == "Add" || kind == "Remove");
+    if !idless || !pin_like || activity.json.get("actor").is_none() {
+        return;
+    }
+    let id = synthesize_id(&activity.json, &activity.signer.ap_id);
+    if let Some(object) = activity.json.as_object_mut() {
+        let _previous = object.insert("id".to_owned(), Value::String(id));
+    }
 }
 
 /// The quick sanity every authenticated activity must pass: a string
