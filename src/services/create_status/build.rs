@@ -34,7 +34,7 @@ use crate::{
     },
     services::mentions::resolve_mentions,
     state::AppState,
-    util::entities::{MentionRef, extract_hashtags, linkify_entities},
+    util::entities::{MentionRef, linkify_entities, written_hashtags},
     util::format::render_content,
 };
 
@@ -46,7 +46,7 @@ use crate::{
 /// edit linkifies, mention-resolves and tags a post exactly the way posting
 /// the same text would. The answer is the HTML with every known
 /// `@-mention` and every hashtag linked, the mentioned accounts in mention
-/// order, and the hashtags as [`extract_hashtags`] folded them.
+/// order, and the hashtags as [`written_hashtags`] spells them.
 ///
 /// The lookup is [`resolve_mentions`], so a bare `@nick`, a
 /// `@nick@our-domain` and a mirrored `@nick@their.domain` are linked from
@@ -107,7 +107,7 @@ fn rendered_fields(
     RenderedFields {
         content: linkify_entities(&html, &link, &state.config.base_url),
         mentioned_user_ids: found.iter().map(|(_, account)| account.id).collect(),
-        hashtags: extract_hashtags(text),
+        hashtags: written_hashtags(text),
     }
 }
 

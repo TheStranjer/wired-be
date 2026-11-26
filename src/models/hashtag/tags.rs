@@ -18,17 +18,21 @@ use uuid::Uuid;
 
 use crate::{error::AppResult, util::id::new_id};
 
-use super::{Hashtag, normalize_name};
+use super::{Hashtag, normalize_name, written_form};
 
 /// The statement behind `upsert_many`: one row per given `(id, name)`
 /// pair, and on a name that already exists the no-op update of
 /// `name = EXCLUDED.name` — the shape the ticket prescribes, and what makes
 /// `RETURNING` answer with the stored row (its original `id` and
-/// `inserted_at`) instead of raising the unique violation.
-const UPSERT_SQL: &str = "INSERT INTO hashtags (id, name)
-     SELECT u.id, u.name FROM unnest($1::uuid[], $2::text[]) AS u(id, name)
-ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name
-RETURNING id, name, inserted_at";
+/// `inserted_at`) instead of raising the unique violation. The display
+/// casing of the first use is kept: a later spelling only fills a
+/// `display_name` that is still NULL (a row older than the column).
+const UPSERT_SQL: &str = "INSERT INTO hashtags (id, name, display_name)
+     SELECT u.id, u.name, u.display_name
+       FROM unnest($1::uuid[], $2::text[], $3::text[]) AS u(id, name, display_name)
+ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name,
+    display_name = COALESCE(hashtags.display_name, EXCLUDED.display_name)
+RETURNING id, name, display_name, inserted_at";
 
 /// [`get_by_name`]: one row by its stored (normalized) name.
 const BY_NAME_SQL: &str = "SELECT * FROM hashtags WHERE name = $1";
@@ -37,7 +41,8 @@ const BY_NAME_SQL: &str = "SELECT * FROM hashtags WHERE name = $1";
 /// ordered by name.
 ///
 /// A name is normalized (trimmed, `#`-stripped, lowercased) before it is
-/// looked at, so `#Foo`, `Foo` and `foo` are one tag; a name that
+/// looked at, so `#Foo`, `Foo` and `foo` are one tag, and the casing of the
+/// tag's first use is kept as its display name; a name that
 /// normalizes to nothing or to more than 100 characters (the extraction
 /// bound, [`crate::util::entities::extract_hashtags`]) is ignored.
 /// Idempotent: a name the table already holds answers its stored row, and
@@ -61,14 +66,16 @@ pub(super) async fn upsert_many_conn(
     conn: &mut PgConnection,
     names: &[String],
 ) -> AppResult<Vec<Hashtag>> {
-    let names = normalized_names(names);
-    if names.is_empty() {
+    let spellings = normalized_names(names);
+    if spellings.is_empty() {
         return Ok(Vec::new());
     }
-    let ids: Vec<Uuid> = names.iter().map(|_| new_id()).collect();
+    let ids: Vec<Uuid> = spellings.iter().map(|_| new_id()).collect();
+    let (lower, shown): (Vec<String>, Vec<String>) = spellings.into_iter().unzip();
     let mut hashtags = sqlx::query_as::<_, Hashtag>(UPSERT_SQL)
         .bind(&ids)
-        .bind(&names)
+        .bind(&lower)
+        .bind(&shown)
         .fetch_all(&mut *conn)
         .await?;
     // The rows come back in whatever order the statement folded them; the
@@ -89,11 +96,7 @@ pub(super) async fn upsert_many_conn(
 /// Any database failure behind the upsert (connection, encoding) arrives
 /// as [`AppError::Database`](crate::error::AppError).
 pub async fn find_or_create(pool: &PgPool, name: &str) -> AppResult<Option<Hashtag>> {
-    let mut usable: Vec<String> = Vec::new();
-    if let Some(tag) = normalize_name(name) {
-        usable.push(tag);
-    }
-    let mut found = upsert_many(pool, &usable).await?;
+    let mut found = upsert_many(pool, &[name.to_owned()]).await?;
     Ok(found.pop())
 }
 
@@ -115,19 +118,21 @@ pub async fn get_by_name(pool: &PgPool, name: &str) -> AppResult<Option<Hashtag>
     Ok(hashtag)
 }
 
-/// `names` normalized, unusable names dropped and repeats folded to their
-/// first occurrence, in order: what [`UPSERT_SQL`] inserts, so one call
-/// never offers the same name twice (which `ON CONFLICT DO UPDATE` refuses
-/// to fold inside a single statement).
-fn normalized_names(names: &[String]) -> Vec<String> {
+/// `names` as `(normalized, display)` pairs, unusable names dropped and
+/// repeats folded to their first occurrence (whose casing wins), in order:
+/// what [`UPSERT_SQL`] inserts, so one call never offers the same name
+/// twice (which `ON CONFLICT DO UPDATE` refuses to fold inside a single
+/// statement).
+fn normalized_names(names: &[String]) -> Vec<(String, String)> {
     let mut seen: HashSet<String> = HashSet::new();
-    let mut usable: Vec<String> = Vec::new();
+    let mut usable: Vec<(String, String)> = Vec::new();
     for name in names {
-        let Some(tag) = normalize_name(name) else {
+        let Some(shown) = written_form(name) else {
             continue;
         };
+        let tag = shown.to_lowercase();
         if seen.insert(tag.clone()) {
-            usable.push(tag);
+            usable.push((tag, shown));
         }
     }
     usable
@@ -159,6 +164,46 @@ mod tests {
             vec![("foo".to_owned(), first[0].id)],
             "and the table still holds exactly one tag"
         );
+    }
+
+    #[tokio::test]
+    async fn the_first_use_keeps_its_display_casing() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let first = upsert_many(&pool, &tags(&["#R5Smoke"]))
+            .await
+            .expect("the first upsert stores");
+        assert_eq!(names(&first), vec!["r5smoke"], "the key is lowercase");
+        assert_eq!(first[0].shown(), "R5Smoke", "the casing is kept");
+
+        let later = upsert_many(&pool, &tags(&["r5smoke", "R5SMOKE"]))
+            .await
+            .expect("a later upsert runs");
+        assert_eq!(later[0].shown(), "R5Smoke", "a later use changes nothing");
+
+        let batch = upsert_many(&pool, &tags(&["Foo", "FOO", "foo"]))
+            .await
+            .expect("a batch runs");
+        assert_eq!(batch[0].shown(), "Foo", "within a call the first wins");
+    }
+
+    #[tokio::test]
+    async fn a_row_without_a_display_name_adopts_the_next_use() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let _inserted = sqlx::query("INSERT INTO hashtags (id, name) VALUES ($1, 'legacy')")
+            .bind(Uuid::now_v7())
+            .execute(&pool)
+            .await
+            .expect("a legacy row inserts");
+        let row = get_by_name(&pool, "legacy").await.unwrap().expect("stored");
+        assert_eq!(row.shown(), "legacy", "no display name shows the name");
+
+        let adopted = upsert_many(&pool, &tags(&["Legacy"]))
+            .await
+            .expect("the upsert runs");
+        assert_eq!(adopted[0].shown(), "Legacy", "the next use fills it in");
+        assert_eq!(adopted[0].id, row.id, "on the same row");
     }
 
     #[tokio::test]

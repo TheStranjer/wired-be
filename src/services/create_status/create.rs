@@ -43,8 +43,8 @@ pub struct RenderedFields {
     pub content: String,
     /// The accounts the text @-mentioned, in mention order.
     pub mentioned_user_ids: Vec<Uuid>,
-    /// The hashtags the text carries, as [`crate::util::entities::extract_hashtags`]
-    /// folded them.
+    /// The hashtags the text carries, as [`crate::util::entities::written_hashtags`]
+    /// spells them (the author's casing).
     pub hashtags: Vec<String>,
 }
 

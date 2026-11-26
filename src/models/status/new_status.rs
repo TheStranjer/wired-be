@@ -10,7 +10,7 @@ use uuid::Uuid;
 use crate::{
     error::{AppError, AppResult},
     models::{featured_tag, hashtag, media_attachment, mention, user::User},
-    util::{entities::extract_hashtags, format::text_to_html, id::new_id},
+    util::{entities::written_hashtags, format::text_to_html, id::new_id},
 };
 
 use super::{
@@ -102,7 +102,7 @@ pub struct NewStatus {
     /// usable ones by name and links them to the new row in its
     /// transaction (see [`crate::models::hashtag`]); empty in the default.
     /// A local post's [`NewStatus::local`] fills them with
-    /// [`extract_hashtags`] of the text; a remote status's caller fills
+    /// [`written_hashtags`] of the text; a remote status's caller fills
     /// them from the activity's `tag` list.
     pub hashtags: Vec<String>,
     /// Media the poster claims for this status, in the order they want them
@@ -182,7 +182,7 @@ impl NewStatus {
     /// set, [`user_id`](Self::user_id) from `user`, [`text_to_html`] in
     /// [`content`](Self::content) with `text` kept in
     /// [`raw_text`](Self::raw_text) as [`DEFAULT_CONTENT_TYPE`],
-    /// [`extract_hashtags`] of `text` in [`hashtags`](Self::hashtags), and
+    /// [`written_hashtags`] of `text` in [`hashtags`](Self::hashtags), and
     /// [`Visibility::Public`].
     ///
     /// The columns that depend on the primary key — `uri`
@@ -197,7 +197,7 @@ impl NewStatus {
             raw_text: text.to_owned(),
             content_type: DEFAULT_CONTENT_TYPE.to_owned(),
             visibility: Visibility::Public,
-            hashtags: extract_hashtags(text),
+            hashtags: written_hashtags(text),
             local: true,
             ..Self::default()
         }

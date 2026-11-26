@@ -18,9 +18,11 @@
 //!
 //! Nothing here extracts tags from text: [`crate::models::status::insert`]
 //! upserts and links what its caller computed —
-//! [`crate::util::entities::extract_hashtags`] of the raw text for a local
+//! [`crate::util::entities::written_hashtags`] of the raw text for a local
 //! status, the `tag` list of the activity for a remote one — in the
-//! status's own transaction.
+//! status's own transaction. Those names keep the author's casing: the
+//! upsert lowercases them for the key and stores the first use's spelling
+//! as `display_name`, which the full Tag entity shows as its `name`.
 //!
 //! [`day_counts`] is the read behind the tag endpoints' `history`: the one
 //! tag's live statuses, bucketed by UTC day. [`search_prefix`] is the read
@@ -68,8 +70,20 @@ pub struct Hashtag {
     pub id: Uuid,
     /// The tag name as stored: lowercase, without the leading `#`.
     pub name: String,
+    /// The casing of the tag's first use, without the leading `#`; `None`
+    /// for a row written before the column existed (see [`Hashtag::shown`]).
+    pub display_name: Option<String>,
     /// When this tag was first created.
     pub inserted_at: DateTime<Utc>,
+}
+
+impl Hashtag {
+    /// The name to show in the full Tag entity: the first use's casing, or
+    /// the lowercase name when none was recorded.
+    #[must_use]
+    pub fn shown(&self) -> &str {
+        self.display_name.as_deref().unwrap_or(&self.name)
+    }
 }
 
 /// The joined row of [`for_statuses`]: one tag link with the [`Hashtag`] its
@@ -105,6 +119,16 @@ static NAME_RE: LazyLock<Option<Regex>> = LazyLock::new(|| Regex::new(NAME_PATTE
 /// run text through it before storing or rendering anything. `None` is the
 /// endpoints' "Invalid hashtag" case, the lowercased text the entity's name.
 pub(crate) fn normalize_name(name: &str) -> Option<String> {
+    written_form(name).map(|written| written.to_lowercase())
+}
+
+/// The display spelling of one written tag name: trimmed, leading `#`s
+/// dropped and NFKC-folded, casing kept — or `None` exactly when
+/// [`normalize_name`] refuses the name.
+///
+/// Its lowercase is the normalized name, so it is what the first use of a
+/// tag stores as `hashtags.display_name`.
+pub(crate) fn written_form(name: &str) -> Option<String> {
     let trimmed = name.trim().trim_start_matches('#').trim();
     if trimmed.is_empty() {
         return None;
@@ -112,7 +136,8 @@ pub(crate) fn normalize_name(name: &str) -> Option<String> {
     // NFKC first (Mastodon's `HashtagNormalizer`), so full-width and
     // decomposed spellings meet the canonical one; no ASCII folding, which
     // would merge distinct non-Latin tags.
-    let tag = trimmed.nfkc().collect::<String>().to_lowercase();
+    let written = trimmed.nfkc().collect::<String>();
+    let tag = written.to_lowercase();
     // The length bound is on the stored tag, so it is checked after the
     // NFKC fold and lowercase (which can change a character count).
     if tag.chars().count() > MAX_HASHTAG_LEN {
@@ -125,7 +150,7 @@ pub(crate) fn normalize_name(name: &str) -> Option<String> {
     if tag.chars().all(char::is_numeric) {
         return None;
     }
-    Some(tag)
+    Some(written)
 }
 
 #[cfg(test)]
@@ -187,6 +212,40 @@ mod tests {
             normalize_name("cafe"),
             "accents are not ASCII-folded"
         );
+    }
+
+    #[test]
+    fn the_written_form_keeps_casing_and_agrees_with_normalize() {
+        assert_eq!(
+            written_form(" ##R5Smoke "),
+            Some("R5Smoke".to_owned()),
+            "hashes and spaces dropped, casing kept"
+        );
+        assert_eq!(
+            written_form("ＲＵＳＴ"),
+            Some("RUST".to_owned()),
+            "NFKC folds full-width capitals, casing kept"
+        );
+        for name in ["#Rust_Lang", "日本語", "a b", "123", " # "] {
+            assert_eq!(
+                written_form(name).map(|written| written.to_lowercase()),
+                normalize_name(name),
+                "`{name}`: the same names are usable"
+            );
+        }
+    }
+
+    #[test]
+    fn shown_prefers_the_display_name() {
+        let mut row = Hashtag {
+            id: Uuid::now_v7(),
+            name: "r5smoke".to_owned(),
+            display_name: Some("R5Smoke".to_owned()),
+            inserted_at: Utc::now(),
+        };
+        assert_eq!(row.shown(), "R5Smoke", "the first use's casing");
+        row.display_name = None;
+        assert_eq!(row.shown(), "r5smoke", "a legacy row shows its name");
     }
 
     #[test]

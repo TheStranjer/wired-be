@@ -620,6 +620,9 @@ mod statuses;
 /// The streaming WebSocket (`/api/v1/streaming`) over a real listener.
 mod streaming;
 
+/// The Tag entity's display casing (WBE-879).
+mod tag_display_names;
+
 /// Tags over HTTP (`/api/v1/tags/{name}`, `/api/v1/followed_tags`, trends).
 mod tags;
 

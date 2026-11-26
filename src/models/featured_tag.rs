@@ -88,7 +88,7 @@ const FIND_SQL: &str = concat!(entry_select!(), " WHERE ft.user_id = $1 AND ft.t
 
 /// [`suggestions`]: the tags the user used most recently in their own
 /// statuses that they do not feature yet, newest use first.
-const SUGGESTIONS_SQL: &str = "SELECT h.id, h.name, h.inserted_at
+const SUGGESTIONS_SQL: &str = "SELECT h.id, h.name, h.display_name, h.inserted_at
   FROM hashtags h
   JOIN (SELECT sh.hashtag_id, max(s.inserted_at) AS last_used
           FROM statuses s
