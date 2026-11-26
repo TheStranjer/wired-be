@@ -157,9 +157,23 @@ fn meta_for(row: &AttachmentRow, kind: AttachmentType) -> Value {
         );
     }
     if let (Some(x), Some(y)) = (row.focus_x, row.focus_y) {
-        put(&mut meta, "focus", json!({ "x": x, "y": y }));
+        put(
+            &mut meta,
+            "focus",
+            json!({ "x": focus_axis(x), "y": focus_axis(y) }),
+        );
     }
     Value::Object(meta)
+}
+
+/// One focus axis widened to `f64` through its shortest `f32` decimal form.
+///
+/// A stored `0.3f32` renders `0.3`, not `0.30000001192092896`. A value that
+/// does not round-trip (not finite) falls back to a plain widening.
+fn focus_axis(axis: f32) -> f64 {
+    format!("{axis}")
+        .parse::<f64>()
+        .unwrap_or_else(|_| f64::from(axis))
 }
 
 /// The `original` part of [`meta_for`]: the stored dimensions plus the
@@ -383,6 +397,33 @@ mod tests {
             value["meta"],
             serde_json::json!({ "original": { "duration": 61.5 } }),
             "the only known part of the meta is the duration"
+        );
+    }
+
+    #[test]
+    fn focus_renders_at_f32_precision_without_widening_noise() {
+        let mut edges = base_row("image/png");
+        edges.focus_x = Some(0.0);
+        edges.focus_y = Some(1.0);
+        assert_eq!(
+            render(&edges)["meta"]["focus"],
+            serde_json::json!({ "x": 0.0, "y": 1.0 }),
+            "0 and 1 round-trip"
+        );
+
+        let mut row = base_row("image/png");
+        row.focus_x = Some(0.3);
+        row.focus_y = Some(-0.6);
+        let value = render(&row);
+        assert_eq!(
+            value["meta"]["focus"],
+            serde_json::json!({ "x": 0.3, "y": -0.6 }),
+            "0.3 and -0.6 are not 0.30000001192092896 and -0.6000000238418579"
+        );
+        assert_eq!(
+            value["meta"]["focus"].to_string(),
+            r#"{"x":0.3,"y":-0.6}"#,
+            "and they serialize that way too"
         );
     }
 
