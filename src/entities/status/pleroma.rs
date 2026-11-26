@@ -29,9 +29,10 @@ use crate::util::sanitize::strip_html;
 /// The `pleroma` extension object of a [`Status`]: the Pleroma-specific
 /// keys of `StatusView.render("show.json", …)`.
 ///
-/// `quote_id` and `quote_url` are not part of this shape (ticket
-/// decision): the quoted id is the entity's top-level `quote_id`, and
-/// this instance stores no bare quote url to render.
+/// `quote_id` and `quote_url` mirror Pleroma's: the quoted status's local
+/// id and its public url (see [`quote_id`](PleromaMetadata::quote_id) and
+/// [`quote_url`](PleromaMetadata::quote_url)), rendered even when `quote`
+/// itself is withheld.
 #[derive(Clone, Debug, Serialize)]
 pub struct PleromaMetadata {
     /// `content`: the post as its author wrote it — see the renderer's
@@ -108,6 +109,17 @@ pub struct PleromaMetadata {
     /// read decides; false exactly when [`quote`](PleromaMetadata::quote)
     /// is `null`, which is why the two can never disagree.
     pub quote_visible: JsonBool,
+    /// `quote_id`: the quoted status's id as the hyphenated lowercase
+    /// `UUIDv7` text (decision 4), or `null` when this status quotes
+    /// nothing — the same value as the entity's top-level `quote_id`,
+    /// emitted whatever the viewer may see of the quoted post.
+    pub quote_id: Option<String>,
+    /// `quote_url`: the quoted post's `url`, else its `uri`, or `null`
+    /// when this status quotes nothing or the quoted row is gone. Like
+    /// [`quote_id`](PleromaMetadata::quote_id) it is rendered even when
+    /// [`quote`](PleromaMetadata::quote) is withheld, which is what
+    /// Pleroma-FE shows for a quote of an invisible post.
+    pub quote_url: Option<String>,
     /// `bookmark_folder`: the id of the folder the viewer's bookmark of
     /// this post is filed in, as the hyphenated lowercase `UUIDv7` text
     /// (decision 4), or `null` — the value of the same
@@ -150,6 +162,9 @@ pub(super) struct BlockViewer {
     /// object the entity's top-level [`Status::quote`] carries as its
     /// `quoted_status`, which is why the two mirrors can never disagree.
     pub(super) quote: Option<Value>,
+    /// The quoted row's `url`, else its `uri`, `None` when there is no
+    /// quoted row — set whether or not the viewer may see it.
+    pub(super) quote_url: Option<String>,
     /// Whether the viewer may see the replied-to status — the batch's
     /// parent-visibility read, `true` for a root post.
     pub(super) parent_visible: JsonBool,
@@ -173,6 +188,7 @@ pub(super) fn pleroma_block(
         bookmark_folder,
         direct_participation,
         quote,
+        quote_url,
         parent_visible,
     } = viewer;
     let quote_visible = JsonBool(quote.is_some());
@@ -192,6 +208,8 @@ pub(super) fn pleroma_block(
         quotes_count: row.quotes_count,
         quote,
         quote_visible,
+        quote_id: row.quote_of_id.map(|id| id.to_string()),
+        quote_url,
         bookmark_folder: bookmark_folder.map(|id| id.to_string()),
         pinned_at,
     }

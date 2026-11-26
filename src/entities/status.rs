@@ -20,11 +20,11 @@
 //!   arm of `show.json` is the same shape.
 //! - `conversation_id` is the row's `UUIDv7` thread id as text
 //!   (decision 4), not Pleroma's deprecated CRC32 of the context.
-//! - Pleroma's `quote_url` is not emitted at all: the quoted target is
-//!   the top-level `quote_id` (its id, whatever the viewer may see of
-//!   it) and the rendered quote is Mastodon's `quote` object, whose
-//!   bare status is mirrored in the `pleroma` block with `quote_visible`
-//!   beside it.
+//! - `pleroma.quote_id` and `pleroma.quote_url` are emitted as Pleroma
+//!   does, whatever the viewer may see of the quoted post: the quoted
+//!   status's id and its `url` (else its `uri`). The rendered quote is
+//!   Mastodon's `quote` object, whose bare status is mirrored in the
+//!   `pleroma` block with `quote_visible` beside it.
 //!
 //! Keys a later ticket fills in, each from exactly one more batched
 //! loader in [`crate::services::render_status`] (see its module docs):

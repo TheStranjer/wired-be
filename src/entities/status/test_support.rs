@@ -80,10 +80,8 @@ pub(super) const EXPECTED_KEYS: [&str; 34] = [
     "url",
     "visibility",
 ];
-/// Every `pleroma` block key, sorted — `quote_id` and `quote_url` are
-/// deliberately absent: the quoted id is a top-level key and no bare
-/// quote url is rendered.
-pub(super) const PLEROMA_KEYS: [&str; 15] = [
+/// Every `pleroma` block key, sorted.
+pub(super) const PLEROMA_KEYS: [&str; 17] = [
     "bookmark_folder",
     "content",
     "conversation_id",
@@ -95,6 +93,8 @@ pub(super) const PLEROMA_KEYS: [&str; 15] = [
     "parent_visible",
     "pinned_at",
     "quote",
+    "quote_id",
+    "quote_url",
     "quote_visible",
     "quotes_count",
     "spoiler_text",
