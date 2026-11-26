@@ -158,7 +158,8 @@ async fn lists_local_enabled_emojis_ordered_by_category_then_shortcode() {
 
 /// `visible_in_picker` is data the client honours, not a filter: an
 /// invisible-but-enabled emoji is listed with the flag false, and a row
-/// with no still url or pack serves those keys as `null`.
+/// with no pack serves `category` as `null` while a row with no still
+/// url serves its `url` as `static_url`.
 #[tokio::test]
 async fn picker_visibility_and_absent_fields_pass_through() {
     let db = common::test_db().await;
@@ -182,7 +183,7 @@ async fn picker_visibility_and_absent_fields_pass_through() {
         json!([{
             "shortcode": "secret",
             "url": "https://test.example/emoji/custom/secret.png",
-            "static_url": null,
+            "static_url": "https://test.example/emoji/custom/secret.png",
             "visible_in_picker": false,
             "category": null,
             "tags": [],

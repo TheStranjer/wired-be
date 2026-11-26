@@ -347,7 +347,7 @@ mod tests {
                 {
                     "shortcode": "wiredcat",
                     "url": "https://test.example/emoji/wiredcat.png",
-                    "static_url": null,
+                    "static_url": "https://test.example/emoji/wiredcat.png",
                     "visible_in_picker": true,
                     "category": null,
                     "tags": [],
@@ -355,7 +355,7 @@ mod tests {
                 {
                     "shortcode": "blob",
                     "url": "https://test.example/emoji/blob.png",
-                    "static_url": null,
+                    "static_url": "https://test.example/emoji/blob.png",
                     "visible_in_picker": true,
                     "category": null,
                     "tags": [],
