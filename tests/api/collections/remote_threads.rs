@@ -1,5 +1,6 @@
 //! Threads rooted on another instance: local replies repeat the thread's
-//! own context, and this instance serves no context collection for it.
+//! own context, and this instance serves no context collection for it. A
+//! remote thread with no context names a minted address, which is served.
 
 use axum::http::StatusCode;
 use sqlx::PgPool;
@@ -122,7 +123,7 @@ async fn a_remote_thread_without_a_context_falls_back_to_the_local_one() {
     );
 }
 
-/// The context route answers only for threads this instance owns.
+/// The context route does not answer for a context the remote thread owns.
 #[tokio::test]
 async fn the_context_of_a_remote_thread_is_not_served() {
     let db = common::test_db().await;
@@ -146,4 +147,93 @@ async fn the_context_of_a_remote_thread_is_not_served() {
             common::assert_answer(&response, StatusCode::NOT_FOUND, &path);
         }
     }
+}
+
+/// The ids a context page lists, as its `orderedItems`.
+fn listed(page: &common::TestResponse) -> Vec<String> {
+    let document = page.json_value();
+    document["orderedItems"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+        .map(str::to_owned)
+        .collect()
+}
+
+/// The minted context a remote thread without a context names is served as
+/// the collection of the thread's statuses here.
+#[tokio::test]
+async fn the_minted_context_of_a_contextless_remote_thread_is_served() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let carol = common::create_remote_user(&pool, "carol", "misskey.test").await;
+    let r6a = common::create_local_user(&pool, "r6a").await;
+    let root = remote_post(&pool, &carol, "https://misskey.test/notes/carol1", None).await;
+    let reply = reply_to(&pool, &r6a, &root, "hi carol", Visibility::Public).await;
+    let app = common::test_app(pool);
+
+    let (context, conversation) = named_context(&app, &reply).await;
+    let expected = format!("{BASE}/contexts/{}", root.conversation_id);
+    assert_eq!(context, expected, "the minted context");
+    assert_eq!(conversation, expected, "as the conversation too");
+
+    let path = format!("/contexts/{}", root.conversation_id);
+    let rooted = fetch_ap(&app, &path).await;
+    common::assert_answer(&rooted, StatusCode::OK, &path);
+    assert_eq!(rooted.json_value()["totalItems"], 2, "root and reply");
+
+    let paged = format!("{path}?page=true");
+    let page = fetch_ap(&app, &paged).await;
+    common::assert_answer(&page, StatusCode::OK, &paged);
+    assert_eq!(listed(&page), vec![root.uri.clone(), reply.uri.clone()]);
+}
+
+/// Private statuses stay out of the minted context's collection.
+#[tokio::test]
+async fn the_minted_context_hides_private_statuses() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let carol = common::create_remote_user(&pool, "carol", "misskey.test").await;
+    let r6a = common::create_local_user(&pool, "r6a").await;
+    let root = remote_post(&pool, &carol, "https://misskey.test/notes/carol2", None).await;
+    let open = reply_to(&pool, &r6a, &root, "open", Visibility::Public).await;
+    let secret = reply_to(&pool, &r6a, &open, "secret", Visibility::Direct).await;
+    let app = common::test_app(pool);
+
+    let path = format!("/contexts/{}?page=true", root.conversation_id);
+    let page = fetch_ap(&app, &path).await;
+    common::assert_answer(&page, StatusCode::OK, &path);
+    let items = listed(&page);
+    assert_eq!(items, vec![root.uri.clone(), open.uri.clone()]);
+    assert!(!items.contains(&secret.uri), "the direct reply is hidden");
+}
+
+/// A minted context with nothing public in it is the plain 404.
+#[tokio::test]
+async fn a_minted_context_with_only_private_statuses_is_not_found() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let carol = common::create_remote_user(&pool, "carol", "misskey.test").await;
+    let r6a = common::create_local_user(&pool, "r6a").await;
+    let root = status::insert(
+        &pool,
+        BASE,
+        &NewStatus {
+            uri: Some("https://misskey.test/notes/carol3".to_owned()),
+            user_id: carol.id,
+            content: "<p>dm</p>".to_owned(),
+            raw_text: "dm".to_owned(),
+            visibility: Visibility::Direct,
+            ..NewStatus::default()
+        },
+    )
+    .await
+    .expect("the remote direct status inserts");
+    let _reply = reply_to(&pool, &r6a, &root, "reply", Visibility::Direct).await;
+    let app = common::test_app(pool);
+
+    let path = format!("/contexts/{}", root.conversation_id);
+    let response = fetch_ap(&app, &path).await;
+    common::assert_answer(&response, StatusCode::NOT_FOUND, &path);
 }

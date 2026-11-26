@@ -81,8 +81,9 @@ pub async fn replies_document(
 /// A conversation with no publicly visible object is
 /// [`AppError::RouteNotFound`], whether it never existed or only holds
 /// private posts: the collection must not tell the two apart. So is a
-/// conversation rooted on another instance: that instance owns the
-/// thread's context, and this one does not claim it.
+/// conversation whose remote thread stored a context of its own: that
+/// context is the thread's, and this instance does not claim it. A remote
+/// thread that carried none names this minted address, which is served.
 ///
 /// # Errors
 ///
@@ -95,7 +96,10 @@ pub async fn context_document(
     conversation_id: Uuid,
     query: Option<&str>,
 ) -> AppResult<Value> {
-    if status::conversation_root_is_remote(pool, conversation_id).await? {
+    if status::remote_thread_context(pool, conversation_id)
+        .await?
+        .is_some()
+    {
         return Err(AppError::RouteNotFound);
     }
     let total = status::public_context_count(pool, conversation_id).await?;
