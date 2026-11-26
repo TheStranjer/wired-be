@@ -97,9 +97,10 @@ struct WebFingerQuery {
 /// # Errors
 ///
 /// [`AppError::BadRequest`] when `resource` is absent; [`AppError::NotFound`]
-/// when it names no live local account (unknown, wrong domain, remote
-/// mirror or deactivated user). Any database failure arrives through `?`
-/// as [`AppError::Database`].
+/// when it names no local account (unknown, wrong domain or remote
+/// mirror); [`AppError::Gone`] when the account's deletion has started. A
+/// deactivated or suspended account is served like an active one. Any
+/// database failure arrives through `?` as [`AppError::Database`].
 async fn webfinger(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -108,7 +109,7 @@ async fn webfinger(
     let Some(resource) = query.resource.as_deref() else {
         return Err(AppError::BadRequest(MISSING_RESOURCE.to_owned()));
     };
-    let Some(user) = find_local_active_user(&state, resource).await? else {
+    let Some(user) = find_local_resolvable_user(&state, resource).await? else {
         return Err(AppError::NotFound);
     };
     let finger = Finger::for_user(&user, &state.config);
@@ -165,20 +166,29 @@ fn parse_resource<'a>(resource: &'a str, domain: &str) -> Resource<'a> {
     }
 }
 
-/// The user `resource` names, `None` when that is no live local account:
-/// the lookup follows [`parse_resource`], and remote mirrors and
-/// deactivated users are filtered out — `WebFinger` here only serves actors
-/// this instance owns and still answers with.
+/// The user `resource` names, `None` when that is no local account: the
+/// lookup follows [`parse_resource`], and remote mirrors are filtered out.
+///
+/// A deactivated or suspended account still resolves, as it does on the
+/// actor route (whose document says `suspended`); only an account whose
+/// deletion started is [`AppError::Gone`].
 ///
 /// # Errors
 ///
-/// Any database failure arrives as [`AppError::Database`].
-async fn find_local_active_user(state: &AppState, resource: &str) -> AppResult<Option<User>> {
+/// [`AppError::Gone`] for an account whose deletion has started; any
+/// database failure arrives as [`AppError::Database`].
+async fn find_local_resolvable_user(state: &AppState, resource: &str) -> AppResult<Option<User>> {
     let user = match parse_resource(resource, state.config.domain()) {
         Resource::Nickname(nickname) => get_by_nickname(&state.db, nickname).await?,
         Resource::ActorId(ap_id) => get_by_ap_id(&state.db, ap_id).await?,
     };
-    Ok(user.filter(User::is_local_active))
+    let Some(user) = user.filter(|user| user.local.get()) else {
+        return Ok(None);
+    };
+    if user.deleted_at.is_some() {
+        return Err(AppError::Gone);
+    }
+    Ok(Some(user))
 }
 
 /// Whether the client asked for the XRD XML representation: a `format`

@@ -3,8 +3,9 @@
 //!
 //! `WebFinger` resolves `acct:nick@domain`, bare `nick@domain` and actor URLs
 //! to live local accounts and answers JRD JSON by default or XRD XML when
-//! the client asks; unknown resources, foreign domains and deactivated or
-//! remote accounts are 404s, a missing `resource` parameter is a 400, and
+//! the client asks; unknown resources, foreign domains and remote accounts
+//! are 404s, a deleted account is a 410, a deactivated or suspended one still
+//! resolves, a missing `resource` parameter is a 400, and
 //! host-meta always serves the lrdd template pointing at `WebFinger`.
 //!
 //! The pure request classification and format negotiation are covered
@@ -22,7 +23,11 @@ use wired_be::{
     config::{
         BASE_URL_VAR, Config, DATABASE_URL_VAR, PROTOCOLS_VAR, TEST_BASE_URL, TEST_DATABASE_URL,
     },
-    models::user::{Flag, NewUser},
+    models::user::{
+        Flag, NewUser,
+        admin::{Standing, set_standing},
+        mark_deleted,
+    },
 };
 
 use crate::common;
@@ -260,37 +265,132 @@ async fn resources_that_name_no_local_user_are_not_found() {
     }
 }
 
-/// Remote mirrors and deactivated local accounts are not served: both the
-/// `acct:` and the actor-URL form answer 404 for them.
+/// Remote mirrors are not served: both the `acct:` and the actor-URL form
+/// answer 404 for them.
 #[tokio::test]
-async fn remote_and_deactivated_users_are_not_found() {
+async fn remote_users_are_not_found() {
     let db = common::test_db().await;
     let pool = db.pool().clone();
     let bob = common::create_remote_user(&pool, "bob", "remote.example").await;
-    let erin = common::create_local_user_with(&pool, "erin", |new| NewUser {
-        is_active: Flag::new(false),
-        ..new
-    })
-    .await;
     let bob_url = bob.ap_id.replace(':', "%3A").replace('/', "%2F");
-    let erin_url = erin.ap_id.replace(':', "%3A").replace('/', "%2F");
-    for resource in [
-        "acct%3Abob%40test.example".to_owned(),
-        bob_url,
-        ERIN_ACCT.to_owned(),
-        erin_url,
-    ] {
+    for resource in ["acct%3Abob%40test.example".to_owned(), bob_url] {
         let response = webfinger(&pool, &resource).await;
         assert_eq!(
             response.status,
             StatusCode::NOT_FOUND,
-            "{resource} is no live local account"
+            "{resource} is no local account"
         );
         assert_eq!(
             response.json_value(),
             json!({"error": "Record not found"}),
             "the 404 body for {resource}"
         );
+    }
+}
+
+/// A disabled account resolves like an active one, in JSON and XRD, by
+/// `acct:` and by actor URL.
+#[tokio::test]
+async fn a_disabled_account_resolves() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let erin = common::create_local_user_with(&pool, "erin", |new| NewUser {
+        is_active: Flag::new(false),
+        ..new
+    })
+    .await;
+    let erin_url = erin.ap_id.replace(':', "%3A").replace('/', "%2F");
+    for resource in [ERIN_ACCT.to_owned(), erin_url] {
+        let response = webfinger(&pool, &resource).await;
+        assert_eq!(response.status, StatusCode::OK, "{resource} resolves");
+        let document = response.json_value();
+        assert_eq!(document["subject"], "acct:erin@test.example", "{resource}");
+        assert_eq!(
+            document["links"][1]["href"], erin.ap_id,
+            "the self link of {resource}"
+        );
+    }
+}
+
+/// A suspended account answers the same document an active one does, in
+/// JSON and in XRD, and the `self` link names the actor the actor route
+/// serves as `suspended`.
+#[tokio::test]
+async fn a_suspended_account_resolves_with_the_same_self_link() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let erin = common::create_local_user(&pool, "erin").await;
+    let active = webfinger(&pool, ERIN_ACCT).await;
+    assert_eq!(active.status, StatusCode::OK, "active erin");
+    let active_document = active.json_value();
+    let _suspended = set_standing(&pool, erin.id, Standing::Suspended)
+        .await
+        .expect("the suspension stores")
+        .expect("erin exists");
+
+    let json_response = webfinger(&pool, ERIN_ACCT).await;
+    assert_eq!(json_response.status, StatusCode::OK, "suspended erin, JSON");
+    assert_eq!(
+        json_response.header("content-type"),
+        Some(JRD_JSON),
+        "still JRD"
+    );
+    let document = json_response.json_value();
+    assert_eq!(
+        document["links"][1],
+        json!({
+            "rel": "self",
+            "type": "application/activity+json",
+            "href": erin.ap_id,
+        }),
+        "the self link"
+    );
+    assert_eq!(
+        document, active_document,
+        "the same document as when active"
+    );
+
+    let xml_response = webfinger_with_accept(&pool, ERIN_ACCT, XRD_XML).await;
+    assert_eq!(xml_response.status, StatusCode::OK, "suspended erin, XRD");
+    assert_eq!(
+        xml_response.header("content-type"),
+        Some(XRD_XML),
+        "XRD content type"
+    );
+    assert!(
+        xml_response.text().contains(&format!(
+            r#"<Link rel="self" type="application/activity+json" href="{}"/>"#,
+            erin.ap_id
+        )),
+        "the XRD self link"
+    );
+
+    let by_url = erin.ap_id.replace(':', "%3A").replace('/', "%2F");
+    let url_response = webfinger(&pool, &by_url).await;
+    assert_eq!(url_response.status, StatusCode::OK, "by actor URL");
+}
+
+/// A deleted account answers the 410 the actor route gives it, by `acct:`
+/// and by actor URL, in both representations.
+#[tokio::test]
+async fn a_deleted_account_is_gone() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let frank = common::create_local_user(&pool, "frank").await;
+    mark_deleted(&pool, frank.id)
+        .await
+        .expect("the deletion marks");
+    let by_url = frank.ap_id.replace(':', "%3A").replace('/', "%2F");
+    for resource in ["acct%3Afrank%40test.example".to_owned(), by_url] {
+        let response = webfinger(&pool, &resource).await;
+        assert_eq!(response.status, StatusCode::GONE, "{resource} is gone");
+        assert_eq!(
+            response.json_value(),
+            json!({"error": "Gone"}),
+            "the 410 body for {resource}"
+        );
+        let xml = webfinger_with_accept(&pool, &resource, XRD_XML).await;
+        assert_eq!(xml.status, StatusCode::GONE, "{resource} is gone in XRD");
     }
 }
 
