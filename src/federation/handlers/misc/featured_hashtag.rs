@@ -64,7 +64,8 @@ pub(super) async fn fold_hashtag(
                 "an Add of a Hashtag with an unusable name",
             ));
         };
-        let featured = featured_tag::feature(&state.db, signer.id, &tag)
+        let shown = featured_tag::display_name(&name, &tag);
+        let featured = featured_tag::feature_as(&state.db, signer.id, &tag, &shown)
             .await
             .map_err(|err| FederationError::transient(failed, &err))?;
         if featured == Featured::LimitReached {
@@ -144,8 +145,8 @@ mod tests {
         assert_handled(&added);
         assert_eq!(
             featured_names(&pool, alice_id).await,
-            ["mastor4feat"],
-            "the tag is featured under its normalized name"
+            ["MastoR4Feat"],
+            "the tag is featured under the casing the peer wrote"
         );
 
         let restated = handle_add(
@@ -162,8 +163,8 @@ mod tests {
         assert_handled(&restated);
         assert_eq!(
             featured_names(&pool, alice_id).await,
-            ["mastor4feat"],
-            "a restated Add is still one row"
+            ["MastoR4Feat"],
+            "a restated Add is still one row, in its first casing"
         );
 
         for n in ["tag-remove-1", "tag-remove-2"] {

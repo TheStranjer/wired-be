@@ -161,7 +161,7 @@ async fn an_update_replaces_the_featured_tags_with_the_advertised_collection() {
 
     assert_eq!(
         featured_names(&pool, alice_id).await,
-        ["fedlab", "rust"],
+        ["fedlab", "Rust"],
         "the collection's tags replaced the old one"
     );
     assert_eq!(fresh_user(&pool, alice_id).await.name, "Alice");

@@ -132,7 +132,8 @@ async fn create(
     let tag = hashtag::find_or_create(&state.db, &written)
         .await?
         .ok_or_else(|| AppError::Unprocessable(NAME_INVALID.to_owned()))?;
-    match featured_tag::feature(&state.db, auth.0.id, &tag).await? {
+    let shown = featured_tag::display_name(&written, &tag);
+    match featured_tag::feature_as(&state.db, auth.0.id, &tag, &shown).await? {
         Featured::Added(entry) => {
             debug!(user = %auth.0.id, tag = %tag.name, "tag featured");
             dispatch(&state, &auth.0, AccountEvent::ProfileChanged).await;

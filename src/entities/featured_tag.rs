@@ -16,7 +16,7 @@ use crate::models::featured_tag::Entry;
 pub struct FeaturedTag {
     /// The `featured_tags` row id, as text.
     pub id: String,
-    /// The tag name, without the leading `#`.
+    /// The tag name in the casing its owner wrote, without the leading `#`.
     pub name: String,
     /// The account's page of posts under this tag.
     pub url: String,
@@ -34,7 +34,7 @@ impl FeaturedTag {
         Self {
             id: entry.id.to_string(),
             name: entry.name.clone(),
-            url: format!("{base_url}/@{nickname}/tagged/{}", entry.name),
+            url: format!("{base_url}/@{nickname}/tagged/{}", entry.tag_name),
             statuses_count: entry.statuses_count.to_string(),
             last_status_at: entry.last_status_at.map(|at| at.date_naive().to_string()),
         }
@@ -58,6 +58,7 @@ mod tests {
             user_id: Uuid::nil(),
             tag_id: Uuid::nil(),
             name: name.to_owned(),
+            tag_name: name.to_lowercase(),
             statuses_count: count,
             last_status_at: used.then_some(at),
             inserted_at: at,
@@ -77,6 +78,18 @@ mod tests {
                 "last_status_at": "2024-03-05",
             }),
             "counts are strings, the last use a plain date"
+        );
+    }
+
+    #[test]
+    fn the_name_keeps_its_casing_and_the_url_slug_does_not() {
+        let rendered = FeaturedTag::new(TEST_BASE_URL, "alice", &entry("FedLabR4", 1, true));
+        let value = serde_json::to_value(rendered).unwrap();
+        assert_eq!(value["name"], "FedLabR4", "the owner's casing");
+        assert_eq!(
+            value["url"],
+            format!("{TEST_BASE_URL}/@alice/tagged/fedlabr4"),
+            "the slug is the lowercase tag"
         );
     }
 
