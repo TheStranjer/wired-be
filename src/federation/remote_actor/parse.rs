@@ -69,6 +69,7 @@ pub fn parse_actor(json: &Value) -> Result<NewRemoteUser, ActorError> {
             .filter(|url| is_http_url(url)),
         locked: bool_field(json, "manuallyApprovesFollowers"),
         discoverable: bool_field(json, "discoverable"),
+        suspended: bool_field(json, "suspended"),
         fields: parse_fields(json),
         emojis,
         inbox,

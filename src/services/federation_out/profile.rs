@@ -1,7 +1,7 @@
 //! The actor-document arms: the profile `Update` an edited account sends to
 //! its remote followers, the account `Delete` its deletion sweep sends to
-//! both sides of every relationship it held, and the `disabled` landing
-//! point that deliberately sends nothing at all.
+//! both sides of every relationship it held, and the inbox snapshot the
+//! deletion and the suspension `Update` share.
 //!
 //! The pair that announces an account's move is [`super::moves`]' arm, which
 //! finishes by running the profile `Update` documented here.
@@ -89,7 +89,7 @@ pub async fn after_profile_updated(state: &AppState, account: &User) {
 /// `actor` is the account's `activitypub_actors` row, which the document's
 /// key and inbox come from, and `emojis` are the custom emojis the profile
 /// uses, tagged on the actor.
-fn update_document(
+pub(super) fn update_document(
     state: &AppState,
     account: &User,
     followers_collection: &str,
@@ -149,39 +149,80 @@ pub async fn after_account_deleted(state: &AppState, account: &User) -> AppResul
     if !account.local.get() {
         return Ok(()); // only our own actors announce themselves
     }
-    let mut recipients: Vec<String> = Vec::new();
-    let fans = follow::remote_followers(&state.db, account.id).await?;
-    recipients.extend(best_inboxes(&state.db, &fans).await?);
-    let idols = follow::remote_followees(&state.db, account.id).await?;
-    recipients.extend(best_inboxes(&state.db, &idols).await?);
-    recipients.extend(relay::accepted_inboxes(&state.db).await?);
-    // Two remote accounts on one instance name one shared inbox; the
-    // publisher's fan-out deduplicates by URL, so the snapshot POSTs there
-    // once.
-    let named: HashSet<&str> = recipients.iter().map(String::as_str).collect();
-    // Every other inbox this instance has ever stored: the long tail that
-    // learns of the deletion behind the follow peers, never ahead of them.
-    let long_tail: Vec<String> = user::all_remote_inboxes(&state.db)
-        .await?
-        .into_iter()
-        .filter(|inbox| !named.contains(inbox.as_str()))
-        .collect();
-    if recipients.is_empty() && long_tail.is_empty() {
+    let inboxes = known_inboxes(state, account).await?;
+    if inboxes.peers.is_empty() && inboxes.long_tail.is_empty() {
         return Ok(()); // nobody on another instance ever knew this account
     }
     let actor_row = activitypub_actor::get(&state.db, account.id).await?;
     let followers = activitypub_actor::followers_address(actor_row.as_ref(), &account.ap_id);
     let document = delete_document(state, account, &followers);
-    for (batch, priority) in [(&recipients, "peers"), (&long_tail, "long tail")] {
+    publish_to_known(state, account, &document, &inboxes, "Delete").await
+}
+
+/// The remote inboxes that know an account, in the two batches an
+/// account-wide announcement goes out in.
+#[derive(Debug)]
+pub(super) struct KnownInboxes {
+    /// The follow peers' inboxes (followers, followees) and the accepted relays'.
+    pub(super) peers: Vec<String>,
+    /// Every other known remote inbox, which hears behind the peers.
+    pub(super) long_tail: Vec<String>,
+}
+
+/// Snapshots the inboxes of every instance that may hold `account`'s posts.
+///
+/// They are its remote followers and followees, the accepted relays, and
+/// then every other remote inbox this instance has stored: the set
+/// [`after_account_deleted`] and the suspension `Update` share.
+///
+/// # Errors
+///
+/// Any database failure reading the follow graph, the relays or the inboxes.
+pub(super) async fn known_inboxes(state: &AppState, account: &User) -> AppResult<KnownInboxes> {
+    let mut peers: Vec<String> = Vec::new();
+    let fans = follow::remote_followers(&state.db, account.id).await?;
+    peers.extend(best_inboxes(&state.db, &fans).await?);
+    let idols = follow::remote_followees(&state.db, account.id).await?;
+    peers.extend(best_inboxes(&state.db, &idols).await?);
+    peers.extend(relay::accepted_inboxes(&state.db).await?);
+    // Two remote accounts on one instance name one shared inbox; the
+    // publisher's fan-out deduplicates by URL, so the snapshot POSTs there
+    // once.
+    let named: HashSet<&str> = peers.iter().map(String::as_str).collect();
+    // Every other inbox this instance has ever stored: the long tail that
+    // learns of the announcement behind the follow peers, never ahead of them.
+    let long_tail: Vec<String> = user::all_remote_inboxes(&state.db)
+        .await?
+        .into_iter()
+        .filter(|inbox| !named.contains(inbox.as_str()))
+        .collect();
+    Ok(KnownInboxes { peers, long_tail })
+}
+
+/// Queues `document` for the peers, then for the long tail, as `account`;
+/// `what` names the activity in the debug log.
+///
+/// # Errors
+///
+/// Any failure to queue a publish job.
+pub(super) async fn publish_to_known(
+    state: &AppState,
+    account: &User,
+    document: &Value,
+    inboxes: &KnownInboxes,
+    what: &str,
+) -> AppResult<()> {
+    for (batch, priority) in [(&inboxes.peers, "peers"), (&inboxes.long_tail, "long tail")] {
         if batch.is_empty() {
             continue;
         }
-        publisher::publish_in_background(state, account.id, &document, batch, None).await?;
+        publisher::publish_in_background(state, account.id, document, batch, None).await?;
         debug!(
             actor = %account.ap_id,
             inboxes = batch.len(),
             priority,
-            "queued account Delete federation"
+            what,
+            "queued account federation"
         );
     }
     Ok(())
@@ -206,19 +247,6 @@ fn delete_document(state: &AppState, account: &User, followers: &str) -> Value {
         "cc": [followers],
     })
 }
-
-/// The `disabled` landing hook: a deactivated account publishes nothing.
-///
-/// An account switched off with `POST /api/pleroma/disable_account` keeps
-/// its actor document resolvable — its posts and follows stay visible in
-/// other people's timelines — so nothing is announced. Pleroma's
-/// `User.deactivate` federates nothing either. The function exists as the
-/// single place a future ticket changes that answer, and at the call site
-/// that states the intent.
-///
-/// Its one non-test caller is `ActivityPub`'s adapter, which runs it on
-/// [`AccountEvent::Deactivated`](crate::protocols::events::AccountEvent::Deactivated).
-pub const fn after_account_disabled(_state: &AppState, _account: &User) {}
 
 #[cfg(test)]
 mod tests {
@@ -444,20 +472,6 @@ mod tests {
         after_profile_updated(&state, &bob).await;
 
         assert_eq!(job_count(&pool).await, 0, "a mirror announces nothing");
-    }
-
-    /// Deactivation keeps the actor document live for the histories that
-    /// cite it: the hook is documented silence, in every configuration.
-    #[tokio::test]
-    async fn deactivating_publishes_nothing() {
-        let db = crate::test_db::test_db().await.expect("test database slot");
-        let pool = db.pool().clone();
-        let alice = local(&pool, "alice").await;
-        let state = app_state(&pool);
-
-        after_account_disabled(&state, &alice);
-
-        assert_eq!(job_count(&pool).await, 0, "a deactivation queues nothing");
     }
 
     /// A remote mirror on `host` with a shared inbox and no relationship.

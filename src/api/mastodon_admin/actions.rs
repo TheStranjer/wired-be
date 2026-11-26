@@ -93,8 +93,9 @@ fn validate_target(actor: &User, account: &User, action: AccountAction) -> AppRe
 
 /// The effect of one action type: the flag its two real actions move, each
 /// with the `deactivate` entry every other writer of that flag leaves, and the
-/// entry naming the submitted type that records the request itself. Neither
-/// queues a job nor federates anything.
+/// entry naming the submitted type that records the request itself. The
+/// flag's `Suspended` event is what tells the protocols (`ActivityPub` queues
+/// an actor `Update`); this function itself queues no job.
 ///
 /// # Errors
 ///
@@ -208,7 +209,7 @@ enum AccountAction {
     /// `disable`: [`is_active`](User::is_active) off, nothing else.
     Disable,
     /// `suspend`: the same as [`Disable`](Self::Disable) — the flag off and
-    /// nothing federated or deleted, so `enable` undoes it.
+    /// nothing deleted, so `enable` (or `unsuspend`) undoes it.
     Suspend,
 }
 

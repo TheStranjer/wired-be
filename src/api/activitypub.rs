@@ -172,7 +172,7 @@ use crate::{
     error::{AppError, AppResult},
     extract::multipart::upload_body_limit,
     federation::{authorized_fetch::fetch_allowed, note::LITEPUB_SCHEMA_PATH},
-    models::user::{User, require_local_active},
+    models::user::{User, require_local_active, require_local_resolvable},
     state::AppState,
 };
 
@@ -364,6 +364,31 @@ pub(super) async fn gate_actor_read(
     headers: &HeaderMap,
     uri: &Uri,
 ) -> AppResult<Reader> {
+    gate(state, nickname, headers, uri, false).await
+}
+
+/// [`gate_actor_read`] for the actor document, which a suspended account keeps serving.
+///
+/// A deactivated account still resolves (its document says `suspended`),
+/// and only an account whose deletion started is the 410.
+pub(super) async fn gate_actor_document_read(
+    state: &AppState,
+    nickname: &str,
+    headers: &HeaderMap,
+    uri: &Uri,
+) -> AppResult<Reader> {
+    gate(state, nickname, headers, uri, true).await
+}
+
+/// The body of the two gates; `resolvable` keeps a deactivated account
+/// readable instead of the 410.
+async fn gate(
+    state: &AppState,
+    nickname: &str,
+    headers: &HeaderMap,
+    uri: &Uri,
+    resolvable: bool,
+) -> AppResult<Reader> {
     if !wants_activity_json(headers) {
         if wants_html(headers) {
             let redirect = frontend_redirect(&state.config, nickname)?;
@@ -372,7 +397,11 @@ pub(super) async fn gate_actor_read(
         return Err(AppError::RouteNotFound);
     }
     fetch_allowed(state, &Method::GET, uri, headers).await?;
-    let user = require_local_active(&state.db, nickname).await?;
+    let user = if resolvable {
+        require_local_resolvable(&state.db, nickname).await?
+    } else {
+        require_local_active(&state.db, nickname).await?
+    };
     Ok(Reader::Account(Box::new(user)))
 }
 

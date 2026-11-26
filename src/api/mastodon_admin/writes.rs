@@ -59,7 +59,9 @@ pub(super) async fn delete_account(
 ///
 /// The flag is the whole gate: the deactivation revoked no token and stamped
 /// no deletion, so the account's own credential works again on this answer
-/// and its actor document never stopped resolving. Re-enabling an active
+/// and its actor document never stopped resolving (the `Unsuspended` event
+/// has `ActivityPub` send the peers a fresh `Update` without the `suspended`
+/// flag). `POST …/unsuspend` is routed here too. Re-enabling an active
 /// account writes the same `true` back and answers the same entity.
 ///
 /// # Errors

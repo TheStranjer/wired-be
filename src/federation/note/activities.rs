@@ -98,6 +98,7 @@ pub fn litepub_context_json() -> Value {
         "quoteUri": "fedibird:quoteUri",
         "quoteUrl": "as:quoteUrl",
         "sensitive": "as:sensitive",
+        "suspended": "toot:suspended",
         "value": "schema:value",
         "votersCount": "toot:votersCount",
     });

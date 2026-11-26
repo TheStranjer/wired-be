@@ -126,12 +126,13 @@ async fn bulk_activation(app: &Router, token: &str, verb: &str, nicknames: &[&st
     common::assert_answer(&response, StatusCode::OK, "the bulk activation");
 }
 
-/// The owner's disable fires `Deactivated`, and `ActivityPub` federates nothing for it.
+/// The owner's disable fires `Deactivated`, and `ActivityPub` announces it as one actor `Update`.
 #[tokio::test]
-async fn disable_account_records_deactivated_and_federates_nothing() {
+async fn disable_account_records_deactivated_and_federates_the_suspended_update() {
     let db = common::test_db().await;
     let pool = db.pool().clone();
     let alice = common::create_user_with_password(&pool, "alice", PASSWORD).await;
+    remote_follower_of(&pool, &alice).await;
     let token = common::create_app_and_token(&pool, &alice, "write:accounts").await;
     let (_state, app) = instance(&pool, BOTH);
 
@@ -142,6 +143,32 @@ async fn disable_account_records_deactivated_and_federates_nothing() {
         vec![Recorded::Event(AccountEvent::Deactivated)],
         "the fixture saw one Deactivated"
     );
+    assert_eq!(activitypub_jobs(&pool).await, 1, "one Update was queued");
+    let activity = sqlx::query_scalar::<_, serde_json::Value>(
+        "SELECT args->'activity' FROM jobs WHERE kind = 'federator.publish'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("the publish job reads");
+    assert_eq!(activity["type"], "Update", "an Update");
+    assert_eq!(
+        activity["object"]["suspended"], true,
+        "of the suspended actor, though the request held the old row"
+    );
+}
+
+/// With the fixture alone no `ActivityPub` code runs, so a disable queues no job.
+#[tokio::test]
+async fn disable_account_federates_nothing_without_activitypub() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let alice = common::create_user_with_password(&pool, "alice", PASSWORD).await;
+    remote_follower_of(&pool, &alice).await;
+    let token = common::create_app_and_token(&pool, &alice, "write:accounts").await;
+    let (_state, app) = instance(&pool, FIXTURE_ONLY);
+
+    owner_post(&app, "/api/pleroma/disable_account", &token).await;
+
     assert_eq!(activitypub_jobs(&pool).await, 0, "nothing was federated");
 }
 

@@ -82,12 +82,13 @@ pub fn actor_json(
     config: &Config,
     emojis: &[CustomEmoji],
 ) -> Value {
-    Value::Object(
+    let document = Value::Object(
         actor_fields(user, actor, config, emojis)
             .into_iter()
             .map(|(name, value)| (name.to_owned(), value))
             .collect(),
-    )
+    );
+    super::suspended_actor::for_activity(document, user.is_active.get())
 }
 
 /// The `ActivityPub` document of the instance actor.

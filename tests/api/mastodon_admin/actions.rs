@@ -1,6 +1,6 @@
 //! The umbrella `POST …/{id}/action` over HTTP (WBE-213): `disable` and
-//! `suspend` with their flag move and entries (neither queues a job, and
-//! `enable` reverses both), the types with nothing
+//! `suspend` with their flag move and entries (`suspend` queues the actor
+//! `Update` that says so, and `enable` or `unsuspend` reverses both), the types with nothing
 //! under them, the `report_id` resolution and its guards, the two 422s of an
 //! unusable `type`, and the urlencoded form of decision 10.
 
@@ -122,13 +122,24 @@ async fn seed_suspendable(seeded: &Writes) -> Suspendable {
     }
 }
 
-/// `suspend` deactivates and nothing else, answering 200 `{}`: no job of any
-/// kind is queued (no `users.delete`, nothing to publish), and the post and
-/// the remote follower stay. The three warning parameters the client sent
-/// alongside are dropped without a trace, and the two entries name the move
-/// and the ask.
+/// The `Update` activities of the queued `federator.publish` jobs, oldest first.
+async fn published_activities(pool: &PgPool) -> Vec<serde_json::Value> {
+    sqlx::query_scalar::<_, serde_json::Value>(
+        "SELECT args->'activity' FROM jobs WHERE kind = 'federator.publish' \
+         AND args->'activity'->>'type' = 'Update' ORDER BY inserted_at",
+    )
+    .fetch_all(pool)
+    .await
+    .expect("the publish jobs read back")
+}
+
+/// `suspend` deactivates and announces it, answering 200 `{}`: no
+/// `users.delete` sweep is queued and the only job is the actor `Update` that
+/// says `"suspended": true` (no `Delete`), and the post and the remote
+/// follower stay. The three warning parameters the client sent alongside are
+/// dropped without a trace, and the two entries name the move and the ask.
 #[tokio::test]
-async fn the_action_suspends_without_deleting_or_federating_anything() {
+async fn the_action_suspends_and_federates_only_the_suspended_update() {
     let db = common::test_db().await;
     let seeded = seed_writes(&db).await;
     let start = seed_suspendable(&seeded).await;
@@ -157,8 +168,19 @@ async fn the_action_suspends_without_deleting_or_federating_anything() {
     );
     assert_eq!(
         job_count(&seeded.pool).await,
-        start.jobs_before,
-        "and no job at all, so no actor `Delete` is published"
+        start.jobs_before + 1,
+        "and exactly one job, the actor `Update`, so no actor `Delete` is published"
+    );
+    let published = published_activities(&seeded.pool).await;
+    assert_eq!(published.len(), 1, "one publish job");
+    assert_eq!(published[0]["type"], "Update", "an Update, not a Delete");
+    assert_eq!(
+        published[0]["object"]["suspended"], true,
+        "of the minimal suspended actor"
+    );
+    assert!(
+        published[0]["object"].get("name").is_none(),
+        "with the profile stripped"
     );
     assert_eq!(
         post_count(&seeded.pool, start.post).await,
@@ -243,10 +265,65 @@ async fn enabling_a_suspended_account_restores_it_with_its_data() {
         1,
         "and its follower intact"
     );
+    let published = published_activities(&seeded.pool).await;
     assert_eq!(
         job_count(&seeded.pool).await,
-        start.jobs_before,
-        "and the whole round trip queued no job"
+        start.jobs_before + 2,
+        "and the round trip queued two Updates and nothing else"
+    );
+    assert_eq!(published.len(), 2, "the suspension's and the enable's");
+    assert_eq!(
+        published[0]["object"]["suspended"], true,
+        "the first says suspended"
+    );
+    assert!(
+        published[1]["object"].get("suspended").is_none(),
+        "the second restores the actor without the flag"
+    );
+    assert!(
+        published[1]["object"].get("name").is_some(),
+        "and with its profile"
+    );
+}
+
+/// `POST …/unsuspend` does what `enable` does: 200 with the entity, the
+/// account active again and a fresh `Update` for its peers.
+#[tokio::test]
+async fn unsuspend_is_the_enable_under_mastodons_name() {
+    let db = common::test_db().await;
+    let seeded = seed_writes(&db).await;
+    let start = seed_suspendable(&seeded).await;
+    act(
+        &seeded.app,
+        &seeded.token,
+        seeded.plain.id,
+        &json!({"type": "suspend"}),
+    )
+    .await;
+
+    let unsuspended = post_json(
+        &seeded.app,
+        &seeded.token,
+        &account_action_path(seeded.plain.id, "unsuspend"),
+        &json!({}),
+    )
+    .await;
+
+    common::assert_answer(&unsuspended, StatusCode::OK, "the unsuspend");
+    let (active, _, doomed) = row_state(&seeded.pool, seeded.plain.id)
+        .await
+        .expect("the row is still there");
+    assert!(active && !doomed, "the account is active again");
+    let published = published_activities(&seeded.pool).await;
+    assert_eq!(published.len(), 2, "the suspension's Update and the second");
+    assert!(
+        published[1]["object"].get("suspended").is_none(),
+        "the second carries no flag"
+    );
+    assert_eq!(
+        job_count(&seeded.pool).await,
+        start.jobs_before + 2,
+        "and nothing else was queued"
     );
 }
 

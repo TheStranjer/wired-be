@@ -60,10 +60,12 @@
 //!   relays' (both sides learned something from the actor, both must learn
 //!   it is gone), then in a second publish to every other known remote
 //!   inbox;
-//! - [`after_account_disabled`]: nothing — deactivation deliberately
-//!   federates no activity, so the hook, run by the `ActivityPub` adapter on
-//!   `AccountEvent::Deactivated`, is the documented landing point for
-//!   a ticket that ever changes that answer;
+//! - [`after_account_activation_changed`]: an `Update` of the actor, run by
+//!   the `ActivityPub` adapter on `AccountEvent::Suspended`, `Deactivated`,
+//!   `Unsuspended` and `Reactivated`. A deactivated account's document is
+//!   the minimal one with `"suspended": true`, an active one's the full
+//!   profile, and it goes to the same inboxes as the account `Delete`;
+//!   no `Reject` of the follows is sent, so re-enabling restores everything;
 //! - [`after_report_created`]: the `Flag` a forwarded report owes a REMOTE
 //!   target's instance — the instance actor speaks it, the reported account
 //!   and its cited status uris are the object and the reporter's comment is
@@ -198,6 +200,7 @@ mod reactions;
 mod reports;
 mod scrobbles;
 mod statuses;
+mod suspension;
 #[cfg(test)]
 mod test_support;
 mod withdrawals;
@@ -215,12 +218,13 @@ pub use polls::{
     KIND_PUBLISH_UPDATE, after_local_poll_changed, after_local_poll_closed, after_poll_vote,
     handle_publish_update,
 };
-pub use profile::{after_account_deleted, after_account_disabled, after_profile_updated};
+pub use profile::{after_account_deleted, after_profile_updated};
 pub use quotes::{QuoteRequestAnswer, answer_quote_request};
 pub use reactions::after_reaction_changed;
 pub use reports::after_report_created;
 pub use scrobbles::after_scrobble_created;
 pub use statuses::{after_status_created, after_status_edited};
+pub use suspension::after_account_activation_changed;
 pub use withdrawals::after_status_deleted;
 
 /// The local actor, the acted-on status and its author: the three rows
