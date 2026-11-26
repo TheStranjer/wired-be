@@ -178,15 +178,21 @@ fn hashtag_names(collection: &Value) -> Vec<String> {
     as_array(items)
         .iter()
         .take(MAX_ITEMS)
-        .filter_map(|item| {
-            let name = item.get("name").and_then(Value::as_str);
-            let from_href = || {
-                let href = item.get("href").and_then(Value::as_str)?;
-                href.trim_end_matches('/').rsplit('/').next()
-            };
-            name.or_else(from_href).map(str::to_owned)
-        })
+        .filter_map(hashtag_name)
         .collect()
+}
+
+/// The tag name of one `Hashtag` object, as written.
+///
+/// It is the object's `name`, or the last path segment of its `href` when it
+/// names nothing; the store normalizes it. `None` for an object with neither.
+pub(crate) fn hashtag_name(item: &Value) -> Option<String> {
+    let name = item.get("name").and_then(Value::as_str);
+    let from_href = || {
+        let href = item.get("href").and_then(Value::as_str)?;
+        href.trim_end_matches('/').rsplit('/').next()
+    };
+    name.or_else(from_href).map(str::to_owned)
 }
 
 #[cfg(test)]

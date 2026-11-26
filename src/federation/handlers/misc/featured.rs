@@ -3,7 +3,8 @@
 //! [`apply_featured_change`] — only a `target` equal to the actor's own
 //! `featured_url` and a status the actor authored can be pinned. An `Add`
 //! of a status this instance has not stored fetches it when it lives on
-//! the actor's own host; a `Remove` only looks it up.
+//! the actor's own host; a `Remove` only looks it up. An embedded `Hashtag`
+//! object is a featured tag instead of a pin (`featured_hashtag`).
 
 use futures::future::BoxFuture;
 use tracing::debug;
@@ -20,6 +21,8 @@ use crate::{
     },
     state::AppState,
 };
+
+use super::featured_hashtag;
 
 /// The `Add` route: pin the actor's own stored status to its featured
 /// collection.
@@ -135,6 +138,13 @@ async fn apply_featured_change(
         return Ok(Outcome::Ignored(
             "an Add or Remove whose target is not the actor's featured collection",
         ));
+    }
+    if let Some(object) = view
+        .object
+        .embedded()
+        .filter(|object| featured_hashtag::is_hashtag(object))
+    {
+        return featured_hashtag::fold_hashtag(&state, &signer, object, pinning).await;
     }
     let Some(uri) = view.object.id() else {
         return Ok(Outcome::Ignored(

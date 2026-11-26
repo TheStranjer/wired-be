@@ -532,6 +532,97 @@ async fn a_nul_in_a_signed_activity_is_stripped_not_a_server_error() {
     );
 }
 
+/// Mastodon's pin `Add`: `type`, `actor`, `target` and `object`, no `id`.
+fn idless_add(signer: &Signer, status: &str) -> Value {
+    json!({
+        "@context": "https://www.w3.org/ns/activitystreams",
+        "type": "Add",
+        "actor": signer.ap_id,
+        "target": format!("{}/collections/featured", signer.ap_id),
+        "object": status,
+    })
+}
+
+/// A signed `Add` without an `id` is accepted with one job, whose activity
+/// carries an id made from the signer and a digest of the body; the same
+/// body delivered twice is one job and another body is a second one.
+#[tokio::test]
+async fn an_idless_add_is_queued_once_per_body() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let _alice = common::create_local_user(&pool, "alice").await;
+    let signer = instance_signer(&pool).await;
+    let app = common::test_app(pool.clone());
+    let pin = idless_add(&signer, "https://peer.example/statuses/1");
+
+    for _delivery in 0..2 {
+        let response = deliver(&app, &signer, "/inbox", &pin).await;
+        assert_eq!(response.status, StatusCode::ACCEPTED, "the Add is accepted");
+    }
+    let jobs = incoming_jobs(&pool).await;
+    assert_eq!(jobs.len(), 1, "the same body is one job: {jobs:?}");
+    let id = jobs[0].args["activity"]["id"]
+        .as_str()
+        .expect("the queued activity was given an id");
+    assert!(
+        id.starts_with(&format!("{}#idless-", signer.ap_id)),
+        "the id is the signer's plus a digest: {id}"
+    );
+    assert_eq!(
+        jobs[0].unique_key.as_deref(),
+        Some(format!("incoming:{}", id.to_lowercase()).as_str()),
+        "the dedupe key is built from it"
+    );
+    assert_eq!(
+        jobs[0].args["activity"]["type"], "Add",
+        "the rest is as sent"
+    );
+
+    let other = idless_add(&signer, "https://peer.example/statuses/2");
+    let response = deliver(&app, &signer, "/inbox", &other).await;
+    assert_eq!(response.status, StatusCode::ACCEPTED, "another pin");
+    assert_eq!(incoming_jobs(&pool).await.len(), 2, "another body, a job");
+}
+
+/// An id-less `Remove` is accepted too, while an id-less activity of any
+/// other type or an id-less `Add` without a `type` is still the 400.
+#[tokio::test]
+async fn only_id_less_adds_and_removes_with_a_type_are_accepted() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let _alice = common::create_local_user(&pool, "alice").await;
+    let signer = instance_signer(&pool).await;
+    let app = common::test_app(pool.clone());
+
+    let mut remove = idless_add(&signer, "https://peer.example/statuses/1");
+    remove["type"] = json!("Remove");
+    let accepted = deliver(&app, &signer, "/inbox", &remove).await;
+    assert_eq!(accepted.status, StatusCode::ACCEPTED, "an id-less Remove");
+    assert_eq!(incoming_jobs(&pool).await.len(), 1, "one job");
+
+    let mut no_type = idless_add(&signer, "https://peer.example/statuses/1");
+    let _removed = no_type
+        .as_object_mut()
+        .expect("an activity is an object")
+        .remove("type");
+    let mut other_type = idless_add(&signer, "https://peer.example/statuses/1");
+    other_type["type"] = json!("Like");
+    for (name, activity) in [("no type", &no_type), ("another type", &other_type)] {
+        let response = deliver(&app, &signer, "/inbox", activity).await;
+        assert_eq!(
+            response.status,
+            StatusCode::BAD_REQUEST,
+            "{name} is refused"
+        );
+        assert_eq!(
+            response.json_value(),
+            json!({"error": "Invalid activity"}),
+            "{name}: the 400 body"
+        );
+    }
+    assert_eq!(incoming_jobs(&pool).await.len(), 1, "nothing else queued");
+}
+
 /// The `object` of the activity a job carries.
 fn job_object(job: &Job) -> &Value {
     &job.args["activity"]["object"]

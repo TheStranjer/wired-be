@@ -10,7 +10,7 @@ use super::{
     Handlers, KIND_INCOMING,
     containment::containment_failure,
     error::is_retryable,
-    identity::dedupe_key,
+    identity::{dedupe_key, is_synthesized_id},
     ledger::{claim_ledger_row, release_ledger_row},
     routing::route,
     types::{ActivityView, MrfFn},
@@ -80,6 +80,11 @@ pub(super) async fn run_pipeline(
     if let Some(reason) = containment_failure(&view, &signer) {
         debug!(reason = %reason, "the activity fails containment; discarding");
         return Ok(());
+    }
+    if is_synthesized_id(&view.id) {
+        // An id-less activity has no identity to remember: its queue job
+        // already collapsed redeliveries, and the same pin may come again.
+        return process(state, &view, signer, handlers, mrf_filter).await;
     }
     let ledger_key = dedupe_key(&view.raw).unwrap_or_else(|| view.id.clone());
     if !claim_ledger_row(state, &ledger_key).await? {
@@ -213,6 +218,35 @@ mod tests {
             1,
             "the dropped activity is still marked seen"
         );
+    }
+
+    /// An activity wearing a made-up id skips the ledger: the same body
+    /// delivered again after its first job ran is processed again.
+    #[tokio::test]
+    async fn an_id_less_activity_is_not_held_in_the_ledger() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = signer(&pool).await;
+        let mut activity = follow_activity("idless-1");
+        let id = crate::federation::dispatch::synthesize_id(
+            &activity,
+            "https://peer.example/users/alice",
+        );
+        activity["id"] = json!(id);
+
+        for _delivery in 0..2 {
+            let outcome = dispatch_activity(
+                &app_state(&pool),
+                incoming_args(&activity, &alice),
+                &test_handlers(),
+                mrf::filter_incoming_boxed,
+            )
+            .await;
+            assert_eq!(outcome, Ok(()), "the delivery completes");
+        }
+
+        assert_eq!(seen("ok", &id), 2, "each delivery reached the handler");
+        assert_eq!(ledger_rows(&pool, &id).await, 0, "and none was remembered");
     }
 
     /// The instance-policy arm: an actor host on the `reject` list gets
