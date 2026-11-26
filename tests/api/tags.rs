@@ -266,7 +266,11 @@ async fn show_normalizes_the_name_and_answers_the_viewer() {
 
     let followed = tag_request(&app, Some(&bearer), "%23RUST", "/follow").await;
     common::assert_answer(&followed, StatusCode::OK, "follow spells it into being");
-    assert_eq!(followed.json_value()["name"], "rust", "stored normalized");
+    assert_eq!(
+        followed.json_value()["name"],
+        "RUST",
+        "the written casing is the display name"
+    );
 
     let shown = tag_request(&app, Some(&bearer), "%23Rust", "").await;
     common::assert_answer(&shown, StatusCode::OK, "any spelling shows it");

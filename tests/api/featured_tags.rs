@@ -261,7 +261,11 @@ async fn the_tag_routes_feature_and_unfeature_and_show_the_flag() {
         .await;
     assert_eq!(featured.status, StatusCode::OK);
     assert_eq!(featured.json_value()["featuring"], true);
-    assert_eq!(featured.json_value()["name"], "rust");
+    assert_eq!(
+        featured.json_value()["name"],
+        "Rust",
+        "the written casing is the display name"
+    );
     let twice = common::TestRequest::post("/api/v1/tags/rust/feature")
         .bearer(&token)
         .send(&app)

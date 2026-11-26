@@ -150,3 +150,91 @@ async fn status_tags_stay_lowercase() {
         "the status render is lowercase, as Mastodon's ShallowTagSerializer"
     );
 }
+
+/// `POST` of an absolute path as `bearer`.
+async fn post(app: &axum::Router, bearer: &str, path: &str) -> common::TestResponse {
+    common::TestRequest::post(path)
+        .bearer(bearer)
+        .send(app)
+        .await
+}
+
+/// Following a new mixed-case tag stores the written casing (WBE-885).
+#[tokio::test]
+async fn following_a_new_tag_keeps_the_written_casing() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let app = common::test_app(pool.clone());
+    let alice = common::create_local_user(&pool, "alice").await;
+    let token = common::create_app_and_token(&pool, &alice, "read:follows write:follows").await;
+
+    let followed = post(&app, &token, "/api/v1/tags/R6FollowTag/follow").await;
+    common::assert_answer(&followed, StatusCode::OK, "the follow");
+    let body = followed.json_value();
+    assert_eq!(body["name"], "R6FollowTag", "the follow answers the casing");
+    assert_eq!(
+        body["url"],
+        format!("{BASE}/tags/r6followtag"),
+        "the url stays lowercase"
+    );
+
+    let listed = get(&app, Some(&token), "/api/v1/followed_tags").await;
+    common::assert_answer(&listed, StatusCode::OK, "the followed tags");
+    assert_eq!(
+        listed.json::<Vec<Value>>()[0]["name"],
+        "R6FollowTag",
+        "followed_tags lists the casing"
+    );
+
+    let shown = get(&app, None, "/api/v1/tags/r6followtag").await;
+    common::assert_answer(&shown, StatusCode::OK, "the lowercase lookup");
+    assert_eq!(
+        shown.json_value()["name"],
+        "R6FollowTag",
+        "and so does show"
+    );
+}
+
+/// Following `#foo` when `Foo` exists keeps `Foo`.
+#[tokio::test]
+async fn following_an_existing_tag_keeps_its_casing() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let app = common::test_app(pool.clone());
+    let alice = common::create_local_user(&pool, "alice").await;
+    let _first = common::create_status(&pool, &alice, "#Foo", Visibility::Public).await;
+    let token = common::create_app_and_token(&pool, &alice, "read:follows write:follows").await;
+
+    let followed = post(&app, &token, "/api/v1/tags/foo/follow").await;
+    common::assert_answer(&followed, StatusCode::OK, "the follow");
+    assert_eq!(followed.json_value()["name"], "Foo", "the first use wins");
+}
+
+/// An unusable name is still the 422, and nothing is stored.
+#[tokio::test]
+async fn following_an_invalid_name_is_still_unprocessable() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let app = common::test_app(pool.clone());
+    let alice = common::create_local_user(&pool, "alice").await;
+    let token = common::create_app_and_token(&pool, &alice, "read:follows write:follows").await;
+
+    for name in ["123", "a%2Fb", "%23"] {
+        let refused = post(&app, &token, &format!("/api/v1/tags/{name}/follow")).await;
+        common::assert_answer(&refused, StatusCode::UNPROCESSABLE_ENTITY, "the bad name");
+    }
+}
+
+/// Featuring a new mixed-case tag keeps the casing too.
+#[tokio::test]
+async fn featuring_a_new_tag_keeps_the_written_casing() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let app = common::test_app(pool.clone());
+    let alice = common::create_local_user(&pool, "alice").await;
+    let token = common::create_app_and_token(&pool, &alice, "write:accounts").await;
+
+    let featured = post(&app, &token, "/api/v1/tags/R6FeatureTag/feature").await;
+    common::assert_answer(&featured, StatusCode::OK, "the feature");
+    assert_eq!(featured.json_value()["name"], "R6FeatureTag", "the casing");
+}
