@@ -15,8 +15,12 @@
 //! 1. the body is read under the hard `INBOX_MAX_BYTES` cap (413), must be
 //!    labelled a JSON `ActivityPub` media type (415) and must parse (400);
 //! 2. a `Signature` header — or the same parameters under
-//!    `Authorization: Signature ...` — must carry parseable parameters
-//!    (401 `Missing signature`);
+//!    `Authorization: Signature ...` — must carry parseable parameters, or
+//!    the request must present RFC 9421 `Signature-Input` and `Signature`
+//!    headers (401 `Missing signature`). A request may present both; steps
+//!    3 to 7 then run for each signature in turn (cavage first) and the
+//!    request is accepted when any one of them passes (a valid signature
+//!    beside an invalid one of the other scheme is no obstacle);
 //! 3. a signer whose host the instance refuses — a row of the
 //!    instance-policy `reject` list
 //!    ([`crate::models::instance_policy_domain`]) or a host the
@@ -25,8 +29,10 @@
 //!    — is refused (403 `Rejected`). The host is the `keyId`'s, known
 //!    before anything is fetched, so a rejected peer costs no outbound
 //!    request;
-//! 4. the `Digest` header must describe the bytes actually received
-//!    (401 `Invalid digest`, [`verify_digest`] and its body rule);
+//! 4. the `Digest` header (cavage) or `Content-Digest` header (RFC 9421)
+//!    must describe the bytes actually received (401 `Invalid digest`,
+//!    [`verify_digest`](crate::federation::signature::verify::verify_digest)
+//!    and its body rule);
 //! 5. the mirror row that stored the full `keyId` as its `publicKey.id`
 //!    (`GoToSocial`'s path-style keys) is the signer; else the `keyId` minus
 //!    its fragment is the signer's actor URL (Mastodon's
@@ -35,7 +41,8 @@
 //!    key object is resolved by fetching that document and following its
 //!    `owner`;
 //! 6. the signature verifies against the stored `public_key` (the
-//!    [`verify`] rules, `Date` skew included); on failure the actor is
+//!    [`verify`] rules, `Date` skew included, or the RFC 9421 rules with
+//!    the same window on `created`); on failure the actor is
 //!    refetched at most once per 60 s and the check retried, then 401
 //!    `Invalid signature`;
 //! 7. the activity's `actor` must equal the signer's `ap_id` — forwarded
@@ -62,7 +69,9 @@ use serde_json::Value;
 
 use crate::{
     federation::{
-        signature::verify::{ParsedSignature, SignedRequestParts, path_and_query, verify_digest},
+        signature::verify::{
+            Presented, SignedRequestParts, path_and_query, present_signatures, public_scheme,
+        },
         vocab::AP_MEDIA_TYPES,
     },
     models::user::User,
@@ -72,6 +81,8 @@ use crate::{
 
 mod body;
 mod error;
+#[cfg(test)]
+mod rfc9421_tests;
 pub mod signer;
 #[cfg(test)]
 mod test_support;
@@ -80,7 +91,7 @@ pub mod verify;
 pub use crate::federation::policy::signer_host;
 pub use error::InboxAuthError;
 
-use body::{declares_json_type, parse_json_body, present_signature, read_limited};
+use body::{declares_json_type, parse_json_body, read_limited};
 use signer::resolve_signer;
 use verify::{require_containment, require_unblocked, verify_signature};
 
@@ -145,14 +156,16 @@ pub struct SignedActivity {
 /// keep every helper under the five-parameter budget (decision 14).
 #[derive(Debug)]
 struct Inbound<'a> {
-    /// The parsed `Signature` header parameters.
-    pub(super) parsed: &'a ParsedSignature,
+    /// The signature under test: cavage or RFC 9421.
+    pub(super) parsed: &'a Presented,
     /// The request headers as received.
     pub(super) headers: &'a HeaderMap,
     /// The method, as received (e.g. `POST`).
     pub(super) method: &'a str,
     /// The request target: path with its query string.
     pub(super) target: &'a str,
+    /// The scheme of the public URL, for RFC 9421's `@target-uri`.
+    pub(super) scheme: &'a str,
     /// The parsed activity body.
     pub(super) json: &'a Value,
 }
@@ -194,21 +207,50 @@ async fn authenticate(
     // The digest below covers the original bytes; only the parsed copy is
     // cleaned, since the database cannot store U+0000 in the queued job.
     strip_nul_json(&mut json);
-    let parsed = present_signature(&parts.headers)?;
-    require_unblocked(state, &parsed.key_id).await?;
-    verify_digest(&parts.headers, &body).map_err(|_err| InboxAuthError::invalid_digest())?;
-    let signer = resolve_signer(state, &parsed.key_id, &json).await?;
+    let presented = present_signatures(&parts.headers);
     let target = path_and_query(&parts.uri);
-    let inbound = Inbound {
-        parsed: &parsed,
-        headers: &parts.headers,
-        method: parts.method.as_str(),
-        target: &target,
-        json: &json,
-    };
-    let signer = verify_signature(state, &inbound, signer).await?;
-    require_containment(&json, &signer)?;
-    Ok(SignedActivity { body, json, signer })
+    let mut refusal = None;
+    for parsed in &presented {
+        let inbound = Inbound {
+            parsed,
+            headers: &parts.headers,
+            method: parts.method.as_str(),
+            target: &target,
+            scheme: public_scheme(&state.config.base_url),
+            json: &json,
+        };
+        match authenticate_with(state, &inbound, &body).await {
+            Ok(signer) => return Ok(SignedActivity { body, json, signer }),
+            Err(InboxAuthError::Discarded) => return Err(InboxAuthError::Discarded),
+            // The first failure is the one reported: it belongs to the
+            // signature a peer presents first (cavage before RFC 9421).
+            Err(err) => {
+                if refusal.is_none() {
+                    refusal = Some(err);
+                }
+            }
+        }
+    }
+    Err(refusal.unwrap_or_else(InboxAuthError::missing_signature))
+}
+
+/// Steps 3 to 7 of the [module docs](self) for one presented signature: the
+/// request is authenticated when any one of its signatures passes them all.
+async fn authenticate_with(
+    state: &AppState,
+    inbound: &Inbound<'_>,
+    body: &Bytes,
+) -> Result<User, InboxAuthError> {
+    let key_id = inbound.parsed.key_id();
+    require_unblocked(state, key_id).await?;
+    inbound
+        .parsed
+        .verify_body(inbound.headers, body)
+        .map_err(|_err| InboxAuthError::invalid_digest())?;
+    let signer = resolve_signer(state, key_id, inbound.json).await?;
+    let signer = verify_signature(state, inbound, signer).await?;
+    require_containment(inbound.json, &signer)?;
+    Ok(signer)
 }
 
 #[cfg(test)]

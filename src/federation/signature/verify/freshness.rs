@@ -18,13 +18,28 @@ pub(super) fn check_freshness(
     request: &SignedRequestParts<'_>,
     now: DateTime<Utc>,
 ) -> Result<(), SignatureError> {
-    if parsed
-        .expires
-        .is_some_and(|expires| expires <= now.timestamp())
-    {
+    check_expiry(parsed.expires, now)?;
+    check_window(signed_moment(parsed, request)?, now)
+}
+
+/// A past `expires` moment (unix seconds) is [`SignatureError::Expired`].
+///
+/// Shared with the RFC 9421 `expires` parameter.
+pub(super) fn check_expiry(expires: Option<i64>, now: DateTime<Utc>) -> Result<(), SignatureError> {
+    if expires.is_some_and(|moment| moment <= now.timestamp()) {
         return Err(SignatureError::Expired);
     }
-    let signed_at = signed_moment(parsed, request)?;
+    Ok(())
+}
+
+/// The signed moment may be at most [`DATE_TOLERANCE`] before `now` and at
+/// most [`CLOCK_SKEW_MARGIN`] after it.
+///
+/// Shared with the RFC 9421 `created` parameter.
+pub(super) fn check_window(
+    signed_at: DateTime<Utc>,
+    now: DateTime<Utc>,
+) -> Result<(), SignatureError> {
     if signed_at > now + CLOCK_SKEW_MARGIN || now - signed_at > DATE_TOLERANCE {
         return Err(SignatureError::Expired);
     }

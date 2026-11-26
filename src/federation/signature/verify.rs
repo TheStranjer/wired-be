@@ -28,6 +28,11 @@
 //! - the signing text is first rebuilt with the path *including* its
 //!   query, as the newer drafts and Mastodon sign it, and — on failure —
 //!   without it, as Pleroma sometimes omits it.
+//!
+//! RFC 9421 (`Signature-Input` + `Signature`) is verified by the
+//! [`rfc9421`](Rfc9421Signature) rules with the same key lookup and clock
+//! window; [`present_signatures`] lists what a request carries under either
+//! scheme so a caller accepts the first one that verifies.
 
 use std::{error::Error, fmt};
 
@@ -38,11 +43,19 @@ mod checks;
 mod digest;
 mod freshness;
 mod parse;
+mod presented;
+mod rfc9421;
+#[cfg(test)]
+pub mod rfc9421_test_support;
 #[cfg(test)]
 mod test_support;
 
 pub use digest::verify_digest;
 pub use parse::{ParsedSignature, parse_signature_header};
+pub use presented::{Presented, present_signatures, public_scheme, signatures_offered};
+pub use rfc9421::{
+    Rfc9421Signature, parse_rfc9421, rfc9421_offered, verify_content_digest, verify_rfc9421,
+};
 
 use self::{
     checks::{check_algorithm, check_signed_headers, signing_text, target_candidates},
@@ -190,18 +203,30 @@ pub fn key_id_actor(key_id: &str) -> &str {
 /// The bare `Signature` header first, then an `Authorization: Signature ...`
 /// carrying the same ones. `None` when neither is present (or readable as
 /// text); [`parse_signature_header`] reads the result and drops the scheme
-/// itself.
+/// itself. An RFC 9421 request also has a bare `Signature` header, in
+/// another shape that does not parse; see [`present_signatures`].
 #[must_use]
 pub fn signature_header(headers: &HeaderMap) -> Option<&str> {
-    let text = |name: &HeaderName| headers.get(name).and_then(|value| value.to_str().ok());
-    text(&SIGNATURE_HEADER).or_else(|| {
-        let value = text(&header::AUTHORIZATION)?;
-        value
-            .trim_start()
-            .split_once(char::is_whitespace)
-            .is_some_and(|(scheme, _rest)| scheme.eq_ignore_ascii_case(SCHEME))
-            .then_some(value)
-    })
+    bare_signature(headers).or_else(|| authorization_signature(headers))
+}
+
+/// The bare `Signature` header's text, `None` when absent or unreadable.
+fn bare_signature(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(&SIGNATURE_HEADER)
+        .and_then(|value| value.to_str().ok())
+}
+
+/// The `Authorization` header's text when its scheme is `Signature`.
+fn authorization_signature(headers: &HeaderMap) -> Option<&str> {
+    let value = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())?;
+    value
+        .trim_start()
+        .split_once(char::is_whitespace)
+        .is_some_and(|(scheme, _rest)| scheme.eq_ignore_ascii_case(SCHEME))
+        .then_some(value)
 }
 
 /// Verifies a parsed inbound signature against the received request.

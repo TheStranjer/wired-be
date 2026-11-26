@@ -18,7 +18,7 @@ use crate::{
         fetch_actor::{FetchError, refresh_user},
         json::value_or_id,
         policy::{host_refused, signer_host},
-        signature::verify::{SignedRequestParts, verify},
+        signature::verify::SignedRequestParts,
     },
     models::{activitypub_actor, user::User},
     state::AppState,
@@ -116,10 +116,13 @@ pub(super) async fn verify_signature(
         })
 }
 
-/// The cryptographic check at the current moment; [`verify`] owns the
-/// signed-header and `Date` skew rules.
+/// The cryptographic check at the current moment; the signature's scheme
+/// owns the signed-header and clock-skew rules.
 fn verifies(inbound: &Inbound<'_>, request: &SignedRequestParts<'_>, public_pem: &str) -> bool {
-    verify(inbound.parsed, request, public_pem, Utc::now()).is_ok()
+    inbound
+        .parsed
+        .verify(request, inbound.scheme, public_pem, Utc::now())
+        .is_ok()
 }
 
 /// Step 7 of the [module docs](super): the activity's `actor` (string or
