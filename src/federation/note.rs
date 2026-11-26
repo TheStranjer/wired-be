@@ -159,6 +159,10 @@ pub struct NoteContext {
     /// the `replies` collection's inline first page. Empty for a status
     /// nobody (or only others) answered and for a non-public one.
     pub self_replies: Vec<String>,
+    /// The context the remote thread this status answers into advertised;
+    /// `None` for a thread rooted here, whose context is this instance's
+    /// own `{base}/contexts/{conversation}`.
+    pub thread_context: Option<String>,
     /// The instance whose origin, schema route and language default the
     /// document is built from.
     pub config: Config,

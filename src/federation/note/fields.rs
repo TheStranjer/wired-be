@@ -71,10 +71,12 @@ pub fn note_json(ctx: &NoteContext) -> Option<Value> {
 /// optional ones ([`note_json`] adds them: `updated`, the poll's `oneOf`
 /// and friends, the quote references).
 fn note_fields(ctx: &NoteContext) -> Vec<(&'static str, Value)> {
-    let context_uri = format!(
-        "{}/contexts/{}",
-        ctx.config.base_url, ctx.status.conversation_id
-    );
+    let context_uri = ctx.thread_context.clone().unwrap_or_else(|| {
+        format!(
+            "{}/contexts/{}",
+            ctx.config.base_url, ctx.status.conversation_id
+        )
+    });
     let (to, cc) = addressing(ctx);
     let language = ctx.status.language.as_deref().filter(|tag| !tag.is_empty());
     let mut fields = vec![
@@ -589,6 +591,21 @@ mod tests {
             document["cc"],
             json!([format!("{AUTHOR_AP}/followers"), BOB_AP]),
             "the parent author rides along in cc, through the mentions"
+        );
+    }
+
+    #[test]
+    fn a_reply_in_a_remote_thread_repeats_the_threads_context() {
+        let mut ctx = note_context(Visibility::Public);
+        ctx.thread_context = Some("https://mastodon.test/contexts/117-118".to_owned());
+        let document = note_json(&ctx).expect("a reply federates");
+        assert_eq!(
+            document["context"], "https://mastodon.test/contexts/117-118",
+            "the remote thread's own context"
+        );
+        assert_eq!(
+            document["conversation"], document["context"],
+            "and the same one as its conversation"
         );
     }
 

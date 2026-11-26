@@ -99,7 +99,8 @@ pub use quote_links::{
 pub use quote_policy::{QuotePolicy, set_quote_policy};
 pub use quoting::quoting_page;
 pub use reads::{
-    conversation_id_for_context, get_by_id, get_by_id_including_deleted, get_by_uri, get_many,
+    conversation_id_for_context, conversation_root_is_remote, get_by_id,
+    get_by_id_including_deleted, get_by_uri, get_many, remote_thread_context,
 };
 pub use reblogs::{
     create_reblog, local_reblogger_ids, reblogged_status_ids, reblogger_page, remove_reblog,

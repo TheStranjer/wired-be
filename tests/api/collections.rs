@@ -21,5 +21,6 @@
 mod follows_featured;
 mod gates;
 mod outbox;
+mod remote_threads;
 mod replies;
 mod support;

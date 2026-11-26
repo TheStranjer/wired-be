@@ -69,6 +69,11 @@ pub async fn load_note_context(
     let quote_uri = load_quote_uri(pool, &status).await?;
     let quote_authorization = quote_request::accepted_authorization(pool, status.id).await?;
     let self_replies = load_self_replies(pool, &status).await?;
+    let thread_context = if status.local {
+        status::remote_thread_context(pool, status.conversation_id).await?
+    } else {
+        None
+    };
     Ok(NoteContext {
         status,
         author,
@@ -82,6 +87,7 @@ pub async fn load_note_context(
         quote_uri,
         quote_authorization,
         self_replies,
+        thread_context,
         config: config.clone(),
     })
 }
