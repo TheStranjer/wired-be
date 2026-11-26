@@ -64,6 +64,7 @@ pub mod collections;
 pub mod delivery;
 pub mod dispatch;
 pub mod emoji_tag;
+pub mod featured_pins;
 pub mod featured_tags;
 pub mod fetch_actor;
 pub mod fetch_object;

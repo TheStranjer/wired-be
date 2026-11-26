@@ -9,7 +9,7 @@ use tracing::{debug, warn};
 use crate::{
     federation::{
         dispatch::{ActivityView, FederationError, Outcome},
-        featured_tags,
+        featured_pins, featured_tags,
         fetch_actor::fetch_signer,
         mrf,
         remote_actor::{ActorError, NewRemoteUser, parse_actor, upsert_remote_user},
@@ -64,21 +64,24 @@ pub(super) async fn apply_update(
         Ok(stored) => stored,
         Err(err) => return refused(err),
     };
-    sync_featured_tags(&state, &updated, &document).await;
+    sync_featured(&state, &updated, &document).await;
     debug!(account = %updated.nickname, "an Update folded a remote actor's new profile");
     Ok(Outcome::Handled)
 }
 
-/// Re-reads the featured tags the updated `document` advertises, signing the
-/// collection fetch the way an actor fetch does.
+/// Re-reads the featured tags and the featured pins the updated `document`
+/// advertises, signing the collection fetches the way an actor fetch does.
 ///
 /// Never fails the `Update`: when the fetch signer cannot be built the sync is
-/// skipped and the stored set stays as it was.
-async fn sync_featured_tags(state: &AppState, updated: &User, document: &Value) {
+/// skipped and the stored sets stay as they were.
+async fn sync_featured(state: &AppState, updated: &User, document: &Value) {
     match fetch_signer(state).await {
-        Ok(signer) => featured_tags::sync_remote(state, updated, document, signer.as_ref()).await,
+        Ok(signer) => {
+            featured_tags::sync_remote(state, updated, document, signer.as_ref()).await;
+            featured_pins::sync_from_actor(state, updated, document, signer.as_ref()).await;
+        }
         Err(err) => {
-            warn!(%err, account = %updated.nickname, "no fetch signer; featured tags not synced");
+            warn!(%err, account = %updated.nickname, "no fetch signer; featured sets not synced");
         }
     }
 }
@@ -152,6 +155,8 @@ async fn store_move_fields(
     Ok(())
 }
 
+#[cfg(test)]
+mod featured_pins_tests;
 #[cfg(test)]
 mod featured_tags_tests;
 #[cfg(test)]

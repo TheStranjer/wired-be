@@ -119,7 +119,7 @@ mod tests {
     }
 
     /// The kinds `ActivityPub` owns, which only its adapter registers.
-    const ACTIVITYPUB_KINDS: [&str; 7] = [
+    const ACTIVITYPUB_KINDS: [&str; 8] = [
         crate::federation::delivery::KIND_DELIVER,
         crate::federation::dispatch::KIND_INCOMING,
         crate::federation::dispatch::KIND_CLEANUP_RECEIVED,
@@ -127,6 +127,7 @@ mod tests {
         services::federation_out::KIND_PUBLISH_UPDATE,
         crate::federation::fetch_object::KIND_BACKFILL,
         crate::federation::fetch_object::KIND_QUOTE_BACKFILL,
+        crate::federation::featured_pins::KIND_SYNC,
     ];
 
     #[test]
