@@ -120,7 +120,8 @@ pub(crate) async fn sync_remote(
 ///
 /// An inline collection is taken as it is; a URL on the actor's own origin
 /// is fetched, and so is its `first` page when the collection is paged.
-async fn load_collection(
+/// The actor's featured pins read their collection the same way.
+pub(crate) async fn load_collection(
     state: &AppState,
     actor_id: &str,
     reference: &Value,

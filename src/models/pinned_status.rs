@@ -59,6 +59,18 @@ const UNPIN_SQL: &str = "DELETE FROM pinned_statuses
       WHERE user_id = $1 AND status_id = $2
    RETURNING *";
 
+/// [`replace_all`], first half: drops every pin of the account that the new
+/// list does not name (an empty list names none, so every pin goes).
+const REPLACE_DELETE_SQL: &str = "DELETE FROM pinned_statuses
+      WHERE user_id = $1 AND NOT (status_id = ANY($2))";
+
+/// [`replace_all`], second half: pins the listed statuses the account does
+/// not pin yet, the first of the list the newest.
+const REPLACE_INSERT_SQL: &str = "INSERT INTO pinned_statuses (user_id, status_id, inserted_at)
+     SELECT $1, listed.status_id, now() - listed.place::float8 * interval '1 microsecond'
+       FROM unnest($2::uuid[]) WITH ORDINALITY AS listed(status_id, place)
+ON CONFLICT (user_id, status_id) DO NOTHING";
+
 /// [`pinned_ids`]: which of a batch of statuses the account pinned, and
 /// when. Only the ids that *have* a row come back; the caller's flag is
 /// membership in the result, its timestamp the map's value.
@@ -137,6 +149,37 @@ pub async fn unpin(
         .bind(status_id)
         .fetch_optional(pool)
         .await?)
+}
+
+/// Makes `status_ids` exactly the statuses `user_id` pins, in that order.
+///
+/// `status_ids` lists the newest pin first, the way a remote actor's
+/// featured collection does. Pins not in the list are removed; a pin already
+/// held keeps its row and its pin time; a new one is stamped a microsecond
+/// older per place down the list, so a set that is all new reads back in the
+/// list's order. An empty list unpins everything. The delete and the insert
+/// run in one transaction.
+///
+/// # Errors
+///
+/// Any database failure arrives as [`AppError::Database`](crate::error::AppError);
+/// the stored pins are then unchanged.
+pub async fn replace_all(pool: &PgPool, user_id: Uuid, status_ids: &[Uuid]) -> AppResult<()> {
+    let mut tx = pool.begin().await?;
+    sqlx::query(REPLACE_DELETE_SQL)
+        .bind(user_id)
+        .bind(status_ids)
+        .execute(&mut *tx)
+        .await
+        .map(drop)?;
+    sqlx::query(REPLACE_INSERT_SQL)
+        .bind(user_id)
+        .bind(status_ids)
+        .execute(&mut *tx)
+        .await
+        .map(drop)?;
+    tx.commit().await?;
+    Ok(())
 }
 
 /// Which of `status_ids` `user_id` has pinned, and since when — the batched
@@ -535,6 +578,70 @@ mod tests {
             stored(&pool).await.is_empty(),
             "and the cascade emptied the table"
         );
+    }
+
+    #[tokio::test]
+    async fn replacing_pins_a_new_set_in_list_order() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = user(&pool, "alice").await;
+        let first = post(&pool, &alice).await.id;
+        let second = post(&pool, &alice).await.id;
+        let third = post(&pool, &alice).await.id;
+
+        replace_all(&pool, alice.id, &[third, first, second])
+            .await
+            .expect("the replacement stores");
+
+        let listed = list_for_user(&pool, alice.id)
+            .await
+            .expect("the list reads");
+        assert_eq!(ids(&listed), vec![third, first, second], "newest pin first");
+    }
+
+    #[tokio::test]
+    async fn replacing_drops_the_pins_the_list_leaves_out_and_keeps_the_rest() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = user(&pool, "alice").await;
+        let bob = user(&pool, "bob").await;
+        let kept = post(&pool, &alice).await.id;
+        let dropped = post(&pool, &alice).await.id;
+        let bobs = post(&pool, &bob).await.id;
+        pin_as(&pool, &alice, kept).await;
+        pin_as(&pool, &alice, dropped).await;
+        pin_as(&pool, &bob, bobs).await;
+        stamp(&pool, &alice, kept, day(1)).await;
+
+        replace_all(&pool, alice.id, &[kept, kept])
+            .await
+            .expect("the replacement stores");
+
+        let held = pinned_ids(&pool, alice.id, &[kept, dropped])
+            .await
+            .expect("the flags read");
+        assert_eq!(held.len(), 1, "only the listed status stays pinned");
+        assert_eq!(held.get(&kept), Some(&day(1)), "and keeps its pin time");
+        assert_eq!(
+            count(&pool, bob.id).await.expect("the count reads"),
+            1,
+            "another account's pins are untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn replacing_with_an_empty_list_unpins_everything() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = user(&pool, "alice").await;
+        let pinned = post(&pool, &alice).await.id;
+        pin_as(&pool, &alice, pinned).await;
+
+        replace_all(&pool, alice.id, &[])
+            .await
+            .expect("the replacement stores");
+
+        assert!(stored(&pool).await.is_empty(), "no pin is left");
     }
 
     #[tokio::test]

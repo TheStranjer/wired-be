@@ -26,6 +26,7 @@
 //! - `polls.publish_update` ([`services::federation_out::KIND_PUBLISH_UPDATE`])
 //! - `federator.backfill` ([`federation::fetch_object::KIND_BACKFILL`])
 //! - `federator.quote_backfill` ([`federation::fetch_object::KIND_QUOTE_BACKFILL`])
+//! - `federator.featured_pins` ([`federation::featured_pins::KIND_SYNC`])
 //!
 //! # Account events
 //!
@@ -115,6 +116,10 @@ const ACTIVITYPUB_JOB_HANDLERS: &[(&str, HandlerFn)] = &[
     (
         federation::fetch_object::KIND_QUOTE_BACKFILL,
         federation::fetch_object::handle_quote,
+    ),
+    (
+        federation::featured_pins::KIND_SYNC,
+        federation::featured_pins::handle,
     ),
 ];
 

@@ -11,7 +11,7 @@ use url::Url;
 
 use crate::{
     federation::{
-        featured_tags, mrf,
+        featured_pins, featured_tags, mrf,
         remote_actor::{parse_actor, upsert_remote_user},
         vocab::{ACTIVITY_JSON, LD_JSON},
     },
@@ -275,6 +275,7 @@ pub(super) async fn fetch_and_store(
         .await
         .map_err(FetchError::from)?;
     featured_tags::sync_remote(state, &user, &document, signer.as_ref()).await;
+    featured_pins::enqueue_sync(state, &user, &document).await;
     Ok(user)
 }
 
