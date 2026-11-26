@@ -274,6 +274,7 @@ pub(super) fn hashtag(name: &str) -> Hashtag {
     Hashtag {
         id: Uuid::now_v7(),
         name: name.to_owned(),
+        display_name: None,
         inserted_at: stamped(),
     }
 }

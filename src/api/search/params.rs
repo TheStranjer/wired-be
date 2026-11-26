@@ -216,7 +216,10 @@ impl HashtagList {
             Version::V1 => Self::Names(tags.into_iter().map(|tag| tag.name).collect()),
             Version::V2 => Self::Tags(
                 tags.iter()
-                    .map(|tag| Tag::with_history(base_url, &tag.name, Vec::new(), None))
+                    .map(|tag| {
+                        Tag::with_history(base_url, &tag.name, Vec::new(), None)
+                            .with_display_name(tag.shown())
+                    })
                     .collect(),
             ),
         }
@@ -243,6 +246,7 @@ mod tests {
         Hashtag {
             id: Uuid::now_v7(),
             name: name.to_owned(),
+            display_name: None,
             inserted_at: chrono::Utc::now(),
         }
     }

@@ -8,7 +8,7 @@ use crate::{
         emoji_tag::parse_emoji_tag,
         json::{as_array, value_or_id},
     },
-    models::{hashtag::normalize_name, user::User},
+    models::{hashtag::written_form, user::User},
 };
 
 use super::{MAX_TAGS, types::TagSets};
@@ -38,11 +38,12 @@ pub(super) fn parse_tags(json: &Value, author: &User) -> TagSets {
     sets
 }
 
-/// One `Hashtag` tag: its `name` as [`normalize_name`] spells it (no leading
-/// `#`, lowercased); names it refuses — empty, over-long, outside the tag
-/// character set or all digits — are skipped.
+/// One `Hashtag` tag: its `name` as [`written_form`] spells it (no leading
+/// `#`, the sender's casing, which the tag upsert keeps as the display name
+/// of a first use); names [`crate::models::hashtag::normalize_name`] refuses — empty, over-long,
+/// outside the tag character set or all digits — are skipped.
 fn parse_hashtag(entry: &Value) -> Option<String> {
-    normalize_name(entry.get("name").and_then(Value::as_str)?)
+    written_form(entry.get("name").and_then(Value::as_str)?)
 }
 
 #[cfg(test)]
@@ -60,8 +61,8 @@ mod tests {
         let parsed = parse(&fixture(MASTODON));
         assert_eq!(
             parsed.hashtags,
-            ["rust"],
-            "lowercased, # dropped; the \
+            ["Rust"],
+            "casing kept, # dropped; the \
                    over-long name, the Show type and the bare string skipped"
         );
         assert_eq!(
@@ -147,7 +148,7 @@ mod tests {
     }
 
     #[test]
-    fn hashtag_names_lose_their_hash_and_their_case() {
+    fn hashtag_names_lose_their_hash_and_keep_their_case() {
         let mut document = minimal_note();
         document["tag"] = json!([
             {"type": "Hashtag", "name": "#RuSt"},
@@ -158,8 +159,8 @@ mod tests {
         let parsed = parse(&document);
         assert_eq!(
             parsed.hashtags,
-            ["rust", "plain", "tada"],
-            "hash dropped, lowercased; a bare hash is no tag"
+            ["RuSt", "plain", "tada"],
+            "hash dropped, casing kept; a bare hash is no tag"
         );
     }
 

@@ -370,6 +370,7 @@ pub(crate) async fn render_tag(
         week(Utc::now().date_naive(), &counts),
         following,
     )
+    .with_display_name(tag.shown())
     .with_featuring(featuring))
 }
 

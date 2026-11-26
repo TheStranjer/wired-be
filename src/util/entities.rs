@@ -340,6 +340,19 @@ fn written_word(word: &str) -> String {
     word.chars().take(MAX_HASHTAG_LEN).collect()
 }
 
+/// Every accepted hashtag in plain text as the author wrote it (the first
+/// spelling of each), without the `#`, in order of first appearance.
+///
+/// What a local post hands the tag upsert, which lowercases for the key and
+/// keeps this casing as the tag's display name on its first use.
+#[must_use]
+pub fn written_hashtags(text: &str) -> Vec<String> {
+    hashtag_spellings(text)
+        .into_iter()
+        .map(|(_, written)| written)
+        .collect()
+}
+
 /// Every accepted hashtag in plain text as `(normalized, as written)`, in
 /// order of first appearance and deduplicated by the normalized form.
 ///

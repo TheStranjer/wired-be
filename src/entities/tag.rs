@@ -30,7 +30,8 @@ use crate::models::hashtag::Hashtag;
 /// `[]` — see [`history`](Self::history).
 #[derive(Debug, Serialize)]
 pub struct Tag {
-    /// The tag name, as stored: lowercase, without the leading `#`.
+    /// The tag name without the leading `#`: lowercase as stored in a
+    /// Status's `tags`, the casing of the tag's first use in the full form.
     pub name: String,
     /// The instance's tag page for this name: `{base_url}/tags/{name}`.
     pub url: String,
@@ -102,6 +103,15 @@ impl Tag {
         }
     }
 
+    /// This tag showing `name` instead of the lowercase one, as Mastodon's
+    /// `TagSerializer#name` shows the display name of the tag's first use.
+    /// The `url` keeps the lowercase name it was built from.
+    #[must_use]
+    pub fn with_display_name(mut self, name: &str) -> Self {
+        name.clone_into(&mut self.name);
+        self
+    }
+
     /// This tag with its `featuring` flag set: `Some` renders the key,
     /// `None` leaves it out.
     #[must_use]
@@ -145,6 +155,7 @@ mod tests {
         let hashtag = Hashtag {
             id: uuid::Uuid::now_v7(),
             name: name.to_owned(),
+            display_name: None,
             inserted_at: chrono::Utc::now(),
         };
         serde_json::to_value(Tag::from_hashtag(TEST_BASE_URL, &hashtag)).unwrap()
@@ -211,6 +222,33 @@ mod tests {
             }),
             "every count is a string, and `following` rides with a viewer"
         );
+    }
+
+    #[test]
+    fn a_display_name_changes_the_name_and_not_the_url() {
+        let value = serde_json::to_value(
+            Tag::with_history(TEST_BASE_URL, "r5smoke", Vec::new(), None)
+                .with_display_name("R5Smoke"),
+        )
+        .unwrap();
+        assert_eq!(value["name"], "R5Smoke", "the first use's casing");
+        assert_eq!(
+            value["url"],
+            format!("{TEST_BASE_URL}/tags/r5smoke"),
+            "the url stays lowercase"
+        );
+    }
+
+    #[test]
+    fn the_status_render_ignores_the_display_name() {
+        let hashtag = Hashtag {
+            id: uuid::Uuid::now_v7(),
+            name: "r5smoke".to_owned(),
+            display_name: Some("R5Smoke".to_owned()),
+            inserted_at: chrono::Utc::now(),
+        };
+        let value = serde_json::to_value(Tag::from_hashtag(TEST_BASE_URL, &hashtag)).unwrap();
+        assert_eq!(value["name"], "r5smoke", "a status's tags stay lowercase");
     }
 
     #[test]

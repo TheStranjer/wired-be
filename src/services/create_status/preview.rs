@@ -17,7 +17,7 @@ use crate::{
     },
     error::AppResult,
     models::{
-        hashtag::Hashtag,
+        hashtag::{Hashtag, normalize_name},
         oauth_app::OauthApp,
         status::{self, NewStatus},
         user::{self, User},
@@ -118,13 +118,18 @@ pub async fn preview_status(
 }
 
 /// The `tags` entries a preview renders: one per usable name
-/// [`extract_hashtags`] folded, deduplicated and in the name order
+/// the text's hashtags name, lowercased, deduplicated and in the name order
 /// [`crate::models::hashtag::for_statuses`] reads stored tags back in. The
 /// rows are fabricated — no `hashtags` row is written for a preview — and
 /// only the name the entity renders off them is meaningful.
 fn preview_tags(names: &[String]) -> Vec<Hashtag> {
     let created_at = Utc::now();
-    let mut unique: Vec<String> = names.to_vec();
+    // The names are as written (the casing a stored tag keeps as its display
+    // name); a status entity's tags are the lowercase names.
+    let mut unique: Vec<String> = names
+        .iter()
+        .filter_map(|name| normalize_name(name))
+        .collect();
     unique.sort_unstable();
     unique.dedup();
     unique
@@ -132,6 +137,7 @@ fn preview_tags(names: &[String]) -> Vec<Hashtag> {
         .map(|name| Hashtag {
             id: new_id(),
             name,
+            display_name: None,
             inserted_at: created_at,
         })
         .collect()
