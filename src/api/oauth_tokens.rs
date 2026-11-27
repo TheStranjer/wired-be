@@ -8,10 +8,12 @@
 //! `GET /api/v1/pleroma/apps`). The ticket's shapes are authoritative:
 //!
 //! - `GET /api/oauth_tokens` — the caller's **valid, unexpired** tokens
-//!   as `[{"id", "app_name", "valid_until"}]`, newest first. Unlike
-//!   Pleroma's `TokenView`, no `scopes` key; unlike its unfiltered
-//!   `Token.get_user_tokens`, expiry is applied here. It requires
-//!   `read:security` (a `read` token covers it).
+//!   as `[{"id", "app_name", "scopes", "valid_until", "last_active",
+//!   "is_current_token"}]` (Pleroma's `TokenView` keys), newest first.
+//!   `is_current_token` flags the token authenticating the request and
+//!   `last_active` is `null` since no usage is recorded. Unlike its
+//!   unfiltered `Token.get_user_tokens`, expiry is applied here. It
+//!   requires `read:security` (a `read` token covers it).
 //! - `DELETE /api/oauth_tokens/{id}` — revoke one of the caller's own
 //!   tokens and answer `200 {}`. Pleroma always answers 201 with an
 //!   empty body; here a foreign or unknown (or malformed) id is the
@@ -42,6 +44,7 @@ use chrono::{DateTime, Utc};
 use serde::Serialize;
 use serde_json::{Map, Value};
 use tracing::debug;
+use uuid::Uuid;
 
 use crate::{
     auth::AuthUser,
@@ -87,7 +90,12 @@ async fn list_tokens(
         user = %auth.0.id,
         "oauth tokens listed"
     );
-    Ok(Json(rows.iter().map(TokenEntry::from_row).collect()))
+    let current_id = auth.1.id;
+    Ok(Json(
+        rows.iter()
+            .map(|row| TokenEntry::from_row(row, current_id))
+            .collect(),
+    ))
 }
 
 /// `DELETE /api/oauth_tokens/{id}` — revoke one of the caller's own
@@ -148,27 +156,39 @@ async fn list_apps(
     ))
 }
 
-/// One entry of `GET /api/oauth_tokens`: exactly the three keys
-/// `id`, `app_name` and `valid_until` the ticket pins (Pleroma's
-/// `TokenView.show.json` without its `scopes`).
+/// One entry of `GET /api/oauth_tokens`: the six keys of Pleroma's
+/// `TokenView.show.json` (`id`, `valid_until`, `scopes`, `last_active`,
+/// `app_name`, `is_current_token`).
 #[derive(Debug, Serialize)]
 struct TokenEntry {
     /// The token's `UUIDv7` id as lowercase hyphenated text (decision 4).
     id: String,
     /// The name of the application that issued the token.
     app_name: String,
+    /// The scopes the token was granted, one string each.
+    scopes: Vec<String>,
     /// When the token expires, in the Mastodon wire format (decision 5).
     #[serde(with = "crate::util::time::serde_mastodon_time")]
     valid_until: DateTime<Utc>,
+    /// When the token was last used; always `null`, as no usage is recorded.
+    #[serde(with = "crate::util::time::serde_mastodon_time::option")]
+    last_active: Option<DateTime<Utc>>,
+    /// Whether this is the token that authenticated the request.
+    is_current_token: bool,
 }
 
 impl TokenEntry {
     /// Renders one join row from [`oauth_token::list_valid_with_app_names`].
-    fn from_row(row: &oauth_token::TokenWithAppName) -> Self {
+    ///
+    /// `current_id` is the id of the token authenticating the request.
+    fn from_row(row: &oauth_token::TokenWithAppName, current_id: Uuid) -> Self {
         Self {
             id: row.id.to_string(),
             app_name: row.app_name.clone(),
+            scopes: scopes::Scopes::parse(&row.scopes).names().to_vec(),
             valid_until: row.valid_until,
+            last_active: None,
+            is_current_token: row.id == current_id,
         }
     }
 }
@@ -225,6 +245,7 @@ mod tests {
         oauth_token::TokenWithAppName {
             id: new_id(),
             app_name: "Mobile Client".to_owned(),
+            scopes: "read write:statuses".to_owned(),
             valid_until: parse_time("2024-01-31T12:34:56.789Z").unwrap(),
         }
     }
@@ -248,20 +269,34 @@ mod tests {
     }
 
     #[test]
-    fn a_token_entry_carries_exactly_the_three_pinned_keys() {
+    fn a_token_entry_carries_exactly_the_six_pleroma_keys() {
         let row = token_row();
         let id = row.id.to_string();
-        let json = serde_json::to_value(TokenEntry::from_row(&row)).unwrap();
+        let json = serde_json::to_value(TokenEntry::from_row(&row, row.id)).unwrap();
         assert_eq!(
             json,
             json!({
                 "id": id,
                 "app_name": "Mobile Client",
+                "scopes": ["read", "write:statuses"],
                 "valid_until": "2024-01-31T12:34:56.789Z",
+                "last_active": null,
+                "is_current_token": true,
             }),
-            "the uuid as hyphenated text, the joined name, the Mastodon time"
+            "the uuid as hyphenated text, the joined name, the scope list, the Mastodon time"
         );
-        assert_eq!(json.as_object().map(Map::len), Some(3), "no other keys");
+        assert_eq!(json.as_object().map(Map::len), Some(6), "no other keys");
+    }
+
+    #[test]
+    fn only_the_authenticating_token_is_flagged_current() {
+        let row = token_row();
+        let json = serde_json::to_value(TokenEntry::from_row(&row, new_id())).unwrap();
+        assert_eq!(
+            json["is_current_token"],
+            json!(false),
+            "another token's id leaves the flag false"
+        );
     }
 
     #[test]
