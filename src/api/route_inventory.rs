@@ -114,9 +114,153 @@ pub fn routes() -> impl Iterator<Item = &'static RouteSpec> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
+    use std::collections::{BTreeSet, HashSet};
 
     use super::{AuthClass, ROUTES, RouteSpec, routes};
+
+    /// Pleroma 2.10.2's client routes, one `METHOD /path` per line.
+    const PLEROMA_FIXTURE: &str =
+        include_str!("../../tests/fixtures/pleroma/v2.10.2-client-routes.txt");
+
+    /// A route and the method it answers, as `(method, normalized path)`.
+    type RouteKey = (String, String);
+
+    /// Pleroma routes this backend deliberately does not serve.
+    ///
+    /// Each entry is `(method, path, reason)`, with the path in fixture form.
+    const WAIVERS: &[(&str, &str, &str)] = &[
+        (
+            "GET",
+            "/api/openapi",
+            "Pleroma's generated OpenAPI document; WiredBE publishes none.",
+        ),
+        (
+            "GET",
+            "/api/v1/pleroma/admin/frontends",
+            "frontend management; WiredBE hosts no frontends.",
+        ),
+        (
+            "POST",
+            "/api/v1/pleroma/admin/frontends/install",
+            "frontend management; WiredBE hosts no frontends.",
+        ),
+        (
+            "POST",
+            "/api/v1/pleroma/uploader_callback/:p",
+            "callback for Pleroma's external uploaders; WiredBE has none.",
+        ),
+        (
+            "GET",
+            "/oauth/mfa",
+            "server-rendered HTML MFA page; WiredBE is API-only, and its frontend does MFA \
+             through POST /oauth/mfa/challenge.",
+        ),
+        (
+            "POST",
+            "/oauth/mfa/verify",
+            "the form post of the HTML MFA page; WiredBE is API-only.",
+        ),
+    ];
+
+    /// Rewrites every `:name` or `{name}` path segment to `:p`.
+    fn normalize_path(path: &str) -> String {
+        path.split('/')
+            .map(|segment| {
+                let braced = segment.starts_with('{') && segment.ends_with('}');
+                if segment.starts_with(':') || braced {
+                    ":p"
+                } else {
+                    segment
+                }
+            })
+            .collect::<Vec<&str>>()
+            .join("/")
+    }
+
+    /// The fixture's routes: comment and blank lines skipped.
+    fn fixture_routes() -> BTreeSet<RouteKey> {
+        PLEROMA_FIXTURE
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+            .filter_map(|line| line.split_once(' '))
+            .map(|(method, path)| (method.to_owned(), normalize_path(path.trim())))
+            .collect()
+    }
+
+    /// The inventory's routes with path parameters normalized.
+    fn inventory_routes() -> BTreeSet<RouteKey> {
+        routes()
+            .map(|row| (row.method.to_owned(), normalize_path(row.path)))
+            .collect()
+    }
+
+    /// The waiver list as route keys.
+    fn waived_routes() -> BTreeSet<RouteKey> {
+        WAIVERS
+            .iter()
+            .map(|(method, path, _reason)| ((*method).to_owned(), (*path).to_owned()))
+            .collect()
+    }
+
+    /// Formats one offender line.
+    fn describe(key: &RouteKey) -> String {
+        format!("{} {}", key.0, key.1)
+    }
+
+    /// Every Pleroma 2.10.2 client route is served or explicitly waived.
+    #[test]
+    fn pleroma_client_routes_are_served_or_waived() {
+        let fixture = fixture_routes();
+        let inventory = inventory_routes();
+        let waived = waived_routes();
+
+        let mut problems: Vec<String> = Vec::new();
+        for key in &fixture {
+            if !inventory.contains(key) && !waived.contains(key) {
+                problems.push(format!(
+                    "missing from inventory, not waived: {}",
+                    describe(key)
+                ));
+            }
+        }
+        for key in &waived {
+            if inventory.contains(key) {
+                problems.push(format!(
+                    "stale waiver, route is in inventory: {}",
+                    describe(key)
+                ));
+            }
+            if !fixture.contains(key) {
+                problems.push(format!("waiver not in fixture: {}", describe(key)));
+            }
+        }
+        assert!(
+            problems.is_empty(),
+            "Pleroma 2.10.2 route conformance failed:\n{}",
+            problems.join("\n")
+        );
+    }
+
+    /// The fixture holds exactly the 308 routes the ticket lists.
+    #[test]
+    fn pleroma_fixture_has_308_routes() {
+        assert_eq!(fixture_routes().len(), 308, "fixture route count");
+    }
+
+    /// Path parameters in both spellings normalize to `:p`.
+    #[test]
+    fn normalize_path_rewrites_both_parameter_spellings() {
+        assert_eq!(
+            normalize_path("/api/v1/accounts/:id/follow"),
+            "/api/v1/accounts/:p/follow"
+        );
+        assert_eq!(
+            normalize_path("/oauth/{provider}/callback"),
+            "/oauth/:p/callback"
+        );
+        assert_eq!(normalize_path("/api/v1/instance"), "/api/v1/instance");
+    }
 
     /// The assembled table is well formed: thirteen sections, none of them
     /// empty, no `(method, path)` pair listed twice, opening with the
