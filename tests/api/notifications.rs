@@ -29,6 +29,8 @@ mod gates;
 mod listing;
 /// The Pleroma `read` route and the cascade of a deleted status.
 mod read;
+/// The same read route under `/api/v1/pleroma`, matched against the legacy one.
+mod read_v1;
 /// The show route and every notification type rendered through the listing.
 mod show_types;
 /// Shared consts, fixtures, seeds and helpers every submodule draws on.

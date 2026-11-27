@@ -270,6 +270,11 @@ pub(super) const ROWS: &[RouteSpec] = &[
         auth: AuthClass::User,
     },
     RouteSpec {
+        method: "POST",
+        path: "/api/v1/pleroma/notifications/read",
+        auth: AuthClass::User,
+    },
+    RouteSpec {
         method: "GET",
         path: "/api/v2/notifications",
         auth: AuthClass::User,
