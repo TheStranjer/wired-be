@@ -55,6 +55,12 @@
 //! must never install a `Router::fallback` of their own: it would shadow the
 //! app-wide one, and merging two routers that each set one panics.
 //!
+//! That fallback also carries Pleroma's `LegacyPleromaApiRerouterPlug`: an
+//! unmatched `/api/pleroma/<rest>` is re-dispatched through the whole router
+//! as `/api/v1/pleroma/<rest>` (`crate::fallback::reroute_legacy_pleroma`),
+//! so explicit `/api/pleroma` routes keep precedence and the rewrite needs no
+//! alias list.
+//!
 //! [`media_files`], [`activitypub`], [`well_known`], [`nodeinfo`],
 //! [`oauth`], [`oauth_external`] and [`emoji_packs::files_router`] are the
 //! routers in this module that [`crate::app`] does not nest under `/api`:
