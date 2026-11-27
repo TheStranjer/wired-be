@@ -17,7 +17,7 @@ use super::{
     },
     error::ConfigError,
     federation_types::Toggle,
-    instance::InstanceProfile,
+    instance::{Endpoints, InstanceProfile, endpoints},
     integrations::{TranslationConfig, TranslationProvider, VapidConfig},
     jobs::{RestSettings, rest_settings},
     limits::ContentLimits,
@@ -103,11 +103,12 @@ where
     })
 }
 
-/// What [`groups`] answers: [`Wording`], [`Signup`] and [`RestSettings`]
-/// flattened into one seven-value tuple, so [`Config::from_lookup`] binds
-/// all seven groups with a single `let` and stays inside Clippy's line
-/// budget.
+/// What [`groups`] answers: [`Endpoints`], [`Wording`], [`Signup`] and
+/// [`RestSettings`] flattened into one eight-value tuple, so
+/// [`Config::from_lookup`] binds all eight groups with a single `let` and
+/// stays inside Clippy's line budget.
 pub(crate) type Groups = (
+    Endpoints,
     InstanceProfile,
     ContentLimits,
     TextLengthLimits,
@@ -119,16 +120,18 @@ pub(crate) type Groups = (
 
 /// [`profile_and_limits`] and [`signup_and_mail`] in one call: the
 /// instance-wording trio followed by the signup, exposure and mailer
-/// trio, flattened. `base_url` is the instance origin, whose domain the
-/// mailer's `From:` default is derived from (the pair the two grouped
+/// trio, flattened, after the [`Endpoints`] they hang off. The origin's domain
+/// is what the mailer's `From:` default is derived from (the pair the two grouped
 /// readers used to take apart).
-pub(crate) fn groups<F>(lookup: &F, base_url: &str) -> Result<Groups, ConfigError>
+pub(crate) fn groups<F>(lookup: &F) -> Result<Groups, ConfigError>
 where
     F: Fn(&str) -> Option<String>,
 {
+    let ends = endpoints(lookup)?;
     let (profile, limits, text) = profile_and_limits(lookup)?;
-    let (auth, exposure, mail) = signup_and_mail(lookup, domain_of(base_url))?;
+    let (auth, exposure, mail) = signup_and_mail(lookup, domain_of(&ends.base_url))?;
     Ok((
+        ends,
         profile,
         limits,
         text,

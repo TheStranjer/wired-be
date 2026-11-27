@@ -114,7 +114,7 @@ pub(crate) async fn resolve_mentions_on_budget(
     for mention in &mentions {
         if let Some(user) = user::get_by_acct(&state.db, &state.config, &mention.acct()).await? {
             drop(found.insert(mention.key(), user));
-        } else if !mention.names_domain(state.config.domain())
+        } else if !mention.names_local(&state.config)
             && queued.len() < state.config.max_remote_mention_lookups
         {
             queued.push(mention);
@@ -497,6 +497,39 @@ mod tests {
             hits(&mock.webfinger_hits),
             0,
             "and even that is settled without a fetch"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn both_domains_of_a_split_config_resolve_locally_without_network() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let (mock, server) = mock_peer(false).await;
+        let mut config = Config::for_tests();
+        config.local_domain = "whatever.com".to_owned();
+        let state = test_state_with_config(&pool, config);
+        let alice = local_user(&pool, "alice").await;
+        for text in ["@alice@whatever.com", "@Alice@test.example"] {
+            let found = resolved_against(&state, text, Some(&mock.base)).await;
+            assert_eq!(
+                found.iter().map(|(_, _, id)| *id).collect::<Vec<_>>(),
+                vec![alice.id],
+                "{text} is the local account"
+            );
+        }
+        for text in ["@missing@whatever.com", "@missing@test.example"] {
+            assert!(
+                resolved_against(&state, text, Some(&mock.base))
+                    .await
+                    .is_empty(),
+                "{text} names no account"
+            );
+        }
+        assert_eq!(
+            (hits(&mock.webfinger_hits), hits(&mock.actor_hits)),
+            (0, 0),
+            "neither domain ever reached the network"
         );
         server.abort();
     }

@@ -22,6 +22,7 @@ use std::sync::LazyLock;
 use regex::{Captures, Regex};
 
 use crate::{
+    config::Config,
     models::hashtag::normalize_name,
     util::{
         format::urls::{is_url_byte, scheme_len},
@@ -123,6 +124,15 @@ impl MentionRef {
         self.domain
             .as_deref()
             .is_none_or(|own| own.eq_ignore_ascii_case(domain))
+    }
+
+    /// Whether this mention names an account of this instance: a bare
+    /// `@nick`, or a `@nick@host` whose `host` is the handle domain or the
+    /// web host of `config`, ignoring ASCII case. Such a mention is never
+    /// looked up on the network.
+    #[must_use]
+    pub fn names_local(&self, config: &Config) -> bool {
+        self.names_domain(config.local_domain()) || self.names_domain(config.web_host())
     }
 }
 
@@ -485,6 +495,27 @@ mod tests {
         assert!(
             !mention("bob", Some("elsewhere.example")).names_domain("test.example"),
             "another domain never matches"
+        );
+    }
+
+    #[test]
+    fn names_local_accepts_either_domain_of_a_split_config() {
+        let mut config = Config::for_tests();
+        config.local_domain = "whatever.com".to_owned();
+        for (written, domain) in [
+            ("bare", None),
+            ("handle", Some("whatever.com")),
+            ("web", Some("test.example")),
+            ("cased", Some("WHATEVER.Com")),
+        ] {
+            assert!(
+                mention("alice", domain).names_local(&config),
+                "the {written} form names a local account"
+            );
+        }
+        assert!(
+            !mention("alice", Some("elsewhere.example")).names_local(&config),
+            "another domain never does"
         );
     }
 

@@ -609,6 +609,11 @@ mod scrobbles;
 /// `/api/v2/search` with their accounts, statuses and hashtag arms).
 mod search;
 
+/// Split-domain support (`LOCAL_DOMAIN`, WBE-889): `WebFinger`, the
+/// instance documents and the account entity on a handle domain apart from
+/// the web host.
+mod split_domain;
+
 /// Status edit endpoints over HTTP (`PUT /api/v1/statuses/{id}`, its
 /// `…/history` and `…/source` twins).
 mod status_edits;

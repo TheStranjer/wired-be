@@ -95,7 +95,8 @@ pub(crate) fn nickname_part(nickname: &str) -> &str {
 
 /// The fully-qualified `nick@domain` handle (Pleroma's
 /// `User.full_nickname`): a remote nickname is stored with its host and
-/// passes through; a local one gains [`Config::domain`]. Crate-visible
+/// passes through; a local one gains [`Config::local_domain`], the handle
+/// domain, not the web host. Crate-visible
 /// because the alias endpoints render stored actor ids back as these
 /// handles (see [`crate::api::pleroma_account_settings`]).
 #[must_use]
@@ -103,7 +104,7 @@ pub(crate) fn full_nickname(user: &User, config: &Config) -> String {
     if user.nickname.contains('@') {
         user.nickname.clone()
     } else {
-        format!("{}@{}", user.nickname, config.domain())
+        format!("{}@{}", user.nickname, config.local_domain())
     }
 }
 

@@ -111,6 +111,7 @@ impl Served {
         let origin = format!("http://{}", listener.local_addr().expect("a bound address"));
         let mut served_config = common::test_config();
         served_config.base_url = origin.clone();
+        served_config.local_domain = listener.local_addr().expect("a bound address").to_string();
         let state = common::test_app_state(pool, served_config);
         let app = wired_be::app(state);
         let server = tokio::spawn(async move {

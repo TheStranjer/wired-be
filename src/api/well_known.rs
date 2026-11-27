@@ -142,24 +142,26 @@ async fn host_meta(State(state): State<AppState>) -> Response {
 #[derive(Debug, PartialEq, Eq)]
 enum Resource<'a> {
     /// The `acct:nickname@domain` (or bare `nickname@domain`) form whose
-    /// domain equals this instance's, case-insensitively: the part before
-    /// the `@` is a local nickname.
+    /// domain is either of this instance's (the handle domain or the web
+    /// host), case-insensitively: the part before the `@` is a local
+    /// nickname.
     Nickname(&'a str),
     /// Anything else — a full actor URL, or an `acct` on some other
     /// domain — tried verbatim as an `ActivityPub` actor id.
     ActorId(&'a str),
 }
 
-/// Classifies `resource` against this instance's `domain`. An `acct` form
-/// on the wrong domain is deliberately not a [`Resource::Nickname`]: it
-/// falls through to the actor-id lookup, where no row matches it, which is
-/// how Pleroma answers a foreign `acct:` on this host (404).
-fn parse_resource<'a>(resource: &'a str, domain: &str) -> Resource<'a> {
+/// Classifies `resource` against this instance's domains. An `acct` form
+/// on a domain that is neither the handle domain nor the web host is
+/// deliberately not a [`Resource::Nickname`]: it falls through to the
+/// actor-id lookup, where no row matches it, which is how Pleroma answers a
+/// foreign `acct:` on this host (404).
+fn parse_resource<'a>(resource: &'a str, config: &Config) -> Resource<'a> {
     let account = resource.strip_prefix("acct:").unwrap_or(resource);
     let Some((nickname, host)) = account.split_once('@') else {
         return Resource::ActorId(resource);
     };
-    if !nickname.is_empty() && host.eq_ignore_ascii_case(domain) {
+    if !nickname.is_empty() && config.is_local_domain(host) {
         Resource::Nickname(nickname)
     } else {
         Resource::ActorId(resource)
@@ -178,7 +180,7 @@ fn parse_resource<'a>(resource: &'a str, domain: &str) -> Resource<'a> {
 /// [`AppError::Gone`] for an account whose deletion has started; any
 /// database failure arrives as [`AppError::Database`].
 async fn find_local_resolvable_user(state: &AppState, resource: &str) -> AppResult<Option<User>> {
-    let user = match parse_resource(resource, state.config.domain()) {
+    let user = match parse_resource(resource, &state.config) {
         Resource::Nickname(nickname) => get_by_nickname(&state.db, nickname).await?,
         Resource::ActorId(ap_id) => get_by_ap_id(&state.db, ap_id).await?,
     };
@@ -221,7 +223,8 @@ fn is_xml_format(value: &str) -> bool {
 /// protocol contributes, in registry order (see [`WebfingerContribution`]).
 #[derive(Debug, Serialize)]
 struct Finger {
-    /// `acct:nickname@domain` on this instance, the nickname stored case.
+    /// `acct:nickname@domain` on this instance's handle domain, the nickname
+    /// stored case.
     subject: String,
     /// Every enabled protocol's aliases, in registry order.
     aliases: Vec<String>,
@@ -273,7 +276,7 @@ impl Finger {
     /// `config` enables, in registry order.
     fn for_user(user: &User, config: &Config) -> Self {
         let mut finger = Self {
-            subject: format!("acct:{}@{}", user.nickname, config.domain()),
+            subject: format!("acct:{}@{}", user.nickname, config.local_domain()),
             aliases: Vec::new(),
             links: Vec::new(),
         };
@@ -479,27 +482,55 @@ mod tests {
 
     #[test]
     fn acct_forms_on_the_local_domain_are_nicknames() {
+        let config = Config::for_tests();
         for (resource, want) in [
             ("acct:alice@test.example", "alice"),
             ("alice@test.example", "alice"),
             ("acct:alice@TEST.example", "alice"),
-            ("acct:alice@localhost:4000", "alice"),
         ] {
-            let domain = if resource.contains("localhost") {
-                "LoCaLhOsT:4000"
-            } else {
-                "test.example"
-            };
             assert_eq!(
-                parse_resource(resource, domain),
+                parse_resource(resource, &config),
                 Resource::Nickname(want),
                 "{resource} is a local acct form"
             );
         }
+        let mut with_port = Config::for_tests();
+        with_port.base_url = "http://localhost:4000".to_owned();
+        with_port.local_domain = "localhost:4000".to_owned();
+        assert_eq!(
+            parse_resource("acct:alice@LoCaLhOsT:4000", &with_port),
+            Resource::Nickname("alice"),
+            "a port is part of the domain"
+        );
+    }
+
+    #[test]
+    fn a_split_config_accepts_the_handle_domain_and_the_web_host() {
+        let mut config = Config::for_tests();
+        config.local_domain = "whatever.com".to_owned();
+        for resource in [
+            "acct:alice@whatever.com",
+            "alice@whatever.com",
+            "acct:alice@WHATEVER.com",
+            "acct:alice@test.example",
+            "alice@TEST.example",
+        ] {
+            assert_eq!(
+                parse_resource(resource, &config),
+                Resource::Nickname("alice"),
+                "{resource} names the local user"
+            );
+        }
+        assert_eq!(
+            parse_resource("acct:alice@other.example", &config),
+            Resource::ActorId("acct:alice@other.example"),
+            "a foreign domain is still no nickname"
+        );
     }
 
     #[test]
     fn anything_else_falls_through_to_the_actor_id_lookup() {
+        let config = Config::for_tests();
         for resource in [
             "https://test.example/users/alice",
             "acct:alice@other.example",
@@ -509,7 +540,7 @@ mod tests {
             "",
         ] {
             assert_eq!(
-                parse_resource(resource, "test.example"),
+                parse_resource(resource, &config),
                 Resource::ActorId(resource),
                 "{resource} is tried verbatim as an actor id"
             );

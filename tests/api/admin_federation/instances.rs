@@ -218,6 +218,32 @@ async fn the_instance_deletion_sweeps_run_on_the_queue() {
     assert_eq!(done, 2, "the queue records both sweeps complete");
 }
 
+/// With a split `LOCAL_DOMAIN` the handle domain is refused exactly like
+/// the web host, in any spelling of either.
+#[tokio::test]
+async fn the_handle_domain_refuses_deletion_like_the_web_host() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let mut config = common::test_config();
+    config.local_domain = "whatever.com".to_owned();
+    let app = common::test_app_with_config(pool.clone(), config);
+    let (_root, token) = admin(&pool, "root", "admin:write:federation").await;
+
+    for spelling in ["whatever.com", "WHATEVER.Com", "test.example"] {
+        let path = format!("{INSTANCES}/{spelling}");
+        let refused = common::TestRequest::delete(&path)
+            .bearer(&token)
+            .send(&app)
+            .await;
+        common::assert_answer(&refused, StatusCode::BAD_REQUEST, spelling);
+        common::assert_error(
+            &refused,
+            "Can't delete the local instance",
+            "Pleroma's refusal wording",
+        );
+    }
+}
+
 /// This instance's own domain is not a deletion candidate — Pleroma's
 /// refusal, verbatim, in any spelling of the host — and an unknown peer
 /// domain deletes cleanly as a no-op.

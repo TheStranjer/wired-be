@@ -80,6 +80,11 @@ async fn get_or_fetch_by_acct_with_base(
         return serve_or_refresh(state, stored, &ap_id, Naming::Caller).await;
     }
     if let Some((_, domain)) = strip_finger_prefixes(acct).rsplit_once('@') {
+        // A handle on either of our own domains that matched no row names
+        // nobody: never WebFinger ourselves.
+        if state.config.is_local_domain(domain) {
+            return Err(FetchError::NotFound);
+        }
         mrf::refuse_rejected(state, &format!("https://{domain}"))
             .await
             .map_err(FetchError::Invalid)?;
@@ -327,11 +332,42 @@ mod tests {
         .await
         .unwrap();
         let state = test_state(pool);
-        let own = format!("alice@{}", state.config.domain());
+        let own = format!("alice@{}", state.config.web_host());
 
         for acct in ["alice", own.as_str(), "ALICE"] {
             let found = get_or_fetch_by_acct(&state, acct).await.unwrap();
             assert_eq!(found.id, alice.id, "the local row answers ({acct})");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_split_config_answers_either_own_domain_without_the_network() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let alice = insert(
+            &pool,
+            &NewUser::local("alice", &local_ap_id(TEST_BASE_URL, "alice")),
+        )
+        .await
+        .unwrap();
+        let mut config = Config::for_tests();
+        config.local_domain = "whatever.com".to_owned();
+        let state = test_state_with_config(pool, config);
+
+        for acct in [
+            "alice@whatever.com",
+            "ALICE@Whatever.com",
+            "alice@test.example",
+        ] {
+            let found = get_or_fetch_by_acct(&state, acct).await.unwrap();
+            assert_eq!(found.id, alice.id, "the local row answers ({acct})");
+        }
+        for acct in ["nobody@whatever.com", "nobody@test.example"] {
+            let error = get_or_fetch_by_acct(&state, acct).await.unwrap_err();
+            assert!(
+                matches!(error, FetchError::NotFound),
+                "{acct} names nobody and is never fingered, got {error:?}"
+            );
         }
     }
 

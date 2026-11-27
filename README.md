@@ -68,6 +68,7 @@ below.
 |---|---|---|---|
 | `DATABASE_URL` | yes | | PostgreSQL URL, e.g. `postgres://user:pass@localhost:5432/wired` |
 | `BASE_URL` | yes | | Public origin of this instance, e.g. `https://social.example` (http(s) with a host, no path or query; trailing slash stripped) |
+| `LOCAL_DOMAIN` | no | host of `BASE_URL` (a non-default port kept) | The domain local handles show, e.g. `whatever.com` for `@alice@whatever.com`, when it differs from the host `BASE_URL` names. A bare host with an optional port: lowercased, a trailing dot stripped; a scheme, path, query, fragment, userinfo, whitespace or an empty value refuses startup. It only changes handles (the `WebFinger` subject, the `fqn` field, the instance `uri` and `domain`); every actor, object, inbox and media URL stays on `BASE_URL`. See [Split-domain deployment](#split-domain-deployment); treat it as permanent once the instance federates |
 | `FRONTEND_BASE_URL` | no | `BASE_URL` | Origin the frontend pages are served from; the source of browser redirects such as `/notice/{id}` and `/oauth/authorize` (the consent screen) and of the password-reset link `{FRONTEND_BASE_URL}/password_reset/{token}` in the reset letter and the admin reset endpoint (the frontend then calls `GET`/`POST /api/v1/pleroma/password_reset`, which answer JSON only) (no trailing slash; the default-asset URLs do not use it, see "Default assets" below) |
 | `BIND_ADDR` | no | `127.0.0.1:4000` | Address the HTTP server listens on |
 | `INSTANCE_NAME` | no | `Wired` | Instance display name |
@@ -161,6 +162,46 @@ below.
 | `RATE_LIMITS` | no | Pleroma's defaults | Bucket overrides as a comma-separated list of `bucket=max:window_secs` entries; each replaces its bucket's default and an unknown name joins the table, which otherwise is `authentication=20:5, app_account_creation=5:1800, relations_actions=10:10, relation_id_action=2:60, statuses_actions=10:10, status_id_action=2:60, password_reset=5:1800, account_confirmation_resend=5:8600, search=30:60, imports=1:3600, remote_interaction=5:60`; a bucket off the table is unlimited |
 | `TRUST_PROXY_HEADERS` | no | `false` | Let `X-Forwarded-For` name the client a rate-limit window counts against — the entry `TRUSTED_PROXY_HOPS` places from the right (by default the rightmost, the hop your reverse proxy appended); while off the socket peer always does (`true`/`false`, or `1`/`0`) |
 | `TRUSTED_PROXY_HOPS` | no | `1` | How many reverse proxies sit in front of the server; with `TRUST_PROXY_HEADERS` on, the client is the `X-Forwarded-For` entry that many places from the right. A header with fewer entries, or a non-IP entry there, falls back to the socket peer (whole number) |
+
+### Split-domain deployment
+
+`LOCAL_DOMAIN` lets the instance run at one host while its handles show
+another, Mastodon's `LOCAL_DOMAIN`/`WEB_DOMAIN` split. With
+`BASE_URL=https://fedi.whatever.com` and `LOCAL_DOMAIN=whatever.com`, accounts
+are `@alice@whatever.com`, while the actor is
+`https://fedi.whatever.com/users/alice`. The two domains need not be related
+(`whatever-fedi.net` works as well as a parent domain), as long as the
+operator controls the handle domain's `/.well-known/` paths.
+
+Remote servers fetch the actor on the web host, `WebFinger`
+`acct:alice@fedi.whatever.com` there and read the subject
+`acct:alice@whatever.com`, then `WebFinger` `acct:alice@whatever.com` on the
+handle domain and require the same `self` link. So the handle domain must
+answer these paths with a `301` to the same path **and query string** on the
+`BASE_URL` host:
+
+| Path on the handle domain | Redirects to |
+|---|---|
+| `/.well-known/webfinger` | `https://fedi.whatever.com/.well-known/webfinger` |
+| `/.well-known/host-meta` | `https://fedi.whatever.com/.well-known/host-meta` |
+| `/.well-known/nodeinfo` | `https://fedi.whatever.com/.well-known/nodeinfo` |
+
+Set the redirect up outside WiredBE, for example a Cloudflare redirect rule
+with "preserve query string" on, or a reverse-proxy `redir` rule. WiredBE
+answers `acct:nick@LOCAL_DOMAIN` and `acct:nick@<BASE_URL host>` alike (any
+case) and names the handle domain in the `subject`; it never fetches from or
+`WebFinger`s either domain itself, and treats a mention of either as local.
+
+Limits to know before choosing a domain:
+
+- A static `/.well-known/webfinger` file cannot do this: it can answer for one
+  fixed account, not for every user, so the redirect is required.
+- The handle domain can host only one fediverse server, because its
+  `WebFinger` is delegated to this one.
+- **The setting is effectively permanent once the instance federates.**
+  Remote servers cache the handle domain with each account, so changing or
+  removing `LOCAL_DOMAIN` later orphans every existing account's identity
+  there. Choose it before the first remote follow.
 
 ### Default assets
 

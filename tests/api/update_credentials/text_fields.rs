@@ -229,6 +229,45 @@ async fn note_links_own_domain_mentions_as_local() {
     );
 }
 
+/// With `LOCAL_DOMAIN` split from the web host, a mention spelled with the
+/// handle domain or the web host links to the local user; a third domain
+/// never does. The bio renderer reads the database only, so no outbound
+/// request is made either way.
+#[tokio::test]
+async fn note_links_mentions_of_either_split_domain_as_local() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let _bob: User = common::create_local_user(&pool, "bob").await;
+    let alice = common::create_local_user(&pool, "alice").await;
+    let token = common::create_app_and_token(&pool, &alice, "write:accounts").await;
+    let mut config = common::test_config();
+    config.local_domain = "whatever.com".to_owned();
+    let app = common::test_app_with_config(pool.clone(), config);
+
+    let body = ok_body(
+        &patch_json(
+            &app,
+            &token,
+            &json!({"note": "ping @bob@whatever.com @bob@test.example @bob@other.example"}),
+        )
+        .await,
+    );
+    let note = body["note"].as_str().expect("the note is a string");
+    assert!(
+        note.contains(&mention_html(&format!("{BASE}/users/bob"), "bob")),
+        "the handle-domain and web-host spellings name the local user: {note}"
+    );
+    assert!(
+        note.contains("@bob@other.example"),
+        "and the foreign one stays plain text: {note}"
+    );
+    assert_eq!(
+        note.matches("h-card").count(),
+        2,
+        "exactly two of the three mentions linked: {note}"
+    );
+}
+
 /// A `note` over `MAX_BIO_CHARS` characters is the 422, and the limit
 /// moves with the configuration.
 #[tokio::test]

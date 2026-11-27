@@ -34,7 +34,7 @@ pub struct Account {
     /// carries `@domain` for remote users (decision 7).
     pub acct: String,
     /// The fully-qualified `nick@domain` handle (Pleroma's
-    /// `User.full_nickname`): a local account gains [`Config::domain`].
+    /// `User.full_nickname`): a local account gains [`Config::local_domain`].
     pub fqn: String,
     /// The display name; empty means "same as the nickname" by the model's
     /// convention (decision 7), rendered as stored here.

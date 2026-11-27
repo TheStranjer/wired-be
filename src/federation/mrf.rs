@@ -182,8 +182,11 @@ pub struct MrfContext {
     /// The instant the chain runs: one "now" for every policy, so two age
     /// checks inside one activity cannot disagree.
     pub now: DateTime<Utc>,
-    /// This instance's domain ([`Config::domain`](crate::config::Config::domain)):
-    /// the "local" a policy compares activity hosts against.
+    /// This instance's **web host**
+    /// ([`Config::web_host`](crate::config::Config::web_host)), not its
+    /// handle domain: the "local" a policy compares activity and object
+    /// ID hosts against. Those IDs are always built from `BASE_URL`, so a
+    /// split `LOCAL_DOMAIN` never appears in them.
     pub local_domain: String,
     /// The activity actor's `users.followers_count`, preloaded by the
     /// chain runner while `anti_link_spam` is enabled. `None` says the

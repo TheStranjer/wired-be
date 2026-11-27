@@ -11,6 +11,8 @@ pub const DATABASE_URL_VAR: &str = "DATABASE_URL";
 pub const BIND_ADDR_VAR: &str = "BIND_ADDR";
 /// Environment variable holding the public origin of this instance.
 pub const BASE_URL_VAR: &str = "BASE_URL";
+/// Environment variable holding the domain local handles show.
+pub const LOCAL_DOMAIN_VAR: &str = "LOCAL_DOMAIN";
 /// Environment variable holding the origin the frontend pages are served from.
 pub const FRONTEND_BASE_URL_VAR: &str = "FRONTEND_BASE_URL";
 /// Environment variable holding the instance display name.

@@ -201,8 +201,9 @@ pub async fn find_password_reset_target(
 /// stored nickname — case-insensitively, because the column is citext, so
 /// `ALICE` and the remote handle `BOB@Remote.Example` find their rows just
 /// like their stored spellings. When nothing matches and the handle
-/// carries this instance's own domain (`alice@test.example`, compared
-/// case-insensitively), the domain is stripped and the bare nickname is
+/// carries either of this instance's own domains (the handle domain or the
+/// web host, `alice@test.example`, compared case-insensitively), the domain
+/// is stripped and the bare nickname is
 /// tried again: local rows are stored without their domain (decision 7).
 /// Resolving a handle this instance has never seen (via `WebFinger`)
 /// belongs to the federation ticket.
@@ -222,7 +223,7 @@ pub async fn get_by_acct(pool: &PgPool, config: &Config, acct: &str) -> AppResul
     let Some((nickname, domain)) = acct.split_once('@') else {
         return Ok(None);
     };
-    if domain.eq_ignore_ascii_case(config.domain()) {
+    if config.is_local_domain(domain) {
         return get_by_nickname(pool, nickname).await;
     }
     Ok(None)
@@ -485,6 +486,30 @@ mod tests {
             assert_eq!(
                 got, expected,
                 "`{acct}` must resolve to {expected:?}, got {got:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn get_by_acct_strips_either_domain_of_a_split_config() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let pool = db.pool().clone();
+        let mut config = Config::for_tests();
+        config.local_domain = "whatever.com".to_owned();
+        let alice = insert(&pool, &local_new("alice")).await.unwrap();
+
+        for (acct, expected) in [
+            ("alice@whatever.com", Some(alice.id)),
+            ("ALICE@Whatever.COM", Some(alice.id)),
+            ("alice@test.example", Some(alice.id)),
+            ("nobody@whatever.com", None),
+            ("alice@other.example", None),
+        ] {
+            let found = get_by_acct(&pool, &config, acct).await.unwrap();
+            assert_eq!(
+                found.map(|user| user.id),
+                expected,
+                "`{acct}` under a split config"
             );
         }
     }

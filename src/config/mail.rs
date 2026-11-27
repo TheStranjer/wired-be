@@ -98,7 +98,7 @@ where
     SmtpTls::parse(&raw).ok_or(ConfigError::InvalidSmtpTls(SMTP_TLS_VAR))
 }
 
-/// The [`Config::domain`] of a normalized base URL: everything after the
+/// The [`Config::web_host`] of a normalized base URL: everything after the
 /// `://`.
 pub(crate) fn domain_of(base_url: &str) -> &str {
     base_url
