@@ -20,6 +20,7 @@ use crate::{
     config::Config,
     error::{AppError, AppResult},
     models::status::{self, ReplyAuthors, Status},
+    util::id::context_ap_id,
 };
 
 use super::{
@@ -81,9 +82,11 @@ pub async fn replies_document(
 /// A conversation with no publicly visible object is
 /// [`AppError::RouteNotFound`], whether it never existed or only holds
 /// private posts: the collection must not tell the two apart. So is a
-/// conversation whose remote thread stored a context of its own: that
-/// context is the thread's, and this instance does not claim it. A remote
-/// thread that carried none names this minted address, which is served.
+/// conversation no local status was published naming this minted address
+/// ([`status::names_context`]): a remote thread whose context was stored
+/// before the first local reply keeps that context, and this instance does
+/// not claim one of its own. Once a local status named the minted address
+/// it stays served, whatever context a later remote reply brings.
 ///
 /// # Errors
 ///
@@ -96,17 +99,14 @@ pub async fn context_document(
     conversation_id: Uuid,
     query: Option<&str>,
 ) -> AppResult<Value> {
-    if status::remote_thread_context(pool, conversation_id)
-        .await?
-        .is_some()
-    {
+    let id = context_id(config, conversation_id);
+    if !status::names_context(pool, conversation_id, &id).await? {
         return Err(AppError::RouteNotFound);
     }
     let total = status::public_context_count(pool, conversation_id).await?;
     if total == 0 {
         return Err(AppError::RouteNotFound);
     }
-    let id = context_id(config, conversation_id);
     if !page_requested(query) {
         return Ok(collection_root(
             &id,
@@ -125,7 +125,7 @@ pub async fn context_document(
 /// what the notes of the thread name as their `context`.
 #[must_use]
 pub fn context_id(config: &Config, conversation_id: Uuid) -> String {
-    format!("{}/contexts/{conversation_id}", config.base_url)
+    context_ap_id(&config.base_url, conversation_id)
 }
 
 /// The object ids of `rows`, as page items.

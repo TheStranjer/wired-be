@@ -1,10 +1,10 @@
 //! Fetching stored statuses by key: by id ([`get_by_id`] and its
 //! tombstone-keeping twin), by `ActivityPub` id ([`get_by_uri`]), in batches
-//! ([`get_many`]), the ingest context lookup
-//! ([`conversation_id_for_context`]) and the derived URLs a fresh row
-//! writes ([`object_uri`], [`notice_url`]).
+//! ([`get_many`]), the context lookups ([`conversation_id_for_context`],
+//! [`remote_thread_context`], [`names_context`]) and the derived URLs a
+//! fresh row writes ([`object_uri`], [`notice_url`]).
 
-use sqlx::PgPool;
+use sqlx::{PgExecutor, PgPool};
 use uuid::Uuid;
 
 use crate::{error::AppResult, util::id::object_ap_id};
@@ -44,6 +44,11 @@ const REMOTE_THREAD_CONTEXT_SQL: &str = "SELECT s.ap_context FROM statuses s
          AND EXISTS (SELECT 1 FROM statuses r WHERE r.id = $1 AND NOT r.local)
     ORDER BY s.id
        LIMIT 1";
+
+/// [`names_context`]: whether a local status of the conversation, deleted
+/// or not, was stamped with the context.
+const NAMES_CONTEXT_SQL: &str = "SELECT EXISTS (SELECT 1 FROM statuses
+       WHERE conversation_id = $1 AND local AND ap_context = $2)";
 
 /// Fetches the live status whose primary key is `id`, `None` when no row
 /// matches or when the row is a tombstone.
@@ -117,23 +122,53 @@ pub async fn conversation_id_for_context(
 ///
 /// The oldest stored `ap_context` among the conversation's statuses, `None`
 /// when the thread is rooted here (this instance owns its context), when
-/// the remote root is unknown, and when no remote status of the thread
-/// carried a context. A local reply names this instead of a context of
-/// its own.
+/// the remote root is unknown, and when no status of the thread stored a
+/// context. A new local reply is stamped with this instead of a context of
+/// its own (see [`insert`](super::insert)).
+///
+/// Local statuses store the context they were published with, so once a
+/// local reply was stamped with the minted `{base}/contexts/{conversation}`
+/// (the thread had no context yet), that minted IRI is the oldest one and
+/// every later local reply of the thread keeps it, whatever context a
+/// remote reply brings afterwards.
 ///
 /// # Errors
 ///
 /// Any database failure (connection, encoding) arrives as
 /// [`AppError::Database`](crate::error::AppError).
-pub async fn remote_thread_context(
-    pool: &PgPool,
+pub async fn remote_thread_context<'e, E>(
+    executor: E,
     conversation_id: Uuid,
-) -> AppResult<Option<String>> {
+) -> AppResult<Option<String>>
+where
+    E: PgExecutor<'e>,
+{
     let context = sqlx::query_scalar::<_, String>(REMOTE_THREAD_CONTEXT_SQL)
         .bind(conversation_id)
-        .fetch_optional(pool)
+        .fetch_optional(executor)
         .await?;
     Ok(context)
+}
+
+/// Whether a local status of conversation `conversation_id` was published
+/// naming `context`.
+///
+/// Tombstones count: a deleted post's `context` was still sent to peers.
+/// This is the gate of the minted context collection — this instance
+/// serves `{base}/contexts/{conversation}` once it has named it, and never
+/// a context it did not name.
+///
+/// # Errors
+///
+/// Any database failure (connection, encoding) arrives as
+/// [`AppError::Database`](crate::error::AppError).
+pub async fn names_context(pool: &PgPool, conversation_id: Uuid, context: &str) -> AppResult<bool> {
+    let named = sqlx::query_scalar::<_, bool>(NAMES_CONTEXT_SQL)
+        .bind(conversation_id)
+        .bind(context)
+        .fetch_one(pool)
+        .await?;
+    Ok(named)
 }
 
 /// Fetches the live statuses whose ids are in `ids`, in `id` order (`UUIDv7`
