@@ -10,12 +10,16 @@ use uuid::Uuid;
 use crate::{
     error::{AppError, AppResult},
     models::{featured_tag, hashtag, media_attachment, mention, user::User},
-    util::{entities::written_hashtags, format::text_to_html, id::new_id},
+    util::{
+        entities::written_hashtags,
+        format::text_to_html,
+        id::{context_ap_id, new_id},
+    },
 };
 
 use super::{
     DEFAULT_CONTENT_TYPE, QuoteApprovalPolicy, QuotePolicy, Status, Visibility,
-    counters::count_new_post, reads::notice_url, reads::object_uri,
+    counters::count_new_post, reads::notice_url, reads::object_uri, reads::remote_thread_context,
 };
 
 /// What to insert: every `statuses` column a caller can decide up front.
@@ -63,10 +67,12 @@ pub struct NewStatus {
     /// conversation, or the new id when there is no parent.
     pub conversation_id: Option<Uuid>,
     /// The `ActivityPub` thread collection a remote status's document
-    /// names; [`insert`] stores it verbatim, and `None` — every local
-    /// status's answer — leaves the column empty (see
+    /// names; [`insert`] stores it verbatim (see
     /// [`crate::services::ingest`] for the read that groups a context's
-    /// statuses under one `conversation_id`).
+    /// statuses under one `conversation_id`). `None` — every local
+    /// status's answer — makes [`insert`] stamp a local status with the
+    /// context it is published with (see [`insert`]), and leaves a remote
+    /// one's column empty.
     pub ap_context: Option<String>,
     /// The `conversations` row a `direct` post answers into: only
     /// `POST /api/v1/statuses`'s `in_reply_to_conversation_id` arm names
@@ -240,6 +246,13 @@ const PARENT_CONVERSATION_SQL: &str = "SELECT conversation_id FROM statuses WHER
 /// conversation when the status answers a stored status, else the new id: a
 /// root status is its own conversation and every answer joins it.
 ///
+/// A local status (reblogs aside) that names no `ap_context` is stamped with
+/// the context it federates with, once and for good: the thread's
+/// [`remote_thread_context`] when one is stored at this moment, else the
+/// minted `{base_url}/contexts/{conversation_id}`. Its note renders that
+/// stored value from then on, Updates included, so a context a later reply
+/// brings never changes what peers already stored for it (WBE-886).
+///
 /// In the same transaction the author's `statuses_count` goes up by one and
 /// their `last_status_at` moves forward to this status's creation time (never
 /// back, so importing an old remote post leaves a newer one on the books),
@@ -369,6 +382,7 @@ async fn write_status(
 ) -> AppResult<Status> {
     let id = new_id();
     let conversation = new_status.conversation_id.or(parent).unwrap_or(id);
+    let context = stamped_context(conn, base_url, new_status, conversation).await?;
     let status = sqlx::query_as::<_, Status>(INSERT_SQL)
         .bind(id)
         .bind(object_uri(base_url, new_status, id))
@@ -393,7 +407,7 @@ async fn write_status(
         .bind(new_status.application_website.as_deref())
         .bind(new_status.edited_at)
         .bind(new_status.expires_at)
-        .bind(new_status.ap_context.as_deref())
+        .bind(context.as_deref())
         .bind(new_status.inserted_at)
         .bind(new_status.quote_uri.as_deref())
         .bind(new_status.quote_policy.clone().map(Json))
@@ -403,5 +417,33 @@ async fn write_status(
     Ok(status)
 }
 
+/// The `ap_context` [`write_status`] stores for `new_status` in
+/// conversation `conversation`.
+///
+/// The one the caller named, if any; else nothing for a remote status or a
+/// reblog row, which renders no note; else, for a local status, the
+/// context it is published with: the thread's stored
+/// [`remote_thread_context`], or the minted [`context_ap_id`] when there is
+/// none (always so for a root, whose row is not written yet).
+async fn stamped_context(
+    conn: &mut PgConnection,
+    base_url: &str,
+    new_status: &NewStatus,
+    conversation: Uuid,
+) -> AppResult<Option<String>> {
+    if new_status.ap_context.is_some() || !new_status.local || new_status.reblog_of_id.is_some() {
+        return Ok(new_status.ap_context.clone());
+    }
+    let inherited = remote_thread_context(&mut *conn, conversation).await?;
+    Ok(Some(
+        inherited.unwrap_or_else(|| context_ap_id(base_url, conversation)),
+    ))
+}
+
 #[cfg(test)]
 mod tests;
+
+/// The context a local status is stamped with, and the backfill that
+/// stamps the statuses written before.
+#[cfg(test)]
+mod context_tests;

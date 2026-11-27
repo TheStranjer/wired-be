@@ -69,11 +69,7 @@ pub async fn load_note_context(
     let quote_uri = load_quote_uri(pool, &status).await?;
     let quote_authorization = quote_request::accepted_authorization(pool, status.id).await?;
     let self_replies = load_self_replies(pool, &status).await?;
-    let thread_context = if status.local {
-        status::remote_thread_context(pool, status.conversation_id).await?
-    } else {
-        None
-    };
+    let thread_context = thread_context(pool, &status).await?;
     Ok(NoteContext {
         status,
         author,
@@ -90,6 +86,24 @@ pub async fn load_note_context(
         thread_context,
         config: config.clone(),
     })
+}
+
+/// The `context` a local note names: the one its row was stamped with when
+/// it was published (see [`status::insert`]), so it never changes
+/// afterwards.
+///
+/// A local row with no stamp (none is written any more; this is the
+/// fallback for one that predates the stamp and its backfill) names the
+/// thread's [`status::remote_thread_context`]; a remote row names none,
+/// and every `None` leaves the minted `{base}/contexts/{conversation}`.
+async fn thread_context(pool: &PgPool, status: &Status) -> AppResult<Option<String>> {
+    if !status.local {
+        return Ok(None);
+    }
+    if let Some(context) = &status.ap_context {
+        return Ok(Some(context.clone()));
+    }
+    status::remote_thread_context(pool, status.conversation_id).await
 }
 
 /// The object ids of the author's own public answers to `status`.

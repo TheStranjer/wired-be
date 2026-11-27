@@ -39,6 +39,16 @@ pub fn object_ap_id(base_url: &str, id: Uuid) -> String {
     format!("{base_url}{OBJECTS_PATH}{id}")
 }
 
+/// The context collection id this instance mints for a conversation.
+///
+/// The shape is `{base_url}/contexts/{conversation_id}`: what a local status
+/// stamps as its `context` when its thread carries no context of its own,
+/// and the address `GET /contexts/{id}` serves.
+#[must_use]
+pub fn context_ap_id(base_url: &str, conversation_id: Uuid) -> String {
+    format!("{base_url}/contexts/{conversation_id}")
+}
+
 /// The id inside `ap_id` when it is an object id of the instance at
 /// `base_url`, `None` for a remote host, another path or a tail that
 /// [`parse_id`] does not read.
@@ -100,6 +110,16 @@ mod tests {
 
     /// How many ids the batch tests generate.
     const BATCH: usize = 100;
+
+    #[test]
+    fn context_ap_id_joins_base_contexts_path_and_conversation() {
+        let id = new_id();
+        assert_eq!(
+            context_ap_id("https://h", id),
+            format!("https://h/contexts/{id}"),
+            "the conversation sits under the instance's contexts path"
+        );
+    }
 
     #[test]
     fn new_ids_are_version_seven() {
