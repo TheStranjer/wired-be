@@ -6,7 +6,7 @@
 use crate::{
     config::Config,
     federation::{
-        fetch_actor::{FetchError, error::server_error},
+        fetch_actor::{FetchError, error::server_error, handle::Naming},
         mrf,
         remote_actor::ActorError,
         webfinger_client::{Resolved, resolve_acct_with_base, strip_finger_prefixes},
@@ -15,16 +15,20 @@ use crate::{
     state::AppState,
 };
 
-use super::get_or_fetch_by_fingered_ap_id;
+use super::{by_ap_id::serve_or_refresh, get_or_fetch_by_fingered_ap_id};
 
 /// Looks an account up by `acct` handle, resolving it through `WebFinger`
 /// and fetching the actor when this instance does not know it yet.
 ///
 /// The stored nickname comes first — a local account, and any remote
 /// mirror this instance already keeps under `nick@domain` (decision 7),
-/// answers straight from the database, case-insensitively, with a handle
+/// answers from the database, case-insensitively, with a handle
 /// carrying this instance's own domain folded to the bare local nickname
-/// (see [`get_by_acct`]). Otherwise the [`WebFinger`] resolver finds the
+/// (see [`get_by_acct`]). A local account and a mirror
+/// fetched within 24 hours answer with no network at all; an older mirror
+/// is refetched inline through the lookup by id's refresh policy (as
+/// Mastodon's `ResolveAccountService` and Pleroma's `needs_update?` do),
+/// and a failed refresh serves the stored row, `Gone` excepted. Otherwise the [`WebFinger`] resolver finds the
 /// actor URL and [`get_or_fetch_by_fingered_ap_id`] mirrors it, without a
 /// second `WebFinger` lookup of its own. The fetched actor
 /// must then vouch for the handle: its `preferredUsername@host` has to
@@ -64,7 +68,16 @@ async fn get_or_fetch_by_acct_with_base(
         .await
         .map_err(|err| server_error(&err))?
     {
-        return Ok(stored);
+        // The same freshness policy as the lookup by id: a local row and a
+        // mirror inside the refresh window answer from the database with no
+        // network; an older mirror is refetched inline (this is the path of
+        // `resolve=true` searches, follows by handle and mention parsing,
+        // and a stale mirror is rare and refreshed once per day), keeping
+        // the stored row when the refresh fails. `Naming::Caller` keeps a
+        // split-domain handle's stored nickname without a second
+        // `WebFinger` query.
+        let ap_id = stored.ap_id.clone();
+        return serve_or_refresh(state, stored, &ap_id, Naming::Caller).await;
     }
     if let Some((_, domain)) = strip_finger_prefixes(acct).rsplit_once('@') {
         mrf::refuse_rejected(state, &format!("https://{domain}"))
@@ -138,36 +151,188 @@ mod tests {
     use axum::{Router, routing::get};
     use serde_json::{Value, json};
 
-    use super::*;
+    use super::{super::fresh_since, *};
     use crate::{
+        config::TEST_BASE_URL,
         federation::{fetch_actor::test_support::*, webfinger_client::WebfingerError},
-        models::user::{NewUser, get_by_nickname, insert},
+        models::{
+            activitypub_actor,
+            user::{NewUser, get_by_nickname, insert, local_ap_id},
+        },
     };
 
+    /// Mirrors alice from the mock by her `acct`, then hands back the
+    /// state, the running mock, its base and the first lookup's result.
+    async fn mirror_alice(db: &crate::test_db::TestDb) -> (AppState, ServedAlice, String, User) {
+        let listener = bind().await;
+        let base = origin(&listener);
+        let acct = format!("alice@{}", authority_of(&base));
+        let jrd = jrd_for(&format!("acct:{acct}"), &base);
+        let served = serve_alice(listener, &base, &jrd);
+        let state = test_state(db.pool().clone());
+        let first = get_or_fetch_by_acct_with_base(&state, &acct, Some(&base))
+            .await
+            .expect("the first lookup mirrors alice");
+        assert_eq!(first.name, "First", "the first document");
+        (state, served, base, first)
+    }
+
     #[tokio::test]
-    async fn a_stored_nickname_answers_without_webfinger() {
+    async fn a_fresh_mirror_answers_by_acct_without_the_network() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let (state, served, base, first) = mirror_alice(&db).await;
+        let acct = format!("ALICE@{}", authority_of(&base).to_uppercase());
+
+        let found = get_or_fetch_by_acct_with_base(&state, &acct, Some(&base))
+            .await
+            .unwrap();
+
+        served.server.abort();
+        assert_eq!(found.id, first.id, "the stored row, however spelled");
+        assert_eq!(found.name, "First", "the database answer");
+        assert_eq!(served.hits.load(Ordering::SeqCst), 1, "no second fetch");
+    }
+
+    #[tokio::test]
+    async fn a_stale_mirror_is_refetched_by_acct() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let (state, served, base, first) = mirror_alice(&db).await;
+        make_stale(&state.db, &first.ap_id).await;
+        let acct = format!("alice@{}", authority_of(&base));
+
+        let found = get_or_fetch_by_acct_with_base(&state, &acct, Some(&base))
+            .await
+            .unwrap();
+
+        served.server.abort();
+        assert_eq!(found.id, first.id, "the same row is updated");
+        assert_eq!(found.name, "Second", "the refetch landed");
+        assert_eq!(served.hits.load(Ordering::SeqCst), 2, "fetched again");
+        let stamp = activitypub_actor::get(&state.db, first.id)
+            .await
+            .unwrap()
+            .and_then(|row| row.last_fetched_at);
+        assert!(fresh_since(stamp), "the refetch restamped the mirror");
+    }
+
+    #[tokio::test]
+    async fn a_failed_refetch_by_acct_serves_the_stored_mirror() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let (state, served, base, first) = mirror_alice(&db).await;
+        make_stale(&state.db, &first.ap_id).await;
+        served.server.abort();
+        drop(served.server.await);
+        let acct = format!("alice@{}", authority_of(&base));
+
+        let found = get_or_fetch_by_acct_with_base(&state, &acct, Some(&base))
+            .await
+            .expect("the peer is down, the stored row answers");
+
+        assert_eq!(found.id, first.id, "the stored mirror");
+        assert_eq!(found.name, "First", "as it was");
+    }
+
+    /// Answers alice's document once, then 410 Gone.
+    async fn alice_then_gone(
+        axum::extract::State(peer): axum::extract::State<Peer>,
+    ) -> axum::response::Response {
+        use axum::response::IntoResponse as _;
+        if peer.hits.load(Ordering::SeqCst) == 0 {
+            return self_actor(axum::extract::State(peer)).await;
+        }
+        axum::http::StatusCode::GONE.into_response()
+    }
+
+    #[tokio::test]
+    async fn a_gone_refetch_by_acct_keeps_the_deletion_handling() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let listener = bind().await;
+        let base = origin(&listener);
+        let acct = format!("alice@{}", authority_of(&base));
+        let peer = peer_at(&base);
+        let server = spawn(
+            listener,
+            Router::new()
+                .route(
+                    "/.well-known/webfinger",
+                    get(webfinger).with_state(jrd_for(&format!("acct:{acct}"), &base)),
+                )
+                .merge(
+                    Router::new()
+                        .route("/users/alice", get(alice_then_gone))
+                        .with_state(peer),
+                ),
+        );
+        let state = test_state(db.pool().clone());
+        let first = get_or_fetch_by_acct_with_base(&state, &acct, Some(&base))
+            .await
+            .unwrap();
+        make_stale(&state.db, &first.ap_id).await;
+
+        let error = get_or_fetch_by_acct_with_base(&state, &acct, Some(&base))
+            .await
+            .unwrap_err();
+
+        server.abort();
+        assert!(
+            matches!(error, FetchError::Gone),
+            "410 is not swallowed: {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refetch_by_acct_keeps_the_local_deactivation() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let (state, served, base, first) = mirror_alice(&db).await;
+        sqlx::query(
+            "UPDATE users SET is_active = false, local_deactivated = true,
+                 remote_suspended = true WHERE id = $1",
+        )
+        .bind(first.id)
+        .execute(&state.db)
+        .await
+        .map(drop)
+        .unwrap();
+        make_stale(&state.db, &first.ap_id).await;
+        let acct = format!("alice@{}", authority_of(&base));
+
+        let found = get_or_fetch_by_acct_with_base(&state, &acct, Some(&base))
+            .await
+            .unwrap();
+
+        served.server.abort();
+        assert_eq!(found.name, "Second", "the mirror was refetched");
+        let flags: (bool, bool, bool) = sqlx::query_as(
+            "SELECT is_active, local_deactivated, remote_suspended FROM users WHERE id = $1",
+        )
+        .bind(first.id)
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+        assert_eq!(
+            flags,
+            (false, true, false),
+            "the origin lifted its suspension, the local deactivation stays"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_local_handle_never_touches_the_network() {
         let db = crate::test_db::test_db().await.expect("test database slot");
         let pool = db.pool().clone();
-        let stored = insert(
+        let alice = insert(
             &pool,
-            &NewUser {
-                nickname: "alice@mock.example".to_owned(),
-                ap_id: "https://mock.example/users/alice".to_owned(),
-                domain: Some("mock.example".to_owned()),
-                ..NewUser::default()
-            },
+            &NewUser::local("alice", &local_ap_id(TEST_BASE_URL, "alice")),
         )
         .await
         .unwrap();
         let state = test_state(pool);
+        let own = format!("alice@{}", state.config.domain());
 
-        // No override, no mock: `mock.example` is never contacted, the
-        // citext nickname lookup answers, case folded.
-        let found = get_or_fetch_by_acct(&state, "ALICE@MOCK.Example")
-            .await
-            .unwrap();
-
-        assert_eq!(found.id, stored.id, "the stored row, however spelled");
+        for acct in ["alice", own.as_str(), "ALICE"] {
+            let found = get_or_fetch_by_acct(&state, acct).await.unwrap();
+            assert_eq!(found.id, alice.id, "the local row answers ({acct})");
+        }
     }
 
     #[tokio::test]
@@ -239,7 +404,7 @@ mod tests {
             )
             .merge(
                 Router::new()
-                    .route("/users/alice", get(self_actor))
+                    .route("/users/alice", get(versioned_actor))
                     .with_state(peer),
             );
         ServedAlice {

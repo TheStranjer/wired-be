@@ -96,7 +96,7 @@ async fn last_fetched_at(
 /// Answers from the stored mirror when it can (a local row, or a remote
 /// one inside the refresh window), refetches otherwise — and on a failed
 /// refetch keeps serving the stale mirror, `Gone` excepted.
-async fn serve_or_refresh(
+pub(super) async fn serve_or_refresh(
     state: &AppState,
     stored: User,
     ap_id: &str,
