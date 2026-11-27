@@ -46,6 +46,9 @@
 mod config_consumers;
 /// The descriptions payload and the reboot pair's successful paths.
 mod config_descriptions;
+/// The `:frontend_configurations` key: subkey merges, deletes, the 400
+/// and the public read.
+mod config_frontend;
 /// The config store's own read/write gate and the reboot pair's gate.
 mod config_gates;
 /// The config store's `config_change` log line and the silence of the

@@ -71,7 +71,7 @@ use crate::{
     extract::{ApiBody, flex},
     models::moderation_log::{self, ConfigChange},
     services::{
-        config_registry::{self, EntryDescription, GROUP_PLEROMA},
+        config_registry::{self, EntryDescription, GROUP_PLEROMA, KEY_FRONTEND_CONFIGURATIONS},
         runtime_config::{self, ConfigEntry, DeleteOutcome, RuntimeConfig},
     },
     state::AppState,
@@ -237,7 +237,8 @@ async fn show(
 ///
 /// [`AppError::Unauthorized`] / [`AppError::Forbidden`] from [`AdminUser`]
 /// and its `admin:write` gate; [`AppError::BadRequest`] when an entry is
-/// not whitelisted; [`AppError::Unprocessable`] when an upsert carries no
+/// not whitelisted or a `:frontend_configurations` value is not a list of
+/// subkey tuples holding settings objects; [`AppError::Unprocessable`] when an upsert carries no
 /// `value` or a value its key refuses (a token lifetime that is not a
 /// positive number of seconds with a representable expiry);
 /// [`AppError::Database`] from the store writes and the log.
@@ -351,7 +352,7 @@ fn view_of_row(row: &ConfigEntry) -> ConfigEntryView {
     ConfigEntryView {
         group: row.group_name.clone(),
         key: row.key.clone(),
-        value: runtime_config::to_wire(&row.value),
+        value: runtime_config::wire_of(&row.key, &row.value),
         db: Some(runtime_config::db_keys(&row.key, &row.value)),
     }
 }
@@ -368,7 +369,7 @@ fn effective_views(config: &Config, rows: &[ConfigEntry]) -> Vec<ConfigEntryView
             ConfigEntryView {
                 group: entry.group.to_owned(),
                 key: entry.key.to_owned(),
-                value: runtime_config::to_wire(&value),
+                value: runtime_config::wire_of(entry.key, &value),
                 db: stored.map(|stored| runtime_config::db_keys(entry.key, stored)),
             }
         })
@@ -399,10 +400,22 @@ fn validate(items: &[UpdateItem]) -> AppResult<()> {
             ));
         }
         if let Some(value) = item.value.as_ref().filter(|_| !item.delete) {
-            runtime_config::check_value(&item.key, value).map_err(AppError::Unprocessable)?;
+            check_upsert_value(&item.key, value)?;
         }
     }
     Ok(())
+}
+
+/// The value check of one upsert: `:frontend_configurations` must be a list
+/// of subkey tuples holding settings objects (400), the token lifetimes
+/// their own rules (422).
+fn check_upsert_value(key: &str, value: &Value) -> AppResult<()> {
+    if key == KEY_FRONTEND_CONFIGURATIONS {
+        return runtime_config::decode_frontend_configurations(value)
+            .map(drop)
+            .map_err(AppError::BadRequest);
+    }
+    runtime_config::check_value(key, value).map_err(AppError::Unprocessable)
 }
 
 /// Runs one validated item against the store.
@@ -463,7 +476,7 @@ impl<'a> Applied<'a> {
             self.configs.push(ConfigEntryView {
                 group: item.group.clone(),
                 key: item.key.clone(),
-                value: runtime_config::to_wire(stored),
+                value: runtime_config::wire_of(&item.key, stored),
                 db: Some(runtime_config::db_keys(&item.key, stored)),
             });
         }
@@ -476,7 +489,6 @@ mod tests {
 
     use super::*;
     use crate::services::config_registry::{KEY_INSTANCE, KEY_MRF};
-
     /// The whitelist refusal names the pair the client sent, and only a
     /// non-delete item without a value trips the second check.
     #[test]
@@ -656,6 +668,38 @@ mod tests {
                 "{key} answers the not-whitelisted 400"
             );
         }
+    }
+
+    /// `:frontend_configurations` is whitelisted, and a malformed value is
+    /// the 400, not the 422 of the token lifetimes.
+    #[test]
+    fn frontend_configurations_values_are_checked_as_bad_requests() {
+        let good = json!([{"tuple": [":soapbox_fe", {"brandColor": "#123456"}]}]);
+        let accepted = validate(&[item(
+            GROUP_PLEROMA,
+            KEY_FRONTEND_CONFIGURATIONS,
+            Some(good),
+            false,
+        )]);
+        assert!(accepted.is_ok(), "a keyword list of objects passes");
+        for bad in [
+            json!({"soapbox_fe": {}}),
+            json!([{"tuple": [":soapbox_fe", "dark"]}]),
+        ] {
+            let refused = validate(&[item(
+                GROUP_PLEROMA,
+                KEY_FRONTEND_CONFIGURATIONS,
+                Some(bad),
+                false,
+            )])
+            .expect_err("a malformed value is refused");
+            assert!(
+                matches!(refused, AppError::BadRequest(_)),
+                "the refusal is a 400"
+            );
+        }
+        let deletes = validate(&[item(GROUP_PLEROMA, KEY_FRONTEND_CONFIGURATIONS, None, true)]);
+        assert!(deletes.is_ok(), "a delete needs no value");
     }
 
     /// The accumulator: only changed items count, upserted entries

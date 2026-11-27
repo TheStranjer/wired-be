@@ -58,7 +58,12 @@ the `config_entries` table); a stored override wins over its environment
 value, and the instance identity, registration flags, the MRF chain and the
 per-role OAuth token lifetimes (`:pleroma/:oauth_token_ttl_secs`, subkeys
 `admin`, `bot` and `user` in seconds; a value that is not a positive whole
-number with a representable expiry is a 422) read through it live. `GET /api/v1/pleroma/admin/config/descriptions` documents
+number with a representable expiry is a 422) read through it live. The
+`:pleroma/:frontend_configurations` key stores one settings object per
+frontend (`[{"tuple": [":soapbox_fe", {...}]}]`; a POST replaces each named
+subkey's whole object, `delete` with `subkeys` drops only those, and any
+other shape is a 400); `GET /api/pleroma/frontend_configurations` serves it
+as `{"soapbox_fe": {...}}`, falling back to the `instance_settings` row. `GET /api/v1/pleroma/admin/config/descriptions` documents
 every whitelisted key (types, descriptions and example values),
 `GET /api/v1/pleroma/admin/need_reboot` says whether a restart-requiring key
 changed since this boot, and `GET /api/v1/pleroma/admin/restart` asks the

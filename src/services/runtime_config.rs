@@ -42,6 +42,7 @@ use crate::config::Config;
 
 #[cfg(test)]
 mod db_tests;
+mod frontend;
 mod overrides;
 mod storage;
 mod token_ttl;
@@ -49,6 +50,7 @@ mod view;
 mod wire;
 
 pub use self::{
+    frontend::{decode_frontend_configurations, wire_of},
     storage::{all, db_keys, remove, stored, write},
     token_ttl::{check_value, token_ttl_secs},
     view::RuntimeConfig,

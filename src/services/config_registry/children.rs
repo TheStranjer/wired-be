@@ -239,3 +239,18 @@ pub(super) const OAUTH_TOKEN_TTL_CHILDREN: [ChildDescription; 3] = [
         &[Suggestion::Count(2_592_000)],
     ),
 ];
+
+/// The `:frontend_configurations` children: the frontends Pleroma's docs
+/// name; any other frontend name is accepted too, each holding one object.
+pub(super) const FRONTEND_CONFIGURATIONS_CHILDREN: [ChildDescription; 2] = [
+    leaf(
+        "pleroma_fe",
+        ValueKind::Map,
+        "Settings object of the Pleroma frontend",
+    ),
+    leaf(
+        "soapbox_fe",
+        ValueKind::Map,
+        "Settings object of the Soapbox frontend",
+    ),
+];
