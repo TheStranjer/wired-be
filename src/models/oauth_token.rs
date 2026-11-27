@@ -10,9 +10,10 @@
 //! `valid_until`. `user_id` is nullable: `NULL` is an app-only token
 //! minted from the `client_credentials` grant, acting as the
 //! application itself. A new token's lifetime defaults to
-//! [`DEFAULT_TOKEN_TTL`] (30 days, the value the `OAUTH_TOKEN_TTL_SECS`
-//! setting starts at; see [`crate::config`]); callers that read the
-//! config pass the configured span as [`NewToken::ttl`].
+//! [`DEFAULT_TOKEN_TTL`] (30 days, the value the admin and user
+//! `OAUTH_TOKEN_TTL_SECS_*` settings start at; see [`crate::config`]);
+//! callers that read the config pass the span of the owner's tier as
+//! [`NewToken::ttl`].
 //!
 //! An authorization row is the `/oauth/authorize` redirect's `code`:
 //! [`create_authorization`] mints one valid for ten minutes, and
@@ -134,8 +135,9 @@ pub struct NewToken {
     pub app_id: Uuid,
     /// Scopes as one space-separated string.
     pub scopes: String,
-    /// Token lifetime; `None` applies [`DEFAULT_TOKEN_TTL`]. Callers
-    /// pass the configured `OAUTH_TOKEN_TTL_SECS` here.
+    /// Token lifetime; `None` applies [`DEFAULT_TOKEN_TTL`]. The `/oauth`
+    /// endpoints pass the lifetime of the owner's tier here
+    /// (`OAUTH_TOKEN_TTL_SECS_ADMIN`, `_BOT` or `_USER`).
     pub ttl: Option<Duration>,
 }
 

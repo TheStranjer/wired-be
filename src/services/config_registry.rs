@@ -12,7 +12,7 @@
 //! (`config/config.exs`) — the list `Pleroma.Web.AdminAPI.ConfigController`
 //! gates every `POST /api/pleroma/admin/config` entry against — with the
 //! registry itself spelled out here because wired-be whitelists exactly
-//! these seven keys, all in group `:pleroma`:
+//! these eight keys, all in group `:pleroma`:
 //!
 //! - `:instance` — the instance's public identity and registration gates,
 //!   whitelist-subkeyed to `name`, `description`, `email`,
@@ -21,7 +21,10 @@
 //!   `max_media_attachments`;
 //! - `:mrf` — the moderation pipeline, whitelist-subkeyed to `policies`;
 //! - `:mrf_simple`, `:mrf_keyword`, `:mrf_hellthread`, `:mrf_object_age`
-//!   and `:mrf_hashtag` — one whole parameter object per policy.
+//!   and `:mrf_hashtag` — one whole parameter object per policy;
+//! - `:oauth_token_ttl_secs` — the OAuth access-token lifetime per role,
+//!   whitelist-subkeyed to `admin`, `bot` and `user` (wired-be's own key:
+//!   Pleroma has one global `[:oauth2, :token_expires_in]`).
 //!
 //! A key is whitelisted only while a runtime consumer reads its stored
 //! row. `:media_proxy` and `:restrict_unauthenticated` are deliberately
@@ -50,6 +53,10 @@ pub const KEY_MRF_HELLTHREAD: &str = ":mrf_hellthread";
 pub const KEY_MRF_OBJECT_AGE: &str = ":mrf_object_age";
 /// The always-on `hashtag` policy's tag lists.
 pub const KEY_MRF_HASHTAG: &str = ":mrf_hashtag";
+/// The access-token lifetimes per role: the `admin`, `bot` and `user`
+/// subkeys, in seconds, overriding `OAUTH_TOKEN_TTL_SECS_ADMIN`, `_BOT`
+/// and `_USER` for the next token issued.
+pub const KEY_OAUTH_TOKEN_TTL_SECS: &str = ":oauth_token_ttl_secs";
 /// Pleroma's `[:instance, :limit]` is the status text length; the
 /// instance document spells it `max_toot_chars`.
 const INSTANCE_LIMIT: &str = "limit";

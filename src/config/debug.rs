@@ -74,7 +74,7 @@ fn debug_identity_and_exposure<'a, 'b, 'd>(
         .field("media_base_url", &config.media_base_url)
         .field("accounts_email_optional", &config.accounts_email_optional)
         .field("min_password_length", &config.min_password_length)
-        .field("oauth_token_ttl_secs", &config.oauth_token_ttl_secs)
+        .field("oauth_token_ttls", &config.oauth_token_ttls)
         .field("password_reset_ttl_secs", &config.password_reset_ttl_secs)
         .field(
             "account_activation_required",

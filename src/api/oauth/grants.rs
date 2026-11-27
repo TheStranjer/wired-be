@@ -13,7 +13,10 @@ use sqlx::PgConnection;
 
 use super::{
     MISSING_CODE, MISSING_REFRESH_TOKEN, TokenReply,
-    issue::{TokenResponse, authenticate_user, check_account_ready, issue_token, issue_token_on},
+    issue::{
+        TokenResponse, authenticate_user, check_account_ready, issue_token, issue_token_on,
+        token_ttl,
+    },
     mfa,
     params::{TokenParams, invalid_credentials, requested_scopes, validate_app},
 };
@@ -222,12 +225,13 @@ async fn rotate_pair(
         .await?
         .ok_or_else(invalid_credentials)?;
     check_account_ready(&owner)?;
+    let ttl = token_ttl(&mut *conn, state, Some(&owner)).await?;
     let fresh = issue_token_on(
         &mut *conn,
-        state,
         Some(&owner),
         app,
         Scopes::parse(&old.scopes),
+        ttl,
     )
     .await?;
     Ok((fresh, owner))

@@ -5,10 +5,11 @@ use serde_json::{Map, Value, json};
 
 use super::{
     GROUP_PLEROMA, INSTANCE_LIMIT, KEY_INSTANCE, KEY_MRF, KEY_MRF_HASHTAG, KEY_MRF_HELLTHREAD,
-    KEY_MRF_KEYWORD, KEY_MRF_OBJECT_AGE, KEY_MRF_SIMPLE,
+    KEY_MRF_KEYWORD, KEY_MRF_OBJECT_AGE, KEY_MRF_SIMPLE, KEY_OAUTH_TOKEN_TTL_SECS,
     children::{
         INSTANCE_CHILDREN, MRF_CHILDREN, MRF_HASHTAG_CHILDREN, MRF_HELLTHREAD_CHILDREN,
         MRF_KEYWORD_CHILDREN, MRF_OBJECT_AGE_CHILDREN, MRF_SIMPLE_CHILDREN,
+        OAUTH_TOKEN_TTL_CHILDREN,
     },
     types::{EntryDescription, RegistryEntry, ValueKind},
 };
@@ -56,9 +57,9 @@ pub fn requires_restart(group: &str, key: &str) -> bool {
     find(group, key).is_some_and(|entry| entry.requires_restart)
 }
 
-/// The whole registry: the seven entries the admin API may change, each one
+/// The whole registry: the eight entries the admin API may change, each one
 /// read at runtime.
-static REGISTRY: [RegistryEntry; 7] = [
+static REGISTRY: [RegistryEntry; 8] = [
     RegistryEntry {
         group: GROUP_PLEROMA,
         key: KEY_INSTANCE,
@@ -139,6 +140,16 @@ static REGISTRY: [RegistryEntry; 7] = [
         requires_restart: false,
         defaults: empty_defaults,
     },
+    RegistryEntry {
+        group: GROUP_PLEROMA,
+        key: KEY_OAUTH_TOKEN_TTL_SECS,
+        kind: ValueKind::Group,
+        description: "OAuth access-token lifetime in seconds, per role of the token's user",
+        children: &OAUTH_TOKEN_TTL_CHILDREN,
+        subkeys: &["admin", "bot", "user"],
+        requires_restart: false,
+        defaults: token_ttl_defaults,
+    },
 ];
 
 /// The `:instance` fallback: the nine whitelisted subkeys, each read off
@@ -164,6 +175,13 @@ fn instance_defaults(config: &Config) -> Value {
 /// env source exactly as [`crate::federation::mrf`] reads it today.
 fn mrf_defaults(config: &Config) -> Value {
     json!({ "policies": config.mrf.policies })
+}
+
+/// The `:oauth_token_ttl_secs` fallback: the three tier lifetimes the
+/// `OAUTH_TOKEN_TTL_SECS*` variables set.
+fn token_ttl_defaults(config: &Config) -> Value {
+    let ttls = config.oauth_token_ttls;
+    json!({ "admin": ttls.admin, "bot": ttls.bot, "user": ttls.user })
 }
 
 /// The fallback of the entries with no environment counterpart: the empty

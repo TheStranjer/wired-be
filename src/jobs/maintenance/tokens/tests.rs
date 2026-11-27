@@ -236,6 +236,25 @@ async fn the_token_sweep_deletes_only_the_dead_rows() {
     );
 }
 
+/// A token of the bot tier's hundred-year default is far outside the
+/// sweep's reach: the grace arithmetic neither overflows nor reaps it.
+#[tokio::test]
+async fn a_hundred_year_token_survives_the_sweep() {
+    let db = crate::test_db::test_db().await.expect("test database slot");
+    let pool = db.pool().clone();
+    let alice = user(&pool, "alice").await;
+    let client = register_app(&pool, "Client").await;
+    let century = oauth_token_expiring_in(&pool, &alice, &client, 3_153_600_000).await;
+
+    let outcome = handle_tokens(app_state(&pool), FIRST_ATTEMPT, json!({})).await;
+
+    assert_eq!(outcome, Ok(()), "the sweep runs over a far-future row");
+    assert!(
+        row_exists(&pool, "oauth_tokens", century).await,
+        "a token valid for a hundred years stays"
+    );
+}
+
 /// The reset window comes from the configuration, not from a literal:
 /// the same row survives the default one-day ttl and dies under an
 /// overridden one-hour one.

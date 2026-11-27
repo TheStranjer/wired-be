@@ -4,7 +4,7 @@
 use super::*;
 use crate::services::config_registry::types::ValueKind;
 
-/// The registry holds exactly the seven `:pleroma` keys a runtime consumer
+/// The registry holds exactly the eight `:pleroma` keys a runtime consumer
 /// reads, in order, and each one resolves through [`find`].
 #[test]
 fn the_registry_carries_the_whitelisted_keys() {
@@ -19,10 +19,11 @@ fn the_registry_carries_the_whitelisted_keys() {
             KEY_MRF_HELLTHREAD,
             KEY_MRF_OBJECT_AGE,
             KEY_MRF_HASHTAG,
+            KEY_OAUTH_TOKEN_TTL_SECS,
         ],
         "the whitelist, in the GET order"
     );
-    assert_eq!(entries().len(), 7, "seven whitelisted entries");
+    assert_eq!(entries().len(), 8, "eight whitelisted entries");
     assert!(
         entries().iter().all(|entry| entry.group == GROUP_PLEROMA),
         "every entry lives in :pleroma"
@@ -146,6 +147,29 @@ fn instance_keys() -> &'static [&'static str] {
         .subkeys
 }
 
+/// The token lifetime entry is subkeyed by role, documents each subkey as
+/// an integer and falls back to the environment's tier values.
+#[test]
+fn the_token_ttl_entry_follows_the_tiers() {
+    let entry = find(GROUP_PLEROMA, KEY_OAUTH_TOKEN_TTL_SECS).expect("registered");
+    assert_eq!(entry.subkeys, &["admin", "bot", "user"], "one per tier");
+    assert!(!entry.requires_restart, "the next token sees the change");
+    assert!(
+        entry
+            .children
+            .iter()
+            .all(|child| child.kind == ValueKind::Integer),
+        "every lifetime is a whole number of seconds"
+    );
+    let mut config = Config::for_tests();
+    config.oauth_token_ttls.admin = 60;
+    assert_eq!(
+        (entry.defaults)(&config),
+        json!({"admin": 60, "bot": 3_153_600_000_u64, "user": 2_592_000}),
+        "the fallback is the env-derived tiers"
+    );
+}
+
 /// The `:mrf` fallback is the `MRF_POLICIES` list; the bare entries
 /// fall back to the empty object.
 #[test]
@@ -203,8 +227,9 @@ fn descriptions_document_every_whitelisted_key() {
             KEY_MRF_HELLTHREAD,
             KEY_MRF_OBJECT_AGE,
             KEY_MRF_HASHTAG,
+            KEY_OAUTH_TOKEN_TTL_SECS,
         ],
-        "the whitelist's order, its seven keys"
+        "the whitelist's order, its eight keys"
     );
     assert!(
         !keys.contains(&":media_proxy") && !keys.contains(&":restrict_unauthenticated"),

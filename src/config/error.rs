@@ -29,6 +29,9 @@ pub enum ConfigError {
     InvalidLocalDomain(String),
     /// A numeric setting is not a whole number; the value is the variable name.
     InvalidNumber(&'static str),
+    /// An OAuth token lifetime is zero, or so long that its expiry is not a
+    /// timestamp; the value is the variable name.
+    InvalidTokenTtl(&'static str),
     /// A boolean setting is not `true`/`false` (or `1`/`0`); the value is the
     /// variable name.
     InvalidBoolean(&'static str),
@@ -81,6 +84,10 @@ impl fmt::Display for ConfigError {
                  optionally with a port: {reason}"
             ),
             Self::InvalidNumber(var) => write!(f, "invalid {var}: expected a whole number"),
+            Self::InvalidTokenTtl(var) => write!(
+                f,
+                "invalid {var}: expected a positive number of seconds that ends in a valid date"
+            ),
             Self::InvalidBoolean(var) => write!(f, "invalid {var}: expected true or false"),
             Self::InvalidOauthProviders(detail) => write!(
                 f,
@@ -141,6 +148,7 @@ impl Error for ConfigError {
             | Self::InvalidBaseUrl
             | Self::InvalidLocalDomain(_)
             | Self::InvalidNumber(_)
+            | Self::InvalidTokenTtl(_)
             | Self::InvalidBoolean(_)
             | Self::InvalidOauthProviders(_)
             | Self::InvalidSmtpTls(_)

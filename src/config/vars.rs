@@ -119,6 +119,16 @@ pub const MIN_PASSWORD_LENGTH_VAR: &str = "MIN_PASSWORD_LENGTH";
 /// Environment variable holding the lifetime of issued OAuth access
 /// tokens, in seconds.
 pub const OAUTH_TOKEN_TTL_SECS_VAR: &str = "OAUTH_TOKEN_TTL_SECS";
+/// Environment variable holding the lifetime of an admin's OAuth access
+/// token, in seconds; defaults to [`OAUTH_TOKEN_TTL_SECS_VAR`]'s value.
+pub const OAUTH_TOKEN_TTL_SECS_ADMIN_VAR: &str = "OAUTH_TOKEN_TTL_SECS_ADMIN";
+/// Environment variable holding the lifetime of a bot's OAuth access
+/// token, in seconds.
+pub const OAUTH_TOKEN_TTL_SECS_BOT_VAR: &str = "OAUTH_TOKEN_TTL_SECS_BOT";
+/// Environment variable holding the lifetime of an ordinary user's OAuth
+/// access token (and of an app-only one), in seconds; defaults to
+/// [`OAUTH_TOKEN_TTL_SECS_VAR`]'s value.
+pub const OAUTH_TOKEN_TTL_SECS_USER_VAR: &str = "OAUTH_TOKEN_TTL_SECS_USER";
 /// Environment variable holding the lifetime of a password-reset token,
 /// in seconds.
 pub const PASSWORD_RESET_TTL_SECS_VAR: &str = "PASSWORD_RESET_TTL_SECS";

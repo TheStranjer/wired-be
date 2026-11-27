@@ -11,7 +11,8 @@ use super::RuntimeConfig;
 use crate::error::AppResult;
 
 /// [`stored`]: the one row's JSON value.
-const STORED_SQL: &str = "SELECT value FROM config_entries WHERE group_name = $1 AND key = $2";
+pub(super) const STORED_SQL: &str =
+    "SELECT value FROM config_entries WHERE group_name = $1 AND key = $2";
 
 /// [`all`]: every row, stably ordered by the composite primary key.
 const ALL_SQL: &str = "SELECT group_name, key, value, inserted_at, updated_at FROM config_entries

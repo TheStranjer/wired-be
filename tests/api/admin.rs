@@ -51,6 +51,8 @@ mod config_gates;
 /// The config store's `config_change` log line and the silence of the
 /// batches that changed nothing.
 mod config_log;
+/// The per-role OAuth token lifetimes and their admin-config override.
+mod config_token_ttl;
 /// The `GET`/`POST /config` round-trips over the whitelist registry.
 mod config_writes;
 /// The extractor matrix and the admin demand on every production route.

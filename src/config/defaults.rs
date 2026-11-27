@@ -225,6 +225,12 @@ pub const DEFAULT_MIN_PASSWORD_LENGTH: usize = 8;
 ///
 /// [`DEFAULT_TOKEN_TTL`]: crate::models::oauth_token::DEFAULT_TOKEN_TTL
 pub const DEFAULT_OAUTH_TOKEN_TTL_SECS: usize = 2_592_000;
+/// Bot token lifetime used when `OAUTH_TOKEN_TTL_SECS_BOT` is unset.
+///
+/// `3_153_600_000` seconds, 100 years — Pleroma's own
+/// `[:oauth2, :token_expires_in]` default, so a pasted bot token does not
+/// quietly die after a month.
+pub const DEFAULT_OAUTH_TOKEN_TTL_SECS_BOT: usize = 3_153_600_000;
 /// Password-reset token lifetime used when `PASSWORD_RESET_TTL_SECS` is
 /// unset: `86_400` seconds, 24 hours — Pleroma's
 /// `[:instance, :password_reset_token_validity]` default.

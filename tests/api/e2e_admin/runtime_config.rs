@@ -113,7 +113,7 @@ async fn descriptions_answer_the_whitelist(app: &Router, token: &str) {
     common::assert_answer(&response, StatusCode::OK, "the descriptions payload");
     let body = response.json_value();
     let entries = body.as_array().expect("the descriptions are an array");
-    assert_eq!(entries.len(), 7, "the whole whitelist is documented");
+    assert_eq!(entries.len(), 8, "the whole whitelist is documented");
     assert_eq!(
         entries[0]["key"],
         json!(":instance"),

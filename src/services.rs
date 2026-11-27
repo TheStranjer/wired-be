@@ -99,7 +99,7 @@
 //! notification and thread reads run between the render and the response.
 //!
 //! [`config_registry`] is the whitelist of runtime-configurable settings:
-//! the six `:pleroma` entries the admin config API may change, each with
+//! the eight `:pleroma` entries the admin config API may change, each with
 //! its subkeys, its restart flag and its env-derived defaults.
 //! [`runtime_config`] is the store beside it: the `config_entries` table,
 //! the two value forms the API and the jsonb column exchange (keyword

@@ -238,7 +238,9 @@ async fn show(
 /// [`AppError::Unauthorized`] / [`AppError::Forbidden`] from [`AdminUser`]
 /// and its `admin:write` gate; [`AppError::BadRequest`] when an entry is
 /// not whitelisted; [`AppError::Unprocessable`] when an upsert carries no
-/// `value`; [`AppError::Database`] from the store writes and the log.
+/// `value` or a value its key refuses (a token lifetime that is not a
+/// positive number of seconds with a representable expiry);
+/// [`AppError::Database`] from the store writes and the log.
 async fn update(
     State(state): State<AppState>,
     admin: AdminUser,
@@ -395,6 +397,9 @@ fn validate(items: &[UpdateItem]) -> AppResult<()> {
             return Err(AppError::Unprocessable(
                 "configs entries need a value unless delete is set".to_owned(),
             ));
+        }
+        if let Some(value) = item.value.as_ref().filter(|_| !item.delete) {
+            runtime_config::check_value(&item.key, value).map_err(AppError::Unprocessable)?;
         }
     }
     Ok(())

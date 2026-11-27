@@ -9,8 +9,10 @@
 //! Here the whitelist is [`config_registry`], the overlay is
 //! [`RuntimeConfig::get`], and — instead of Pleroma's env-rewriting
 //! transfer task — the consumers read the store directly: the MRF
-//! pipeline through [`RuntimeConfig::mrf_document`] and the instance
-//! documents through [`RuntimeConfig::effective_config`].
+//! pipeline through [`RuntimeConfig::mrf_document`], the instance
+//! documents through [`RuntimeConfig::effective_config`] and the token
+//! endpoints, for each role's access-token lifetime, through
+//! [`token_ttl_secs`].
 //!
 //! Beside the table the module also carries the two process-wide flags
 //! of the admin API's reboot pair: the [`RuntimeConfig::need_reboot`]
@@ -42,11 +44,13 @@ use crate::config::Config;
 mod db_tests;
 mod overrides;
 mod storage;
+mod token_ttl;
 mod view;
 mod wire;
 
 pub use self::{
     storage::{all, db_keys, remove, stored, write},
+    token_ttl::{check_value, token_ttl_secs},
     view::RuntimeConfig,
     wire::{effective_value, merge_value, to_storage, to_wire},
 };
