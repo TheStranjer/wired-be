@@ -9,14 +9,16 @@ use sqlx::PgPool;
 #[cfg(doc)]
 use super::to_wire;
 use super::{
-    DeleteOutcome, NEED_REBOOT, all, effective_value, merge_value,
-    overrides::apply_instance_overrides, remove, restart_channel, stored, to_storage,
-    wire::normalize_key, write,
+    DeleteOutcome, NEED_REBOOT, all, decode_frontend_configurations, effective_value,
+    frontend::replace_subkeys, merge_value, overrides::apply_instance_overrides, remove,
+    restart_channel, stored, to_storage, wire::normalize_key, write,
 };
 use crate::{
     config::Config,
-    error::AppResult,
-    services::config_registry::{self, GROUP_PLEROMA, KEY_INSTANCE, KEY_MRF},
+    error::{AppError, AppResult},
+    services::config_registry::{
+        self, GROUP_PLEROMA, KEY_FRONTEND_CONFIGURATIONS, KEY_INSTANCE, KEY_MRF,
+    },
 };
 
 /// The store as one request sees it: table access beside the
@@ -139,17 +141,22 @@ impl<'a> RuntimeConfig<'a> {
     ///
     /// As [`stored`].
     pub async fn set(&self, group: &str, key: &str, value: &Value) -> AppResult<Value> {
-        let decoded = to_storage(value);
-        let incoming = if decoded.as_array().is_some_and(Vec::is_empty) {
-            Value::Object(Map::new())
-        } else {
-            decoded
-        };
         let old = stored(self.db, group, key).await?;
-        let merged = old.as_ref().map_or_else(
-            || incoming.clone(),
-            |previous| merge_value(previous, &incoming),
-        );
+        let merged = if key == KEY_FRONTEND_CONFIGURATIONS {
+            let incoming = decode_frontend_configurations(value).map_err(AppError::BadRequest)?;
+            replace_subkeys(old.as_ref(), incoming)
+        } else {
+            let decoded = to_storage(value);
+            let incoming = if decoded.as_array().is_some_and(Vec::is_empty) {
+                Value::Object(Map::new())
+            } else {
+                decoded
+            };
+            old.as_ref().map_or_else(
+                || incoming.clone(),
+                |previous| merge_value(previous, &incoming),
+            )
+        };
         write(self.db, group, key, &merged).await?;
         Ok(merged)
     }

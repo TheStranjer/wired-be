@@ -61,7 +61,7 @@ async fn config_descriptions_answer_with_the_registry() {
     let token = config_admin(&pool, "configdocs").await;
 
     let objects = descriptions_json(&app, &token).await;
-    assert_eq!(objects.len(), 8, "one object per whitelist entry");
+    assert_eq!(objects.len(), 9, "one object per whitelist entry");
     let keys: Vec<&str> = objects
         .iter()
         .map(|object| {
@@ -90,6 +90,7 @@ async fn config_descriptions_answer_with_the_registry() {
             ":mrf_object_age",
             ":mrf_hashtag",
             ":oauth_token_ttl_secs",
+            ":frontend_configurations",
         ],
         "the whitelist, in table order, the two unread keys absent"
     );
@@ -186,7 +187,7 @@ async fn config_descriptions_document_the_registry_children() {
         "one integer child per tier"
     );
 
-    assert_eq!(objects.len(), 8, "the registry's eight entries, no more");
+    assert_eq!(objects.len(), 9, "the registry's nine entries, no more");
 
     let mut types = Vec::new();
     for object in objects {

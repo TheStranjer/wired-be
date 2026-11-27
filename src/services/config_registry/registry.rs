@@ -4,12 +4,13 @@
 use serde_json::{Map, Value, json};
 
 use super::{
-    GROUP_PLEROMA, INSTANCE_LIMIT, KEY_INSTANCE, KEY_MRF, KEY_MRF_HASHTAG, KEY_MRF_HELLTHREAD,
-    KEY_MRF_KEYWORD, KEY_MRF_OBJECT_AGE, KEY_MRF_SIMPLE, KEY_OAUTH_TOKEN_TTL_SECS,
+    GROUP_PLEROMA, INSTANCE_LIMIT, KEY_FRONTEND_CONFIGURATIONS, KEY_INSTANCE, KEY_MRF,
+    KEY_MRF_HASHTAG, KEY_MRF_HELLTHREAD, KEY_MRF_KEYWORD, KEY_MRF_OBJECT_AGE, KEY_MRF_SIMPLE,
+    KEY_OAUTH_TOKEN_TTL_SECS,
     children::{
-        INSTANCE_CHILDREN, MRF_CHILDREN, MRF_HASHTAG_CHILDREN, MRF_HELLTHREAD_CHILDREN,
-        MRF_KEYWORD_CHILDREN, MRF_OBJECT_AGE_CHILDREN, MRF_SIMPLE_CHILDREN,
-        OAUTH_TOKEN_TTL_CHILDREN,
+        FRONTEND_CONFIGURATIONS_CHILDREN, INSTANCE_CHILDREN, MRF_CHILDREN, MRF_HASHTAG_CHILDREN,
+        MRF_HELLTHREAD_CHILDREN, MRF_KEYWORD_CHILDREN, MRF_OBJECT_AGE_CHILDREN,
+        MRF_SIMPLE_CHILDREN, OAUTH_TOKEN_TTL_CHILDREN,
     },
     types::{EntryDescription, RegistryEntry, ValueKind},
 };
@@ -57,9 +58,9 @@ pub fn requires_restart(group: &str, key: &str) -> bool {
     find(group, key).is_some_and(|entry| entry.requires_restart)
 }
 
-/// The whole registry: the eight entries the admin API may change, each one
+/// The whole registry: the nine entries the admin API may change, each one
 /// read at runtime.
-static REGISTRY: [RegistryEntry; 8] = [
+static REGISTRY: [RegistryEntry; 9] = [
     RegistryEntry {
         group: GROUP_PLEROMA,
         key: KEY_INSTANCE,
@@ -149,6 +150,16 @@ static REGISTRY: [RegistryEntry; 8] = [
         subkeys: &["admin", "bot", "user"],
         requires_restart: false,
         defaults: token_ttl_defaults,
+    },
+    RegistryEntry {
+        group: GROUP_PLEROMA,
+        key: KEY_FRONTEND_CONFIGURATIONS,
+        kind: ValueKind::Keyword,
+        description: "Frontend settings: one object per frontend, keyed by frontend name",
+        children: &FRONTEND_CONFIGURATIONS_CHILDREN,
+        subkeys: &[],
+        requires_restart: false,
+        defaults: empty_defaults,
     },
 ];
 

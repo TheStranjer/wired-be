@@ -4,7 +4,7 @@
 use super::*;
 use crate::services::config_registry::types::ValueKind;
 
-/// The registry holds exactly the eight `:pleroma` keys a runtime consumer
+/// The registry holds exactly the nine `:pleroma` keys a runtime consumer
 /// reads, in order, and each one resolves through [`find`].
 #[test]
 fn the_registry_carries_the_whitelisted_keys() {
@@ -20,10 +20,11 @@ fn the_registry_carries_the_whitelisted_keys() {
             KEY_MRF_OBJECT_AGE,
             KEY_MRF_HASHTAG,
             KEY_OAUTH_TOKEN_TTL_SECS,
+            KEY_FRONTEND_CONFIGURATIONS,
         ],
         "the whitelist, in the GET order"
     );
-    assert_eq!(entries().len(), 8, "eight whitelisted entries");
+    assert_eq!(entries().len(), 9, "nine whitelisted entries");
     assert!(
         entries().iter().all(|entry| entry.group == GROUP_PLEROMA),
         "every entry lives in :pleroma"
@@ -228,8 +229,9 @@ fn descriptions_document_every_whitelisted_key() {
             KEY_MRF_OBJECT_AGE,
             KEY_MRF_HASHTAG,
             KEY_OAUTH_TOKEN_TTL_SECS,
+            KEY_FRONTEND_CONFIGURATIONS,
         ],
-        "the whitelist's order, its eight keys"
+        "the whitelist's order, its nine keys"
     );
     assert!(
         !keys.contains(&":media_proxy") && !keys.contains(&":restrict_unauthenticated"),

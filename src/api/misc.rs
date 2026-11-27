@@ -9,6 +9,7 @@
 //! - [`frontend_configurations_router`], merged by [`crate::api::pleroma`]:
 //!   `GET /api/pleroma/frontend_configurations`, the same
 //!   `UtilController.frontend_configurations/2`, reading its document from
+//!   the admin config store's `:frontend_configurations` row, else from
 //!   [`instance_setting`].
 //!
 //! `CAPTCHA_ENABLED` / `HEALTHCHECK_ENABLED` gate the captcha and
@@ -43,6 +44,10 @@ use tracing::warn;
 use crate::{
     error::{AppError, AppResult},
     models::instance_setting,
+    services::{
+        config_registry::{GROUP_PLEROMA, KEY_FRONTEND_CONFIGURATIONS},
+        runtime_config,
+    },
     state::AppState,
 };
 
@@ -120,14 +125,20 @@ async fn healthcheck(State(state): State<AppState>) -> Response {
 
 /// `GET /api/pleroma/frontend_configurations` — the frontend configuration
 /// object (Pleroma renders its `:frontend_configurations` runtime config
-/// here). This instance keeps that document in the `instance_settings`
-/// table; no row is the empty object. Any database failure is the usual
-/// 500.
+/// here). The admin config store's `:frontend_configurations` row wins,
+/// as an object keyed by frontend name; with none stored the
+/// `instance_settings` document answers, and no row there is the empty
+/// object. Any database failure is the usual 500.
 ///
 /// # Errors
 ///
-/// [`AppError::Database`] when the lookup fails.
+/// [`AppError::Database`] when a lookup fails.
 async fn frontend_configurations(State(state): State<AppState>) -> AppResult<Json<Value>> {
+    let admin_row =
+        runtime_config::stored(&state.db, GROUP_PLEROMA, KEY_FRONTEND_CONFIGURATIONS).await?;
+    if let Some(document) = admin_row.filter(Value::is_object) {
+        return Ok(Json(document));
+    }
     let configured = instance_setting::get(&state.db, FRONTEND_CONFIGURATIONS_KEY).await?;
     Ok(Json(configured.unwrap_or_else(|| json!({}))))
 }

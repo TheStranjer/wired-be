@@ -89,7 +89,7 @@ fn tuples_to_object(items: &[Value]) -> Option<Map<String, Value>> {
 /// The `(key, value)` a `{"tuple": [key, value]}` object spells, `None`
 /// for any other object. The key must be a string; a number-keyed or
 /// nested-tuple key is data, not a pair.
-fn tuple_pair(map: &Map<String, Value>) -> Option<(&String, &Value)> {
+pub(super) fn tuple_pair(map: &Map<String, Value>) -> Option<(&String, &Value)> {
     if map.len() != 1 {
         return None;
     }

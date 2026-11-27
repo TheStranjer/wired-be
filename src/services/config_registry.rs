@@ -12,7 +12,7 @@
 //! (`config/config.exs`) — the list `Pleroma.Web.AdminAPI.ConfigController`
 //! gates every `POST /api/pleroma/admin/config` entry against — with the
 //! registry itself spelled out here because wired-be whitelists exactly
-//! these eight keys, all in group `:pleroma`:
+//! these nine keys, all in group `:pleroma`:
 //!
 //! - `:instance` — the instance's public identity and registration gates,
 //!   whitelist-subkeyed to `name`, `description`, `email`,
@@ -24,7 +24,10 @@
 //!   and `:mrf_hashtag` — one whole parameter object per policy;
 //! - `:oauth_token_ttl_secs` — the OAuth access-token lifetime per role,
 //!   whitelist-subkeyed to `admin`, `bot` and `user` (wired-be's own key:
-//!   Pleroma has one global `[:oauth2, :token_expires_in]`).
+//!   Pleroma has one global `[:oauth2, :token_expires_in]`);
+//! - `:frontend_configurations` — one arbitrary settings object per
+//!   frontend, keyed by frontend name (`soapbox_fe`, `pleroma_fe`, …); a
+//!   write replaces each named subkey's whole object.
 //!
 //! A key is whitelisted only while a runtime consumer reads its stored
 //! row. `:media_proxy` and `:restrict_unauthenticated` are deliberately
@@ -57,6 +60,9 @@ pub const KEY_MRF_HASHTAG: &str = ":mrf_hashtag";
 /// subkeys, in seconds, overriding `OAUTH_TOKEN_TTL_SECS_ADMIN`, `_BOT`
 /// and `_USER` for the next token issued.
 pub const KEY_OAUTH_TOKEN_TTL_SECS: &str = ":oauth_token_ttl_secs";
+/// The frontend settings, one object per frontend (`:pleroma_fe`,
+/// `:soapbox_fe`, …), served at `GET /api/pleroma/frontend_configurations`.
+pub const KEY_FRONTEND_CONFIGURATIONS: &str = ":frontend_configurations";
 /// Pleroma's `[:instance, :limit]` is the status text length; the
 /// instance document spells it `max_toot_chars`.
 const INSTANCE_LIMIT: &str = "limit";
