@@ -259,13 +259,14 @@ pub(super) async fn show_extended_description(
 }
 
 /// The `version` string: Mastodon's API level, commented with the Pleroma
-/// release this server is compatible with and Wired's own crate version —
-/// the same comment style the [`NodeInfo`] software version uses.
+/// release this server is compatible with.
 ///
-/// [`NodeInfo`]: crate::api::nodeinfo
+/// Wired's own crate version rides along as `SemVer` build metadata
+/// (`+wired.<version>`), the way Pleroma forks mark themselves, so clients
+/// that SemVer-parse the Pleroma version still can.
 pub(super) fn version_string() -> String {
     format!(
-        "{MASTODON_API_LEVEL} (compatible; Pleroma {PLEROMA_COMPATIBILITY_VERSION}; Wired {})",
+        "{MASTODON_API_LEVEL} (compatible; Pleroma {PLEROMA_COMPATIBILITY_VERSION}+wired.{})",
         env!("CARGO_PKG_VERSION")
     )
 }
@@ -282,15 +283,53 @@ pub(super) fn streaming_api_url(config: &Config) -> String {
 mod tests {
     use super::*;
 
+    /// The Pleroma convention clients parse the `version` string with.
+    const PLEROMA_VERSION_PATTERN: &str = r"^([\w+.-]*)(?: \(compatible; ([\w]*) (.*)\))?$";
+
+    /// The official `SemVer` 2.0.0 regular expression.
+    const SEMVER_PATTERN: &str = r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-((?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*)(?:\.(?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*))*))?(?:\+([0-9a-zA-Z-]+(?:\.[0-9a-zA-Z-]+)*))?$";
+
     #[test]
-    fn the_version_names_the_api_level_pleroma_and_wired() {
+    fn the_version_names_the_api_level_and_pleroma_with_wired_build_metadata() {
         assert_eq!(
             version_string(),
             format!(
-                "2.7.2 (compatible; Pleroma 2.10.2; Wired {})",
+                "2.7.2 (compatible; Pleroma 2.10.2+wired.{})",
                 env!("CARGO_PKG_VERSION")
             ),
-            "the API level, the compatibility target, and Wired's own version"
+            "the API level, the compatibility target, and Wired's version as build metadata"
+        );
+    }
+
+    #[test]
+    fn the_version_parses_the_way_pleroma_clients_parse_it() {
+        let version = version_string();
+        let outer = regex::Regex::new(PLEROMA_VERSION_PATTERN).expect("the outer pattern compiles");
+        let captures = outer
+            .captures(&version)
+            .expect("the version matches the Pleroma convention");
+        assert_eq!(
+            captures.get(1).map(|m| m.as_str()),
+            Some("2.7.2"),
+            "capture 1 is the Mastodon API level"
+        );
+        assert_eq!(
+            captures.get(2).map(|m| m.as_str()),
+            Some("Pleroma"),
+            "capture 2 names the software"
+        );
+        let semver_text = captures
+            .get(3)
+            .expect("capture 3 is the software version")
+            .as_str();
+        let semver = regex::Regex::new(SEMVER_PATTERN).expect("the SemVer pattern compiles");
+        let parts = semver
+            .captures(semver_text)
+            .expect("capture 3 is a valid SemVer 2.0.0 version");
+        assert_eq!(
+            parts.get(5).map(|m| m.as_str()),
+            Some(format!("wired.{}", env!("CARGO_PKG_VERSION")).as_str()),
+            "the build metadata is wired.<crate version>"
         );
     }
 
