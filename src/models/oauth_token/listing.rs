@@ -15,16 +15,19 @@ pub struct TokenWithAppName {
     pub id: Uuid,
     /// `oauth_apps.client_name` of the issuing application.
     pub app_name: String,
+    /// The scopes the token was granted, space-separated.
+    pub scopes: String,
     /// When the token stops being valid; always in the future.
     pub valid_until: DateTime<Utc>,
 }
 
-/// The `SELECT` behind [`list_valid_with_app_names`]: only the three
+/// The `SELECT` behind [`list_valid_with_app_names`]: only the four
 /// columns the token list renders, `JOIN`ed for the app name (the
 /// `ON DELETE CASCADE` foreign key on `app_id` makes the join total),
 /// unexpired rows only, and `ORDER BY t.id DESC` so the newest token
 /// leads (`UUIDv7` text sorts by mint time, decision 4).
-const LIST_VALID_WITH_APP_NAMES_SQL: &str = "SELECT t.id, a.client_name AS app_name, t.valid_until
+const LIST_VALID_WITH_APP_NAMES_SQL: &str =
+    "SELECT t.id, a.client_name AS app_name, t.scopes, t.valid_until
    FROM oauth_tokens t
    JOIN oauth_apps a ON a.id = t.app_id
   WHERE t.user_id = $1 AND t.valid_until > now()
@@ -96,6 +99,7 @@ mod tests {
         );
         let first = listed.first().unwrap();
         assert_eq!(first.app_name, "Second App", "the joined app name");
+        assert_eq!(first.scopes, newest.scopes, "the granted scopes ride along");
         assert!(
             first.valid_until > Utc::now(),
             "what comes back is still valid"

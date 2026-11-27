@@ -4,8 +4,9 @@
 //! registered.
 //!
 //! The tests pin what the ticket promises: the token list shows only the
-//! caller's own unexpired tokens, newest first, with exactly the keys
-//! `id`, `app_name` and `valid_until` (Mastodon time); a foreign,
+//! caller's own unexpired tokens, newest first, with exactly Pleroma's
+//! keys `id`, `app_name`, `scopes`, `valid_until` (Mastodon time),
+//! `last_active` and `is_current_token`; a foreign,
 //! unknown or malformed revocation id is one and the same 404 "Record
 //! not found" while the owner's `DELETE` answers 200 `{}` and really
 //! removes the row; `/api/v1/pleroma/apps` lists only owned apps, newest
@@ -29,7 +30,14 @@ const TOKENS: &str = "/api/oauth_tokens";
 /// The Pleroma apps endpoint.
 const APPS: &str = "/api/v1/pleroma/apps";
 /// Every JSON key a token entry must carry, sorted.
-const TOKEN_KEYS: [&str; 3] = ["app_name", "id", "valid_until"];
+const TOKEN_KEYS: [&str; 6] = [
+    "app_name",
+    "id",
+    "is_current_token",
+    "last_active",
+    "scopes",
+    "valid_until",
+];
 /// Every JSON key an app entity must carry, sorted.
 const APP_KEYS: [&str; 8] = [
     "client_id",
@@ -109,7 +117,7 @@ fn names_of(body: &Value) -> Vec<&str> {
 }
 
 /// `GET /api/oauth_tokens` — only the caller's own, unexpired tokens,
-/// newest first, under exactly the three pinned keys.
+/// newest first, under exactly Pleroma's six keys.
 #[tokio::test]
 async fn token_list_shows_the_callers_valid_tokens_newest_first() {
     let db = common::test_db().await;
@@ -141,7 +149,7 @@ async fn token_list_shows_the_callers_valid_tokens_newest_first() {
          the expired and bob's rows excluded"
     );
     for entry in body.as_array().expect("array body") {
-        assert_eq!(keys_of(entry), TOKEN_KEYS, "exactly the three keys");
+        assert_eq!(keys_of(entry), TOKEN_KEYS, "exactly Pleroma's six keys");
     }
     assert_eq!(body[0]["app_name"], "App Y", "the newest token's app");
     assert_eq!(
@@ -155,6 +163,58 @@ async fn token_list_shows_the_callers_valid_tokens_newest_first() {
         !common::ids_of(&body).contains(&foreign.id.to_string()),
         "bob's token never appears in alice's list"
     );
+}
+
+/// `GET /api/oauth_tokens` — exactly one entry is flagged
+/// `is_current_token`, the calling token; `scopes` lists what each token
+/// was granted and `last_active` is `null`.
+#[tokio::test]
+async fn token_list_flags_the_calling_token_and_lists_scopes() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let alice = session(&pool, "alice").await;
+    let other = token_with(&pool, &alice, "read:security follow").await;
+
+    let response = common::TestRequest::get(TOKENS)
+        .bearer(&other.token)
+        .send(&common::test_app(pool.clone()))
+        .await;
+    assert_eq!(response.status, StatusCode::OK, "listing works");
+    let body = response.json_value();
+    let entries = body.as_array().expect("array body");
+    let current: Vec<&Value> = entries
+        .iter()
+        .filter(|entry| entry["is_current_token"] == json!(true))
+        .collect();
+    assert_eq!(current.len(), 1, "exactly one entry is current: {body}");
+    let calling = current.first().expect("one current entry");
+    assert_eq!(
+        calling["id"],
+        other.id.to_string(),
+        "and it is the calling token"
+    );
+    assert_eq!(
+        calling["scopes"],
+        json!(["read:security", "follow"]),
+        "the calling token's granted scopes"
+    );
+    let session_entry = entries
+        .iter()
+        .find(|entry| entry["id"] == alice.token.id.to_string())
+        .expect("the session token is listed");
+    assert_eq!(
+        session_entry["is_current_token"],
+        json!(false),
+        "the other token is not current"
+    );
+    assert_eq!(
+        session_entry["scopes"],
+        json!(["read", "write"]),
+        "the session token's granted scopes"
+    );
+    for entry in entries {
+        assert_eq!(entry["last_active"], Value::Null, "no usage is recorded");
+    }
 }
 
 /// `DELETE /api/oauth_tokens/{id}` — the owner revokes their token:
