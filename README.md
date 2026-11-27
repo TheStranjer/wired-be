@@ -631,3 +631,12 @@ SELECT pg_reload_conf();
 
 `fsync`, `full_page_writes` and `synchronous_commit` are all reloadable, so no restart is needed. Never point `DATABASE_URL` at a database you care about with these settings: `fsync = off` means the server does not flush to disk at all. `.github/workflows/ci.yml` applies the same three settings to its throwaway Postgres service in a setup step (GitHub service containers cannot be started with a command).
 
+### Models used
+
+So far, these LLMs have been used:
+
+* Opus 5.5
+* Sonnet 5.5
+* Qwen3.8 Flash next
+* DeepSeek V4 Pro
+
