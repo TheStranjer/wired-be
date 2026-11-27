@@ -302,6 +302,25 @@ restart over the admin API (`GET /api/v1/pleroma/admin/need_reboot` says
 whether a restart-requiring config change is pending;
 `POST /api/v1/pleroma/admin/restart` exits the process for its supervisor).
 
+### Installing on a server
+
+[`scripts/installers/ubuntu-2604.sh`](scripts/installers/ubuntu-2604.sh)
+installs and upgrades wired-be on a fresh Ubuntu 26.04 LTS server, run as
+root. It refuses any other release, and another release gets its own file in
+`scripts/installers/`. It builds `WIRED_REF` from source under an
+unprivileged user, creates a peer-authenticated PostgreSQL database, writes a
+hardened systemd unit and an API-only nginx reverse proxy, and by default
+locks the origin to Cloudflare. That means 80/443 from Cloudflare's ranges
+only, the client address taken from `CF-Connecting-IP`, and Let's Encrypt by
+DNS-01. The settings of the first run are saved, so `wired-be-setup` with no
+arguments upgrades later. `--help` lists every setting. Pin `WIRED_REF` to a
+commit or tag for a repeatable install.
+
+```sh
+WIRED_BASE_URL=https://fedi.example.com WIRED_LOCAL_DOMAIN=example.com \
+  CLOUDFLARE_API_TOKEN=... bash scripts/installers/ubuntu-2604.sh
+```
+
 ## Creating the first admin
 
 ```sh
