@@ -275,7 +275,7 @@ pub(super) fn version_string() -> String {
 /// `Endpoint.websocket_url()`).
 pub(super) fn streaming_api_url(config: &Config) -> String {
     let scheme = if config.is_https() { "wss" } else { "ws" };
-    format!("{scheme}://{}", config.domain())
+    format!("{scheme}://{}", config.web_host())
 }
 
 #[cfg(test)]

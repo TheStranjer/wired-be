@@ -146,7 +146,7 @@ async fn local_mention_urls(
 ) -> AppResult<HashMap<String, String>> {
     let mut urls = HashMap::new();
     for mention in extract_mentions(text) {
-        if !mention.names_domain(config.domain()) {
+        if !mention.names_local(config) {
             continue;
         }
         if let Some(found) = user::get_by_nickname(db, &mention.nickname)

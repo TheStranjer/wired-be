@@ -101,7 +101,7 @@ async fn context(state: &AppState) -> MrfContext {
     MrfContext {
         config: load_config(state).await,
         now: Utc::now(),
-        local_domain: state.config.domain().to_owned(),
+        local_domain: state.config.web_host().to_owned(),
         author_follower_count: None,
         author_status_count: None,
         author_tags: Vec::new(),
@@ -244,7 +244,7 @@ mod tests {
         let ctx = MrfContext {
             config,
             now: Utc::now(),
-            local_domain: state.config.domain().to_owned(),
+            local_domain: state.config.web_host().to_owned(),
             author_follower_count: None,
             author_status_count: None,
             author_tags: Vec::new(),
@@ -256,6 +256,30 @@ mod tests {
             ctx.config.params_for("noop"),
             Some(&json!({"probe": true})),
             "and the preloaded setting document"
+        );
+    }
+
+    /// A split `LOCAL_DOMAIN` never reaches the chain: activity and object
+    /// ids are built from the web host, so that is the "local" a policy
+    /// compares against, and a foreign host (the handle domain included) is
+    /// not.
+    #[tokio::test]
+    async fn a_split_config_preloads_the_web_host_as_local() {
+        let db = crate::test_db::test_db().await.expect("test database slot");
+        let state = crate::test_support::app_state_with(db.pool(), |config| {
+            config.local_domain = "whatever.com".to_owned();
+        });
+
+        let ctx = context(&state).await;
+
+        assert_eq!(ctx.local_domain, "test.example", "the web host is local");
+        assert!(
+            !ctx.local_domain.eq_ignore_ascii_case("whatever.com"),
+            "the handle domain is not an id host"
+        );
+        assert!(
+            !ctx.local_domain.eq_ignore_ascii_case("peer.example"),
+            "a foreign host is not local"
         );
     }
 

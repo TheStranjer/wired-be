@@ -331,7 +331,7 @@ fn test_config_is_the_fixed_configuration() {
         !config.rate_limit.enabled.get(),
         "the harness runs unthrottled so a suite never trips a limiter of its own"
     );
-    assert_eq!(config.domain(), "test.example", "test domain");
+    assert_eq!(config.web_host(), "test.example", "test domain");
 }
 
 /// [`create_local_user`](common::create_local_user) inserts a local,

@@ -31,6 +31,11 @@ pub struct Config {
     /// Public origin of this instance, normalized to e.g.
     /// `https://social.example` (no path, query or trailing slash).
     pub base_url: String,
+    /// The domain local handles show (`@alice@whatever.com`), from
+    /// `LOCAL_DOMAIN`: lowercased, without a trailing dot, and the host of
+    /// [`base_url`](Self::base_url) (port kept) when the variable is unset.
+    /// Read it through [`Config::local_domain`]; it never builds a URL.
+    pub local_domain: String,
     /// Origin the frontend pages are served from, from `FRONTEND_BASE_URL`;
     /// [`base_url`](Self::base_url) when unset or blank. A set value is
     /// trimmed and loses its trailing slashes, so a browser redirect such as

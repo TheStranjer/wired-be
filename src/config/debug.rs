@@ -32,6 +32,7 @@ fn debug_identity_and_exposure<'a, 'b, 'd>(
         .field("database_url", &"<redacted>")
         .field("bind_addr", &config.bind_addr)
         .field("base_url", &config.base_url)
+        .field("local_domain", &config.local_domain)
         .field("frontend_base_url", &config.frontend_base_url)
         .field("instance_name", &config.instance_name)
         .field("instance_description", &config.instance_description)

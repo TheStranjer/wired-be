@@ -5,6 +5,7 @@
 use serde_json::{Map, Number, Value, json};
 
 use crate::{
+    config::Config,
     models::{custom_emoji::CustomEmoji, media_attachment::MediaAttachment, user::User},
     util::{entities::hashtag_spellings, time::mastodon_time},
 };
@@ -30,7 +31,11 @@ pub(super) fn tags_json(ctx: &NoteContext) -> Vec<Value> {
             hashtag_tag(base, name, written.unwrap_or(name))
         })
         .collect();
-    tags.extend(ctx.mentions.iter().map(mention_tag));
+    tags.extend(
+        ctx.mentions
+            .iter()
+            .map(|person| mention_tag(person, &ctx.config)),
+    );
     tags.extend(used_emoji_tags(ctx));
     tags
 }
@@ -50,11 +55,21 @@ fn hashtag_tag(base: &str, name: &str, written: &str) -> Value {
 /// One mentioned account as its tag object: `@nick` for a local account,
 /// `@nick@domain` for a remote one, which is exactly how the nickname is
 /// stored (decision 7).
-fn mention_tag(person: &User) -> Value {
+///
+/// When the instance splits its handle domain from its web host, a local
+/// account is named by its handle, `@nick@LOCAL_DOMAIN`; the `href` stays
+/// the actor id on the web host either way.
+fn mention_tag(person: &User, config: &Config) -> Value {
+    let split = config.local_domain() != config.web_host();
+    let name = if split && !person.nickname.contains('@') {
+        format!("@{}@{}", person.nickname, config.local_domain())
+    } else {
+        format!("@{}", person.nickname)
+    };
     json!({
         "type": TYPE_MENTION,
         "href": &person.ap_id,
-        "name": format!("@{}", person.nickname),
+        "name": name,
     })
 }
 
@@ -266,6 +281,31 @@ mod tests {
                  "icon": {"type": "Image", "url": format!("{BASE}/emoji/railroad_track.png")}},
             ]),
             "hashtags, mentions, then the emojis the content actually uses"
+        );
+    }
+
+    #[test]
+    fn a_local_mention_is_named_by_its_handle_only_when_the_domains_split() {
+        let mut ctx = note_context(Visibility::Public);
+        ctx.mentions = vec![author()];
+        let plain = note_json(&ctx).expect("a mentioning note federates");
+        assert_eq!(
+            plain["tag"],
+            json!([{"type": "Mention", "href": AUTHOR_AP, "name": "@alice"}]),
+            "unsplit, the name is unchanged"
+        );
+        ctx.config.local_domain = "whatever.com".to_owned();
+        let split = note_json(&ctx).expect("a mentioning note federates");
+        assert_eq!(
+            split["tag"],
+            json!([{"type": "Mention", "href": AUTHOR_AP, "name": "@alice@whatever.com"}]),
+            "split, the handle domain names the account and the href stays on the web host"
+        );
+        ctx.mentions = vec![mentioned_bob()];
+        let remote = note_json(&ctx).expect("a mentioning note federates");
+        assert_eq!(
+            remote["tag"][0]["name"], "@bob@remote.example",
+            "a remote name is never rewritten"
         );
     }
 

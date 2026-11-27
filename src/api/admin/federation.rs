@@ -77,6 +77,7 @@ use tracing::debug;
 
 use crate::{
     auth::admin::AdminUser,
+    config::Config,
     entities::admin::{AdminRelay, AdminRelayList},
     error::{AppError, AppResult},
     extract::{ApiBody, flex},
@@ -257,7 +258,7 @@ async fn delete_instance(
 ) -> AppResult<Json<String>> {
     admin.require(CLASS_WRITE, AREA_FEDERATION)?;
     let host = normalized_host(&raw);
-    if host_is_local(state.config.domain(), &host) {
+    if host_is_local(&state.config, &host) {
         return Err(AppError::BadRequest(CANNOT_DELETE_LOCAL.to_owned()));
     }
     let doomed = user::mark_deleted_by_domain(&state.db, &host).await?;
@@ -347,12 +348,14 @@ fn normalized_host(raw: &str) -> String {
     raw.trim().to_ascii_lowercase()
 }
 
-/// Whether `host` names this instance's own domain: [`Config::domain`]
-/// against the normalized segment, case-insensitively like the fold.
+/// Whether `host` names one of this instance's own domains: the
+/// [`Config::local_domain`] or the [`Config::web_host`], against the
+/// normalized segment, case-insensitively like the fold.
 ///
-/// [`Config::domain`]: crate::config::Config::domain
-const fn host_is_local(domain: &str, host: &str) -> bool {
-    domain.eq_ignore_ascii_case(host)
+/// [`Config::local_domain`]: crate::config::Config::local_domain
+/// [`Config::web_host`]: crate::config::Config::web_host
+fn host_is_local(config: &Config, host: &str) -> bool {
+    config.is_local_domain(host)
 }
 
 #[cfg(test)]
@@ -360,7 +363,6 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::config::Config;
 
     /// The follow body reads the ticket's shape, an absent `relay_url`
     /// defaults to the empty text the service refuses, and the
@@ -449,22 +451,42 @@ mod tests {
         assert_eq!(normalized_host("peer.example"), "peer.example");
 
         let config = Config::for_tests();
-        assert_eq!(config.domain(), "test.example", "the fixture origin");
+        assert_eq!(config.web_host(), "test.example", "the fixture origin");
         assert!(
-            host_is_local(config.domain(), "test.example"),
+            host_is_local(&config, "test.example"),
             "the exact domain is local"
         );
         assert!(
-            host_is_local(config.domain(), "Test.Example"),
+            host_is_local(&config, "Test.Example"),
             "and the fold makes case irrelevant"
         );
         assert!(
-            !host_is_local(config.domain(), "peer.example"),
+            !host_is_local(&config, "peer.example"),
             "a peer is not local"
         );
         assert!(
-            !host_is_local(config.domain(), "test.example.evil"),
+            !host_is_local(&config, "test.example.evil"),
             "and a suffix is not the domain"
+        );
+    }
+
+    /// With a split config both the handle domain and the web host are
+    /// local, so neither can be deleted.
+    #[test]
+    fn a_split_config_treats_both_domains_as_local() {
+        let mut config = Config::for_tests();
+        config.local_domain = "whatever.com".to_owned();
+        assert!(
+            host_is_local(&config, "whatever.com"),
+            "the handle domain is local"
+        );
+        assert!(
+            host_is_local(&config, "test.example"),
+            "the web host is local"
+        );
+        assert!(
+            !host_is_local(&config, "other.example"),
+            "a peer is not local"
         );
     }
 }

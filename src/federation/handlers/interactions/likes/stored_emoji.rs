@@ -28,8 +28,8 @@ pub(super) struct StoredEmoji {
 /// Resolves what `reaction` is stored with; `None` refuses the reaction.
 ///
 /// A unicode reaction carries no image. A custom emoji must claim either this
-/// instance (the image is our stored one, the tag's URL is discarded, and an
-/// unknown shortcode is refused) or an origin we hold a row for (that row's
+/// instance, under its handle domain or its web host (the image is our stored
+/// one, the tag's URL is discarded, and an unknown shortcode is refused) or an origin we hold a row for (that row's
 /// image is used), or the signer's own domain (the tag's image is the
 /// signer's word about its own emoji). Any other origin is refused.
 pub(super) async fn resolve_emoji(
@@ -46,7 +46,7 @@ pub(super) async fn resolve_emoji(
     let Some(claimed) = reaction.origin.as_deref() else {
         return Ok(None);
     };
-    if claimed.eq_ignore_ascii_case(state.config.domain()) {
+    if state.config.is_local_domain(claimed) {
         let local = stored_emoji(state, code, None)
             .await?
             .filter(|emoji| !emoji.disabled);

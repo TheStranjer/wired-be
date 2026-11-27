@@ -162,6 +162,47 @@ async fn a_claim_of_our_own_emoji_shows_our_stored_image() {
     );
 }
 
+/// With a split `LOCAL_DOMAIN`, an origin of either the handle domain or
+/// the web host is this instance's emoji: the stored image shows, never
+/// the tag's.
+#[tokio::test]
+async fn a_claim_of_either_split_domain_is_our_own_emoji() {
+    let db = crate::test_db::test_db().await.expect("test database slot");
+    let pool = db.pool().clone();
+    let state = crate::test_support::app_state_with(&pool, |config| {
+        config.local_domain = "whatever.com".to_owned();
+    });
+    let post = local_post(&pool, "wanda").await;
+    let _local = custom_emoji::upsert(&pool, &NewCustomEmoji::local("wiredcat", WIRED_URL))
+        .await
+        .expect("the local emoji stores");
+
+    for (n, who, id) in [
+        ("r1", "xena", "https://whatever.com/emoji/wiredcat"),
+        ("r2", "yara", "https://test.example/emoji/wiredcat"),
+    ] {
+        let signer = reactor(&pool, who, "wired2.test").await;
+        deliver_react(
+            &state,
+            &signer,
+            &post,
+            (n, "wiredcat"),
+            tag("wiredcat", Some(id), EVIL_URL),
+        )
+        .await;
+        assert_eq!(
+            stored(&pool, &signer).await,
+            vec![(":wiredcat:".to_owned(), None, Some(WIRED_URL.to_owned()))],
+            "{id} maps onto the local emoji with the image we hold"
+        );
+    }
+    assert_eq!(
+        emojis(&pool).await,
+        vec![("wiredcat".to_owned(), None)],
+        "no emoji row is added"
+    );
+}
+
 /// A claim of our domain for a shortcode we do not hold, or hold disabled, is refused.
 #[tokio::test]
 async fn a_claim_of_an_unknown_or_disabled_local_emoji_is_refused() {

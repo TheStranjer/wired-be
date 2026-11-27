@@ -104,7 +104,7 @@ impl Instance {
         pleroma: PleromaBlock,
     ) -> Self {
         Self {
-            uri: config.domain().to_owned(),
+            uri: config.local_domain().to_owned(),
             title: config.instance_name.clone(),
             short_description: config.instance_description.clone(),
             description: config.instance_description.clone(),

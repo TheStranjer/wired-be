@@ -9,8 +9,9 @@ use crate::protocols::ProtocolId;
 use super::{
     defaults::MIN_MEDIA_PROXY_SECRET_CHARS,
     vars::{
-        BASE_URL_VAR, BIND_ADDR_VAR, OAUTH_PROVIDERS_VAR, PROTOCOLS_VAR, RATE_LIMITS_VAR,
-        RESTRICT_UNAUTHENTICATED_AREAS, RESTRICT_UNAUTHENTICATED_VAR, VAPID_PRIVATE_KEY_VAR,
+        BASE_URL_VAR, BIND_ADDR_VAR, LOCAL_DOMAIN_VAR, OAUTH_PROVIDERS_VAR, PROTOCOLS_VAR,
+        RATE_LIMITS_VAR, RESTRICT_UNAUTHENTICATED_AREAS, RESTRICT_UNAUTHENTICATED_VAR,
+        VAPID_PRIVATE_KEY_VAR,
     },
 };
 
@@ -23,6 +24,9 @@ pub enum ConfigError {
     InvalidBindAddr(AddrParseError),
     /// `BASE_URL` is not an http(s) origin without path or query.
     InvalidBaseUrl,
+    /// `LOCAL_DOMAIN` is not a bare host with an optional port; the value
+    /// is what is wrong with it.
+    InvalidLocalDomain(String),
     /// A numeric setting is not a whole number; the value is the variable name.
     InvalidNumber(&'static str),
     /// A boolean setting is not `true`/`false` (or `1`/`0`); the value is the
@@ -70,6 +74,11 @@ impl fmt::Display for ConfigError {
                 f,
                 "invalid {BASE_URL_VAR}: expected an http(s) origin such as \
                  https://social.example with no path or query"
+            ),
+            Self::InvalidLocalDomain(reason) => write!(
+                f,
+                "invalid {LOCAL_DOMAIN_VAR}: expected a bare host such as whatever.com, \
+                 optionally with a port: {reason}"
             ),
             Self::InvalidNumber(var) => write!(f, "invalid {var}: expected a whole number"),
             Self::InvalidBoolean(var) => write!(f, "invalid {var}: expected true or false"),
@@ -130,6 +139,7 @@ impl Error for ConfigError {
             Self::InvalidBindAddr(err) => Some(err),
             Self::Missing(_)
             | Self::InvalidBaseUrl
+            | Self::InvalidLocalDomain(_)
             | Self::InvalidNumber(_)
             | Self::InvalidBoolean(_)
             | Self::InvalidOauthProviders(_)

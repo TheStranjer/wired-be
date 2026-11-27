@@ -13,6 +13,7 @@ use super::{
         DEFAULT_INSTANCE_NAME,
     },
     error::ConfigError,
+    local_domain::local_domain,
     parse::{comma_list, required_var},
     urls::media_base_url,
     vars::{
@@ -22,27 +23,40 @@ use super::{
 };
 use crate::util::url::{host_with_port, parse_http_url};
 
-/// The shape [`endpoints`] answers: the database URL, the listen socket,
-/// the public origin and the media URL prefix, in [`Config`] field order;
-/// factored out because a four-value tuple is a very complex type to
-/// spell inline.
-pub(crate) type Endpoints = (String, SocketAddr, String, String);
+/// What [`endpoints`] answers: the settings that say where the process
+/// and its media are reached, and the domain its handles show, each hung
+/// on the [`Config`] field of the same name.
+#[derive(Debug)]
+pub(crate) struct Endpoints {
+    /// The PostgreSQL connection URL (`DATABASE_URL`).
+    pub(crate) database_url: String,
+    /// The socket address the server listens on (`BIND_ADDR`).
+    pub(crate) bind_addr: SocketAddr,
+    /// The normalized public origin (`BASE_URL`).
+    pub(crate) base_url: String,
+    /// The URL prefix media is served under (`MEDIA_BASE_URL`).
+    pub(crate) media_base_url: String,
+    /// The domain handles show (`LOCAL_DOMAIN`), the web host by default.
+    pub(crate) local_domain: String,
+}
 
-/// Reads the four settings that say where the process and its media are
-/// reached: the database URL it connects to, the socket address it listens
-/// on, the public origin it is known by, and the media URL prefix that
-/// defaults onto that origin. Grouped because each is a few lines of its
-/// own and [`Config::from_lookup`] has a size budget (AGENTS.md); the tuple
-/// comes back in [`Config`] field order. `media_base_url` is read last, off
-/// the normalized origin it defaults onto.
+/// Reads the settings that say where the process and its media are
+/// reached and which domain its handles show: the database URL it connects
+/// to, the socket address it listens on, the public origin it is known by,
+/// the media URL prefix that defaults onto that origin, and the handle
+/// domain that defaults onto its host. Grouped because each is a few lines
+/// of its own and [`Config::from_lookup`] has a size budget (AGENTS.md).
+/// `media_base_url` and `local_domain` are read last, off the normalized
+/// origin they default onto.
 ///
 /// # Errors
 ///
 /// Returns [`ConfigError::Missing`] when `DATABASE_URL` or `BASE_URL` is
 /// unset or blank, [`ConfigError::InvalidBindAddr`] when `BIND_ADDR` holds
-/// something that is not a socket address, and
+/// something that is not a socket address,
 /// [`ConfigError::InvalidBaseUrl`] when `BASE_URL` is not an http(s)
-/// origin without path or query.
+/// origin without path or query, and [`ConfigError::InvalidLocalDomain`]
+/// when `LOCAL_DOMAIN` is not a bare host with an optional port.
 pub(crate) fn endpoints<F>(lookup: &F) -> Result<Endpoints, ConfigError>
 where
     F: Fn(&str) -> Option<String>,
@@ -51,7 +65,14 @@ where
     let bind_addr = listen_addr(lookup)?;
     let base_url = normalize_base_url(&required_var(lookup, BASE_URL_VAR)?)?;
     let media_base_url = media_base_url(lookup, &base_url);
-    Ok((database_url, bind_addr, base_url, media_base_url))
+    let local_domain = local_domain(lookup, &base_url)?;
+    Ok(Endpoints {
+        database_url,
+        bind_addr,
+        base_url,
+        media_base_url,
+        local_domain,
+    })
 }
 
 /// Validates a `BASE_URL` value and normalizes it to the bare origin with no
@@ -253,7 +274,7 @@ mod tests {
             !config.registrations_open.get(),
             "registration is closed by default"
         );
-        assert_eq!(config.domain(), "social.example", "domain without port");
+        assert_eq!(config.web_host(), "social.example", "domain without port");
         assert!(config.is_https(), "https base_url");
     }
 
@@ -397,14 +418,14 @@ mod tests {
     fn base_url_trailing_slash_is_stripped() {
         let config = base_url_result("https://social.example/").unwrap();
         assert_eq!(config.base_url, ORIGIN, "trailing slash stripped");
-        assert_eq!(config.domain(), "social.example", "domain unchanged");
+        assert_eq!(config.web_host(), "social.example", "domain unchanged");
     }
 
     #[test]
     fn base_url_with_port_keeps_it_in_domain() {
         let config = base_url_result("http://localhost:4000").unwrap();
         assert_eq!(config.base_url, "http://localhost:4000", "base_url kept");
-        assert_eq!(config.domain(), "localhost:4000", "domain with port");
+        assert_eq!(config.web_host(), "localhost:4000", "domain with port");
         assert!(!config.is_https(), "http base_url is not https");
     }
 
@@ -412,7 +433,7 @@ mod tests {
     fn base_url_default_port_is_dropped() {
         let config = base_url_result("https://example.com:443/").unwrap();
         assert_eq!(config.base_url, "https://example.com", "default port gone");
-        assert_eq!(config.domain(), "example.com", "domain without port");
+        assert_eq!(config.web_host(), "example.com", "domain without port");
         assert!(config.is_https(), "https stays https");
     }
 }

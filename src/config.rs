@@ -8,7 +8,7 @@
 //! [`vars`] and their defaults in [`defaults`]; [`Config`] itself is
 //! declared in [`model`] beside its value types ([`federation_types`],
 //! [`frontend`], [`integrations`]); the readers take it group by group
-//! ([`instance`], [`fetch`], [`federation`], [`jobs`], [`mail`], [`auth`],
+//! ([`instance`], [`local_domain`], [`fetch`], [`federation`], [`jobs`], [`mail`], [`auth`],
 //! [`registration`], [`limits`], [`wording`], [`uploads`], [`urls`],
 //! [`exposure`], [`media`], [`protocols`]) on the shared primitives of [`parse`],
 //! reported as [`ConfigError`] from [`error`] and rendered redacted by
@@ -28,7 +28,6 @@ use self::{
         accept_unsolicited_public, federation_enabled, mrf_settings, rate_limit_settings,
         unreachable_grace_secs,
     },
-    instance::endpoints,
     jobs::streaming_heartbeat,
     mail::domain_of,
     media::{ffmpeg_path, media_proxy_settings, rich_media_ignore_hosts, rich_media_remote},
@@ -52,6 +51,7 @@ pub mod instance;
 pub mod integrations;
 pub mod jobs;
 pub mod limits;
+pub mod local_domain;
 pub mod mail;
 pub mod media;
 pub mod model;
@@ -88,13 +88,13 @@ impl Config {
     ///
     /// Returns [`ConfigError`] if a required variable is missing or a value is invalid.
     pub fn from_lookup<F: Fn(&str) -> Option<String>>(lookup: F) -> Result<Self, ConfigError> {
-        let (database_url, bind_addr, base_url, media_base_url) = endpoints(&lookup)?;
-        let (profile, limits, text, auth, exposure, mail, rest) = groups(&lookup, &base_url)?;
+        let (ends, profile, limits, text, auth, exposure, mail, rest) = groups(&lookup)?;
         Ok(Self {
-            database_url,
-            bind_addr,
-            frontend_base_url: frontend_base_url(&lookup, &base_url),
-            base_url,
+            database_url: ends.database_url,
+            bind_addr: ends.bind_addr,
+            frontend_base_url: frontend_base_url(&lookup, &ends.base_url),
+            base_url: ends.base_url,
+            local_domain: ends.local_domain,
             instance_name: profile.name,
             instance_description: profile.description,
             contact_email: profile.contact_email,
@@ -125,7 +125,7 @@ impl Config {
             uploads_dir: directory(&lookup, UPLOADS_DIR_VAR, DEFAULT_UPLOADS_DIR),
             ffmpeg_path: ffmpeg_path(&lookup),
             emoji_dir: directory(&lookup, EMOJI_DIR_VAR, DEFAULT_EMOJI_DIR),
-            media_base_url,
+            media_base_url: ends.media_base_url,
             accounts_email_optional: auth.accounts_email_optional,
             min_password_length: auth.min_password_length,
             oauth_token_ttl_secs: auth.oauth_token_ttl_secs,
@@ -169,11 +169,37 @@ impl Config {
         })
     }
 
-    /// The [`base_url`](Self::base_url) without its scheme: `social.example`,
-    /// or `localhost:4000` when a non-default port is part of the origin.
+    /// The **web host**: the [`base_url`](Self::base_url) without its
+    /// scheme, `social.example`, or `localhost:4000` when a non-default port
+    /// is part of the origin.
+    ///
+    /// This is where the instance is served from, so it is the host of every
+    /// actor, object, inbox and media URL, and what a URL is compared
+    /// against. It is not the domain handles show; that is
+    /// [`local_domain`](Self::local_domain).
     #[must_use]
-    pub fn domain(&self) -> &str {
+    pub fn web_host(&self) -> &str {
         domain_of(&self.base_url)
+    }
+
+    /// The **handle domain**: the domain local handles show, from
+    /// `LOCAL_DOMAIN`; [`web_host`](Self::web_host) when it is unset.
+    ///
+    /// It goes after the `@` in `nick@domain`, in the `WebFinger` `subject` and
+    /// in the instance `uri`/`domain`. It never builds a URL: those use the
+    /// [`web_host`](Self::web_host).
+    #[must_use]
+    pub fn local_domain(&self) -> &str {
+        &self.local_domain
+    }
+
+    /// Whether `domain` is one of the two names this instance answers to in
+    /// a handle: the [`local_domain`](Self::local_domain) or the
+    /// [`web_host`](Self::web_host), compared case-insensitively.
+    #[must_use]
+    pub fn is_local_domain(&self, domain: &str) -> bool {
+        domain.eq_ignore_ascii_case(self.local_domain())
+            || domain.eq_ignore_ascii_case(self.web_host())
     }
 
     /// The lifetime of a freshly minted OAuth token:
@@ -270,6 +296,7 @@ impl Config {
             database_url: TEST_DATABASE_URL.to_owned(),
             bind_addr: SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 4000)),
             base_url: TEST_BASE_URL.to_owned(),
+            local_domain: domain_of(TEST_BASE_URL).to_owned(),
             frontend_base_url: TEST_BASE_URL.to_owned(),
             instance_name: DEFAULT_INSTANCE_NAME.to_owned(),
             instance_description: DEFAULT_INSTANCE_DESCRIPTION.to_owned(),
@@ -384,7 +411,12 @@ mod tests {
             "test frontend_base_url defaults onto the test base_url"
         );
         assert_eq!(config.database_url, TEST_DATABASE_URL, "placeholder url");
-        assert_eq!(config.domain(), "test.example", "test domain");
+        assert_eq!(config.web_host(), "test.example", "test web host");
+        assert_eq!(
+            config.local_domain(),
+            "test.example",
+            "the test handle domain is the web host"
+        );
         assert!(config.is_https(), "test base_url is https");
         assert!(
             config.fetch.http_allow_private_hosts,

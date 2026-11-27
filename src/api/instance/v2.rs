@@ -77,7 +77,7 @@ impl InstanceV2 {
         pleroma: PleromaBlock,
     ) -> Self {
         Self {
-            domain: config.domain().to_owned(),
+            domain: config.local_domain().to_owned(),
             title: config.instance_name.clone(),
             version: version_string(),
             source_url: SOURCE_URL,
