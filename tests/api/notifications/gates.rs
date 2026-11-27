@@ -6,7 +6,7 @@ use axum::{Router, http::StatusCode};
 use serde_json::json;
 use uuid::Uuid;
 
-use super::support::{READ, READ_ROUTE, V1, WRITE, assert_empty_object, fixture};
+use super::support::{READ, READ_ROUTE, READ_ROUTE_V1, V1, WRITE, assert_empty_object, fixture};
 use crate::common;
 
 /// No credential answers 401 "Invalid credentials" on every route here,
@@ -79,6 +79,11 @@ fn gated_routes(id: Uuid) -> Vec<GatedRoute> {
         GatedRoute {
             verb: "POST",
             path: READ_ROUTE.to_owned(),
+            with_id_body: true,
+        },
+        GatedRoute {
+            verb: "POST",
+            path: READ_ROUTE_V1.to_owned(),
             with_id_body: true,
         },
     ]

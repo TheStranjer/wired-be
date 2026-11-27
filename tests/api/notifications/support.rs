@@ -23,6 +23,8 @@ use crate::common;
 pub(super) const V1: &str = "/api/v1/notifications";
 /// Pleroma's read route.
 pub(super) const READ_ROUTE: &str = "/api/pleroma/notifications/read";
+/// Pleroma's read route under `/api/v1/pleroma`, the same handler.
+pub(super) const READ_ROUTE_V1: &str = "/api/v1/pleroma/notifications/read";
 /// The scope the two reads demand.
 pub(super) const READ: &str = "read:notifications";
 /// The scope every write route in this file demands.

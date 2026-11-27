@@ -139,8 +139,9 @@ pub fn router() -> Router<AppState> {
         .route("/notifications/destroy_multiple", delete(destroy_multiple))
 }
 
-/// The `/api/pleroma/notifications` router, merged into
-/// [`crate::api::pleroma`].
+/// The Pleroma `read` router, nested at `/api/pleroma/notifications`
+/// ([`crate::api::pleroma`]) and at `/api/v1/pleroma/notifications`
+/// ([`crate::api::v1`]).
 pub fn pleroma_router() -> Router<AppState> {
     Router::new().route("/read", post(mark_as_read))
 }

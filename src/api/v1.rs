@@ -63,6 +63,7 @@ pub fn core_router(state: &AppState) -> Router<AppState> {
         .merge(push::router())
         .merge(streaming::router())
         .nest("/pleroma", misc::util_router())
+        .nest("/pleroma/notifications", notifications::pleroma_router())
         .nest("/pleroma/admin", admin::core_router(&state.config))
         .nest("/pleroma/apps", oauth_tokens::apps_router())
         .nest("/pleroma/backups", backups::router())
