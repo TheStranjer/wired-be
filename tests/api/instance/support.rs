@@ -75,11 +75,11 @@ pub(super) const TOP_KEYS: [&str; 26] = [
 ];
 
 /// The `version` string the endpoint claims: the Mastodon API level,
-/// commented with the Pleroma release Wired is compatible with and
-/// Wired's own crate version.
+/// commented with the Pleroma release Wired is compatible with, carrying
+/// Wired's own crate version as `SemVer` build metadata.
 pub(super) fn instance_version() -> String {
     format!(
-        "2.7.2 (compatible; Pleroma 2.10.2; Wired {})",
+        "2.7.2 (compatible; Pleroma 2.10.2+wired.{})",
         env!("CARGO_PKG_VERSION")
     )
 }
