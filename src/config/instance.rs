@@ -259,7 +259,7 @@ mod tests {
         );
         assert_eq!(config.min_password_length, 8, "default MIN_PASSWORD_LENGTH");
         assert_eq!(
-            config.oauth_token_ttl_secs, 2_592_000,
+            config.oauth_token_ttls.user, 2_592_000,
             "default OAUTH_TOKEN_TTL_SECS is 30 days"
         );
         assert!(
@@ -350,7 +350,7 @@ mod tests {
         );
         assert_eq!(config.min_password_length, 12, "custom MIN_PASSWORD_LENGTH");
         assert_eq!(
-            config.oauth_token_ttl_secs, 3_600,
+            config.oauth_token_ttls.user, 3_600,
             "custom OAUTH_TOKEN_TTL_SECS"
         );
         assert!(config.captcha_enabled.get(), "custom CAPTCHA_ENABLED");

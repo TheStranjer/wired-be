@@ -111,7 +111,7 @@ async fn config_set_renders_the_wire_shape_and_the_effective_view() {
     let view = merged.json_value();
     assert_eq!(
         view["configs"].as_array().map(Vec::len),
-        Some(7),
+        Some(8),
         "every whitelisted key answers without only_db"
     );
     let instance = &view["configs"][0];

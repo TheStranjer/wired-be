@@ -55,8 +55,10 @@ Baseline configuration comes from environment variables. For local development, 
 A whitelisted subset of these settings can be overridden at runtime through
 the admin config store (`GET`/`POST /api/v1/pleroma/admin/config`, backed by
 the `config_entries` table); a stored override wins over its environment
-value, and the instance identity, registration flags and the MRF chain read
-through it live. `GET /api/v1/pleroma/admin/config/descriptions` documents
+value, and the instance identity, registration flags, the MRF chain and the
+per-role OAuth token lifetimes (`:pleroma/:oauth_token_ttl_secs`, subkeys
+`admin`, `bot` and `user` in seconds; a value that is not a positive whole
+number with a representable expiry is a 422) read through it live. `GET /api/v1/pleroma/admin/config/descriptions` documents
 every whitelisted key (types, descriptions and example values),
 `GET /api/v1/pleroma/admin/need_reboot` says whether a restart-requiring key
 changed since this boot, and `GET /api/v1/pleroma/admin/restart` asks the
@@ -94,7 +96,10 @@ below.
 | `MAX_SCHEDULED_PER_USER_PER_DAY` | no | `25` | How many pending scheduled rows one account may hold for one UTC day; the per-user-per-day scheduled-status limit check reads it to refuse a `scheduled_at` on a day that already holds this many |
 | `ACCOUNTS_EMAIL_OPTIONAL` | no | `false` | Allow registering local accounts without an email address (`true`/`false`, or `1`/`0`) |
 | `MIN_PASSWORD_LENGTH` | no | `8` | Minimum length of a registration or reset password, in characters |
-| `OAUTH_TOKEN_TTL_SECS` | no | `2592000` | Lifetime granted to newly issued OAuth access tokens, in seconds (default: 30 days) |
+| `OAUTH_TOKEN_TTL_SECS` | no | `2592000` | Legacy single lifetime of newly issued OAuth access tokens, in seconds (default: 30 days); now only the default of `OAUTH_TOKEN_TTL_SECS_ADMIN` and `OAUTH_TOKEN_TTL_SECS_USER` when they are unset |
+| `OAUTH_TOKEN_TTL_SECS_ADMIN` | no | `OAUTH_TOKEN_TTL_SECS` (30 days) | Lifetime of an access token issued to an admin (`is_admin`; wins over the bot tier), in seconds. A value that is not a positive whole number, or whose expiry is not a valid date, refuses startup |
+| `OAUTH_TOKEN_TTL_SECS_BOT` | no | `3153600000` | Lifetime of an access token issued to a bot (actor type `Service`, not an admin), in seconds (default: 100 years, Pleroma's own); it does not read `OAUTH_TOKEN_TTL_SECS` |
+| `OAUTH_TOKEN_TTL_SECS_USER` | no | `OAUTH_TOKEN_TTL_SECS` (30 days) | Lifetime of an access token issued to any other account, and of an app-only `client_credentials` token, in seconds |
 | `PASSWORD_RESET_TTL_SECS` | no | `86400` | Lifetime of a password-reset token, in seconds (default: 24 hours); a token is valid while unused and within this window |
 | `ALLOW_ACCOUNT_DELETION` | no | `true` | Whether accounts may delete their own account: while off, `POST /api/pleroma/delete_account` answers 403 `{"error":"Account deletion is disabled"}`; `disable_account` is unaffected (`true`/`false`, or `1`/`0`) |
 | `OAUTH_PROVIDERS` | no | `[]` | External OAuth login providers, as the JSON text of an array of `{"name","client_id","client_secret","authorize_url","token_url","userinfo_url","scopes","uid_field","nickname_field","email_field","name_field"}` objects; invalid JSON refuses startup and `client_secret` is never logged. The provider callback hands the browser to the frontend: `{FRONTEND_BASE_URL}/oauth/external/register?state=…` for an unlinked account, `{FRONTEND_BASE_URL}/oauth/external/consent?state=…&confirm_token=…` for a linked account of an untrusted app; those screens use the JSON-only `GET /oauth/registration_details`, `POST /oauth/register` and `GET`/`POST /oauth/external/consent` |

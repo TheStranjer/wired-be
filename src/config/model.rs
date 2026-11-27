@@ -170,11 +170,14 @@ pub struct Config {
     /// Minimum length of a registration password in characters, from
     /// `MIN_PASSWORD_LENGTH`.
     pub min_password_length: usize,
-    /// Lifetime granted to newly issued OAuth access tokens, in seconds,
-    /// from `OAUTH_TOKEN_TTL_SECS`. The `/oauth` endpoints pass it to
+    /// Lifetimes granted to newly issued OAuth access tokens, in seconds,
+    /// per [`TokenTier`](super::token_ttl::TokenTier): from
+    /// `OAUTH_TOKEN_TTL_SECS_ADMIN`, `_BOT` and `_USER`, with the legacy
+    /// `OAUTH_TOKEN_TTL_SECS` as the admin and user default. The `/oauth`
+    /// endpoints pass the owner's tier to
     /// [`create_token`](crate::models::oauth_token::create_token) as the
-    /// token's `ttl`.
-    pub oauth_token_ttl_secs: usize,
+    /// token's `ttl`, unless the admin config store overrides it.
+    pub oauth_token_ttls: super::token_ttl::TokenTtls,
     /// Lifetime of a password-reset token, in seconds, from
     /// `PASSWORD_RESET_TTL_SECS`. A token is valid while it is unused and
     /// its `inserted_at` is within this window (see

@@ -215,3 +215,27 @@ pub(super) const MRF_HASHTAG_CHILDREN: [ChildDescription; 3] = [
         "A list of hashtags which result in the message being removed from the federated timeline (a.k.a. the whole known network).",
     ),
 ];
+
+/// The `:oauth_token_ttl_secs` children: the three role lifetimes
+/// ([`RegistryEntry::subkeys`]), each the runtime override of its
+/// `OAUTH_TOKEN_TTL_SECS_*` environment variable.
+pub(super) const OAUTH_TOKEN_TTL_CHILDREN: [ChildDescription; 3] = [
+    hinted(
+        "admin",
+        ValueKind::Integer,
+        "Lifetime in seconds of an access token issued to an admin (`OAUTH_TOKEN_TTL_SECS_ADMIN`). A bot that is also an admin gets this one.",
+        &[Suggestion::Count(2_592_000)],
+    ),
+    hinted(
+        "bot",
+        ValueKind::Integer,
+        "Lifetime in seconds of an access token issued to a bot, an account whose actor type is `Service` (`OAUTH_TOKEN_TTL_SECS_BOT`)",
+        &[Suggestion::Count(3_153_600_000)],
+    ),
+    hinted(
+        "user",
+        ValueKind::Integer,
+        "Lifetime in seconds of an access token issued to any other account, or to an app alone (`OAUTH_TOKEN_TTL_SECS_USER`)",
+        &[Suggestion::Count(2_592_000)],
+    ),
+];

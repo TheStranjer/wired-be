@@ -7,16 +7,16 @@ use super::Config;
 use super::{
     defaults::{
         DEFAULT_ACCOUNTS_EMAIL_OPTIONAL, DEFAULT_ALLOW_ACCOUNT_DELETION,
-        DEFAULT_MIN_PASSWORD_LENGTH, DEFAULT_OAUTH_PROVIDERS, DEFAULT_OAUTH_TOKEN_TTL_SECS,
-        DEFAULT_PASSWORD_RESET_TTL_SECS,
+        DEFAULT_MIN_PASSWORD_LENGTH, DEFAULT_OAUTH_PROVIDERS, DEFAULT_PASSWORD_RESET_TTL_SECS,
     },
     error::ConfigError,
     federation_types::Toggle,
     integrations::OauthProvider,
     parse::{boolean, number},
+    token_ttl::{TokenTtls, token_ttls},
     vars::{
         ACCOUNTS_EMAIL_OPTIONAL_VAR, ALLOW_ACCOUNT_DELETION_VAR, MIN_PASSWORD_LENGTH_VAR,
-        OAUTH_PROVIDERS_VAR, OAUTH_TOKEN_TTL_SECS_VAR, PASSWORD_RESET_TTL_SECS_VAR,
+        OAUTH_PROVIDERS_VAR, PASSWORD_RESET_TTL_SECS_VAR,
     },
 };
 
@@ -30,8 +30,9 @@ pub(crate) struct AuthSettings {
     pub(crate) accounts_email_optional: bool,
     /// The registration password minimum (`MIN_PASSWORD_LENGTH`).
     pub(crate) min_password_length: usize,
-    /// The access-token lifetime (`OAUTH_TOKEN_TTL_SECS`).
-    pub(crate) oauth_token_ttl_secs: usize,
+    /// The access-token lifetimes (`OAUTH_TOKEN_TTL_SECS` and its
+    /// `_ADMIN`, `_BOT` and `_USER` variants).
+    pub(crate) oauth_token_ttls: TokenTtls,
     /// The password-reset token lifetime (`PASSWORD_RESET_TTL_SECS`).
     pub(crate) password_reset_ttl_secs: usize,
     /// Whether accounts may delete their own account through
@@ -56,11 +57,7 @@ where
         DEFAULT_ACCOUNTS_EMAIL_OPTIONAL,
     )?;
     let min_password_length = number(lookup, MIN_PASSWORD_LENGTH_VAR, DEFAULT_MIN_PASSWORD_LENGTH)?;
-    let oauth_token_ttl_secs = number(
-        lookup,
-        OAUTH_TOKEN_TTL_SECS_VAR,
-        DEFAULT_OAUTH_TOKEN_TTL_SECS,
-    )?;
+    let oauth_token_ttls = token_ttls(lookup)?;
     let password_reset_ttl_secs = number(
         lookup,
         PASSWORD_RESET_TTL_SECS_VAR,
@@ -75,7 +72,7 @@ where
     Ok(AuthSettings {
         accounts_email_optional,
         min_password_length,
-        oauth_token_ttl_secs,
+        oauth_token_ttls,
         password_reset_ttl_secs,
         allow_account_deletion,
         oauth_providers: oauth_providers(lookup)?,
@@ -110,7 +107,10 @@ mod tests {
 
     use super::*;
 
-    use crate::config::test_support::{config_with, try_config_with};
+    use crate::config::{
+        test_support::{config_with, try_config_with},
+        vars::OAUTH_TOKEN_TTL_SECS_USER_VAR,
+    };
 
     /// No signing secret is configured or read any more: the config loads
     /// from an empty environment (the old field no longer exists, which the
@@ -185,15 +185,7 @@ mod tests {
 
     #[test]
     fn ttl_accessors_return_the_configured_seconds_as_durations() {
-        let config = config_with(&[
-            (OAUTH_TOKEN_TTL_SECS_VAR, "600"),
-            (PASSWORD_RESET_TTL_SECS_VAR, "1200"),
-        ]);
-        assert_eq!(
-            config.oauth_token_ttl().as_secs(),
-            600,
-            "the token lifetime"
-        );
+        let config = config_with(&[(PASSWORD_RESET_TTL_SECS_VAR, "1200")]);
         assert_eq!(
             config.password_reset_ttl().as_secs(),
             1_200,
@@ -221,12 +213,12 @@ mod tests {
     #[test]
     fn debug_shows_the_token_ttl_setting() {
         let config = config_with(&[
-            (OAUTH_TOKEN_TTL_SECS_VAR, "600"),
+            (OAUTH_TOKEN_TTL_SECS_USER_VAR, "600"),
             (PASSWORD_RESET_TTL_SECS_VAR, "1200"),
         ]);
         let debug = format!("{config:?}");
         assert!(
-            debug.contains("oauth_token_ttl_secs: 600"),
+            debug.contains("oauth_token_ttls: TokenTtls") && debug.contains("user: 600"),
             "the token lifetime is visible in Debug output: {debug}"
         );
         assert!(

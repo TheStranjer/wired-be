@@ -10,7 +10,7 @@
 //! [`frontend`], [`integrations`]); the readers take it group by group
 //! ([`instance`], [`local_domain`], [`fetch`], [`federation`], [`jobs`], [`mail`], [`auth`],
 //! [`registration`], [`limits`], [`wording`], [`uploads`], [`urls`],
-//! [`exposure`], [`media`], [`protocols`]) on the shared primitives of [`parse`],
+//! [`exposure`], [`media`], [`protocols`], [`token_ttl`]) on the shared primitives of [`parse`],
 //! reported as [`ConfigError`] from [`error`] and rendered redacted by
 //! [`debug`]. Everything the rest of the crate imports is re-exported
 //! here, so the `crate::config::…` paths outside this module keep
@@ -58,6 +58,7 @@ pub mod model;
 pub mod parse;
 pub mod protocols;
 pub mod registration;
+pub mod token_ttl;
 pub mod uploads;
 pub mod urls;
 pub mod vars;
@@ -67,8 +68,15 @@ pub mod wording;
 pub mod test_support;
 
 pub use self::{
-    defaults::*, error::*, federation_types::*, frontend::*, integrations::*, model::*,
-    protocols::EnabledProtocols, vars::*,
+    defaults::*,
+    error::*,
+    federation_types::*,
+    frontend::*,
+    integrations::*,
+    model::*,
+    protocols::EnabledProtocols,
+    token_ttl::{TokenTier, TokenTtls, ttl_secs_valid},
+    vars::*,
 };
 
 impl Config {
@@ -128,7 +136,7 @@ impl Config {
             media_base_url: ends.media_base_url,
             accounts_email_optional: auth.accounts_email_optional,
             min_password_length: auth.min_password_length,
-            oauth_token_ttl_secs: auth.oauth_token_ttl_secs,
+            oauth_token_ttls: auth.oauth_token_ttls,
             password_reset_ttl_secs: auth.password_reset_ttl_secs,
             allow_account_deletion: auth.allow_account_deletion,
             captcha_enabled: rest.captcha_enabled,
@@ -202,20 +210,11 @@ impl Config {
             || domain.eq_ignore_ascii_case(self.web_host())
     }
 
-    /// The lifetime of a freshly minted OAuth token:
-    /// [`oauth_token_ttl_secs`](Self::oauth_token_ttl_secs) as a
+    /// How long a password-reset token stays valid:
+    /// [`password_reset_ttl_secs`](Self::password_reset_ttl_secs) as a
     /// [`Duration`](std::time::Duration). On any target where the
     /// `usize` could exceed `u64::MAX` the absurd upper bound is kept
     /// rather than silently shortening the lifetime.
-    #[must_use]
-    pub fn oauth_token_ttl(&self) -> std::time::Duration {
-        std::time::Duration::from_secs(u64::try_from(self.oauth_token_ttl_secs).unwrap_or(u64::MAX))
-    }
-
-    /// How long a password-reset token stays valid:
-    /// [`password_reset_ttl_secs`](Self::password_reset_ttl_secs) as a
-    /// [`Duration`](std::time::Duration), saturating like
-    /// [`oauth_token_ttl`](Self::oauth_token_ttl).
     #[must_use]
     pub fn password_reset_ttl(&self) -> std::time::Duration {
         std::time::Duration::from_secs(
@@ -331,7 +330,7 @@ impl Config {
             media_base_url: format!("{TEST_BASE_URL}{DEFAULT_MEDIA_URL_PATH}"),
             accounts_email_optional: DEFAULT_ACCOUNTS_EMAIL_OPTIONAL,
             min_password_length: DEFAULT_MIN_PASSWORD_LENGTH,
-            oauth_token_ttl_secs: DEFAULT_OAUTH_TOKEN_TTL_SECS,
+            oauth_token_ttls: TokenTtls::default(),
             password_reset_ttl_secs: DEFAULT_PASSWORD_RESET_TTL_SECS,
             account_activation_required: Toggle::new(DEFAULT_ACCOUNT_ACTIVATION_REQUIRED),
             allow_account_deletion: Toggle::new(DEFAULT_ALLOW_ACCOUNT_DELETION),

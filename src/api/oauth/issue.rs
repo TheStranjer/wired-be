@@ -6,6 +6,8 @@
 //! consults before an account may act; the 200 body renders the fresh
 //! pair Pleroma's "token.json" shape.
 
+use std::time::Duration;
+
 use chrono::Utc;
 use serde::Serialize;
 use sqlx::{Executor, PgPool, Postgres};
@@ -17,6 +19,7 @@ use super::{
 use crate::{
     api::password_reset::{PASSWORD_RESET_REQUIRED, PASSWORD_RESET_REQUIRED_ID},
     auth::{AWAITING_APPROVAL, AWAITING_APPROVAL_ID, EMAIL_UNCONFIRMED, EMAIL_UNCONFIRMED_ID},
+    config::TokenTier,
     error::{AppError, AppResult},
     models::{
         oauth_app::OauthApp,
@@ -24,6 +27,7 @@ use crate::{
         user::{AccountStatus, User, register},
     },
     oauth::scopes::Scopes,
+    services::runtime_config,
     state::AppState,
 };
 
@@ -95,9 +99,46 @@ pub(crate) fn check_account_ready(user: &User) -> Result<(), AppError> {
     Ok(())
 }
 
-/// Mints the access/refresh token pair for the granted scopes, valid for
-/// the configured `OAUTH_TOKEN_TTL_SECS`. `user` is the account the
-/// token acts as; `None` mints the app-only token of the
+/// The `actor_type` of a bot account.
+const SERVICE_ACTOR_TYPE: &str = "Service";
+
+/// Which lifetime tier the token of `user` gets: admin beats bot beats
+/// everyone else, and `None` — the app-only `client_credentials` token —
+/// is in the last tier.
+fn token_tier(user: Option<&User>) -> TokenTier {
+    match user {
+        Some(user) if user.is_admin.get() => TokenTier::Admin,
+        Some(user) if user.actor_type == SERVICE_ACTOR_TYPE => TokenTier::Bot,
+        Some(_) | None => TokenTier::User,
+    }
+}
+
+/// How long a token for `user` lives, decided now.
+///
+/// That is the tier's stored admin-config override, else the environment's
+/// value. Read on the caller's `executor`, so the refresh grant needs no
+/// second connection.
+///
+/// # Errors
+///
+/// Any database failure arrives as [`AppError::Database`].
+pub(super) async fn token_ttl<'e, E>(
+    executor: E,
+    state: &AppState,
+    user: Option<&User>,
+) -> AppResult<Duration>
+where
+    E: Executor<'e, Database = Postgres>,
+{
+    let secs = runtime_config::token_ttl_secs(executor, &state.config, token_tier(user)).await?;
+    Ok(Duration::from_secs(u64::try_from(secs).unwrap_or(u64::MAX)))
+}
+
+/// Mints the access/refresh token pair for the granted scopes.
+///
+/// It is valid for the lifetime of the user's tier (`OAUTH_TOKEN_TTL_SECS_ADMIN`,
+/// `_BOT` or `_USER`, or the admin config store's override of it). `user` is
+/// the account the token acts as; `None` mints the app-only token of the
 /// `client_credentials` grant (`user_id = NULL`).
 ///
 /// # Errors
@@ -109,21 +150,23 @@ pub(crate) async fn issue_token(
     app: &OauthApp,
     scopes: Scopes,
 ) -> AppResult<OauthToken> {
-    issue_token_on(&state.db, state, user, app, scopes).await
+    let ttl = token_ttl(&state.db, state, user).await?;
+    issue_token_on(&state.db, user, app, scopes, ttl).await
 }
 
-/// [`issue_token`] on the caller's executor: the refresh grant mints the
-/// replacement pair in the transaction that consumed the old one.
+/// [`issue_token`] on the caller's executor, for the `ttl` the caller got
+/// from [`token_ttl`]: the refresh grant mints the replacement pair in the
+/// transaction that consumed the old one.
 ///
 /// # Errors
 ///
 /// Any database failure arrives as [`AppError::Database`].
 pub(super) async fn issue_token_on<'e, E>(
     executor: E,
-    state: &AppState,
     user: Option<&User>,
     app: &OauthApp,
     scopes: Scopes,
+    ttl: Duration,
 ) -> AppResult<OauthToken>
 where
     E: Executor<'e, Database = Postgres>,
@@ -134,7 +177,7 @@ where
             user_id: user.map(|user| user.id),
             app_id: app.id,
             scopes: scopes.to_string(),
-            ttl: Some(state.config.oauth_token_ttl()),
+            ttl: Some(ttl),
         },
     )
     .await
@@ -374,6 +417,23 @@ mod tests {
             panic!("the refusal must carry an identifier, got {err}")
         };
         assert_eq!(message, ACCOUNT_DISABLED, "the disabled answer wins");
+    }
+
+    #[test]
+    fn the_tier_follows_admin_then_bot_then_user() {
+        let mut user = user_row(true);
+        assert_eq!(token_tier(None), TokenTier::User, "an app-only token");
+        assert_eq!(token_tier(Some(&user)), TokenTier::User, "a plain Person");
+        user.actor_type = SERVICE_ACTOR_TYPE.to_owned();
+        assert_eq!(token_tier(Some(&user)), TokenTier::Bot, "a Service actor");
+        user.is_admin = Flag::new(true);
+        assert_eq!(
+            token_tier(Some(&user)),
+            TokenTier::Admin,
+            "a bot that is an admin takes the admin tier"
+        );
+        user.actor_type = "Person".to_owned();
+        assert_eq!(token_tier(Some(&user)), TokenTier::Admin, "an admin Person");
     }
 
     #[test]
