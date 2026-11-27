@@ -6,9 +6,21 @@
 //! answering Pleroma's `api_not_implemented` below `/api` and the plain
 //! "Not found" everywhere else.
 
-use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, Uri};
+use axum::{
+    Router,
+    extract::Request,
+    http::{HeaderMap, HeaderName, HeaderValue, StatusCode, Uri, uri::PathAndQuery},
+    response::{IntoResponse as _, Response},
+};
+use tower::ServiceExt as _;
 
 use crate::error::AppError;
+
+/// The path prefix Pleroma's `LegacyPleromaApiRerouterPlug` rewrites.
+const LEGACY_PLEROMA_PREFIX: &str = "/api/pleroma/";
+
+/// What an unmatched `/api/pleroma/<rest>` is re-dispatched as.
+const V1_PLEROMA_PREFIX: &str = "/api/v1/pleroma/";
 
 /// Liveness probe.
 pub(crate) async fn health() -> StatusCode {
@@ -51,6 +63,38 @@ pub(crate) async fn not_found(uri: Uri) -> (HeaderMap, AppError) {
     (fallback_headers(), error)
 }
 
+/// `uri` with a leading `/api/pleroma/` swapped for `/api/v1/pleroma/`, the
+/// query kept; `None` when the path is not under that prefix or the result
+/// is not a valid URI.
+fn legacy_pleroma_target(uri: &Uri) -> Option<Uri> {
+    let rest = uri.path().strip_prefix(LEGACY_PLEROMA_PREFIX)?;
+    let rewritten = uri.query().map_or_else(
+        || format!("{V1_PLEROMA_PREFIX}{rest}"),
+        |query| format!("{V1_PLEROMA_PREFIX}{rest}?{query}"),
+    );
+    let path_and_query = rewritten.parse::<PathAndQuery>().ok()?;
+    let mut parts = uri.clone().into_parts();
+    parts.path_and_query = Some(path_and_query);
+    Uri::from_parts(parts).ok()
+}
+
+/// The app-wide fallback: Pleroma's `LegacyPleromaApiRerouterPlug`, then [`not_found`].
+///
+/// A request under `/api/pleroma/` that no route matched is handed, with its
+/// method, headers and body, to `routes` (the whole router, whose own
+/// fallback is [`not_found`]) as the same request to `/api/v1/pleroma/`.
+/// Everything else gets [`not_found`] directly.
+pub(crate) async fn reroute_legacy_pleroma(routes: Router, mut request: Request) -> Response {
+    let Some(target) = legacy_pleroma_target(request.uri()) else {
+        return not_found(request.uri().clone()).await.into_response();
+    };
+    *request.uri_mut() = target;
+    routes
+        .oneshot(request)
+        .await
+        .unwrap_or_else(|never| match never {})
+}
+
 /// Which 404 an unmatched `path` answers with: Pleroma's
 /// `api_not_implemented` below `/api`, the plain "Not found" everywhere else.
 fn error_for_unmatched(path: &str) -> AppError {
@@ -66,7 +110,6 @@ mod tests {
     use super::*;
     use axum::{Router, body::Body, http::Request};
     use http_body_util::BodyExt as _;
-    use tower::ServiceExt as _;
 
     use crate::{app, config::Config, state::AppState};
 
@@ -131,6 +174,25 @@ mod tests {
             matches!(error_for_unmatched("/apibot"), AppError::RouteNotFound),
             "an /api lookalike is not below /api/"
         );
+    }
+
+    /// Only a path below `/api/pleroma/` is rewritten, and its query survives.
+    #[test]
+    fn legacy_pleroma_paths_are_rewritten_to_v1() {
+        let target = |text: &str| legacy_pleroma_target(&text.parse::<Uri>().unwrap());
+        assert_eq!(
+            target("/api/pleroma/captcha").map(|uri| uri.to_string()),
+            Some("/api/v1/pleroma/captcha".to_owned()),
+            "the prefix is swapped"
+        );
+        assert_eq!(
+            target("/api/pleroma/a/b?x=1&y=2").map(|uri| uri.to_string()),
+            Some("/api/v1/pleroma/a/b?x=1&y=2".to_owned()),
+            "deeper segments and the query are kept"
+        );
+        assert_eq!(target("/api/pleroma"), None, "the bare prefix is left");
+        assert_eq!(target("/api/pleromax/a"), None, "a lookalike is left");
+        assert_eq!(target("/api/v1/pleroma/a"), None, "v1 is left");
     }
 
     #[tokio::test]

@@ -42,11 +42,11 @@ pub mod util;
 
 pub use crate::server::{MIGRATOR, job_registry, run_migrations, serve};
 
-use axum::{Router, routing::get};
+use axum::{Router, extract::Request, routing::get};
 
 use crate::{
     api::media_files,
-    fallback::{health, not_found},
+    fallback::{health, not_found, reroute_legacy_pleroma},
     services::media_proxy,
     state::AppState,
 };
@@ -94,21 +94,24 @@ pub fn app(state: AppState) -> Router {
         .fold(Router::new(), |routes, adapter| {
             routes.merge(adapter.client_api_router(&state))
         });
+    let routes = Router::new()
+        .route("/health", get(health))
+        .merge(api::core_router(&state))
+        .merge(client_api_routes)
+        .merge(protocol_routes)
+        .merge(api::oauth::router(&state))
+        .merge(api::oauth_external::router())
+        .merge(api::password_reset::auth_router(&state))
+        .merge(discovery::router(&state))
+        .merge(api::nodeinfo::router())
+        .merge(media_files::router())
+        .merge(media_proxy::router())
+        .merge(api::emoji_packs::files_router())
+        .with_state(state);
+    // Unmatched `/api/pleroma/*` is re-dispatched through this copy, which
+    // answers what still matches nothing with `not_found`.
+    let rerouted = routes.clone().fallback(not_found);
     middleware::apply(
-        Router::new()
-            .route("/health", get(health))
-            .merge(api::core_router(&state))
-            .merge(client_api_routes)
-            .merge(protocol_routes)
-            .merge(api::oauth::router(&state))
-            .merge(api::oauth_external::router())
-            .merge(api::password_reset::auth_router(&state))
-            .merge(discovery::router(&state))
-            .merge(api::nodeinfo::router())
-            .merge(media_files::router())
-            .merge(media_proxy::router())
-            .merge(api::emoji_packs::files_router())
-            .fallback(not_found)
-            .with_state(state),
+        routes.fallback(move |request: Request| reroute_legacy_pleroma(rerouted.clone(), request)),
     )
 }

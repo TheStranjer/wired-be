@@ -459,6 +459,9 @@ mod notification_quotes;
 /// and the owner-only render of the flags.
 mod notification_settings;
 
+/// The legacy `/api/pleroma/*` reroute to `/api/v1/pleroma/*`.
+mod legacy_pleroma_reroute;
+
 /// The notification policy and filtered-notification requests
 /// (`/api/v{1,2}/notifications/policy`, `/api/v1/notifications/requests`).
 mod notification_policy;

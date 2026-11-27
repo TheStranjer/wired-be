@@ -156,6 +156,7 @@ subtle = "2.6.1"
 # dev-dependency; the build side needs it in the library.)
 tempfile = "3.27.0"
 tokio = { version = "1.53.2", features = ["full"] }
+tower = { version = "0.5.3", features = ["util"] }
 tower-http = { version = "0.7.1", features = ["trace", "cors", "timeout", "limit", "request-id", "compression-gzip"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
@@ -190,7 +191,6 @@ tokio = { version = "1.53.2", features = ["test-util"] }
 # `connect` + `handshake` features are all `connect_async` needs: the tests
 # talk plain HTTP to `127.0.0.1`, so no TLS stays compiled in.
 tokio-tungstenite = "0.29"
-tower = { version = "0.5.3", features = ["util"] }
 tracing-core = "0.1.36"
 # Self-dependency: turns on `integration-tests` for the integration tests only.
 wired-be = { path = ".", features = ["integration-tests"] }
