@@ -12,9 +12,14 @@
 //! serde helpers that also accept the string spellings of booleans and
 //! integers. Failures are [`AppError`]s (decision 8): malformed JSON 400, a
 //! type mismatch 422, an unsupported content type with a non-empty body 415.
-//! Multipart bodies are handled by [`multipart::MultipartForm`], which
-//! structures its text fields with the same rules and keeps the file parts
-//! beside them.
+//! The whole body is capped at [`MAX_BODY_BYTES`].
+//! `multipart/form-data` is accepted too: its text parts are structured with
+//! the same rules (`media_ids[]`, `poll[options][]` and
+//! `fields_attributes[0][name]` nest as they do in a urlencoded body), and a
+//! file part is refused with a 422 naming it, since these extractors have
+//! nowhere to put a file. A malformed multipart body or boundary is a 400.
+//! Endpoints that take files use [`multipart::MultipartForm`], which keeps
+//! the file parts beside the fields and applies the upload limits.
 //!
 //! [`ApiParams`] additionally parses the query string with the same key
 //! rules and merges it under the body: Mastodon clients put parameters in
@@ -85,11 +90,12 @@ pub struct ApiBody<T>(
 ///
 /// # Errors
 ///
-/// [`AppError::BadRequest`] when the body cannot be read, is not UTF-8 or
-/// is malformed JSON; [`AppError::UnsupportedMediaType`] for any content
-/// type other than JSON and urlencoded with a non-empty body;
+/// [`AppError::BadRequest`] when the body cannot be read, is not UTF-8, is
+/// malformed JSON or is a malformed multipart body;
+/// [`AppError::UnsupportedMediaType`] for any content type other than JSON,
+/// urlencoded and multipart with a non-empty body;
 /// [`AppError::Unprocessable`] when the parameters do not have the shape
-/// `T` asks for.
+/// `T` asks for or a multipart body carries a file part.
 impl<T, S> FromRequest<S> for ApiBody<T>
 where
     T: DeserializeOwned,
@@ -141,15 +147,19 @@ where
 ///
 /// As [`ApiBody`]'s `from_request`.
 pub(crate) async fn body_value(req: Request<Body>) -> Result<Value, AppError> {
-    let content_type = req
-        .headers()
+    let (parts, body) = req.into_parts();
+    let content_type = parts
+        .headers
         .get(CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
         .unwrap_or_default()
         .to_owned();
-    let bytes = axum::body::to_bytes(req.into_body(), MAX_BODY_BYTES)
+    let bytes = axum::body::to_bytes(body, MAX_BODY_BYTES)
         .await
         .map_err(|err| AppError::BadRequest(err.to_string()))?;
+    if multipart::is_multipart(&parts.headers) && !bytes.is_empty() {
+        return multipart::text_fields_value(parts, bytes).await;
+    }
     let text = std::str::from_utf8(&bytes)
         .map_err(|err| AppError::BadRequest(format!("Body is not valid UTF-8: {err}")))?;
     parse_body(text, &content_type)

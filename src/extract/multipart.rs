@@ -3,7 +3,9 @@
 //!
 //! Handlers that take files use [`MultipartForm<T>`] as their last
 //! argument, with [`ApiBody`](crate::extract::ApiBody) as the fallback for
-//! every other body.
+//! every other body. Handlers that take no files need no special extractor:
+//! `ApiBody` and `ApiParams` also read the text parts of a multipart body
+//! (through the same part reader) and refuse a file part with a 422.
 //!
 //! For a `multipart/form-data` body the extractor streams every part: text
 //! fields are structured into one parameters value with exactly the
@@ -31,10 +33,11 @@ use axum::{
         DefaultBodyLimit, FromRequest, Multipart,
         multipart::{Field, MultipartError},
     },
-    http::{HeaderMap, Request, StatusCode, header::CONTENT_TYPE},
+    http::{HeaderMap, Request, StatusCode, header::CONTENT_TYPE, request::Parts},
 };
 use bytes::Bytes;
 use serde::de::DeserializeOwned;
+use serde_json::Value;
 
 use crate::{
     config::Config,
@@ -144,7 +147,7 @@ where
 /// Whether `headers` announce a `multipart/form-data` body. The boundary
 /// itself is left to the multipart parser, which answers a missing or
 /// malformed one with a 400.
-fn is_multipart(headers: &HeaderMap) -> bool {
+pub(super) fn is_multipart(headers: &HeaderMap) -> bool {
     headers
         .get(CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
@@ -166,11 +169,8 @@ async fn read_parts(
     while let Some(field) = stream.next_field().await.map_err(|err| failure(&err))? {
         let name = field.name().unwrap_or_default().to_owned();
         let Some(filename) = field.file_name().map(str::to_owned) else {
-            let bytes = field.bytes().await.map_err(|err| failure(&err))?;
-            let text = std::str::from_utf8(&bytes).map_err(|err| {
-                AppError::BadRequest(format!("Text field {name} is not valid UTF-8: {err}"))
-            })?;
-            texts.push((name, text.to_owned()));
+            let text = read_text(field, &name).await?;
+            texts.push((name, text));
             continue;
         };
         if files.len() >= limits.max_files {
@@ -179,6 +179,59 @@ async fn read_parts(
         files.push(read_file(field, name, filename, limits.max_file_bytes).await?);
     }
     Ok((texts, files))
+}
+
+/// Reads one text part as UTF-8.
+///
+/// # Errors
+///
+/// [`AppError::BadRequest`] when the part is not valid UTF-8, or the broken
+/// stream's failure, mapped by [`failure`].
+async fn read_text(field: Field<'_>, name: &str) -> Result<String, AppError> {
+    let bytes = field.bytes().await.map_err(|err| failure(&err))?;
+    let text = std::str::from_utf8(&bytes).map_err(|err| {
+        AppError::BadRequest(format!("Text field {name} is not valid UTF-8: {err}"))
+    })?;
+    Ok(text.to_owned())
+}
+
+/// Parses the already-read `bytes` of a `multipart/form-data` body into the
+/// parameters value, for the endpoints that take no files.
+///
+/// The text parts are structured by the same key rules as a urlencoded
+/// body. `parts` carry the request's headers, whose `content-type` holds
+/// the boundary.
+///
+/// # Errors
+///
+/// [`AppError::BadRequest`] for a missing or malformed boundary or body;
+/// [`AppError::Unprocessable`] naming the first file part.
+pub(super) async fn text_fields_value(parts: Parts, bytes: Bytes) -> Result<Value, AppError> {
+    let req = Request::from_parts(parts, Body::from(bytes));
+    let stream = Multipart::from_request(req, &())
+        .await
+        .map_err(|rejection| AppError::BadRequest(rejection.body_text()))?;
+    parse_pairs(read_text_parts(stream).await?)
+}
+
+/// Drains the multipart `stream` into its text fields' decoded pairs.
+///
+/// # Errors
+///
+/// As [`text_fields_value`].
+async fn read_text_parts(mut stream: Multipart) -> Result<Vec<(String, String)>, AppError> {
+    let mut texts: Vec<(String, String)> = Vec::new();
+    while let Some(field) = stream.next_field().await.map_err(|err| failure(&err))? {
+        let name = field.name().unwrap_or_default().to_owned();
+        if field.file_name().is_some() {
+            return Err(AppError::Unprocessable(format!(
+                "File part '{name}' is not accepted: this endpoint takes no file uploads"
+            )));
+        }
+        let text = read_text(field, &name).await?;
+        texts.push((name, text));
+    }
+    Ok(texts)
 }
 
 /// Buffers one file part, rejecting it as soon as it passes `max_bytes`.

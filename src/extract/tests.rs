@@ -2,6 +2,7 @@
 //! in the `flex` child, which shares the fixtures below.
 
 mod flex;
+mod multipart;
 
 use axum::{
     http::{HeaderValue, StatusCode},

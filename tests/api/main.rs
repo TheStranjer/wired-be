@@ -431,6 +431,9 @@ mod media_proxy;
 /// The media upload endpoints (`POST /api/v1/media` and `/api/v2/media`).
 mod media_upload;
 
+/// `multipart/form-data` bodies on `ApiBody` / `ApiParams` endpoints (statuses, follow).
+mod multipart_bodies;
+
 /// The MFA endpoints (`/api/pleroma/accounts/mfa`).
 mod mfa;
 
