@@ -58,7 +58,8 @@ pub struct CreateStatusParams {
     /// absent.
     #[serde(default)]
     pub content_type: Option<String>,
-    /// The status to quote, named by id; absent or `null` posts no quote.
+    /// The status to quote, named by id; absent, `null` or the exact empty
+    /// string posts no quote.
     /// Pleroma's older `quoted_status_id` spelling is accepted as an alias,
     /// in JSON and form bodies alike through the [`ApiBody`] extractor
     /// (decision 10). The service's private `quote_target` step checks the

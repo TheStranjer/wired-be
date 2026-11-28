@@ -164,6 +164,8 @@ mod media;
 mod preview;
 /// Quoting on the way in: `quote_id` accepted, refused and rendered.
 mod quotes_create;
+/// An empty `quote_id` is no quote; a blank or unknown one is still a 404.
+mod quotes_empty;
 /// `GET …/quotes` on both mounts: pages, cursors, links and the gate.
 mod quotes_list;
 /// `in_reply_to_id`: the parent's thread, counters, audience and language.
