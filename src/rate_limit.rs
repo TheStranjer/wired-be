@@ -46,8 +46,10 @@
 //!
 //! Three tickets have mounted buckets so far: WBE-56 the ones whose routes
 //! already existed — `authentication` on `POST /oauth/token` and
-//! `/oauth/authorize`, and `app_account_creation` on `POST /api/v1/apps`
-//! and `POST /api/v1/accounts`; WBE-135 `password_reset` on
+//! `/oauth/authorize`, and `app_account_creation` on `POST /api/v1/accounts`
+//! (WBE-905 split app registration out: `oauth_app_creation` on
+//! `POST /api/v1/apps`, as Pleroma does, so logins that register an app
+//! no longer spend the sign-up budget); WBE-135 `password_reset` on
 //! `POST /auth/password`; WBE-120 `statuses_actions` on
 //! `POST /api/v1/reports`, joined by WBE-76's `POST /api/v1/statuses` —
 //! Pleroma's `@rate_limited_status_actions` keeps the status write and the
@@ -88,7 +90,8 @@ pub use middleware::{RateLimitLayer, RateLimited, rate_limit};
 /// `(name, max requests, window seconds)` triples.
 ///
 /// The numbers of Pleroma's `config :pleroma, :rate_limit`: `authentication`
-/// 20 per 5 s, `app_account_creation` 5 per 1800 s, `relations_actions`
+/// 20 per 5 s, `oauth_app_creation` 5 per 900 s (app registration),
+/// `app_account_creation` 25 per 1800 s (sign-up), `relations_actions`
 /// 10 per 10 s, `relation_id_action` 2 per 60 s, `statuses_actions`
 /// 10 per 10 s, `status_id_action` 2 per 60 s, `password_reset` 5 per
 /// 1800 s, `account_confirmation_resend` 5 per 8600 s, and `search`
@@ -99,11 +102,12 @@ pub use middleware::{RateLimitLayer, RateLimited, rate_limit};
 /// `POST /api/v1/pleroma/remote_interaction` makes this server `WebFinger`
 /// a caller-named host (WBE-814), so one client address gets five lookups
 /// a minute.
-pub const DEFAULT_LIMITS: [(&str, u64, u64); 11] = [
+pub const DEFAULT_LIMITS: [(&str, u64, u64); 12] = [
     ("account_confirmation_resend", 5, 8_600),
-    ("app_account_creation", 5, 1_800),
+    ("app_account_creation", 25, 1_800),
     ("authentication", 20, 5),
     ("imports", 1, 3_600),
+    ("oauth_app_creation", 5, 900),
     ("password_reset", 5, 1_800),
     ("relation_id_action", 2, 60),
     ("remote_interaction", 5, 60),
@@ -194,15 +198,16 @@ pub fn parse_limits(text: &str) -> Result<BTreeMap<String, RateLimit>, String> {
 mod tests {
     use super::*;
 
-    /// The eleven buckets and their budgets, as the tickets fix them.
+    /// The twelve buckets and their budgets, as the tickets fix them.
     #[test]
     fn default_limits_carry_the_pleroma_buckets() {
         let limits = default_limits();
-        let want: [(&str, u64, u64); 11] = [
+        let want: [(&str, u64, u64); 12] = [
             ("remote_interaction", 5, 60),
             ("imports", 1, 3_600),
             ("authentication", 20, 5),
-            ("app_account_creation", 5, 1_800),
+            ("oauth_app_creation", 5, 900),
+            ("app_account_creation", 25, 1_800),
             ("relations_actions", 10, 10),
             ("relation_id_action", 2, 60),
             ("statuses_actions", 10, 10),
@@ -211,7 +216,7 @@ mod tests {
             ("account_confirmation_resend", 5, 8_600),
             ("search", 30, 60),
         ];
-        assert_eq!(limits.len(), want.len(), "exactly the eleven buckets");
+        assert_eq!(limits.len(), want.len(), "exactly the twelve buckets");
         for (name, max, secs) in want {
             let limit = limits
                 .get(name)

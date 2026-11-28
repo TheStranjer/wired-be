@@ -282,7 +282,7 @@ mod tests {
             (5, std::time::Duration::from_secs(60)),
             "remote_interaction is 5 per 60 seconds"
         );
-        assert_eq!(config.rate_limit.limits.len(), 11, "exactly eleven buckets");
+        assert_eq!(config.rate_limit.limits.len(), 12, "exactly twelve buckets");
     }
 
     /// `RATE_LIMITS` overrides entries of the default table and adds
@@ -295,7 +295,7 @@ mod tests {
         )]);
         assert_eq!(
             config.rate_limit.limits.len(),
-            11,
+            12,
             "no bucket left the table"
         );
         assert_eq!(

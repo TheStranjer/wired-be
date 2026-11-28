@@ -106,56 +106,147 @@ async fn the_two_oauth_paths_share_one_bucket() {
     );
 }
 
-/// `POST /api/v1/apps` and `POST /api/v1/accounts` share the
-/// `app_account_creation` bucket across their routers.
+/// `POST /api/v1/apps` with a valid registration body.
+fn app_request(name: &str) -> common::TestRequest {
+    common::TestRequest::post("/api/v1/apps").json(&json!({
+        "client_name": name,
+        "redirect_uris": "https://client.example/callback",
+        "scopes": "read",
+    }))
+}
+
+/// `POST /api/v1/accounts` under `token`; `agree` false makes the body a
+/// 422 the limiter still counts.
+fn account_request(token: &str, username: &str, agree: bool) -> common::TestRequest {
+    common::TestRequest::post("/api/v1/accounts")
+        .bearer(token)
+        .json(&json!({
+            "username": username,
+            "email": format!("{username}@example.org"),
+            "password": "a-throttling-password",
+            "agreement": agree,
+        }))
+}
+
+/// App registration has its own `oauth_app_creation` bucket (5 per 900 s):
+/// the sixth `POST /api/v1/apps` from one client is refused while a
+/// sign-up from the same client still succeeds, in its own window.
 #[tokio::test]
-async fn app_and_account_registration_share_their_bucket() {
+async fn app_registration_throttles_without_spending_the_sign_up_bucket() {
     let db = common::test_db().await;
     let pool = db.pool().clone();
-    let config = common::test_config_with_rate_limits("app_account_creation=2:1800");
+    let config = common::test_config_with_rate_limits("");
+    let token = common::create_app_only_token(&pool, "read write follow push").await;
     let app = common::test_app_with_config(pool, config);
-    let registered = common::TestRequest::post("/api/v1/apps")
-        .json(&json!({
-            "client_name": "Throttle Client",
-            "redirect_uris": "https://client.example/callback",
-            "scopes": "read",
-        }))
+    for n in 1..=5_u8 {
+        let registered = app_request("Throttle Client")
+            .peer(peer(3))
+            .send(&app)
+            .await;
+        common::assert_answer(&registered, StatusCode::OK, "app registration");
+        assert_eq!(
+            registered.header("x-ratelimit-limit"),
+            Some("5"),
+            "five apps per window"
+        );
+        assert_eq!(
+            registered.header("x-ratelimit-reset"),
+            Some("900"),
+            "a 900 second window"
+        );
+        let left = (5 - n).to_string();
+        assert_eq!(
+            registered.header("x-ratelimit-remaining"),
+            Some(left.as_str()),
+            "each registration is counted"
+        );
+    }
+    let refused = app_request("Too Late").peer(peer(3)).send(&app).await;
+    common::assert_answer(&refused, StatusCode::TOO_MANY_REQUESTS, "the sixth app");
+    common::assert_error(&refused, "Throttled", "the refusal body");
+    let signed_up = account_request(&token, "signs-up", true)
         .peer(peer(3))
         .send(&app)
         .await;
-    common::assert_answer(&registered, StatusCode::OK, "app registration");
+    common::assert_answer(&signed_up, StatusCode::OK, "the sign-up still succeeds");
+    assert_eq!(
+        signed_up.header("x-ratelimit-remaining"),
+        Some("24"),
+        "the sign-up bucket is untouched by the five apps"
+    );
+}
+
+/// Sign-ups run in `app_account_creation` (25 per 1800 s): the 26th
+/// `POST /api/v1/accounts` is refused, not the 6th, and apps stay free.
+#[tokio::test]
+async fn account_creation_throttles_on_the_twenty_sixth() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let config = common::test_config_with_rate_limits("");
+    let token = common::create_app_only_token(&pool, "read write follow push").await;
+    let app = common::test_app_with_config(pool, config);
+    for n in 1..=25_u8 {
+        let attempt = account_request(&token, "refused", false)
+            .peer(peer(10))
+            .send(&app)
+            .await;
+        common::assert_answer(&attempt, StatusCode::UNPROCESSABLE_ENTITY, "counted 422");
+        assert_eq!(
+            attempt.header("x-ratelimit-limit"),
+            Some("25"),
+            "25 sign-ups per window"
+        );
+        assert_eq!(
+            attempt.header("x-ratelimit-reset"),
+            Some("1800"),
+            "a 1800 second window"
+        );
+        let left = (25 - n).to_string();
+        assert_eq!(
+            attempt.header("x-ratelimit-remaining"),
+            Some(left.as_str()),
+            "each attempt is counted"
+        );
+    }
+    let refused = account_request(&token, "refused", false)
+        .peer(peer(10))
+        .send(&app)
+        .await;
+    common::assert_answer(&refused, StatusCode::TOO_MANY_REQUESTS, "the 26th attempt");
+    common::assert_error(&refused, "Throttled", "the refusal body");
+    let registered = app_request("Still Free").peer(peer(10)).send(&app).await;
+    common::assert_answer(&registered, StatusCode::OK, "apps keep their own bucket");
     assert_eq!(
         registered.header("x-ratelimit-remaining"),
-        Some("1"),
-        "the registration is counted"
+        Some("4"),
+        "the app bucket is untouched by the sign-ups"
     );
-    let attempted = common::TestRequest::post("/api/v1/accounts")
-        .json(&json!({
-            "username": "throttled",
-            "email": "throttled@example.org",
-            "password": "a-throttling-password",
-            "agreement": true,
-        }))
-        .peer(peer(3))
+}
+
+/// `RATE_LIMITS=oauth_app_creation=2:60` retunes app registration only:
+/// the third app is refused, the sign-up bucket keeps its default.
+#[tokio::test]
+async fn an_oauth_app_creation_override_applies_to_apps_only() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let config = common::test_config_with_rate_limits("oauth_app_creation=2:60");
+    let token = common::create_app_only_token(&pool, "read write follow push").await;
+    let app = common::test_app_with_config(pool, config);
+    let first = app_request("One").peer(peer(11)).send(&app).await;
+    assert_eq!(first.header("x-ratelimit-limit"), Some("2"), "the override");
+    assert_eq!(first.header("x-ratelimit-reset"), Some("60"), "its window");
+    let second = app_request("Two").peer(peer(11)).send(&app).await;
+    common::assert_answer(&second, StatusCode::OK, "the second app passes");
+    let third = app_request("Three").peer(peer(11)).send(&app).await;
+    common::assert_answer(&third, StatusCode::TOO_MANY_REQUESTS, "the third app");
+    let attempt = account_request(&token, "unaffected", false)
+        .peer(peer(11))
         .send(&app)
         .await;
     assert_eq!(
-        attempted.header("x-ratelimit-remaining"),
-        Some("0"),
-        "registration spends the app's window too"
-    );
-    let refused = common::TestRequest::post("/api/v1/apps")
-        .json(&json!({
-            "client_name": "Too Late",
-            "redirect_uris": "https://client.example/callback",
-        }))
-        .peer(peer(3))
-        .send(&app)
-        .await;
-    common::assert_answer(
-        &refused,
-        StatusCode::TOO_MANY_REQUESTS,
-        "the shared budget is spent",
+        attempt.header("x-ratelimit-limit"),
+        Some("25"),
+        "sign-ups keep the default budget"
     );
 }
 
