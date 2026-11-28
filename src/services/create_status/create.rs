@@ -180,7 +180,8 @@ pub(super) async fn created_entity(
 }
 
 /// The original a body's `quote_id` names: `None` when the body named no
-/// target (absent or `null` — posting without a quote is untouched), the
+/// target (absent, `null` or the exact empty string, as Pleroma ignores it —
+/// posting without a quote is untouched), the
 /// quotable original's row once the target has been read and checked; its
 /// id is the `quote_of_id` to store.
 ///
@@ -210,7 +211,7 @@ pub(super) async fn quote_target(
     user: &User,
     quote_id: Option<&str>,
 ) -> AppResult<Option<status::Status>> {
-    let Some(text) = quote_id else {
+    let Some(text) = quote_id.filter(|text| !text.is_empty()) else {
         return Ok(None);
     };
     let id = parse_id(text).ok_or(AppError::NotFound)?;
