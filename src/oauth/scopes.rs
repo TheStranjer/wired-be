@@ -4,7 +4,8 @@
 //! separated by spaces or, when they came through a URL-encoded form field,
 //! `+` signs. The six valid top-level scopes are `read`, `write`, `follow`,
 //! `push`, `admin:read` and `admin:write`, each of which also covers its
-//! `:subscope` forms (`read:accounts`, `admin:read:reports`, ...).
+//! `:subscope` forms (`read:accounts`, `admin:read:reports`, ...). Pleroma's
+//! bare `admin` is accepted too and covers both admin trees.
 //!
 //! Matching follows Pleroma's `filter_descendants`
 //! (`lib/pleroma/web/plugs/o_auth_scopes_plug.ex`): a granted scope satisfies
@@ -26,6 +27,12 @@ pub const FOLLOW: &str = "follow";
 /// Top-level push scope: standalone, grants `push` and its own sub-scopes
 /// and nothing outside them.
 pub const PUSH: &str = "push";
+/// Pleroma's bare admin scope, which Soapbox requests.
+///
+/// It grants itself, [`ADMIN_READ`], [`ADMIN_WRITE`] and every sub-scope of
+/// either. It only widens the token's scopes: admin endpoints still demand
+/// an admin or moderator account.
+pub const ADMIN: &str = "admin";
 /// Admin scope granting `admin:read` and every `admin:read:*` sub-scope.
 pub const ADMIN_READ: &str = "admin:read";
 /// Admin scope granting `admin:write` and every `admin:write:*` sub-scope.
@@ -200,6 +207,9 @@ pub const READ_SCROBBLES: &str = "read:scrobbles";
 pub const WRITE_SCROBBLES: &str = "write:scrobbles";
 
 /// The roots of the scope trees [`Scopes::validate`] accepts.
+///
+/// The bare [`ADMIN`] is not listed: it is accepted as that exact word only,
+/// since a root here would also admit `admin:foo`.
 const VALID_ROOTS: [&str; 6] = [READ, WRITE, FOLLOW, PUSH, ADMIN_READ, ADMIN_WRITE];
 
 /// A scope list: the scopes an OAuth token carries, or the ones an
@@ -259,8 +269,9 @@ impl Scopes {
     /// Checks that every scope is a known top-level scope or a sub-scope
     /// below one: the roots `read`, `write`, `follow`, `push`, `admin:read`
     /// and `admin:write`, with non-empty lowercase `:subscope` pieces after
-    /// them. `admin` without `read`/`write` is not
-    /// a scope, and neither is anything else.
+    /// them, or Pleroma's bare `admin` ([`ADMIN`]) on its own. Anything
+    /// below `admin:` must sit under `admin:read` or `admin:write`, so
+    /// `admin:foo` is not a scope, and neither is anything else.
     ///
     /// # Errors
     ///
@@ -322,12 +333,15 @@ fn validate_scope(scope: &str) -> Result<(), String> {
 /// Whether `scope` is one of the roots or hangs below one of them (with the
 /// `:` boundary that keeps `readx` out of the `read` tree).
 fn in_known_tree(scope: &str) -> bool {
-    VALID_ROOTS.iter().any(|root| {
-        scope == *root
-            || scope
-                .strip_prefix(*root)
-                .is_some_and(|rest| rest.starts_with(':'))
-    })
+    // Pleroma's bare `admin` is a scope by itself, but not a root: `admin:foo`
+    // must stay outside every tree.
+    scope == ADMIN
+        || VALID_ROOTS.iter().any(|root| {
+            scope == *root
+                || scope
+                    .strip_prefix(*root)
+                    .is_some_and(|rest| rest.starts_with(':'))
+        })
 }
 
 /// Sub-scope pieces are non-empty lowercase names: ASCII letters, digits
@@ -599,8 +613,47 @@ mod tests {
     }
 
     #[test]
+    fn the_bare_admin_grants_both_admin_trees() {
+        let admin = Scopes::parse(ADMIN);
+        for required in [
+            ADMIN,
+            ADMIN_READ,
+            ADMIN_WRITE,
+            "admin:read:accounts",
+            "admin:write:reports",
+        ] {
+            assert!(admin.contains(required), "`admin` grants {required}");
+        }
+        for absent in [READ, WRITE, FOLLOW, PUSH, "adminx", "read:accounts"] {
+            assert!(!admin.contains(absent), "`admin` does not grant {absent}");
+        }
+        assert!(
+            !Scopes::parse(ADMIN_READ).contains(ADMIN),
+            "`admin:read` does not grant `admin`"
+        );
+    }
+
+    #[test]
+    fn the_bare_admin_narrows_like_pleroma() {
+        let registered = Scopes::parse("admin");
+        assert!(
+            Scopes::parse("admin:read").is_subset_of(&registered),
+            "`admin:read` is covered by an `admin` app"
+        );
+        assert!(
+            Scopes::parse("admin").is_subset_of(&registered),
+            "`admin` is covered by an `admin` app"
+        );
+        assert!(
+            !Scopes::parse("admin").is_subset_of(&Scopes::parse("admin:read admin:write")),
+            "`admin` is not covered by its two halves"
+        );
+    }
+
+    #[test]
     fn validate_accepts_the_known_trees() {
         for scope in [
+            ADMIN,
             READ,
             WRITE,
             FOLLOW,
@@ -627,8 +680,10 @@ mod tests {
     fn validate_rejects_garbage() {
         for scope in [
             "bogus",          // unknown top-level
-            "admin",          // admin only exists split into read and write
             "admin:foo",      // unknown admin branch
+            "adminx",         // a longer word is not the bare `admin`
+            "admin:",         // empty sub-scope
+            "admin:admin",    // the bare word has no sub-scopes of its own
             "admin:readx",    // not a root and not under one
             "readx",          // a root is not granted by a longer word
             "READ",           // wrong case
