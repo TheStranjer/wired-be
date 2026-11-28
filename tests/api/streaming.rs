@@ -50,3 +50,7 @@ mod scopes;
 /// The subscription frames: `subscribe` and `unsubscribe`, the list stream,
 /// the refusal frames, the cap and `pleroma:authenticate`.
 mod subscriptions;
+
+/// The trailing-slash path `/api/v1/streaming/` answers exactly as the bare
+/// one does.
+mod trailing_slash;
