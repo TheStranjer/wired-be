@@ -130,8 +130,9 @@ async fn publicly_replyable(state: &AppState, raw_id: &str) -> AppResult<Status>
 
 /// `GET /objects/{uuid}` — the status document with the `ActivityPub`
 /// object id `{BASE_URL}/objects/{uuid}` (decision 6), whatever `Accept`
-/// names an `ActivityPub` media type; anything else is the plain 404. No
-/// OAuth: peers dereference objects anonymously — or, once
+/// names an `ActivityPub` media type. A browser (`text/html`) gets the 302
+/// to the post's frontend page, like [`get_notice`]; anything else is the
+/// plain 404. No OAuth: peers dereference objects anonymously — or, once
 /// `AUTHORIZED_FETCH` is on, with HTTP Signatures.
 pub(super) async fn get_object(
     State(state): State<AppState>,
@@ -147,6 +148,8 @@ pub(super) async fn get_object(
 /// [`get_object`], reached through the nickname-scoped path Pleroma
 /// answers with the shared `object/2` action: the named account must
 /// actually be the status' live local author, or the read is the plain 404.
+/// A browser (`text/html`) is redirected to `notice/{uuid}` on the frontend
+/// before any author check, as [`get_object`] does.
 pub(super) async fn get_scoped_object(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -182,8 +185,10 @@ pub(super) async fn get_notice(
 /// The shared object-read core of the three routes above, the steps in
 /// the order the ticket fixes them: an unparsable uuid is the 404 (the
 /// route cannot name a document it cannot address); only `ActivityPub`
-/// clients get documents here — unlike the actor route, no browser is
-/// redirected; then the `AUTHORIZED_FETCH` gate, in the same position
+/// clients get documents here. A browser (`text/html`, no `ActivityPub`
+/// type) is redirected to the post's frontend page, as [`get_notice`] does,
+/// with no database read and no `AUTHORIZED_FETCH` gate; any other `Accept`
+/// is the 404; then the `AUTHORIZED_FETCH` gate, in the same position
 /// [`gate_actor_read`](super::gate_actor_read) runs it, so an unsigned read under
 /// the gate is the
 /// 401 before any status is read; then the row, which must be a live
@@ -205,6 +210,9 @@ async fn object_core(
         return Err(AppError::RouteNotFound);
     };
     if !wants_activity_json(headers) {
+        if wants_html(headers) {
+            return frontend_redirect(&state.config, &format!("notice/{id}"));
+        }
         return Err(AppError::RouteNotFound);
     }
     fetch_allowed(state, &Method::GET, uri, headers).await?;
