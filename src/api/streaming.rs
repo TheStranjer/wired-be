@@ -90,12 +90,16 @@ mod test_support;
 
 pub use self::names::{FILTER_TTL, MAX_SUBSCRIPTIONS, PING_INTERVAL};
 
-/// The `/api/v1/streaming` router: the WebSocket endpoint and the health
-/// probe Mastodon's streaming server answers on the same prefix. Merged into
+/// The `/api/v1/streaming` router: the WebSocket endpoint and the health probe.
+///
+/// The endpoint answers with and without a trailing slash, as Pleroma's
+/// socket dispatch does and Soapbox needs. The probe is the one Mastodon's
+/// streaming server answers on the same prefix. Merged into
 /// [`crate::api::v1`].
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/streaming", get(connect))
+        .route("/streaming/", get(connect))
         .route("/streaming/health", get(health))
 }
 

@@ -102,6 +102,15 @@ impl Server {
         format!("ws://{}/api/v1/streaming?{query}", self.addr)
     }
 
+    /// The streaming endpoint's url with a trailing slash, as Soapbox dials
+    /// it, and `query` appended after a `?`.
+    pub(super) fn url_with_slash(&self, query: &str) -> String {
+        if query.is_empty() {
+            return format!("ws://{}/api/v1/streaming/", self.addr);
+        }
+        format!("ws://{}/api/v1/streaming/?{query}", self.addr)
+    }
+
     /// Puts `event` on the hub the served router is reading.
     pub(super) fn publish(&self, event: StreamEvent) {
         self.state.hub.publish(event);
