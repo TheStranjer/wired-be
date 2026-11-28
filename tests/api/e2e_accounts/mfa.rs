@@ -145,8 +145,8 @@ async fn backup_codes(world: &World, account: &Account) -> Vec<String> {
     )
     .await;
     common::assert_answer(&response, StatusCode::OK, "the backup-code issue");
-    serde_json::from_value(response.json_value()["backup_codes"].clone())
-        .expect("backup_codes is a list of strings")
+    serde_json::from_value(response.json_value()["codes"].clone())
+        .expect("codes is a list of strings")
 }
 
 /// The `password` grant for `username` while MFA is on: the 403 challenge,

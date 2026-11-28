@@ -5,7 +5,7 @@
 //! would (setup → wrong code → confirm → settings → backup codes →
 //! disable); the tests beside it pin the ticket's individual rules:
 //! re-setup replaces an unconfirmed secret but not a confirmed one, the
-//! password gate precedes the code gate, backup codes require MFA, and
+//! password gate precedes the code gate, backup codes need no MFA, and
 //! every route enforces Pleroma's `AuthUser` + scope pipeline. The secret
 //! must never reach `Debug` output, tested last against the loaded row.
 
@@ -18,7 +18,10 @@ use serde_json::{Value, json};
 use sqlx::PgPool;
 use uuid::Uuid;
 use wired_be::{
-    models::user::{self, User, mfa::MfaSettings},
+    models::{
+        oauth_app::OauthApp,
+        user::{self, User, mfa::MfaSettings},
+    },
     util::totp,
 };
 
@@ -61,9 +64,9 @@ fn wrong_code(real: &str) -> String {
     format!("{replacement}{tail}")
 }
 
-/// The body list of a `backup_codes` response, as strings.
+/// The `codes` list of a `backup_codes` response, as strings.
 fn codes_in(body: &Value) -> Vec<String> {
-    serde_json::from_value(body["backup_codes"].clone()).expect("backup_codes is a list")
+    serde_json::from_value(body["codes"].clone()).expect("codes is a list")
 }
 
 /// `GET /api/pleroma/accounts/mfa` as `token`, asserting 200, parsed.
@@ -432,32 +435,156 @@ async fn confirm_checks_the_password_before_the_code() {
     );
 }
 
-/// Backup codes require MFA; disabling requires the password.
+/// The password grant as `username` (JSON body) with `oauth_app`'s credentials.
+async fn password_grant(
+    app: &Router,
+    oauth_app: &OauthApp,
+    username: &str,
+) -> common::TestResponse {
+    common::TestRequest::post("/oauth/token")
+        .json(&json!({
+            "grant_type": "password",
+            "username": username,
+            "password": PASSWORD,
+            "scope": "read",
+            "client_id": oauth_app.client_id,
+            "client_secret": oauth_app.client_secret,
+        }))
+        .send(app)
+        .await
+}
+
+/// Asserts `grant` is the 403 `mfa_required` challenge and returns its token.
+fn challenge_token(grant: &common::TestResponse) -> String {
+    assert_eq!(grant.status, StatusCode::FORBIDDEN, "MFA gates the grant");
+    let body = grant.json_value();
+    assert_eq!(body["error"], "mfa_required", "the challenge error");
+    body["mfa_token"]
+        .as_str()
+        .expect("mfa_token is a string")
+        .to_owned()
+}
+
+/// `POST /oauth/mfa/challenge` answering `mfa_token` with the recovery `code`.
+async fn recover(
+    app: &Router,
+    oauth_app: &OauthApp,
+    mfa_token: &str,
+    code: &str,
+) -> common::TestResponse {
+    common::TestRequest::post("/oauth/mfa/challenge")
+        .form(&[
+            ("mfa_token", mfa_token),
+            ("challenge_type", "recovery"),
+            ("code", code),
+            ("client_id", oauth_app.client_id.as_str()),
+            ("client_secret", oauth_app.client_secret.as_str()),
+        ])
+        .send(app)
+        .await
+}
+
+/// With MFA off, backup codes are issued as `{codes}` and change no login.
 #[tokio::test]
-async fn backup_codes_and_disable_gates() {
+async fn backup_codes_are_issued_while_mfa_is_off() {
     let db = common::test_db().await;
     let pool = db.pool().clone();
     let app = common::test_app(pool.clone());
     let (fern, token) = fixture(&pool, "fern", "read write").await;
+    let oauth_app = common::create_app(&pool, "read write").await;
 
-    let early = backup_codes(&app, &token).await;
-    assert_eq!(early.status, StatusCode::UNPROCESSABLE_ENTITY, "422");
+    let issued = backup_codes(&app, &token).await;
+    common::assert_answer(&issued, StatusCode::OK, "no MFA gate on issuing");
+    let body = issued.json_value();
     assert_eq!(
-        early.json_value(),
-        json!({"error": "MFA not enabled"}),
-        "backup codes are a post-MFA feature"
+        body.as_object().map(serde_json::Map::len),
+        Some(1),
+        "only the `codes` key: {body}"
     );
+    let codes = codes_in(&body);
+    assert_eq!(codes.len(), 5, "five strings");
+    assert_stored_hashes(&pool, fern.id, &codes).await;
+    let settings = stored(&pool, fern.id).await;
+    assert!(
+        !settings.enabled && !settings.totp.confirmed,
+        "issuing codes does not enable MFA"
+    );
+
+    let login = password_grant(&app, &oauth_app, "fern").await;
+    common::assert_answer(&login, StatusCode::OK, "login without a challenge");
+    assert!(
+        login.json_value()["access_token"].is_string(),
+        "the grant answers a token"
+    );
+}
+
+/// Soapbox's order: setup, codes (MFA still off), confirm; a code issued
+/// before the confirm then completes the login challenge.
+#[tokio::test]
+async fn codes_issued_before_confirming_totp_stay_valid() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let app = common::test_app(pool.clone());
+    let (_gina, token) = fixture(&pool, "gina", "read write").await;
+    let oauth_app = common::create_app(&pool, "read write").await;
 
     let key = setup(&app, &token).await.json_value()["key"]
         .as_str()
         .expect("a key")
         .to_owned();
-    let unconfirmed = backup_codes(&app, &token).await;
-    assert_eq!(
-        unconfirmed.json_value(),
-        json!({"error": "MFA not enabled"}),
-        "an unconfirmed secret is not MFA yet"
-    );
+    let issued = backup_codes(&app, &token).await;
+    common::assert_answer(&issued, StatusCode::OK, "codes before the confirm");
+    let codes = codes_in(&issued.json_value());
+    let early_login = password_grant(&app, &oauth_app, "gina").await;
+    common::assert_answer(&early_login, StatusCode::OK, "MFA is still off");
+
+    let accepted = confirm(&app, &token, PASSWORD, &current_code(&key)).await;
+    common::assert_answer(&accepted, StatusCode::OK, "the confirm");
+
+    let challenge = challenge_token(&password_grant(&app, &oauth_app, "gina").await);
+    let recovered = recover(&app, &oauth_app, &challenge, &codes[0]).await;
+    common::assert_answer(&recovered, StatusCode::OK, "a pre-confirm code passes");
+}
+
+/// With MFA on, a new issue answers `{codes}` and retires the previous codes.
+#[tokio::test]
+async fn reissuing_codes_with_mfa_on_retires_the_old_ones() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let app = common::test_app(pool.clone());
+    let (_hugo, token) = fixture(&pool, "hugo", "read write").await;
+    let oauth_app = common::create_app(&pool, "read write").await;
+    let key = setup(&app, &token).await.json_value()["key"]
+        .as_str()
+        .expect("a key")
+        .to_owned();
+    let accepted = confirm(&app, &token, PASSWORD, &current_code(&key)).await;
+    common::assert_answer(&accepted, StatusCode::OK, "fixture: MFA on");
+
+    let first = codes_in(&backup_codes(&app, &token).await.json_value());
+    let second_answer = backup_codes(&app, &token).await;
+    common::assert_answer(&second_answer, StatusCode::OK, "reissue with MFA on");
+    let second = codes_in(&second_answer.json_value());
+
+    let challenge = challenge_token(&password_grant(&app, &oauth_app, "hugo").await);
+    let stale = recover(&app, &oauth_app, &challenge, &first[0]).await;
+    common::assert_answer(&stale, StatusCode::BAD_REQUEST, "a replaced code");
+    let fresh = recover(&app, &oauth_app, &challenge, &second[0]).await;
+    common::assert_answer(&fresh, StatusCode::OK, "a current code");
+}
+
+/// Disabling requires the password.
+#[tokio::test]
+async fn disable_gate_matches_the_confirm_gate() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let app = common::test_app(pool.clone());
+    let (fern, token) = fixture(&pool, "fern", "read write").await;
+
+    let key = setup(&app, &token).await.json_value()["key"]
+        .as_str()
+        .expect("a key")
+        .to_owned();
 
     let accepted = confirm(&app, &token, PASSWORD, &current_code(&key)).await;
     assert_eq!(accepted.status, StatusCode::OK, "fixture: MFA on");
