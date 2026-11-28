@@ -109,10 +109,13 @@ async fn collections_negotiate_content() {
     }
 
     let browser_asks = [
-        ("/users/alice/outbox", format!("{BASE}/alice")),
-        ("/users/alice/followers", format!("{BASE}/alice")),
-        ("/users/alice/following", format!("{BASE}/alice")),
-        ("/users/alice/collections/featured", format!("{BASE}/alice")),
+        ("/users/alice/outbox", format!("{BASE}/users/alice")),
+        ("/users/alice/followers", format!("{BASE}/users/alice")),
+        ("/users/alice/following", format!("{BASE}/users/alice")),
+        (
+            "/users/alice/collections/featured",
+            format!("{BASE}/users/alice"),
+        ),
         (
             &format!("/objects/{}/replies", post.id),
             format!("{BASE}/notice/{}", post.id),

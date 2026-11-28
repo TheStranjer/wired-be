@@ -55,9 +55,9 @@ fn accept_text(headers: &HeaderMap) -> Option<&str> {
 }
 
 /// The 302 an HTML client gets instead of a document:
-/// `{FRONTEND_BASE_URL}/{path}` — the actor route sends browsers to the
-/// profile page (`path` is the nickname), the replies and notice routes to
-/// the post page (`notice/{id}`). This instance serves no HTML of its own
+/// `{FRONTEND_BASE_URL}/{path}` — the actor routes send browsers to the
+/// profile page (`users/{nickname}`, which every frontend serves), the
+/// replies and notice routes to the post page (`notice/{id}`). This instance serves no HTML of its own
 /// (decision 1), so every browser redirect leaves for the frontend origin,
 /// which decides whether that page exists. `FRONTEND_BASE_URL` defaults to
 /// `BASE_URL`. A `path` whose text cannot ride a `Location` header names no
@@ -271,7 +271,8 @@ mod tests {
     #[test]
     fn browsers_are_redirected_to_the_frontend_origin() {
         let config = separate_frontend_config();
-        let response = frontend_redirect(&config, "alice").expect("a plain nickname redirects");
+        let response =
+            frontend_redirect(&config, "users/alice").expect("a plain nickname redirects");
         assert_eq!(
             response.status(),
             StatusCode::FOUND,
@@ -279,7 +280,7 @@ mod tests {
         );
         assert_eq!(
             response.headers().get(header::LOCATION),
-            Some(&HeaderValue::from_static("https://fe.example/alice")),
+            Some(&HeaderValue::from_static("https://fe.example/users/alice")),
             "the Location is built from the frontend origin, not the base URL"
         );
     }
@@ -301,10 +302,13 @@ mod tests {
     #[test]
     fn the_frontend_origin_defaults_onto_the_base_url() {
         let config = Config::for_tests();
-        let response = frontend_redirect(&config, "alice").expect("a plain nickname redirects");
+        let response =
+            frontend_redirect(&config, "users/alice").expect("a plain nickname redirects");
         assert_eq!(
             response.headers().get(header::LOCATION),
-            Some(&HeaderValue::from_static("https://test.example/alice")),
+            Some(&HeaderValue::from_static(
+                "https://test.example/users/alice"
+            )),
             "without a separate frontend the redirect stays on the base URL"
         );
     }
@@ -312,7 +316,7 @@ mod tests {
     #[test]
     fn a_path_no_header_can_carry_is_the_plain_404() {
         let config = separate_frontend_config();
-        let err = frontend_redirect(&config, "bad\nnickname")
+        let err = frontend_redirect(&config, "users/bad\nnickname")
             .expect_err("no Location header can carry a newline");
         assert_eq!(
             err.to_string(),

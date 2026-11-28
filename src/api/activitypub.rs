@@ -391,7 +391,7 @@ async fn gate(
 ) -> AppResult<Reader> {
     if !wants_activity_json(headers) {
         if wants_html(headers) {
-            let redirect = frontend_redirect(&state.config, nickname)?;
+            let redirect = frontend_redirect(&state.config, &format!("users/{nickname}"))?;
             return Ok(Reader::Redirect(redirect));
         }
         return Err(AppError::RouteNotFound);
