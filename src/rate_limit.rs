@@ -86,7 +86,7 @@ pub use clock::{Clock, ManualClock, SystemClock};
 pub use limiter::{Decision, RateLimiter};
 pub use middleware::{RateLimitLayer, RateLimited, rate_limit};
 
-/// The limiter's buckets with their Pleroma defaults, as
+/// The limiter's buckets and their defaults, as
 /// `(name, max requests, window seconds)` triples.
 ///
 /// The numbers of Pleroma's `config :pleroma, :rate_limit`: `authentication`
@@ -94,14 +94,19 @@ pub use middleware::{RateLimitLayer, RateLimited, rate_limit};
 /// `app_account_creation` 25 per 1800 s (sign-up), `relations_actions`
 /// 10 per 10 s, `relation_id_action` 2 per 60 s, `statuses_actions`
 /// 15 per 10 s, `status_id_action` 3 per 60 s, `password_reset` 5 per
-/// 1800 s, `account_confirmation_resend` 5 per 8640 s, and `search`
-/// 30 per 60 s. `imports` (1 per 3600 s) is this server's own: the CSV
-/// follow, block and mute imports (WBE-504) each fan out to thousands of
-/// outbound fetches, so a user gets one import per hour across the three.
-/// `remote_interaction` (5 per 60 s) is its own too: the anonymous
-/// `POST /api/v1/pleroma/remote_interaction` makes this server `WebFinger`
-/// a caller-named host (WBE-814), so one client address gets five lookups
-/// a minute.
+/// 1800 s, and `account_confirmation_resend` 5 per 8640 s.
+///
+/// Three entries are this server's own. `search` (30 per 60 s) is not
+/// Pleroma's: Pleroma 2.10.2 has the two-tier `search: [{1000, 10},
+/// {1000, 30}]`, 10 per second signed out and 30 per second signed in.
+/// The limiter cannot yet tell signed-in callers from signed-out ones
+/// (WBE-906), so `WiredBE` keeps one 30 per 60 s bucket for both.
+/// `imports` (1 per 3600 s): the CSV follow, block and mute imports
+/// (WBE-504) each fan out to thousands of outbound fetches, so a user gets
+/// one import per hour across the three. `remote_interaction` (5 per 60 s):
+/// the anonymous `POST /api/v1/pleroma/remote_interaction` makes this server
+/// `WebFinger` a caller-named host (WBE-814), so one client address gets
+/// five lookups a minute.
 pub const DEFAULT_LIMITS: [(&str, u64, u64); 12] = [
     ("account_confirmation_resend", 5, 8_640),
     ("app_account_creation", 25, 1_800),
