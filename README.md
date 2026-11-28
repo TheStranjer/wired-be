@@ -206,6 +206,22 @@ answers `acct:nick@LOCAL_DOMAIN` and `acct:nick@<BASE_URL host>` alike (any
 case) and names the handle domain in the `subject`; it never fetches from or
 `WebFinger`s either domain itself, and treats a mention of either as local.
 
+The three redirects should also send `Access-Control-Allow-Origin: *`.
+Federation works without it, but a browser client that discovers the API host
+from the handle domain (WiredFE's `/connect <handle domain>` reads
+`https://<handle domain>/.well-known/nodeinfo`) cannot follow a cross-origin
+redirect from `fetch()` unless the redirect response itself carries that
+header. These are public reads of public documents, so `*` is safe.
+
+- **nginx:** add `add_header Access-Control-Allow-Origin * always;` in the
+  redirect `location`. `always` is needed because nginx skips `add_header` on
+  3xx responses without it.
+- **Caddy:** add `header @wk Access-Control-Allow-Origin *` next to the `redir`
+  (`@wk` being the matcher the `redir` uses).
+- **Cloudflare:** a redirect rule has to carry the header too. Check that your
+  Cloudflare setup can put a header on a redirect it generates; if it can't,
+  answer these three paths from a reverse proxy you control instead.
+
 Limits to know before choosing a domain:
 
 - A static `/.well-known/webfinger` file cannot do this: it can answer for one
