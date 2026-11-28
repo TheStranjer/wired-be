@@ -7,10 +7,11 @@
 //! The first two are one shared core: an `Accept` naming an `ActivityPub`
 //! media type gets the status' `Note` (or `Question`) document as
 //! `application/activity+json; charset=utf-8`, keyed by the status uuid
-//! the object id embeds; everything else — a browser included, since an
-//! object is a document and not a page — is the 404 `{"error":"Not found"}`.
+//! the object id embeds; a browser's `text/html` is sent to
+//! `{FRONTEND_BASE_URL}/notice/{id}` with no database read; everything else
+//! is the 404 `{"error":"Not found"}`.
 //! `/notice/{id}` runs the same core for an `ActivityPub` ask and sends a
-//! browser's `text/html` to `{FRONTEND_BASE_URL}/notice/{id}`. Within the
+//! browser's `text/html` to the same place. Within the
 //! core a remote row, a reblog row (an `Announce`), a nickname that is not
 //! the live local author, and an unparsable uuid are all the same 404; a
 //! soft-deleted status answers 410 with its `Tombstone`; a `local` status
@@ -680,11 +681,65 @@ async fn the_notice_route_serves_or_redirects_by_accept() {
     );
 }
 
-/// `Accept: text/html` is a browser on `/notice/{id}` and nothing at all
-/// on the object paths: an object read never redirects, the 404 answers.
-/// An absent `Accept` states nothing and gets the same 404.
+/// Asserts `response` is the 302 to `{origin}/notice/{id}` that varies on
+/// `Accept`.
+fn assert_notice_redirect(response: &common::TestResponse, id: Uuid, what: &str) {
+    assert_eq!(response.status, StatusCode::FOUND, "{what}: a 302");
+    assert_eq!(
+        response.header("location"),
+        Some(format!("https://test.example/notice/{id}").as_str()),
+        "{what}: to the post page on the frontend"
+    );
+    assert_eq!(
+        response.header("vary"),
+        Some("Accept"),
+        "{what}: the redirect varies on Accept"
+    );
+}
+
+/// `Accept: text/html` is a browser on the object paths too: it is sent to
+/// the post's frontend page, whatever the row is (an unknown uuid included).
 #[tokio::test]
-async fn browsers_are_not_redirected_from_the_object_paths() {
+async fn browsers_are_redirected_from_the_object_paths() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let alice = common::create_local_user(&pool, "alice").await;
+    let note = common::create_status(&pool, &alice, "a browser here", Visibility::Public).await;
+    let app = common::test_app(pool);
+    let unknown = Uuid::now_v7();
+
+    let object = common::TestRequest::get(&object_path(&note))
+        .header("accept", "text/html")
+        .send(&app)
+        .await;
+    assert_notice_redirect(&object, note.id, "a browser's read of an object");
+
+    let browser_accept = common::TestRequest::get(&object_path(&note))
+        .header(
+            "accept",
+            "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        )
+        .send(&app)
+        .await;
+    assert_notice_redirect(&browser_accept, note.id, "a full browser Accept");
+
+    let scoped = common::TestRequest::get(&format!("/users/alice/statuses/{}", note.id))
+        .header("accept", "text/html")
+        .send(&app)
+        .await;
+    assert_notice_redirect(&scoped, note.id, "a browser's read on the scoped path");
+
+    let missing = common::TestRequest::get(&format!("/objects/{unknown}"))
+        .header("accept", "text/html")
+        .send(&app)
+        .await;
+    assert_notice_redirect(&missing, unknown, "an unknown uuid");
+}
+
+/// Only a browser is redirected: `*/*`, a bare JSON ask, an absent `Accept`
+/// and a path segment that is no uuid keep the 404.
+#[tokio::test]
+async fn non_browser_asks_keep_the_object_404() {
     let db = common::test_db().await;
     let pool = db.pool().clone();
     let alice = common::create_local_user(&pool, "alice").await;
@@ -694,21 +749,35 @@ async fn browsers_are_not_redirected_from_the_object_paths() {
 
     assert_not_found(
         &common::TestRequest::get(&path)
-            .header("accept", "text/html")
+            .header("accept", "*/*")
             .send(&app)
             .await,
-        "a browser's read of an object",
+        "a wildcard Accept",
     );
     assert_not_found(
-        &common::TestRequest::get(&format!("/users/alice/statuses/{}", note.id))
-            .header("accept", "text/html")
+        &common::TestRequest::get(&path)
+            .header("accept", "application/json")
             .send(&app)
             .await,
-        "a browser's read on the scoped path",
+        "a bare JSON ask",
     );
     assert_not_found(
         &common::TestRequest::get(&path).send(&app).await,
         "an object read with no Accept at all",
+    );
+    assert_not_found(
+        &common::TestRequest::get("/objects/not-a-uuid")
+            .header("accept", "text/html")
+            .send(&app)
+            .await,
+        "a browser asking for a non-uuid id",
+    );
+    assert_not_found(
+        &common::TestRequest::get("/users/alice/statuses/not-a-uuid")
+            .header("accept", "text/html")
+            .send(&app)
+            .await,
+        "a browser asking for a non-uuid id on the scoped path",
     );
 }
 
@@ -768,6 +837,16 @@ async fn the_authorized_fetch_gate_gates_the_object_reads() {
         browser.header("location"),
         Some(format!("https://test.example/notice/{}", note.id).as_str()),
         "the redirect is the ordinary frontend notice URL"
+    );
+
+    let object_browser = common::TestRequest::get(&path)
+        .header("accept", "text/html")
+        .send(&app)
+        .await;
+    assert_notice_redirect(
+        &object_browser,
+        note.id,
+        "a browser on the object id, unsigned",
     );
 }
 
