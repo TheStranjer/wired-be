@@ -8,6 +8,7 @@ use tracing::debug;
 use super::ConfigEntry;
 #[cfg(doc)]
 use super::RuntimeConfig;
+use super::wire::wire_key;
 use crate::error::AppResult;
 
 /// [`stored`]: the one row's JSON value.
@@ -93,14 +94,14 @@ pub async fn remove(db: &PgPool, group: &str, key: &str) -> AppResult<bool> {
 }
 
 /// The `db` field of a stored value: its subkey names when it is a
-/// keyword list (object), the entry's own key when it is a plain value —
-/// Pleroma's `ConfigDB.get_db_keys`.
+/// keyword list (object), the entry's own key when it is a plain value,
+/// all colon-prefixed — Pleroma's `ConfigDB.get_db_keys`.
 #[must_use]
 pub fn db_keys(key: &str, value: &Value) -> Vec<String> {
     match value {
-        Value::Object(map) => map.keys().cloned().collect(),
+        Value::Object(map) => map.keys().map(|name| wire_key(name)).collect(),
         Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) | Value::Array(_) => {
-            vec![key.to_owned()]
+            vec![wire_key(key)]
         }
     }
 }
@@ -117,8 +118,13 @@ mod tests {
     fn db_keys_name_the_stored_subkeys_or_the_key() {
         assert_eq!(
             db_keys(":instance", &json!({"name": "Wired", "email": ""})),
-            vec!["email".to_owned(), "name".to_owned()],
-            "stored subkeys, in key order"
+            vec![":email".to_owned(), ":name".to_owned()],
+            "stored subkeys, colon-prefixed, in key order"
+        );
+        assert_eq!(
+            db_keys("media_proxy", &json!([1])),
+            vec![":media_proxy".to_owned()],
+            "a bare entry key gains the colon"
         );
         assert_eq!(
             db_keys(":media_proxy", &json!(true)),

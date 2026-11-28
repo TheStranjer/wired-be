@@ -279,7 +279,7 @@ async fn an_admin_config_override_applies_to_the_next_token() {
         .expect("the key is whitelisted");
     assert_eq!(
         entry["db"],
-        json!(["bot"]),
+        json!([":bot"]),
         "the row holds the one stored subkey"
     );
 

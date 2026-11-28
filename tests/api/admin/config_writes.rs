@@ -94,14 +94,14 @@ async fn config_set_renders_the_wire_shape_and_the_effective_view() {
     assert_eq!(
         body["configs"][0]["value"],
         json!(wire(&[
-            ("email", json!("staff@example.test")),
-            ("name", json!("Renamed"))
+            (":email", json!("staff@example.test")),
+            (":name", json!("Renamed"))
         ])),
-        "the stored row renders as its tuple array"
+        "the stored row renders as its tuple array, keys with their colon"
     );
     assert_eq!(
         body["configs"][0]["db"],
-        json!(["email", "name"]),
+        json!([":email", ":name"]),
         "db names the stored subkeys"
     );
     assert_eq!(body["need_reboot"], json!(false), ":instance changes live");
@@ -116,16 +116,16 @@ async fn config_set_renders_the_wire_shape_and_the_effective_view() {
     );
     let instance = &view["configs"][0];
     assert_eq!(
-        tuple_value(&instance["value"], "name"),
+        tuple_value(&instance["value"], ":name"),
         Some(&json!("Renamed")),
         "the row's name is the effective one"
     );
     assert_eq!(
-        tuple_value(&instance["value"], "description"),
+        tuple_value(&instance["value"], ":description"),
         Some(&json!("A Wired instance, compatible with Pleroma clients")),
         "the untouched sibling keeps the env default"
     );
-    assert_eq!(instance["db"], json!(["email", "name"]), "and db stays");
+    assert_eq!(instance["db"], json!([":email", ":name"]), "and db stays");
     assert_eq!(
         view["configs"][1].get("db"),
         None,
@@ -167,18 +167,18 @@ async fn config_second_write_merges_into_the_stored_row() {
     .await;
     let body = second.json_value();
     assert_eq!(
-        tuple_value(&body["configs"][0]["value"], "name"),
+        tuple_value(&body["configs"][0]["value"], ":name"),
         Some(&json!("Again")),
         "the re-set writes through"
     );
     assert_eq!(
-        tuple_value(&body["configs"][0]["value"], "email"),
+        tuple_value(&body["configs"][0]["value"], ":email"),
         Some(&json!("staff@example.test")),
         "and the earlier subkey survives the merge"
     );
     assert_eq!(
         body["configs"][0]["db"],
-        json!(["email", "name"]),
+        json!([":email", ":name"]),
         "both subkeys are stored now"
     );
 
@@ -232,10 +232,10 @@ async fn config_delete_takes_subkeys_then_the_whole_row() {
     let left = subkey_delete.json_value();
     assert_eq!(
         left["configs"][0]["value"],
-        json!(wire(&[("email", json!("staff@example.test"))])),
+        json!(wire(&[(":email", json!("staff@example.test"))])),
         "the deleted subkey is out and the row keeps the rest"
     );
-    assert_eq!(left["configs"][0]["db"], json!(["email"]), "db shrank too");
+    assert_eq!(left["configs"][0]["db"], json!([":email"]), "db shrank too");
 
     let whole_delete = post_configs(
         &app,
@@ -261,7 +261,7 @@ async fn config_delete_takes_subkeys_then_the_whole_row() {
     let effective = TestRequest::get(CONFIG).bearer(&token).send(&app).await;
     let fallback = &effective.json_value()["configs"][0];
     assert_eq!(
-        tuple_value(&fallback["value"], "name"),
+        tuple_value(&fallback["value"], ":name"),
         Some(&json!("Wired")),
         "the effective name fell back to the env default"
     );
@@ -325,5 +325,61 @@ async fn config_whitelist_refuses_unknown_pairs() {
         &valueless,
         StatusCode::UNPROCESSABLE_ENTITY,
         "an upsert without a value",
+    );
+}
+
+/// A POST with colon keys and a POST with bare keys store the same row,
+/// and both read back (POST answer and `only_db` GET) with colon keys.
+#[tokio::test]
+async fn config_keys_round_trip_with_colons_whichever_spelling_is_sent() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let app = common::test_app(pool.clone());
+    let token = config_admin(&pool, "configcolons").await;
+    let expected = json!(wire(&[
+        (":email", json!("staff@example.test")),
+        (":name", json!("Renamed")),
+    ]));
+
+    let mut stored_rows = Vec::new();
+    for pairs in [
+        [
+            (":name", json!("Renamed")),
+            (":email", json!("staff@example.test")),
+        ],
+        [
+            ("name", json!("Renamed")),
+            ("email", json!("staff@example.test")),
+        ],
+    ] {
+        let write = post_configs(
+            &app,
+            &token,
+            json!([{ "group": ":pleroma", "key": ":instance", "value": wire(&pairs) }]),
+        )
+        .await;
+        common::assert_answer(&write, StatusCode::OK, "the write");
+        assert_eq!(
+            write.json_value()["configs"][0]["value"],
+            expected,
+            "the answer carries colon keys"
+        );
+        let listing = TestRequest::get(&format!("{CONFIG}?only_db=true"))
+            .bearer(&token)
+            .send(&app)
+            .await;
+        let rows = listing.json_value();
+        assert_eq!(rows["configs"][0]["value"], expected, "the GET agrees");
+        assert_eq!(
+            rows["configs"][0]["db"],
+            json!([":email", ":name"]),
+            "db carries colons"
+        );
+        stored_rows.push(rows["configs"][0].clone());
+    }
+    assert_eq!(
+        stored_rows.first(),
+        stored_rows.get(1),
+        "both spellings store the same thing"
     );
 }

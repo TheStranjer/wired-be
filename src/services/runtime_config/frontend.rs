@@ -9,7 +9,7 @@
 
 use serde_json::{Map, Value, json};
 
-use super::wire::{normalize_key, tuple_pair};
+use super::wire::{normalize_key, tuple_pair, wire_key};
 use crate::services::config_registry::KEY_FRONTEND_CONFIGURATIONS;
 
 /// The refusal for a value that is not a list of `[:frontend, {…}]` tuples.
@@ -75,7 +75,7 @@ pub fn wire_of(key: &str, value: &Value) -> Value {
     };
     Value::Array(
         map.iter()
-            .map(|(name, settings)| json!({"tuple": [name, settings]}))
+            .map(|(name, settings)| json!({"tuple": [wire_key(name), settings]}))
             .collect(),
     )
 }
@@ -170,12 +170,20 @@ mod tests {
                 KEY_FRONTEND_CONFIGURATIONS,
                 &json!({"soapbox_fe": {"brandColor": "#123456"}})
             ),
-            json!([{"tuple": ["soapbox_fe", {"brandColor": "#123456"}]}]),
-            "tuple outside, plain object inside"
+            json!([{"tuple": [":soapbox_fe", {"brandColor": "#123456"}]}]),
+            "colon-keyed tuple outside, plain object inside"
+        );
+        assert_eq!(
+            wire_of(
+                KEY_FRONTEND_CONFIGURATIONS,
+                &json!({"soapbox_fe": {"brand": {"x": 1}, ":odd": [1]}})
+            ),
+            json!([{"tuple": [":soapbox_fe", {"brand": {"x": 1}, ":odd": [1]}]}]),
+            "the settings object's own keys are untouched"
         );
         assert_eq!(
             wire_of(":instance", &json!({"name": "Wired"})),
-            json!([{"tuple": ["name", "Wired"]}]),
+            json!([{"tuple": [":name", "Wired"]}]),
             "other keys render as before"
         );
     }

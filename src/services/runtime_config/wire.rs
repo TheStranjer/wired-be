@@ -37,9 +37,11 @@ pub fn to_storage(value: &Value) -> Value {
     }
 }
 
-/// Translates the storage form into the admin API's wire form: every JSON
-/// object (recursively) becomes its array of `{"tuple": [key, value]}`
-/// entries — Pleroma's keyword-list encoding.
+/// Translates the storage form into the admin API's wire form.
+///
+/// Every JSON object (recursively) becomes its array of
+/// `{"tuple": [":key", value]}` entries — Pleroma's keyword-list encoding,
+/// whose atom keys keep their leading colon.
 ///
 /// Arrays of plain values and scalars stay JSON as they are.
 #[must_use]
@@ -47,7 +49,7 @@ pub fn to_wire(value: &Value) -> Value {
     match value {
         Value::Object(map) => Value::Array(
             map.iter()
-                .map(|(key, inner)| tuple_entry(Value::String(key.clone()), to_wire(inner)))
+                .map(|(key, inner)| tuple_entry(wire_key(key), to_wire(inner)))
                 .collect(),
         ),
         Value::Array(items) => Value::Array(items.iter().map(to_wire).collect()),
@@ -57,10 +59,20 @@ pub fn to_wire(value: &Value) -> Value {
     }
 }
 
+/// The wire spelling of a keyword key: the name behind one `:`.
+///
+/// Pleroma's `to_json_types` inspects every atom this way.
+pub(super) fn wire_key(key: &str) -> String {
+    format!(":{}", normalize_key(key))
+}
+
 /// The `{"tuple": [key, value]}` entry of the wire form.
-fn tuple_entry(key: Value, value: Value) -> Value {
+fn tuple_entry(key: String, value: Value) -> Value {
     let mut entry = Map::new();
-    let previous = entry.insert("tuple".to_owned(), Value::Array(vec![key, value]));
+    let previous = entry.insert(
+        "tuple".to_owned(),
+        Value::Array(vec![Value::String(key), value]),
+    );
     drop(previous);
     Value::Object(entry)
 }
@@ -148,10 +160,10 @@ mod tests {
         assert_eq!(
             to_wire(&json!({"name": "Wired", "registrations_open": false})),
             json!([
-                {"tuple": ["name", "Wired"]},
-                {"tuple": ["registrations_open", false]},
+                {"tuple": [":name", "Wired"]},
+                {"tuple": [":registrations_open", false]},
             ]),
-            "one entry per subkey, in stored order"
+            "one entry per subkey, in stored order, keys with their colon"
         );
         assert_eq!(
             to_wire(&json!({})),
@@ -161,11 +173,47 @@ mod tests {
         assert_eq!(
             to_wire(&json!({"reject": [["evil.example", "bots"]]})),
             json!([
-                {"tuple": ["reject", [["evil.example", "bots"]]]}
+                {"tuple": [":reject", [["evil.example", "bots"]]]}
             ]),
             "a pair LIST stays a list — only objects become tuples"
         );
         assert_eq!(to_wire(&json!("text")), json!("text"), "scalars pass");
+    }
+
+    /// Nested keyword levels each get colons; data arrays and strings in
+    /// them do not.
+    #[test]
+    fn to_wire_colons_every_keyword_level_but_not_data() {
+        assert_eq!(
+            to_wire(&json!({
+                "mrf_simple": {"reject": [["evil.example", "bots"]], "media_nsfw": ["a.example"]},
+                "timelines": [{"local": true}],
+            })),
+            json!([
+                {"tuple": [":mrf_simple", [
+                    {"tuple": [":media_nsfw", ["a.example"]]},
+                    {"tuple": [":reject", [["evil.example", "bots"]]]},
+                ]]},
+                {"tuple": [":timelines", [[{"tuple": [":local", true]}]]]},
+            ]),
+            "colons at each keyword level, none inside data arrays"
+        );
+        assert_eq!(
+            to_wire(&json!({":odd": 1})),
+            json!([{"tuple": [":odd", 1]}]),
+            "a key is never double-colonned"
+        );
+    }
+
+    /// Colon and bare keys store identically, and the wire form of the
+    /// result is the colon spelling either way.
+    #[test]
+    fn colon_and_bare_keys_round_trip_to_colon_keys() {
+        let colon = json!([{"tuple": [":limit", 5]}, {"tuple": [":name", "Wired"]}]);
+        let bare = json!([{"tuple": ["name", "Wired"]}, {"tuple": ["limit", 5]}]);
+        assert_eq!(to_storage(&colon), to_storage(&bare), "same stored value");
+        assert_eq!(to_wire(&to_storage(&colon)), colon, "colons come back");
+        assert_eq!(to_wire(&to_storage(&bare)), colon, "bare keys gain them");
     }
 
     /// [`to_storage`] decodes tuple arrays back — accepting both this
@@ -201,7 +249,7 @@ mod tests {
             json!([]),
             "the empty array stays the empty list it is"
         );
-        let wire = json!([{"tuple": ["reject", [["a.example", "why"]]]}]);
+        let wire = json!([{"tuple": [":reject", [["a.example", "why"]]]}]);
         assert_eq!(
             to_wire(&to_storage(&wire)),
             wire,
