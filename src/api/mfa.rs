@@ -27,7 +27,7 @@
 //!   "`invalid_token`", no prior setup 422 "Setup required".
 //! - `GET  /api/pleroma/accounts/mfa/backup_codes` — issue five new codes
 //!   (old ones stop working), store their hashes, return the plaintexts
-//!   once; requires MFA enabled.
+//!   once as `{codes}`; allowed while MFA is still off and never enables it.
 //! - `DELETE /api/pleroma/accounts/mfa/totp` — `password`; clears the
 //!   secret, the backup codes and `enabled`, answers `{}`.
 //!
@@ -68,8 +68,6 @@ const INVALID_PASSWORD: &str = "Invalid password.";
 const INVALID_TOKEN: &str = "invalid_token";
 /// 422 body when confirmation runs before any setup produced a secret.
 const SETUP_REQUIRED: &str = "Setup required";
-/// 422 body when backup codes are requested for an account with MFA off.
-const MFA_NOT_ENABLED: &str = "MFA not enabled";
 /// Backup codes issued per generation (Pleroma's
 /// `[:instance, :multi_factor_authentication, :backup_codes, :number]`
 /// default of 5).
@@ -224,16 +222,16 @@ impl fmt::Debug for PasswordParams {
 ///
 /// # Errors
 ///
-/// [`AppError::Unprocessable`] with [`MFA_NOT_ENABLED`] when MFA is off.
 /// Auth and scope errors as in [`get_settings`] (this is a `write:security`
 /// action in Pleroma, despite being a `GET`). Any database failure arrives
 /// through `?` as [`AppError::Database`].
+///
+/// There is no MFA-state gate, as in Pleroma: Soapbox fetches codes before
+/// confirming TOTP, and storing them never turns MFA on. The answer is
+/// `{codes: [...]}`.
 async fn get_backup_codes(State(state): State<AppState>, auth: AuthUser) -> AppResult<Json<Value>> {
     auth.require(WRITE_SECURITY)?;
     let mut settings = mfa_of(&auth.0);
-    if !settings.enabled {
-        return Err(AppError::Unprocessable(MFA_NOT_ENABLED.to_owned()));
-    }
     let codes = totp::generate_backup_codes(BACKUP_CODE_COUNT);
     let hashes = codes
         .iter()
@@ -241,7 +239,7 @@ async fn get_backup_codes(State(state): State<AppState>, auth: AuthUser) -> AppR
         .collect();
     settings.rotate_backup_codes(hashes);
     mfa::save(&state.db, auth.0.id, &settings).await?;
-    Ok(Json(json!({"backup_codes": codes})))
+    Ok(Json(json!({"codes": codes})))
 }
 
 /// `DELETE /api/pleroma/accounts/mfa/totp` — disable TOTP and MFA,
