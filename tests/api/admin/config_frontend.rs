@@ -82,7 +82,7 @@ async fn frontend_configurations_are_written_listed_and_served() {
         "the key takes effect live"
     );
     assert_eq!(
-        tuple_value(&body["configs"][0]["value"], "soapbox_fe"),
+        tuple_value(&body["configs"][0]["value"], ":soapbox_fe"),
         Some(&json!({"brandColor": "#123456"})),
         "the write renders as a tuple around the plain object"
     );
@@ -96,9 +96,9 @@ async fn frontend_configurations_are_written_listed_and_served() {
         .await
         .expect("the admin listing shows the key");
     assert_eq!(listed["group"], json!(":pleroma"), "listed under :pleroma");
-    assert_eq!(listed["db"], json!(["soapbox_fe"]), "db names the subkey");
+    assert_eq!(listed["db"], json!([":soapbox_fe"]), "db names the subkey");
     assert_eq!(
-        tuple_value(&listed["value"], "soapbox_fe"),
+        tuple_value(&listed["value"], ":soapbox_fe"),
         Some(&json!({"brandColor": "#123456"})),
         "the listing uses the tuple shape"
     );
@@ -114,7 +114,7 @@ async fn frontend_configurations_are_written_listed_and_served() {
         })
         .expect("the effective listing carries the key");
     assert_eq!(
-        tuple_value(&in_effective["value"], "soapbox_fe"),
+        tuple_value(&in_effective["value"], ":soapbox_fe"),
         Some(&json!({"brandColor": "#123456"})),
         "the effective view shows the stored subkey"
     );

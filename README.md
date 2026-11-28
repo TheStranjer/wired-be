@@ -63,7 +63,11 @@ number with a representable expiry is a 422) read through it live. The
 frontend (`[{"tuple": [":soapbox_fe", {...}]}]`; a POST replaces each named
 subkey's whole object, `delete` with `subkeys` drops only those, and any
 other shape is a 400); `GET /api/pleroma/frontend_configurations` serves it
-as `{"soapbox_fe": {...}}`, falling back to the `instance_settings` row. `GET /api/v1/pleroma/admin/config/descriptions` documents
+as `{"soapbox_fe": {...}}` (no colon), falling back to the `instance_settings` row.
+The admin config answers spell every keyword key, and each `db` entry, with
+Pleroma's leading colon (`{"tuple": [":name", "Wired"]}`, `"db": [":name"]`);
+requests may send keys with or without it, and the store keeps them without.
+`GET /api/v1/pleroma/admin/config/descriptions` documents
 every whitelisted key (types, descriptions and example values),
 `GET /api/v1/pleroma/admin/need_reboot` says whether a restart-requiring key
 changed since this boot, and `GET /api/v1/pleroma/admin/restart` asks the

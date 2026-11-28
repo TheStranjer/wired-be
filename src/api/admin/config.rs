@@ -11,7 +11,8 @@
 //! `lib/pleroma/web/admin_api/controllers/config_controller.ex` with the
 //! value encoding of `lib/pleroma/config/transfer_task.ex`: only the
 //! pairs [`config_registry`] whitelists are readable and changeable here,
-//! keyword lists travel as arrays of `{"tuple": [key, value]}` entries,
+//! keyword lists travel as arrays of `{"tuple": [":key", value]}` entries
+//! (answers always carry the colon; requests may omit it),
 //! and every stored row is an overlay on the environment-derived
 //! [`Config`] rather than a replacement of it.
 //!
@@ -579,11 +580,28 @@ mod tests {
             json!({
                 "group": ":pleroma",
                 "key": ":instance",
-                "value": [{"tuple": ["name", "Wired"]}],
-                "db": ["name"],
+                "value": [{"tuple": [":name", "Wired"]}],
+                "db": [":name"],
             }),
-            "the ticket's shape"
+            "Pleroma's shape: atom keys keep their colon"
         );
+    }
+
+    /// `:frontend_configurations` renders its subkey with the colon and
+    /// the settings object untouched.
+    #[test]
+    fn frontend_rows_render_a_colon_subkey_around_the_plain_object() {
+        let view = view_of_row(&row(
+            KEY_FRONTEND_CONFIGURATIONS,
+            json!({"soapbox_fe": {"brandColor": "#123456"}}),
+        ));
+        let rendered = serde_json::to_value(&view).expect("the view serializes");
+        assert_eq!(
+            rendered["value"],
+            json!([{"tuple": [":soapbox_fe", {"brandColor": "#123456"}]}]),
+            "colon on the subkey, nothing inside the object"
+        );
+        assert_eq!(rendered["db"], json!([":soapbox_fe"]), "db carries it too");
     }
 
     /// The effective GET view merges the row over the env defaults, names
@@ -612,14 +630,14 @@ mod tests {
                 .iter()
                 .any(|pair| pair.first() == Some(&json!(key)) && pair.get(1) == Some(&want))
         };
-        assert!(named("name", json!("Overridden")), "the row's subkey wins");
+        assert!(named(":name", json!("Overridden")), "the row's subkey wins");
         assert!(
-            named("description", json!(config.instance_description)),
+            named(":description", json!(config.instance_description)),
             "and an untouched sibling keeps the env value"
         );
         assert_eq!(
             instance["db"],
-            json!(["name"]),
+            json!([":name"]),
             "db names exactly the stored subkey"
         );
         let mrf = serde_json::to_value(&views[1]).expect("the view serializes");
@@ -630,7 +648,7 @@ mod tests {
         );
         assert_eq!(
             mrf["value"],
-            json!([{"tuple": ["policies", []]}]),
+            json!([{"tuple": [":policies", []]}]),
             "and the :mrf value is the env chain"
         );
     }
@@ -721,10 +739,10 @@ mod tests {
         let view = serde_json::to_value(&applied.configs[0]).expect("the view serializes");
         assert_eq!(
             view["value"],
-            json!([{"tuple": ["policies", ["simple"]]}]),
+            json!([{"tuple": [":policies", ["simple"]]}]),
             "the stored value travels in wire form"
         );
-        assert_eq!(view["db"], json!(["policies"]), "with its stored subkeys");
+        assert_eq!(view["db"], json!([":policies"]), "with its stored subkeys");
 
         let deleted = item(GROUP_PLEROMA, KEY_INSTANCE, None, true);
         applied.record(&deleted, &Outcome::Deleted);

@@ -22,7 +22,7 @@
 //! Two value forms live in this module. The **storage form** is what the
 //! jsonb column holds: keyword lists as JSON objects, everything else as
 //! plain JSON. The **wire form** is what the admin API exchanges: an
-//! object as an array of `{"tuple": [key, value]}` entries (Pleroma's
+//! object as an array of `{"tuple": [":key", value]}` entries (Pleroma's
 //! `to_json_types`/`to_elixir_types` pair), recursively. [`to_wire`] and
 //! [`to_storage`] translate, and the two are inverses for every value
 //! the API can send.
