@@ -22,5 +22,6 @@ mod lookup;
 mod pending;
 mod restricted;
 mod show;
+mod show_by_handle;
 mod support;
 mod verify_credentials;

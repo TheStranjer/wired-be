@@ -60,6 +60,7 @@ use crate::{
     models::user,
     oauth::scopes::{READ_ACCOUNTS, READ_FOLLOWS},
     state::AppState,
+    util::id::parse_id,
 };
 
 use super::{follow::resolve_actor_or_fetch, follow_lists::require_profile_read, render_account};
@@ -69,10 +70,18 @@ use super::{follow::resolve_actor_or_fetch, follow_lists::require_profile_read, 
 const MISSING_ACCT: &str = "Missing parameter: acct";
 
 /// `GET /api/v1/accounts/{id}` — the account whose id is `id`, local or
-/// remote. An id that is not `UUID` text is a 404, not a 400, like every
-/// other miss (see [`visible_account_or_404`]); so is an account the viewer
-/// may not see (one awaiting approval or email confirmation, see
-/// [`visible_to`]).
+/// remote. An unknown id is a 404, not a 400, like every other miss (see
+/// [`visible_account_or_404`]); so is an account the viewer may not see (one
+/// awaiting approval or email confirmation, see [`visible_to`]).
+///
+/// A path value that is not `UUID` text is read as a handle, as Pleroma's
+/// `get_cached_by_nickname_or_id` does: a stored nickname (`erin`),
+/// `nick@LOCAL_DOMAIN` or `nick@<BASE_URL host>` for a local account, or a
+/// stored remote `nick@host`, resolved exactly as `lookup` resolves a stored
+/// handle ([`get_by_acct`](crate::models::user::get_by_acct), then
+/// [`visible_to`]). Nothing is fetched: no `WebFinger`, no remote
+/// resolution, so a handle this instance has never stored is a 404. A `UUID`
+/// keeps the id path.
 ///
 /// The viewer behind an optional token is the account the entity is
 /// rendered for; without one the anonymous view is answered. A viewer who
@@ -81,8 +90,8 @@ const MISSING_ACCT: &str = "Missing parameter: acct";
 ///
 /// # Errors
 ///
-/// [`AppError::NotFound`] for a malformed, unknown, deactivated or (to this
-/// viewer) invisible id;
+/// [`AppError::NotFound`] for an unknown, deactivated or (to this viewer)
+/// invisible id or handle;
 /// [`AppError::Forbidden`] ("This API requires an authenticated user") for
 /// an anonymous request while `RESTRICT_UNAUTHENTICATED` closes the
 /// account's profile half (see [`require_profile_read`]; Pleroma's `show`
@@ -97,7 +106,14 @@ pub(super) async fn show_account(
 ) -> AppResult<Json<Account>> {
     auth.require_user_scope(READ_ACCOUNTS)?;
     let viewer = auth.0;
-    let found = visible_account_or_404(&state, &id, viewer.as_ref()).await?;
+    let found = if parse_id(&id).is_some() {
+        visible_account_or_404(&state, &id, viewer.as_ref()).await?
+    } else {
+        user::get_by_acct(&state.db, &state.config, &id)
+            .await?
+            .filter(|found| visible_to(found, viewer.as_ref()))
+            .ok_or(AppError::NotFound)?
+    };
     require_profile_read(&state.config, viewer.as_ref(), &found)?;
     Ok(Json(render_account(&state, viewer.as_ref(), &found).await?))
 }
