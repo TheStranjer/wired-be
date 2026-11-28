@@ -136,3 +136,32 @@ async fn the_write_route_does_not_leak_onto_the_read_route() {
         "and the visible ids it answers are unchanged by the throttle"
     );
 }
+
+/// The default `statuses_actions` budget is Pleroma's 15 per 10 s: the 15th
+/// post is accepted and the 16th is throttled.
+#[tokio::test]
+async fn the_default_budget_is_fifteen_posts_per_window() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let (_alice, token) = user_with_token(&pool, "alice", WRITE).await;
+    let app = common::test_app_with_config(pool.clone(), common::test_config_with_rate_limits(""));
+
+    for n in 1..=15_u32 {
+        let response = publish(&app, Some(token.as_str()), json!({"status": "counted"})).await;
+        common::assert_answer(&response, StatusCode::OK, &format!("post {n} is inside"));
+        assert_eq!(
+            response.header("x-ratelimit-limit"),
+            Some("15"),
+            "fifteen per window"
+        );
+        assert_eq!(
+            response.header("x-ratelimit-reset"),
+            Some("10"),
+            "a ten second window"
+        );
+    }
+    let throttled = publish(&app, Some(token.as_str()), json!({"status": "16th"})).await;
+    common::assert_answer(&throttled, StatusCode::TOO_MANY_REQUESTS, "the 16th post");
+    common::assert_error(&throttled, "Throttled", "the 16th post");
+    assert_eq!(stored_count(&pool).await, 15, "the 16th never posted");
+}

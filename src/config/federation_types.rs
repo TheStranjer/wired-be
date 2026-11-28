@@ -251,8 +251,8 @@ mod tests {
             .unwrap();
         assert_eq!(
             (authentication.max, authentication.window),
-            (20, std::time::Duration::from_secs(5)),
-            "authentication is 20 per 5 seconds"
+            (15, std::time::Duration::from_secs(60)),
+            "authentication is 15 per 60 seconds"
         );
         let confirmation = config
             .rate_limit
@@ -262,8 +262,8 @@ mod tests {
             .unwrap();
         assert_eq!(
             (confirmation.max, confirmation.window),
-            (5, std::time::Duration::from_secs(8_600)),
-            "account_confirmation_resend is 5 per 8600 seconds"
+            (5, std::time::Duration::from_mins(144)),
+            "account_confirmation_resend is 5 per 8640 seconds"
         );
         let imports = config.rate_limit.limits.get("imports").copied().unwrap();
         assert_eq!(
