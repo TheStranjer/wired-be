@@ -31,7 +31,7 @@ there:
 | `/registration/{token}` | invite letter |
 | `/authorize_interaction?uri=` | the `WebFinger` subscribe template |
 | `/notice/{id}` | browser `GET /notice/{id}` and status permalinks |
-| `/{nickname}` | browser `GET /users/{nickname}` and profile links |
+| `/users/{nickname}` | browser `GET /users/{nickname}` and profile links |
 
 `tests/api/route_inventory.rs` checks that no parameterless `GET` route
 answers `Accept: text/html` with `text/html`.

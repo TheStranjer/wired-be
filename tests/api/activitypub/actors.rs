@@ -375,7 +375,7 @@ async fn ld_json_clients_get_the_actor_too() {
 }
 
 /// A browser is not an `ActivityPub` client: it gets Pleroma's redirect to
-/// the frontend profile page, 302 with `Location: {BASE_URL}/{nickname}`.
+/// the frontend profile page, 302 with `Location: {FRONTEND_BASE_URL}/users/{nickname}`.
 /// A client that asks for neither `ActivityPub` nor HTML still gets the
 /// router-level 404 (this backend is API-only and serves no HTML, decision
 /// 1).
@@ -397,7 +397,7 @@ async fn a_browser_is_redirected_to_the_frontend() {
         );
         assert_eq!(
             response.header("location"),
-            Some("https://test.example/alice"),
+            Some("https://test.example/users/alice"),
             "{accept} is sent to the frontend profile URL"
         );
         assert_eq!(
@@ -589,7 +589,7 @@ async fn a_deactivated_user_resolves_as_suspended_and_a_deleted_one_is_gone() {
     );
     assert_eq!(
         browser.header("location"),
-        Some("https://test.example/alice"),
+        Some("https://test.example/users/alice"),
         "the redirect is the ordinary frontend profile URL"
     );
 }
@@ -668,7 +668,7 @@ async fn the_actor_redirect_follows_the_frontend_origin() {
     assert_eq!(browser.status, StatusCode::FOUND, "a browser redirects");
     assert_eq!(
         browser.header("location"),
-        Some("https://fe.example/alice"),
+        Some("https://fe.example/users/alice"),
         "to the frontend origin, not the base URL"
     );
     assert_eq!(
@@ -762,4 +762,106 @@ async fn the_actor_document_takes_its_key_and_inbox_from_activitypub_actors() {
         json!(format!("{BASE}/users/alice#main-key")),
         "the key id stays the actor id with the fragment"
     );
+}
+
+/// Every route behind the actor gates sends a browser to the frontend's
+/// `/users/{nickname}` page on `FRONTEND_BASE_URL`, not to the sub-path it
+/// asked for and not to the base URL.
+#[tokio::test]
+async fn every_actor_gated_route_redirects_browsers_to_the_users_page() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let _alice = common::create_local_user(&pool, "alice").await;
+    let mut config = common::test_config();
+    config.frontend_base_url = "https://fe.example".to_owned();
+    let app = common::test_app_with_config(pool, config);
+
+    for path in [
+        "/users/alice",
+        "/users/alice/outbox",
+        "/users/alice/followers",
+        "/users/alice/following",
+        "/users/alice/collections/featured",
+        "/users/alice/collections/tags",
+    ] {
+        let response = common::TestRequest::get(path)
+            .header("accept", "text/html")
+            .send(&app)
+            .await;
+        assert_eq!(
+            response.status,
+            StatusCode::FOUND,
+            "{path} redirects a browser"
+        );
+        assert_eq!(
+            response.header("location"),
+            Some("https://fe.example/users/alice"),
+            "{path} is sent to the frontend users page"
+        );
+    }
+}
+
+/// A nickname that cannot ride a `Location` header names no page: the
+/// browser gets the plain 404 on every actor-gated route.
+#[tokio::test]
+async fn a_nickname_no_location_header_can_carry_is_the_plain_404() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let app = common::test_app(pool);
+
+    for path in [
+        "/users/bad%0Anickname",
+        "/users/bad%0Anickname/outbox",
+        "/users/bad%0Anickname/followers",
+        "/users/bad%0Anickname/following",
+        "/users/bad%0Anickname/collections/featured",
+        "/users/bad%0Anickname/collections/tags",
+    ] {
+        let response = common::TestRequest::get(path)
+            .header("accept", "text/html")
+            .send(&app)
+            .await;
+        assert_eq!(response.status, StatusCode::NOT_FOUND, "{path} is a 404");
+        assert_eq!(
+            response.json_value(),
+            json!({"error": "Not found"}),
+            "{path} keeps the fallback body"
+        );
+    }
+}
+
+/// An `Accept` that is neither `ActivityPub` nor HTML is still the 404 on
+/// every actor-gated route, with no redirect.
+#[tokio::test]
+async fn a_non_browser_accept_is_the_404_on_every_actor_gated_route() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let _alice = common::create_local_user(&pool, "alice").await;
+    let app = common::test_app(pool);
+
+    for path in [
+        "/users/alice",
+        "/users/alice/outbox",
+        "/users/alice/followers",
+        "/users/alice/following",
+        "/users/alice/collections/featured",
+        "/users/alice/collections/tags",
+    ] {
+        for accept in ["*/*", "application/json"] {
+            let response = common::TestRequest::get(path)
+                .header("accept", accept)
+                .send(&app)
+                .await;
+            assert_eq!(
+                response.status,
+                StatusCode::NOT_FOUND,
+                "{path} with {accept} is a 404"
+            );
+            assert_eq!(
+                response.header("location"),
+                None,
+                "{path} with {accept} does not redirect"
+            );
+        }
+    }
 }

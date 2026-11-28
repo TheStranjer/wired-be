@@ -172,7 +172,7 @@ async fn the_gate_demands_a_verifiable_signature() {
     );
     assert_eq!(
         browser.header("location"),
-        Some("https://test.example/alice"),
+        Some("https://test.example/users/alice"),
         "the browser is sent to the frontend profile page"
     );
 }
