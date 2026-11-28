@@ -43,6 +43,8 @@
 
 #![cfg(test)]
 
+/// Pleroma's bare `admin` scope: registration, grant and the role check.
+mod admin_scope;
 /// The browser `GET /oauth/authorize`: the redirect to the frontend and
 /// the refusals, plus the app, query and code helpers the other authorize
 /// tests share.
