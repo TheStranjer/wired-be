@@ -363,17 +363,18 @@ write_nginx() {
   rm -f /etc/nginx/sites-enabled/default
   cat >"$NGINX_DEFAULT" <<'EOF'
 # Managed by wired-be-setup: refuse every request for a name we do not serve.
-server_tokens off;
 server {
     listen 80 default_server;
     listen [::]:80 default_server;
     server_name _;
+    server_tokens off;
     return 444;
 }
 server {
     listen 443 ssl default_server;
     listen [::]:443 ssl default_server;
     server_name _;
+    server_tokens off;
     ssl_reject_handshake on;
 }
 EOF
@@ -392,6 +393,7 @@ server {
     listen 80;
     listen [::]:80;
     server_name $HOST;
+    server_tokens off;
     location /.well-known/acme-challenge/ { root $ACME_ROOT; }
 EOF
     if [[ ! -f $cert/fullchain.pem ]]; then
@@ -406,6 +408,7 @@ server {
     listen [::]:443 ssl;
     http2 on;
     server_name $HOST;
+    server_tokens off;
     ssl_certificate $cert/fullchain.pem;
     ssl_certificate_key $cert/privkey.pem;
     ssl_protocols TLSv1.2 TLSv1.3;
