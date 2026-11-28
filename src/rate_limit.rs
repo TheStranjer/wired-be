@@ -90,11 +90,11 @@ pub use middleware::{RateLimitLayer, RateLimited, rate_limit};
 /// `(name, max requests, window seconds)` triples.
 ///
 /// The numbers of Pleroma's `config :pleroma, :rate_limit`: `authentication`
-/// 20 per 5 s, `oauth_app_creation` 5 per 900 s (app registration),
+/// 15 per 60 s, `oauth_app_creation` 5 per 900 s (app registration),
 /// `app_account_creation` 25 per 1800 s (sign-up), `relations_actions`
 /// 10 per 10 s, `relation_id_action` 2 per 60 s, `statuses_actions`
-/// 10 per 10 s, `status_id_action` 2 per 60 s, `password_reset` 5 per
-/// 1800 s, `account_confirmation_resend` 5 per 8600 s, and `search`
+/// 15 per 10 s, `status_id_action` 3 per 60 s, `password_reset` 5 per
+/// 1800 s, `account_confirmation_resend` 5 per 8640 s, and `search`
 /// 30 per 60 s. `imports` (1 per 3600 s) is this server's own: the CSV
 /// follow, block and mute imports (WBE-504) each fan out to thousands of
 /// outbound fetches, so a user gets one import per hour across the three.
@@ -103,9 +103,9 @@ pub use middleware::{RateLimitLayer, RateLimited, rate_limit};
 /// a caller-named host (WBE-814), so one client address gets five lookups
 /// a minute.
 pub const DEFAULT_LIMITS: [(&str, u64, u64); 12] = [
-    ("account_confirmation_resend", 5, 8_600),
+    ("account_confirmation_resend", 5, 8_640),
     ("app_account_creation", 25, 1_800),
-    ("authentication", 20, 5),
+    ("authentication", 15, 60),
     ("imports", 1, 3_600),
     ("oauth_app_creation", 5, 900),
     ("password_reset", 5, 1_800),
@@ -113,8 +113,8 @@ pub const DEFAULT_LIMITS: [(&str, u64, u64); 12] = [
     ("remote_interaction", 5, 60),
     ("relations_actions", 10, 10),
     ("search", 30, 60),
-    ("status_id_action", 2, 60),
-    ("statuses_actions", 10, 10),
+    ("status_id_action", 3, 60),
+    ("statuses_actions", 15, 10),
 ];
 
 /// The default table of [`DEFAULT_LIMITS`] as owned bucket names.
@@ -205,15 +205,15 @@ mod tests {
         let want: [(&str, u64, u64); 12] = [
             ("remote_interaction", 5, 60),
             ("imports", 1, 3_600),
-            ("authentication", 20, 5),
+            ("authentication", 15, 60),
             ("oauth_app_creation", 5, 900),
             ("app_account_creation", 25, 1_800),
             ("relations_actions", 10, 10),
             ("relation_id_action", 2, 60),
-            ("statuses_actions", 10, 10),
-            ("status_id_action", 2, 60),
+            ("statuses_actions", 15, 10),
+            ("status_id_action", 3, 60),
             ("password_reset", 5, 1_800),
-            ("account_confirmation_resend", 5, 8_600),
+            ("account_confirmation_resend", 5, 8_640),
             ("search", 30, 60),
         ];
         assert_eq!(limits.len(), want.len(), "exactly the twelve buckets");

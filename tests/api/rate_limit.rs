@@ -409,3 +409,33 @@ async fn a_bearer_token_keys_the_window_on_its_user() {
         "the user's window does not bind the socket's own requests",
     );
 }
+
+/// The default `authentication` budget is Pleroma's 15 per 60 s: the 15th
+/// password grant is still counted and answered, the 16th is throttled.
+#[tokio::test]
+async fn authentication_defaults_to_fifteen_per_minute() {
+    let db = common::test_db().await;
+    let pool = db.pool().clone();
+    let app = common::test_app_with_config(pool, common::test_config_with_rate_limits(""));
+    for n in 1..=15_u32 {
+        let response = token_request().peer(peer(12)).send(&app).await;
+        assert_ne!(
+            response.status,
+            StatusCode::TOO_MANY_REQUESTS,
+            "grant {n} is inside the budget"
+        );
+        assert_eq!(
+            response.header("x-ratelimit-limit"),
+            Some("15"),
+            "fifteen per window"
+        );
+        assert_eq!(
+            response.header("x-ratelimit-reset"),
+            Some("60"),
+            "a 60 second window"
+        );
+    }
+    let sixteenth = token_request().peer(peer(12)).send(&app).await;
+    common::assert_answer(&sixteenth, StatusCode::TOO_MANY_REQUESTS, "the 16th grant");
+    common::assert_error(&sixteenth, "Throttled", "the 16th grant");
+}
